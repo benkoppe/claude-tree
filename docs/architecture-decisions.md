@@ -1,0 +1,49 @@
+# Architecture Decisions
+
+This document records decisions that shape the project and the reasons behind them. Specific libraries and versions are an initial baseline and can be upgraded or replaced when a better implementation preserves these constraints.
+
+## Stock Claude Code Runs In Owned PTYs
+
+Each live branch is a normal interactive `claude` process attached to its own pseudo-terminal and terminal emulator state. The application forwards input to the selected process and continues consuming output from every hidden process.
+
+Only the selected emulator is rendered. Switching views must not suspend or recreate unrelated Claude processes.
+
+This preserves the complete Claude Code experience and avoids maintaining a partial clone of its UI. It also rules out tmux and Herdr-style visible panes as the primary architecture.
+
+The initial implementation direction is Bun's native PTY API with OpenTUI's `EmbeddedTerminalRenderable`, which uses Ghostty's VT parser. This combination has been validated in the development environment, but the ownership model is more important than those particular dependencies.
+
+## The Agent SDK Is A Session Tool, Not The Chat Runtime
+
+Use supported SDK functions for session discovery, message reads, and historical forks. In particular, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation.
+
+The initial SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.239 with Claude Code 2.1.239. Upgrade them deliberately and verify session compatibility together.
+
+Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
+
+## Branch Relationships Need Application Metadata
+
+Claude sessions are persisted independently. Historical forking remaps message UUIDs and does not retain enough source-branch information for this application to reconstruct a reliable cross-session tree later.
+
+Store only the missing relationship data, such as the child session, parent session, source message, and copied-prefix boundary. Keep it outside the repository under the user's XDG state directory, scoped by project. Write it defensively so a failed or partial update cannot damage Claude's transcripts.
+
+Sessions and forks not created or recorded by `claude-tree` should still be usable. When their ancestry cannot be established reliably, show them as independent roots rather than guessing from message content.
+
+## One Process For The Initial Product
+
+Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child Claude processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
+
+A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
+
+Do not run two live processes against the same Claude session ID, because concurrent transcript ownership is unsafe. Different branches may run concurrently.
+
+## Input And View Ownership
+
+The application has two modes: navigator and embedded terminal. In terminal mode, input belongs to Claude except for one configurable host escape chord. The initial default is `Ctrl+Space`, selected explicitly for returning to the navigator.
+
+Avoid intercepting ordinary Claude keys. Host shortcuts should be mode-specific, visible to the user, and configurable when practical.
+
+## Shared Working Tree Is Deliberate
+
+Every Claude process starts in the same project directory. This allows branches to observe and build on the same filesystem state, but it also permits simultaneous edits and conflicts. The application should communicate status accurately and must not claim branch-level file isolation or silently create worktrees.
+
+Future agents have latitude in UI composition, state modeling, testing strategy, and dependency choices. Changes should be judged against the goals in `project-goals.md` and the behavioral constraints above.
