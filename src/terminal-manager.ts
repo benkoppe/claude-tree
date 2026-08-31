@@ -17,6 +17,8 @@ interface ManagedTerminal {
   pty: Bun.Terminal
   terminal: EmbeddedTerminalRenderable
   observer: TerminalObserver
+  state: "running" | "stopping" | "cleanup-incomplete"
+  stopRequest?: TerminalStopRequest
   exitCode: number | null
   draftPreview?: DraftPreview
   inputObserved: boolean
@@ -32,6 +34,12 @@ export interface TerminalExitEvent {
 export interface TerminalActivityEvent {
   sessionId: string
   activity: AgentActivity
+}
+
+export interface TerminalStopRequest {
+  sessionId: string
+  wasActive: boolean
+  completion: Promise<void>
 }
 
 export class TerminalManager {
@@ -53,6 +61,9 @@ export class TerminalManager {
       throw new Error("Cannot open an agent session while claude-tree is shutting down")
     }
     let managed = this.terminals.get(launch.sessionId)
+    if (managed && managed.state !== "running") {
+      throw new Error(`Agent session ${launch.sessionId} is still stopping`)
+    }
     if (managed && managed.exitCode !== null) {
       this.destroyTerminal(managed)
       this.terminals.delete(launch.sessionId)
@@ -94,7 +105,7 @@ export class TerminalManager {
   runningSessionIds(): Set<string> {
     return new Set(
       [...this.terminals.values()]
-        .filter((managed) => managed.exitCode === null)
+        .filter((managed) => managed.state === "running" && managed.exitCode === null)
         .map((managed) => managed.sessionId),
     )
   }
@@ -102,7 +113,12 @@ export class TerminalManager {
   draftPreviews(): Map<string, DraftPreview> {
     return new Map(
       [...this.terminals.values()]
-        .filter((managed) => managed.exitCode === null && managed.draftPreview !== undefined)
+        .filter(
+          (managed) =>
+            managed.state === "running" &&
+            managed.exitCode === null &&
+            managed.draftPreview !== undefined,
+        )
         .map((managed) => [managed.sessionId, managed.draftPreview!]),
     )
   }
@@ -110,9 +126,38 @@ export class TerminalManager {
   workingSessionIds(): Set<string> {
     return new Set(
       [...this.terminals.values()]
-        .filter((managed) => managed.exitCode === null && managed.activity === "working")
+        .filter(
+          (managed) =>
+            managed.state === "running" && managed.exitCode === null && managed.activity === "working",
+        )
         .map((managed) => managed.sessionId),
     )
+  }
+
+  stopSession(
+    sessionId: string,
+    gracePeriodMs = SHUTDOWN_GRACE_PERIOD_MS,
+  ): TerminalStopRequest | undefined {
+    const managed = this.terminals.get(sessionId)
+    if (!managed) return undefined
+    if (managed.stopRequest) return managed.stopRequest
+    if (managed.exitCode !== null) return undefined
+
+    managed.state = "stopping"
+    const wasActive = this.activeSessionId === sessionId
+    if (wasActive) {
+      this.activeSessionId = null
+      this.renderer.clearSelection()
+    }
+    this.destroyEmulator(managed)
+
+    const request: TerminalStopRequest = {
+      sessionId,
+      wasActive,
+      completion: this.performSessionStop(managed, gracePeriodMs),
+    }
+    managed.stopRequest = request
+    return request
   }
 
   shutdown(gracePeriodMs = SHUTDOWN_GRACE_PERIOD_MS): Promise<void> {
@@ -127,6 +172,9 @@ export class TerminalManager {
     this.renderer.clearSelection()
 
     const owned = [...this.terminals.values()]
+    const pendingStops = owned.flatMap((managed) =>
+      managed.stopRequest ? [managed.stopRequest.completion] : [],
+    )
     const errors: unknown[] = []
     try {
       signalProcessGroups(owned, "SIGTERM", errors)
@@ -138,6 +186,7 @@ export class TerminalManager {
       const survivors = owned.filter((managed) => isProcessGroupAlive(managed.process.pid))
       signalProcessGroups(survivors, "SIGKILL", errors)
       await waitForProcessGroups(survivors, FORCED_SHUTDOWN_PERIOD_MS)
+      await Promise.allSettled(pendingStops)
     } finally {
       for (const managed of owned) {
         if (!managed.pty.closed) managed.pty.close()
@@ -147,6 +196,37 @@ export class TerminalManager {
     }
 
     if (errors.length > 0) throw new AggregateError(errors, "Unable to stop every agent process")
+  }
+
+  private async performSessionStop(
+    managed: ManagedTerminal,
+    gracePeriodMs: number,
+  ): Promise<void> {
+    const errors: unknown[] = []
+    try {
+      signalProcessGroups([managed], "SIGTERM", errors)
+      await waitForProcessGroups([managed], gracePeriodMs)
+
+      if (isProcessGroupAlive(managed.process.pid)) {
+        signalProcessGroups([managed], "SIGKILL", errors)
+        await waitForProcessGroups([managed], FORCED_SHUTDOWN_PERIOD_MS)
+      }
+      if (isProcessGroupAlive(managed.process.pid)) {
+        errors.push(new Error(`Agent process group ${managed.process.pid} did not stop`))
+      }
+    } finally {
+      if (!managed.pty.closed) managed.pty.close()
+      this.destroyEmulator(managed)
+      if (managed.process.exitCode === null) managed.process.unref()
+    }
+
+    if (errors.length > 0) {
+      managed.state = "cleanup-incomplete"
+      throw new AggregateError(errors, `Unable to stop agent session ${managed.sessionId}`)
+    }
+    if (this.terminals.get(managed.sessionId) === managed) {
+      this.terminals.delete(managed.sessionId)
+    }
   }
 
   private spawn(launch: TerminalLaunch): ManagedTerminal {
@@ -176,14 +256,16 @@ export class TerminalManager {
       rows,
       maxScrollback: 1_000_000,
       onData(data, source) {
+        if (managed?.state !== "running") return
         if (source === "input" && managed) managed.inputObserved = true
         if (pty && !pty.closed) pty.write(data)
       },
       onTerminalResize(nextCols, nextRows) {
+        if (managed?.state !== "running") return
         if (pty && !pty.closed) pty.resize(nextCols, nextRows)
       },
       onScreenChange() {
-        if (!managed) return
+        if (!managed || managed.state !== "running") return
         const activity = launch.observer.observeScreen(terminal.screen())
         if (activity !== undefined) {
           observedActivity = activity
@@ -208,8 +290,8 @@ export class TerminalManager {
           cols,
           rows,
           data(childPty, data) {
-            if (manager.shuttingDown) return
             pty = childPty
+            if (manager.shuttingDown || (managed && managed.state !== "running")) return
             const clipboardWrites = osc52.observe(data)
             const activity = launch.observer.observeOutput(data)
             if (activity !== undefined) {
@@ -246,6 +328,7 @@ export class TerminalManager {
       pty,
       terminal,
       observer: launch.observer,
+      state: "running",
       exitCode: null,
       ...(launch.initialDraft === undefined ? {} : { draftPreview: launch.initialDraft }),
       inputObserved: false,
@@ -254,6 +337,7 @@ export class TerminalManager {
     void process.exited.then(async (exitCode) => {
       managed.exitCode = exitCode
       await waitForPtyDrain(ptyClosed)
+      if (managed.state !== "running") return
       if (this.terminals.get(managed.sessionId) !== managed) return
       const wasActive = this.activeSessionId === managed.sessionId
       if (wasActive) {
@@ -280,6 +364,7 @@ export class TerminalManager {
   }
 
   private setActivity(managed: ManagedTerminal, activity: AgentActivity): void {
+    if (managed.state !== "running") return
     if (managed.activity === activity) return
     managed.activity = activity
     this.onActivityChanged({ sessionId: managed.sessionId, activity })
@@ -287,7 +372,13 @@ export class TerminalManager {
 
   private pruneExited(): void {
     for (const [sessionId, managed] of this.terminals) {
-      if (managed.exitCode === null || sessionId === this.activeSessionId) continue
+      if (
+        managed.state !== "running" ||
+        managed.exitCode === null ||
+        sessionId === this.activeSessionId
+      ) {
+        continue
+      }
       this.destroyTerminal(managed)
       this.terminals.delete(sessionId)
     }

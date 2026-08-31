@@ -1,13 +1,13 @@
 import {
   BoxRenderable,
   CliRenderEvents,
+  RGBA,
   StyledText,
   TextAttributes,
   TextRenderable,
   type CliRenderer,
   type KeyEvent,
   type MouseEvent,
-  type RGBA,
   type TextChunk,
 } from "@opentui/core"
 
@@ -66,7 +66,19 @@ type FooterAction =
   | "quit"
   | "open"
   | "fork"
+  | "kill"
   | "roots"
+
+interface KillConfirmation {
+  sessionId: string
+  kind: "draft" | "working"
+  choice: "kill" | "cancel"
+}
+
+interface PreferredOpenSession {
+  nodeId: string
+  sessionId: string
+}
 
 interface FooterControl {
   key: string
@@ -104,6 +116,7 @@ const GRAPH_FOOTER_CONTROLS: FooterControl[] = [
   { key: "←→ / hl", description: "branches" },
   { key: "Enter", description: "open", action: "open" },
   { key: "f", description: "fork", action: "fork" },
+  { key: "x", description: "kill", action: "kill" },
   { key: "r", description: "refresh", action: "refresh" },
   { key: "q", description: "quit", action: "roots" },
 ]
@@ -115,6 +128,13 @@ export class AgentTreeApp {
   private readonly content: TextRenderable
   private readonly footerSeparator: TextRenderable
   private readonly footer: TextRenderable
+  private readonly killOverlay: BoxRenderable
+  private readonly killDialog: BoxRenderable
+  private readonly killMessage: TextRenderable
+  private readonly killCancelButton: BoxRenderable
+  private readonly killCancelLabel: TextRenderable
+  private readonly killConfirmButton: BoxRenderable
+  private readonly killConfirmLabel: TextRenderable
   private readonly terminalManager: TerminalManager
   private readonly temporarySessions = new Map<string, AgentSession>()
   private readonly stopped: Promise<void>
@@ -135,8 +155,11 @@ export class AgentTreeApp {
   private graphNavigationIntent: GraphNavigationIntent | null = null
   private footerHitRegions: FooterHitRegion[] = []
   private pendingMouseAction: PendingMouseAction | null = null
+  private killConfirmation: KillConfirmation | null = null
+  private preferredOpenSession: PreferredOpenSession | null = null
   private status: string
   private busy = false
+  private busyStatus = "Working…"
   private stopping = false
   private refreshGeneration = 0
   private spinnerFrame = 0
@@ -234,6 +257,131 @@ export class AgentTreeApp {
     this.navigator.add(this.footerSeparator)
     this.navigator.add(this.footer)
     renderer.root.add(this.navigator)
+
+    this.killOverlay = new BoxRenderable(renderer, {
+      id: "kill-overlay",
+      position: "absolute",
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      alignItems: "center",
+      paddingTop: Math.floor(renderer.terminalHeight / 4),
+      backgroundColor: RGBA.fromInts(0, 0, 0, 150),
+      visible: false,
+      zIndex: 3000,
+      onMouseDown: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      },
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.completeKillConfirmation("cancel")
+      },
+    })
+    this.killDialog = new BoxRenderable(renderer, {
+      id: "kill-dialog",
+      width: 60,
+      maxWidth: Math.max(1, renderer.terminalWidth - 2),
+      paddingTop: 1,
+      backgroundColor: theme.element,
+      onMouseDown: (event) => {
+        event.stopPropagation()
+      },
+      onMouseUp: (event) => {
+        event.stopPropagation()
+      },
+    })
+    const killContent = new BoxRenderable(renderer, {
+      id: "kill-content",
+      paddingLeft: 2,
+      paddingRight: 2,
+      rowGap: 1,
+      backgroundColor: theme.element,
+    })
+    const killHeader = new BoxRenderable(renderer, {
+      id: "kill-header",
+      flexDirection: "row",
+      justifyContent: "space-between",
+      backgroundColor: theme.element,
+    })
+    const killTitle = new TextRenderable(renderer, {
+      id: "kill-title",
+      fg: theme.text,
+      attributes: TextAttributes.BOLD,
+      selectable: false,
+      content: "Kill live session",
+    })
+    const killEscape = new TextRenderable(renderer, {
+      id: "kill-escape",
+      fg: theme.textMuted,
+      selectable: false,
+      content: "esc",
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.completeKillConfirmation("cancel")
+      },
+    })
+    killHeader.add(killTitle)
+    killHeader.add(killEscape)
+
+    this.killMessage = new TextRenderable(renderer, {
+      id: "kill-message",
+      fg: theme.textMuted,
+      marginBottom: 1,
+      selectable: false,
+      wrapMode: "word",
+      content: "",
+    })
+    const killActions = new BoxRenderable(renderer, {
+      id: "kill-actions",
+      flexDirection: "row",
+      justifyContent: "flex-end",
+      paddingBottom: 1,
+      backgroundColor: theme.element,
+    })
+    this.killCancelButton = new BoxRenderable(renderer, {
+      id: "kill-cancel",
+      paddingLeft: 1,
+      paddingRight: 1,
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.completeKillConfirmation("cancel")
+      },
+    })
+    this.killCancelLabel = new TextRenderable(renderer, {
+      id: "kill-cancel-label",
+      selectable: false,
+      content: "Cancel",
+    })
+    this.killCancelButton.add(this.killCancelLabel)
+    this.killConfirmButton = new BoxRenderable(renderer, {
+      id: "kill-confirm",
+      paddingLeft: 1,
+      paddingRight: 1,
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.completeKillConfirmation("kill")
+      },
+    })
+    this.killConfirmLabel = new TextRenderable(renderer, {
+      id: "kill-confirm-label",
+      selectable: false,
+      content: "Kill",
+    })
+    this.killConfirmButton.add(this.killConfirmLabel)
+    killActions.add(this.killCancelButton)
+    killActions.add(this.killConfirmButton)
+    killContent.add(killHeader)
+    killContent.add(this.killMessage)
+    killContent.add(killActions)
+    this.killDialog.add(killContent)
+    this.killOverlay.add(this.killDialog)
+    renderer.root.add(this.killOverlay)
   }
 
   static async create(
@@ -293,6 +441,9 @@ export class AgentTreeApp {
 
   private onTerminalExited(event: TerminalExitEvent): void {
     if (this.stopping) return
+    if (this.killConfirmation?.sessionId === event.sessionId) {
+      this.killConfirmation = null
+    }
     this.pendingCompletionRefreshes.delete(event.sessionId)
     const exitStatus =
       event.exitCode === 0
@@ -336,6 +487,10 @@ export class AgentTreeApp {
       return
     }
     if (this.view === "terminal") return
+    if (this.killConfirmation) {
+      this.handleKillConfirmationKey(key)
+      return
+    }
 
     if (this.view === "roots") {
       this.handleRootKey(key)
@@ -346,7 +501,14 @@ export class AgentTreeApp {
 
   private readonly onContentMouseDown = (event: MouseEvent) => {
     this.pendingMouseAction = null
-    if (event.button !== 0 || this.busy || this.view === "terminal") return
+    if (
+      event.button !== 0 ||
+      this.busy ||
+      this.killConfirmation ||
+      this.view === "terminal"
+    ) {
+      return
+    }
     const action = this.contentMouseActionAt(event)
     if (!action) return
     event.preventDefault()
@@ -357,7 +519,15 @@ export class AgentTreeApp {
   private readonly onContentMouseUp = (event: MouseEvent) => {
     const pending = this.pendingMouseAction
     this.pendingMouseAction = null
-    if (event.button !== 0 || this.busy || this.view === "terminal" || !pending) return
+    if (
+      event.button !== 0 ||
+      this.busy ||
+      this.killConfirmation ||
+      this.view === "terminal" ||
+      !pending
+    ) {
+      return
+    }
     const action = this.contentMouseActionAt(event)
     if (!action || !sameMouseAction(pending, action)) return
     event.preventDefault()
@@ -374,6 +544,7 @@ export class AgentTreeApp {
       void this.runAction(() => this.openSelectedLeaf())
     } else {
       this.selectedGraphNodeId = action.nodeId
+      this.preferredOpenSession = null
       this.graphNavigationIntent = null
       this.render()
     }
@@ -399,7 +570,7 @@ export class AgentTreeApp {
   }
 
   private readonly onContentMouseScroll = (event: MouseEvent) => {
-    if (this.busy || this.view !== "roots") return
+    if (this.busy || this.killConfirmation || this.view !== "roots") return
     const direction = event.scroll?.direction
     if (direction !== "up" && direction !== "down") return
     event.preventDefault()
@@ -410,7 +581,7 @@ export class AgentTreeApp {
 
   private readonly onFooterMouseDown = (event: MouseEvent) => {
     this.pendingMouseAction = null
-    if (event.button !== 0 || this.view === "terminal") return
+    if (event.button !== 0 || this.killConfirmation || this.view === "terminal") return
     const action = this.footerMouseActionAt(event)
     if (!action || (this.busy && action.action !== "quit")) return
     event.preventDefault()
@@ -421,7 +592,14 @@ export class AgentTreeApp {
   private readonly onFooterMouseUp = (event: MouseEvent) => {
     const pending = this.pendingMouseAction
     this.pendingMouseAction = null
-    if (event.button !== 0 || this.view === "terminal" || pending?.kind !== "footer") return
+    if (
+      event.button !== 0 ||
+      this.killConfirmation ||
+      this.view === "terminal" ||
+      pending?.kind !== "footer"
+    ) {
+      return
+    }
     const action = this.footerMouseActionAt(event)
     if (!action || action.action !== pending.action || (this.busy && action.action !== "quit")) return
     event.preventDefault()
@@ -452,6 +630,8 @@ export class AgentTreeApp {
       void this.runAction(() => this.openSelectedLeaf())
     } else if (action === "fork") {
       void this.runAction(() => this.forkSelectedNode())
+    } else if (action === "kill") {
+      this.showKillConfirmation()
     } else if (action === "roots") {
       this.showRoots()
     }
@@ -487,7 +667,7 @@ export class AgentTreeApp {
     const recognized =
       exit ||
       back ||
-      ["up", "down", "left", "right", "k", "j", "h", "l", "return", "f", "n", "r"].includes(
+      ["up", "down", "left", "right", "k", "j", "h", "l", "return", "f", "x", "n", "r"].includes(
         key.name,
       )
     if (!recognized) return
@@ -511,6 +691,8 @@ export class AgentTreeApp {
       void this.runAction(() => this.openSelectedLeaf())
     } else if (key.name === "f" && !key.repeated) {
       void this.runAction(() => this.forkSelectedNode())
+    } else if (key.name === "x" && !key.repeated) {
+      this.showKillConfirmation()
     } else if (key.name === "n" && !key.repeated) {
       void this.runAction(() => this.newSession())
     } else if (key.name === "r" && !key.repeated) {
@@ -518,8 +700,80 @@ export class AgentTreeApp {
     }
   }
 
-  private async runAction(action: () => Promise<unknown>): Promise<void> {
+  private handleKillConfirmationKey(key: KeyEvent): void {
+    const confirmation = this.killConfirmation
+    if (!confirmation) return
+    key.stopPropagation()
+    if (key.name === "c" && key.ctrl) {
+      void this.stop()
+      return
+    }
+    if (key.name === "q" || key.name === "escape") {
+      this.completeKillConfirmation("cancel")
+      return
+    }
+    if (
+      key.name === "tab" ||
+      key.name === "left" ||
+      key.name === "right" ||
+      key.name === "up" ||
+      key.name === "down" ||
+      key.name === "h" ||
+      key.name === "j" ||
+      key.name === "k" ||
+      key.name === "l"
+    ) {
+      confirmation.choice = confirmation.choice === "kill" ? "cancel" : "kill"
+      this.render()
+      return
+    }
+    if (key.name !== "return" || key.repeated) return
+
+    this.completeKillConfirmation(confirmation.choice)
+  }
+
+  private completeKillConfirmation(choice: "kill" | "cancel"): void {
+    const confirmation = this.killConfirmation
+    if (!confirmation) return
+    this.killConfirmation = null
+    if (choice === "kill") {
+      void this.runAction(
+        () => this.killLiveSession(confirmation.sessionId),
+        "Stopping session…",
+      )
+      return
+    }
+    this.render()
+  }
+
+  private showKillConfirmation(): void {
+    if (this.busy || this.view !== "graph") return
+    const selected = this.selectedGraphNode()
+    if (
+      selected?.kind !== "endpoint" ||
+      !this.terminalManager.runningSessionIds().has(selected.session.id)
+    ) {
+      this.status = "Select a live Draft or Agent to kill"
+      this.render()
+      return
+    }
+
+    const sessionId = selected.session.id
+    this.killConfirmation = {
+      sessionId,
+      kind: this.displayedWorkingSessionIds().has(sessionId) ? "working" : "draft",
+      choice: "kill",
+    }
+    this.pendingMouseAction = null
+    this.render()
+  }
+
+  private async runAction(
+    action: () => Promise<unknown>,
+    busyStatus = "Working…",
+  ): Promise<void> {
     this.busy = true
+    this.busyStatus = busyStatus
     this.render()
     try {
       await action()
@@ -527,6 +781,7 @@ export class AgentTreeApp {
       this.status = error instanceof Error ? error.message : String(error)
     } finally {
       this.busy = false
+      this.busyStatus = "Working…"
       this.scheduleCompletionRefresh()
       this.render()
     }
@@ -557,6 +812,7 @@ export class AgentTreeApp {
     }
     this.currentRootSessionId = graph.rootSessionId
     this.selectedGraphNodeId = selectedNodeId
+    this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.view = "graph"
@@ -574,6 +830,7 @@ export class AgentTreeApp {
     )
     if (!move) return
     this.selectedGraphNodeId = move.nodeId
+    this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = move.intent
     this.render()
@@ -581,6 +838,7 @@ export class AgentTreeApp {
 
   private showRoots(): void {
     this.view = "roots"
+    this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.render()
@@ -671,10 +929,17 @@ export class AgentTreeApp {
 
     let endpoint = selected.kind === "endpoint" ? selected : undefined
     if (!endpoint) {
-      endpoint = selected.childIds
+      const endpoints = selected.childIds
         .map((childId) => graph.nodes.get(childId))
         .filter((node): node is SessionEndpointNode => node?.kind === "endpoint")
-        .sort(compareSessionEndpoints)[0]
+        .sort(compareSessionEndpoints)
+      const preferred = this.preferredOpenSession
+      endpoint =
+        preferred?.nodeId === selected.id
+          ? endpoints.find(
+              (candidate) => candidate.session.id === preferred.sessionId,
+            ) ?? endpoints[0]
+          : endpoints[0]
     }
     if (endpoint?.kind !== "endpoint") {
       this.status = `This message is not the end of a ${this.provider.displayName} session`
@@ -686,6 +951,49 @@ export class AgentTreeApp {
 
   private async openEndpoint(endpoint: SessionEndpointNode): Promise<void> {
     await this.openTerminal(await this.provider.prepareResume(endpoint.session))
+    this.preferredOpenSession = null
+  }
+
+  private async killLiveSession(sessionId: string): Promise<void> {
+    const graph = this.currentGraph()
+    const endpointId = graph?.endpointBySessionId.get(sessionId)
+    const request = this.terminalManager.stopSession(sessionId)
+    if (!request) {
+      throw new Error(`The selected ${this.provider.displayName} session is no longer running`)
+    }
+
+    this.refreshGeneration += 1
+    this.pendingCompletionRefreshes.delete(sessionId)
+    if (this.pendingCompletionRefreshes.size === 0 && this.completionRefreshTimer) {
+      clearTimeout(this.completionRefreshTimer)
+      this.completionRefreshTimer = undefined
+    }
+    if (graph && endpointId && this.selectedGraphNodeId === endpointId) {
+      const fallbackNodeId = visibleGraphNodeId(
+        graph,
+        endpointId,
+        this.terminalManager.runningSessionIds(),
+      )
+      if (fallbackNodeId) {
+        this.selectedGraphNodeId = fallbackNodeId
+        this.graphViewportOffset = null
+        this.graphNavigationIntent = null
+      } else {
+        this.currentRootSessionId = null
+        this.selectedGraphNodeId = null
+        this.view = "roots"
+      }
+    }
+    this.render()
+
+    await request.completion
+    if (this.stopping) return
+    const refreshed = await this.refreshData(sessionId, false)
+    if (!refreshed) return
+    this.status = `${this.provider.displayName} session killed`
+    this.preferredOpenSession = this.selectedGraphNodeId
+      ? { nodeId: this.selectedGraphNodeId, sessionId }
+      : null
   }
 
   private async forkSelectedNode(): Promise<void> {
@@ -752,7 +1060,10 @@ export class AgentTreeApp {
   private render(): void {
     if (this.renderer.isDestroyed) return
     this.updateSpinnerAnimation()
-    if (this.view === "terminal") return
+    if (this.view === "terminal") {
+      this.killOverlay.visible = false
+      return
+    }
     const tooSmall =
       this.renderer.terminalWidth < MINIMUM_WIDTH || this.renderer.terminalHeight < MINIMUM_HEIGHT
     this.header.content = tooSmall
@@ -767,7 +1078,9 @@ export class AgentTreeApp {
     this.headerSeparator.visible = !tooSmall
     this.footerSeparator.visible = !tooSmall
     this.footer.visible = !tooSmall
+    this.killOverlay.visible = false
     if (tooSmall) {
+      this.killConfirmation = null
       this.graphLayout = null
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
@@ -829,6 +1142,30 @@ export class AgentTreeApp {
       this.footer.content = footer.content
       this.footerHitRegions = footer.hitRegions
     }
+    this.renderKillOverlay()
+  }
+
+  private renderKillOverlay(): void {
+    const confirmation = this.killConfirmation
+    if (!confirmation || this.view !== "graph") {
+      if (this.view !== "graph") this.killConfirmation = null
+      this.killOverlay.visible = false
+      return
+    }
+
+    const message =
+      confirmation.kind === "working"
+        ? "Interrupt this working Agent?\nPersisted response text remains resumable."
+        : "Kill this Draft?\nIts unsent text will be discarded."
+    const killSelected = confirmation.choice === "kill"
+    this.killOverlay.paddingTop = Math.floor(this.renderer.terminalHeight / 4)
+    this.killDialog.maxWidth = Math.max(1, this.renderer.terminalWidth - 2)
+    this.killMessage.content = message
+    this.killCancelButton.backgroundColor = killSelected ? undefined : theme.primary
+    this.killCancelLabel.fg = killSelected ? theme.textMuted : theme.selectedText
+    this.killConfirmButton.backgroundColor = killSelected ? theme.primary : undefined
+    this.killConfirmLabel.fg = killSelected ? theme.selectedText : theme.textMuted
+    this.killOverlay.visible = true
   }
 
   private renderHeader(): StyledText {
@@ -880,7 +1217,7 @@ export class AgentTreeApp {
   }
 
   private statusChunks(): TextChunk[] {
-    const status = this.busy ? "Working…" : this.status
+    const status = this.busy ? this.busyStatus : this.status
     const result = [
       chunk(status, this.busy ? theme.primary : theme.text, this.busy ? TextAttributes.BOLD : TextAttributes.NONE),
     ]

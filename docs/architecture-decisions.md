@@ -14,7 +14,7 @@ Branching is an explicit capability. A provider that cannot branch through a sup
 
 Each live branch is a normal interactive provider process attached to its own pseudo-terminal and terminal emulator state. The application forwards input to the selected process and continues consuming output from every hidden process.
 
-Only the selected emulator is rendered. Switching views must not suspend or recreate unrelated Claude processes.
+Only the selected emulator is rendered. Switching views must not suspend or recreate unrelated agent processes.
 
 This preserves the complete stock-agent experience and avoids maintaining a partial clone of its UI. It also rules out tmux and Herdr-style visible panes as the primary architecture.
 
@@ -59,6 +59,10 @@ Navigation retains a preferred world-space column for vertical movement and dept
 Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child Claude processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
 
 Shutdown releases the navigator and terminal emulators immediately, then remains in the foreground for a short, bounded cleanup of each owned agent process group. Keep PTYs open during the graceful termination window so the agent can finish its signal handling; escalate surviving process groups and close their PTYs before the application exits.
+
+Stopping one live endpoint uses the same bounded process-group cleanup but leaves every unrelated endpoint running. Mark the session as stopping and reserve its session ID before signaling it, so graph actions cannot start a second owner while cleanup is in progress. Keep that ownership reserved if cleanup cannot be proven complete; application shutdown is the final cleanup boundary.
+
+After an intentional stop, rebuild the graph from a fresh provider transcript read. A Draft with no persisted message disappears. A working response is frozen only to the extent the provider persisted it, and later resume creates a fresh Draft after that persisted boundary. Never reconstruct or append transcript history from terminal emulator cells.
 
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 

@@ -91,6 +91,57 @@ test("shutdown keeps the PTY open for graceful process cleanup", async () => {
   }
 })
 
+test("stops one session process group without disturbing another", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const directory = await mkdtemp(join(tmpdir(), "claude-tree-session-stop-test-"))
+  temporaryDirectories.push(directory)
+  const firstMarker = join(directory, "first")
+  const secondMarker = join(directory, "second")
+  const fakeClaude = await createFakeClaude(
+    `case "$2" in
+      11111111-*) marker=${JSON.stringify(firstMarker)} ;;
+      *) marker=${JSON.stringify(secondMarker)} ;;
+    esac
+    trap '' HUP TERM
+    sleep 30 &
+    child=$!
+    printf '%s %s\n' "$$" "$child" > "$marker"
+    wait "$child"`,
+  )
+  const exitEvents: Array<{ sessionId: string }> = []
+  const manager = new TerminalManager(setup.renderer, (event) => exitEvents.push(event))
+  const firstSessionId = "11111111-1111-4111-8111-111111111111"
+  const secondSessionId = "22222222-2222-4222-8222-222222222222"
+
+  try {
+    await manager.show(launch(fakeClaude, firstSessionId))
+    await manager.show(launch(fakeClaude, secondSessionId))
+    const firstProcessIds = await readProcessIds(firstMarker)
+    const secondProcessIds = await readProcessIds(secondMarker)
+
+    const request = manager.stopSession(firstSessionId, 50)
+    expect(request).toBeDefined()
+    expect(request?.wasActive).toBeFalse()
+    expect(manager.stopSession(firstSessionId)).toBe(request)
+    expect(manager.runningSessionIds()).toEqual(new Set([secondSessionId]))
+    expect(setup.renderer.root.getChildrenCount()).toBe(1)
+    await expect(manager.show(launch(fakeClaude, firstSessionId))).rejects.toThrow(
+      "still stopping",
+    )
+
+    await request?.completion
+    await waitUntil(() => firstProcessIds.every((processId) => !isProcessAlive(processId)))
+    expect(secondProcessIds.every(isProcessAlive)).toBeTrue()
+    expect(exitEvents).toEqual([])
+
+    await manager.show(launch(fakeClaude, firstSessionId))
+    expect(manager.runningSessionIds()).toEqual(new Set([secondSessionId, firstSessionId]))
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
 test("uses launch arguments and initial draft only when spawning a process", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-prefill-test-"))

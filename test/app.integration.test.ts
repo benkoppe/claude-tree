@@ -135,6 +135,52 @@ test("returns to the navigator when the visible Claude process exits", async () 
   }
 })
 
+test("forwards x to Claude while the terminal owns input", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const inputMarker = join(root, "input")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+IFS= read -r value
+printf '%s' "$value" > ${JSON.stringify(inputMarker)}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return []
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return []
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No Claude Code conversations found"))
+    setup.mockInput.pressKey("n")
+    await Bun.sleep(30)
+    setup.mockInput.pressKey("x")
+    setup.mockInput.pressEnter()
+    await waitUntil(() => Bun.file(inputMarker).exists())
+    expect(await readFile(inputMarker, "utf8")).toBe("x")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("quit closes the UI immediately while live sessions finish shutting down", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -342,6 +388,208 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
       setup,
       (candidate) => listCalls > callsBeforeRefresh && candidate.includes("Refreshed"),
     )
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("kill confirmation freezes a working response and resume creates a fresh draft", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const launchCountPath = join(root, "launch-count")
+  const interruptedMarker = join(root, "interrupted")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+count=0
+if [ -f ${JSON.stringify(launchCountPath)} ]; then count=$(cat ${JSON.stringify(launchCountPath)}); fi
+count=$((count + 1))
+printf '%s' "$count" > ${JSON.stringify(launchCountPath)}
+if [ "$count" -eq 1 ]; then
+  trap 'touch ${JSON.stringify(interruptedMarker)}; exit 0' TERM
+  ${String.raw`printf '\033]0;\342\240\213 Claude Code\007'`}
+  while :; do sleep 30 & wait "$!"; done
+fi
+${String.raw`printf '\033]0;\342\234\263 Claude Code\007'`}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const userMessage = sessionMessage(
+    sessionId,
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "user",
+    "question",
+  )
+  const interruptedMessage = sessionMessage(
+    sessionId,
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+    "assistant",
+    "frozen partial response",
+  )
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [
+        {
+          sessionId,
+          summary: "Interruptible conversation",
+          firstPrompt: "question",
+          lastModified: Date.now(),
+        },
+      ]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return (await Bun.file(interruptedMarker).exists())
+        ? [userMessage, interruptedMessage]
+        : [userMessage]
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Interruptible conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("question") && frame.includes("Message graph"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(50)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(
+      setup,
+      (frame) => BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
+    )
+
+    setup.mockInput.pressKey("x")
+    const confirmation = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Kill live session") && frame.includes("Interrupt this working Agent?"),
+    )
+    expect(confirmation).toContain("Kill")
+    expect(confirmation).toContain("esc")
+    expect(confirmation).not.toContain("┌")
+    expect(confirmation.indexOf("Cancel")).toBeLessThan(confirmation.lastIndexOf("Kill"))
+    expect(setup.captureSpans().lines[0]?.spans[0]?.bg.equals(theme.background)).toBeFalse()
+    const defaultKill = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("Kill") && span.bg.equals(theme.selected))
+    expect(defaultKill).toBeDefined()
+
+    setup.mockInput.pressArrow("right")
+    await setup.renderOnce()
+    const selectedCancel = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("Cancel") && span.bg.equals(theme.selected))
+    expect(selectedCancel).toBeDefined()
+    setup.mockInput.pressKey("q")
+    const cancelled = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && !frame.includes("Kill live session"),
+    )
+    expect(cancelled).not.toContain("Conversation roots")
+
+    setup.mockInput.pressKey("x")
+    const escapeDialog = await waitForFrame(setup, (frame) => frame.includes("Kill live session"))
+    const escapeAction = coordinateOf(escapeDialog, "esc")
+    await setup.mockMouse.click(escapeAction.x, escapeAction.y)
+    await waitForFrame(setup, (frame) => !frame.includes("Kill live session"))
+
+    setup.mockInput.pressKey("x")
+    await waitForFrame(setup, (frame) => frame.includes("Kill live session"))
+    await setup.mockMouse.click(0, 0)
+    await waitForFrame(setup, (frame) => !frame.includes("Kill live session"))
+
+    setup.mockInput.pressKey("x")
+    const clickableDialog = await waitForFrame(setup, (frame) => frame.includes("Cancel  Kill"))
+    const actions = coordinateOf(clickableDialog, "Cancel  Kill")
+    await setup.mockMouse.click(actions.x + displayWidth("Cancel  "), actions.y)
+    const frozen = await waitForFrame(
+      setup,
+      (frame) => frame.includes("frozen partial response") && frame.includes("Claude Code session killed"),
+    )
+    expect(frozen).not.toContain("Draft")
+    expect(BRAILLE_SPINNER_FRAMES.every((spinner) => !frozen.includes(spinner))).toBeTrue()
+
+    setup.mockInput.pressEnter()
+    await waitUntil(async () => (await readFile(launchCountPath, "utf8")).trim() === "2")
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const resumed = await waitForFrame(
+      setup,
+      (frame) => frame.includes("frozen partial response") && frame.includes("Draft"),
+    )
+    expect(resumed.indexOf("frozen partial response")).toBeLessThan(resumed.indexOf("Draft"))
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("killing a draft removes it without fabricating transcript history", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(fakeClaude, "#!/bin/sh\nsleep 30\n")
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const userMessage = sessionMessage(
+    sessionId,
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "user",
+    "saved question",
+  )
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [
+        {
+          sessionId,
+          summary: "Saved conversation",
+          firstPrompt: "saved question",
+          lastModified: Date.now(),
+        },
+      ]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return [userMessage]
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Saved conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("saved question"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(30)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Draft"))
+
+    setup.mockInput.pressKey("x")
+    setup.mockInput.pressEnter()
+    const killed = await waitForFrame(
+      setup,
+      (frame) => frame.includes("saved question") && frame.includes("Claude Code session killed"),
+    )
+    expect(killed).not.toContain("Draft")
+    expect(killed).not.toContain("Agent")
   } finally {
     await app.stop()
     await running
@@ -563,10 +811,13 @@ async function readProcessIds(path: string): Promise<number[]> {
   return contents.trim().split(/\s+/).map(Number)
 }
 
-async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+async function waitUntil(condition: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
   const deadline = performance.now() + timeoutMs
-  while (!condition() && performance.now() < deadline) await Bun.sleep(10)
-  expect(condition()).toBeTrue()
+  while (performance.now() < deadline) {
+    if (await condition()) return
+    await Bun.sleep(10)
+  }
+  expect(await condition()).toBeTrue()
 }
 
 function isProcessAlive(processId: number): boolean {

@@ -63,6 +63,7 @@ Message graph:
 | `Right` / `l` | Move to the nearest node on the right, preserving depth |
 | `Enter` | Open or resume the session ending at the selected node |
 | `f` | Fork an agent message, or replay a selected user message |
+| `x` | Kill the selected live Draft or working Agent after confirmation |
 | `n` | Start a new root conversation |
 | `r` | Refresh the graph |
 | `q` or `Escape` | Return to conversation roots |
@@ -83,6 +84,8 @@ Message nodes are filled cards labeled with Nerd Font icons and readable roles s
 Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
 Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
+
+Pressing `x` on a live Draft or working Agent opens a confirmation popup with `Kill` selected by default. Use the arrow keys, `h`/`j`/`k`/`l`, or `Tab` to choose; `Enter` confirms, while `q` or `Escape` cancels. Killing a Draft discards its in-memory composer preview. Killing a working Agent interrupts only that session, then refreshes Claude's persisted transcript. Any partial response Claude persisted appears as a completed Agent message; terminal screen cells are never copied into history. Resuming afterward starts a fresh Draft from the last persisted message. In Claude terminal mode, `x` remains ordinary Claude input.
 
 ## Fork Behavior
 
