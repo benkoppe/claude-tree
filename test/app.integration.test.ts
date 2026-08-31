@@ -72,6 +72,7 @@ test("renders navigator chrome against the terminal edges in both views", async 
       (frame) => frame.includes("Message graph") && frame.includes("question"),
     )
     expectNavigatorChrome(graph, "Graph ready")
+    expect(coordinateOf(graph, "question").x).toBe(26)
   } finally {
     await app.stop()
     await running
@@ -339,6 +340,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
       (candidate) => candidate.includes("follow-up 8") && isSelected(setup, "follow-up 8"),
     )
     const assistant = coordinateOf(frame, "Assistant")
+    expect(assistant.x).toBeGreaterThan(30)
     await setup.mockMouse.click(assistant.x, assistant.y)
     await setup.renderOnce()
     frame = setup.captureCharFrame()

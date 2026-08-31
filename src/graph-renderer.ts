@@ -116,10 +116,12 @@ export function renderConversationGraph(
   const selected = positioned.get(selectedNodeId) ?? positioned.values().next().value
   const selectedCenterX = (selected?.x ?? 0) + Math.floor((selected?.width ?? nodeWidth) / 2)
   const selectedCenterY = (selected?.y ?? 0) + Math.floor((selected?.height ?? GRAPH_NODE_HEIGHT) / 2)
+  const centeredOffsetX =
+    worldWidth === 0 ? 0 : -Math.floor(Math.max(0, safeWidth - worldWidth) / 2)
   const offsetX = clamp(
     viewportOffset?.x ?? selectedCenterX - Math.floor(safeWidth / 2),
-    0,
-    Math.max(0, worldWidth - safeWidth),
+    centeredOffsetX,
+    worldWidth <= safeWidth ? centeredOffsetX : worldWidth - safeWidth,
   )
   const offsetY = clamp(
     viewportOffset?.y ?? selectedCenterY - Math.floor(safeHeight / 2),
