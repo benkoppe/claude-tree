@@ -259,8 +259,10 @@ describe("renderRootPicker", () => {
     const rendered = renderRootPicker([graph], 0, 5, 80, new Set([CHILD]))
 
     expect(rendered.text.split("\n")[0]).toBe(
-      " ● Live  Root                                           3 messages · 2 sessions",
+      " ●  Root                                                3 messages · 2 sessions",
     )
+    expect(rendered.text).not.toContain("Live")
+    expect(rendered.text).not.toContain("Saved")
     expect(rendered.text).not.toContain(">")
     const selectedTitle = rendered.content.chunks.find((chunk) => chunk.text === "Root")
     expect(selectedTitle?.bg?.equals(theme.selected)).toBeTrue()

@@ -176,7 +176,7 @@ export function renderRootPicker(
     const live = [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
     const messageCount = [...graph.nodes.values()].filter((node) => node.kind === "message").length
     const sessionCount = graph.endpointBySessionId.size
-    const status = live ? "● Live" : "○ Saved"
+    const status = live ? "●" : "○"
     const metadata = `${messageCount} messages · ${sessionCount} ${sessionCount === 1 ? "session" : "sessions"}`
     const rowStyle = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     const statusStyle = {

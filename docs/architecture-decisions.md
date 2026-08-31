@@ -4,7 +4,7 @@ This document records decisions that shape the project and the reasons behind th
 
 ## Providers Are Explicit Application Dependencies
 
-One provider is selected when the application starts and is injected into the application controller. The provider owns session discovery, transcript normalization, new and resumed session launch preparation, historical branch semantics, compatibility checks, and interpretation of provider-specific terminal output. The application core owns graph construction, navigation, rendering, process lifecycle, and relationship persistence.
+One provider is selected when the application starts and is injected into the application controller. The provider owns session discovery, transcript normalization, new and resumed session launch preparation, historical branch semantics, and interpretation of provider-specific terminal output. The application core owns graph construction, navigation, rendering, process lifecycle, and relationship persistence.
 
 Session and message identifiers are opaque provider strings. The core must not assume UUIDs, provider CLI flags, transcript payload formats, or a particular branching implementation. Historical branch results expose validated parent-to-child message correspondence so the graph can merge shared history without understanding how the provider created it.
 
@@ -24,8 +24,6 @@ The generic terminal manager executes provider-prepared commands and delegates a
 
 Use supported provider APIs for session discovery, message reads, and historical forks. For the Claude adapter, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation.
 
-The initial SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.239 with Claude Code 2.1.239. Upgrade them deliberately and verify session compatibility together.
-
 Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
 
 ## Branch Relationships Need Application Metadata
@@ -42,7 +40,7 @@ Forking an agent message copies the transcript through that exact SDK message. F
 
 A user replay with no agent ancestor copies a zero-message prefix but remains in the same conversation family. The graph represents all top-level roots as children of one synthetic empty-history origin. That origin is application state rather than a Claude message or session: it is never rendered, selected, counted, or used as a fork target, and no connectors are drawn from it.
 
-The validated Claude Code 2.1.239 baseline provides a hidden `--prefill` option that initializes the stock interactive composer. It is preferable to timing simulated PTY keystrokes, but it is not a public compatibility surface. Claude Code upgrades must explicitly revalidate it. Prompts that cannot be represented as text fail closed rather than silently losing content.
+User replay initializes the stock Claude composer through `--prefill` rather than timing simulated PTY keystrokes. Prompts that cannot be represented as text fail closed rather than silently losing content.
 
 Claude Code does not expose semantic composer state. The application may show a conservative, in-memory preview parsed from the visible input box when leaving a live terminal, but it must mark that preview as approximate and never persist it as transcript or relationship state.
 

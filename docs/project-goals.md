@@ -23,7 +23,7 @@ Users should interact with the stock, interactive TUI supplied by the selected p
 
 The application may use supported provider APIs to discover and organize sessions, but it should not become a custom Agent SDK chat frontend unless the product goals fundamentally change.
 
-Provider-specific session formats, branching rules, launch arguments, compatibility checks, and terminal telemetry belong behind an explicit provider boundary. One application invocation uses one provider; aggregating unrelated providers into one navigator is not a current goal.
+Provider-specific session formats, branching rules, launch arguments, and terminal telemetry belong behind an explicit provider boundary. One application invocation uses one provider; aggregating unrelated providers into one navigator is not a current goal.
 
 ## Reliability And Scope
 

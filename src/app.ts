@@ -42,6 +42,7 @@ import {
   type SessionEndpointNode,
 } from "./message-graph"
 import { BranchMetadataStore, type BranchRelation } from "./metadata"
+import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import {
   TerminalManager,
   type TerminalActivityEvent,
@@ -53,11 +54,12 @@ const MINIMUM_WIDTH = 50
 const MINIMUM_HEIGHT = 12
 const NAVIGATOR_HORIZONTAL_MARGIN = 1
 const HEADER_HEIGHT = 2
-const FOOTER_HEIGHT = 3
+const FOOTER_HEIGHT = 2
 const SEPARATOR_HEIGHT = 1
 const NAVIGATOR_CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const COMPLETION_REFRESH_DELAY_MS = 75
+const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
 
 type FooterAction =
   | "enter-root"
@@ -68,6 +70,7 @@ type FooterAction =
   | "fork"
   | "kill"
   | "roots"
+  | "about"
 
 interface KillConfirmation {
   sessionId: string
@@ -78,6 +81,14 @@ interface KillConfirmation {
 interface PreferredOpenSession {
   nodeId: string
   sessionId: string
+}
+
+type InfoModal = { kind: "about" } | { kind: "error"; message: string }
+
+interface ActiveRefresh {
+  generation: number
+  controller: AbortController
+  focusSessionId?: string
 }
 
 interface FooterControl {
@@ -104,21 +115,23 @@ type FooterMouseAction = { kind: "footer"; action: FooterAction }
 type PendingMouseAction = ContentMouseAction | FooterMouseAction
 
 const ROOT_FOOTER_CONTROLS: FooterControl[] = [
-  { key: "↑↓ / jk", description: "select" },
+  { key: "↑↓/jk", description: "select" },
   { key: "Enter", description: "graph", action: "enter-root" },
   { key: "n", description: "new", action: "new" },
   { key: "r", description: "refresh", action: "refresh" },
   { key: "q", description: "quit", action: "quit" },
+  { key: "?", description: "about", action: "about" },
 ]
 
 const GRAPH_FOOTER_CONTROLS: FooterControl[] = [
-  { key: "↑↓ / kj", description: "edges" },
-  { key: "←→ / hl", description: "branches" },
+  { key: "↑↓/kj", description: "edges" },
+  { key: "←→/hl", description: "branches" },
   { key: "Enter", description: "open", action: "open" },
   { key: "f", description: "fork", action: "fork" },
   { key: "x", description: "kill", action: "kill" },
   { key: "r", description: "refresh", action: "refresh" },
   { key: "q", description: "quit", action: "roots" },
+  { key: "?", description: "about", action: "about" },
 ]
 
 export class AgentTreeApp {
@@ -135,6 +148,12 @@ export class AgentTreeApp {
   private readonly killCancelLabel: TextRenderable
   private readonly killConfirmButton: BoxRenderable
   private readonly killConfirmLabel: TextRenderable
+  private readonly infoOverlay: BoxRenderable
+  private readonly infoDialog: BoxRenderable
+  private readonly infoTitle: TextRenderable
+  private readonly infoTab: TextRenderable
+  private readonly infoTabSeparator: TextRenderable
+  private readonly infoBody: TextRenderable
   private readonly terminalManager: TerminalManager
   private readonly temporarySessions = new Map<string, AgentSession>()
   private readonly stopped: Promise<void>
@@ -156,12 +175,12 @@ export class AgentTreeApp {
   private footerHitRegions: FooterHitRegion[] = []
   private pendingMouseAction: PendingMouseAction | null = null
   private killConfirmation: KillConfirmation | null = null
+  private infoModal: InfoModal | null = null
   private preferredOpenSession: PreferredOpenSession | null = null
-  private status: string
   private busy = false
-  private busyStatus = "Working…"
   private stopping = false
   private refreshGeneration = 0
+  private activeRefresh: ActiveRefresh | null = null
   private spinnerFrame = 0
   private spinnerTimer: ReturnType<typeof setInterval> | undefined
   private completionRefreshTimer: ReturnType<typeof setTimeout> | undefined
@@ -175,7 +194,6 @@ export class AgentTreeApp {
     relations: BranchRelation[],
   ) {
     this.relations = relations
-    this.status = "Ready"
     this.terminalManager = new TerminalManager(
       renderer,
       (event) => this.onTerminalExited(event),
@@ -382,6 +400,139 @@ export class AgentTreeApp {
     this.killDialog.add(killContent)
     this.killOverlay.add(this.killDialog)
     renderer.root.add(this.killOverlay)
+
+    this.infoOverlay = new BoxRenderable(renderer, {
+      id: "info-overlay",
+      position: "absolute",
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: RGBA.fromInts(0, 0, 0, 150),
+      visible: false,
+      zIndex: 3000,
+      onMouseDown: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      },
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.closeInfoModal()
+      },
+    })
+    this.infoDialog = new BoxRenderable(renderer, {
+      id: "info-dialog",
+      width: 76,
+      height: 22,
+      backgroundColor: theme.element,
+      onMouseDown: (event) => {
+        event.stopPropagation()
+      },
+      onMouseUp: (event) => {
+        event.stopPropagation()
+      },
+    })
+    const infoContent = new BoxRenderable(renderer, {
+      id: "info-content",
+      width: "100%",
+      height: "100%",
+      paddingTop: 1,
+      paddingBottom: 1,
+      paddingLeft: 2,
+      paddingRight: 2,
+      backgroundColor: theme.element,
+    })
+    const infoHeader = new BoxRenderable(renderer, {
+      id: "info-header",
+      flexDirection: "row",
+      justifyContent: "space-between",
+      backgroundColor: theme.element,
+    })
+    this.infoTitle = new TextRenderable(renderer, {
+      id: "info-title",
+      fg: theme.text,
+      attributes: TextAttributes.BOLD,
+      selectable: false,
+      content: "",
+    })
+    const infoEscape = new TextRenderable(renderer, {
+      id: "info-escape",
+      fg: theme.textMuted,
+      selectable: false,
+      content: "esc",
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.closeInfoModal()
+      },
+    })
+    infoHeader.add(this.infoTitle)
+    infoHeader.add(infoEscape)
+    this.infoTab = new TextRenderable(renderer, {
+      id: "info-tab",
+      marginTop: 1,
+      bg: theme.element,
+      selectable: false,
+      content: styledText([
+        chunk(" About ", theme.selectedText, TextAttributes.BOLD, theme.primary),
+      ]),
+    })
+    this.infoTabSeparator = new TextRenderable(renderer, {
+      id: "info-tab-separator",
+      fg: theme.separator,
+      bg: theme.element,
+      selectable: false,
+      wrapMode: "none",
+      content: "",
+    })
+    this.infoBody = new TextRenderable(renderer, {
+      id: "info-body",
+      flexGrow: 1,
+      marginTop: 1,
+      fg: theme.textMuted,
+      bg: theme.element,
+      selectable: false,
+      wrapMode: "word",
+      content: "",
+    })
+    const infoActions = new BoxRenderable(renderer, {
+      id: "info-actions",
+      flexDirection: "row",
+      justifyContent: "center",
+      backgroundColor: theme.element,
+    })
+    const infoCloseButton = new BoxRenderable(renderer, {
+      id: "info-close",
+      paddingLeft: 1,
+      paddingRight: 1,
+      backgroundColor: theme.primary,
+      onMouseUp: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.closeInfoModal()
+      },
+    })
+    infoCloseButton.add(
+      new TextRenderable(renderer, {
+        id: "info-close-label",
+        fg: theme.selectedText,
+        attributes: TextAttributes.BOLD,
+        selectable: false,
+        content: "esc close",
+      }),
+    )
+    infoActions.add(infoCloseButton)
+    infoContent.add(infoHeader)
+    infoContent.add(this.infoTab)
+    infoContent.add(this.infoTabSeparator)
+    infoContent.add(this.infoBody)
+    infoContent.add(infoActions)
+    this.infoDialog.add(infoContent)
+    this.infoOverlay.add(this.infoDialog)
+    renderer.root.add(this.infoOverlay)
   }
 
   static async create(
@@ -414,7 +565,7 @@ export class AgentTreeApp {
 
   private async performStop(): Promise<void> {
     this.stopping = true
-    this.refreshGeneration += 1
+    this.cancelActiveRefresh()
     try {
       this.renderer.keyInput.off("keypress", this.onKeyPress)
       this.renderer.keyInput.off("keyrelease", this.onKeyRelease)
@@ -445,22 +596,21 @@ export class AgentTreeApp {
       this.killConfirmation = null
     }
     this.pendingCompletionRefreshes.delete(event.sessionId)
-    const exitStatus =
-      event.exitCode === 0
-        ? `${this.provider.displayName} session exited`
-        : `${this.provider.displayName} session exited with code ${event.exitCode}`
     if (event.wasActive) {
       this.view = "roots"
       this.navigator.visible = true
     }
+    const exitError =
+      event.exitCode === 0
+        ? undefined
+        : `${this.provider.displayName} session exited with code ${event.exitCode}`
     void this.refreshData(event.wasActive ? event.sessionId : undefined)
       .then(() => {
-        this.status = exitStatus
-        this.render()
+        if (exitError) this.showError(exitError)
       })
       .catch((error) => {
-        this.status = `${exitStatus}; refresh failed: ${error instanceof Error ? error.message : String(error)}`
-        this.render()
+        const refreshError = error instanceof Error ? error.message : String(error)
+        this.showError(exitError ? `${exitError}; refresh failed: ${refreshError}` : refreshError)
       })
   }
 
@@ -487,8 +637,17 @@ export class AgentTreeApp {
       return
     }
     if (this.view === "terminal") return
+    if (this.infoModal) {
+      this.handleInfoModalKey(key)
+      return
+    }
     if (this.killConfirmation) {
       this.handleKillConfirmationKey(key)
+      return
+    }
+    if (key.name === "?" && !key.repeated) {
+      key.stopPropagation()
+      this.showAbout()
       return
     }
 
@@ -503,8 +662,8 @@ export class AgentTreeApp {
     this.pendingMouseAction = null
     if (
       event.button !== 0 ||
-      this.busy ||
-      this.killConfirmation ||
+      this.interactionBlocked() ||
+      this.hasModal() ||
       this.view === "terminal"
     ) {
       return
@@ -521,8 +680,8 @@ export class AgentTreeApp {
     this.pendingMouseAction = null
     if (
       event.button !== 0 ||
-      this.busy ||
-      this.killConfirmation ||
+      this.interactionBlocked() ||
+      this.hasModal() ||
       this.view === "terminal" ||
       !pending
     ) {
@@ -570,7 +729,7 @@ export class AgentTreeApp {
   }
 
   private readonly onContentMouseScroll = (event: MouseEvent) => {
-    if (this.busy || this.killConfirmation || this.view !== "roots") return
+    if (this.interactionBlocked() || this.hasModal() || this.view !== "roots") return
     const direction = event.scroll?.direction
     if (direction !== "up" && direction !== "down") return
     event.preventDefault()
@@ -581,9 +740,9 @@ export class AgentTreeApp {
 
   private readonly onFooterMouseDown = (event: MouseEvent) => {
     this.pendingMouseAction = null
-    if (event.button !== 0 || this.killConfirmation || this.view === "terminal") return
+    if (event.button !== 0 || this.hasModal() || this.view === "terminal") return
     const action = this.footerMouseActionAt(event)
-    if (!action || (this.busy && action.action !== "quit")) return
+    if (!action || !this.footerActionAvailable(action.action)) return
     event.preventDefault()
     event.stopPropagation()
     this.pendingMouseAction = action
@@ -594,14 +753,14 @@ export class AgentTreeApp {
     this.pendingMouseAction = null
     if (
       event.button !== 0 ||
-      this.killConfirmation ||
+      this.hasModal() ||
       this.view === "terminal" ||
       pending?.kind !== "footer"
     ) {
       return
     }
     const action = this.footerMouseActionAt(event)
-    if (!action || action.action !== pending.action || (this.busy && action.action !== "quit")) return
+    if (!action || action.action !== pending.action || !this.footerActionAvailable(action.action)) return
     event.preventDefault()
     event.stopPropagation()
     this.runFooterAction(action.action)
@@ -623,7 +782,7 @@ export class AgentTreeApp {
     } else if (action === "new") {
       void this.runAction(() => this.newSession())
     } else if (action === "refresh") {
-      void this.runAction(() => this.refreshData())
+      void this.requestRefresh()
     } else if (action === "quit") {
       void this.stop()
     } else if (action === "open") {
@@ -634,6 +793,8 @@ export class AgentTreeApp {
       this.showKillConfirmation()
     } else if (action === "roots") {
       this.showRoots()
+    } else if (action === "about") {
+      this.showAbout()
     }
   }
 
@@ -646,7 +807,9 @@ export class AgentTreeApp {
 
     if (quit) {
       void this.stop()
-    } else if (this.busy) {
+    } else if (key.name === "r" && !key.repeated && !this.busy) {
+      void this.requestRefresh()
+    } else if (this.interactionBlocked()) {
       return
     } else if (key.name === "up" || key.name === "k") {
       this.moveRoot(-1)
@@ -656,8 +819,6 @@ export class AgentTreeApp {
       this.enterSelectedRoot()
     } else if (key.name === "n" && !key.repeated) {
       void this.runAction(() => this.newSession())
-    } else if (key.name === "r" && !key.repeated) {
-      void this.runAction(() => this.refreshData())
     }
   }
 
@@ -675,7 +836,9 @@ export class AgentTreeApp {
 
     if (exit) {
       void this.stop()
-    } else if (this.busy) {
+    } else if (key.name === "r" && !key.repeated && !this.busy) {
+      void this.requestRefresh()
+    } else if (this.interactionBlocked()) {
       return
     } else if (back) {
       this.showRoots()
@@ -695,8 +858,22 @@ export class AgentTreeApp {
       this.showKillConfirmation()
     } else if (key.name === "n" && !key.repeated) {
       void this.runAction(() => this.newSession())
-    } else if (key.name === "r" && !key.repeated) {
-      void this.runAction(() => this.refreshData())
+    }
+  }
+
+  private handleInfoModalKey(key: KeyEvent): void {
+    key.stopPropagation()
+    if (key.name === "c" && key.ctrl) {
+      void this.stop()
+      return
+    }
+    if (
+      key.name === "escape" ||
+      key.name === "q" ||
+      key.name === "return" ||
+      (key.name === "?" && !key.repeated)
+    ) {
+      this.closeInfoModal()
     }
   }
 
@@ -737,24 +914,20 @@ export class AgentTreeApp {
     if (!confirmation) return
     this.killConfirmation = null
     if (choice === "kill") {
-      void this.runAction(
-        () => this.killLiveSession(confirmation.sessionId),
-        "Stopping session…",
-      )
+      void this.runAction(() => this.killLiveSession(confirmation.sessionId))
       return
     }
     this.render()
   }
 
   private showKillConfirmation(): void {
-    if (this.busy || this.view !== "graph") return
+    if (this.interactionBlocked() || this.view !== "graph") return
     const selected = this.selectedGraphNode()
     if (
       selected?.kind !== "endpoint" ||
       !this.terminalManager.runningSessionIds().has(selected.session.id)
     ) {
-      this.status = "Select a live Draft or Agent to kill"
-      this.render()
+      this.showError("Select a live Draft or Agent to kill")
       return
     }
 
@@ -768,23 +941,55 @@ export class AgentTreeApp {
     this.render()
   }
 
-  private async runAction(
-    action: () => Promise<unknown>,
-    busyStatus = "Working…",
-  ): Promise<void> {
+  private async runAction(action: () => Promise<unknown>): Promise<void> {
     this.busy = true
-    this.busyStatus = busyStatus
     this.render()
     try {
       await action()
     } catch (error) {
-      this.status = error instanceof Error ? error.message : String(error)
+      this.showError(error)
     } finally {
       this.busy = false
-      this.busyStatus = "Working…"
       this.scheduleCompletionRefresh()
       this.render()
     }
+  }
+
+  private showAbout(): void {
+    this.infoModal = { kind: "about" }
+    this.pendingMouseAction = null
+    this.render()
+  }
+
+  private showError(error: unknown): void {
+    if (isAbortError(error) || this.stopping) return
+    this.infoModal = {
+      kind: "error",
+      message: error instanceof Error ? error.message : String(error),
+    }
+    this.killConfirmation = null
+    this.pendingMouseAction = null
+    this.render()
+  }
+
+  private closeInfoModal(): void {
+    if (!this.infoModal) return
+    this.infoModal = null
+    this.render()
+  }
+
+  private hasModal(): boolean {
+    return this.killConfirmation !== null || this.infoModal !== null
+  }
+
+  private interactionBlocked(): boolean {
+    return this.busy || this.activeRefresh !== null
+  }
+
+  private footerActionAvailable(action: FooterAction): boolean {
+    if (action === "quit" || action === "about") return true
+    if (action === "refresh") return !this.busy
+    return !this.interactionBlocked()
   }
 
   private moveRoot(delta: number): void {
@@ -816,8 +1021,8 @@ export class AgentTreeApp {
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.view = "graph"
-    this.status = graph.warnings[0] ?? "Graph ready"
     this.render()
+    if (graph.warnings[0]) this.showError(graph.warnings[0])
   }
 
   private moveSelection(direction: GraphDirection): void {
@@ -844,76 +1049,137 @@ export class AgentTreeApp {
     this.render()
   }
 
-  private async refreshData(focusSessionId?: string, updateStatus = true): Promise<boolean> {
-    const generation = ++this.refreshGeneration
-    const pendingCompletions = new Map(this.pendingCompletionRefreshes)
-    const discovered = await this.provider.listSessions()
-    if (generation !== this.refreshGeneration || this.stopping) return false
-
-    const discoveredIds = new Set(discovered.map((session) => session.id))
-    for (const sessionId of discoveredIds) this.temporarySessions.delete(sessionId)
-    const runningIds = this.terminalManager.runningSessionIds()
-    for (const [sessionId, session] of this.temporarySessions) {
-      if (session.transient && !runningIds.has(sessionId)) this.temporarySessions.delete(sessionId)
+  private async requestRefresh(focusSessionId?: string, showWarnings = true): Promise<boolean> {
+    try {
+      return await this.refreshData(focusSessionId, showWarnings)
+    } catch (error) {
+      this.showError(error)
+      return false
     }
-    this.sessions = [...discovered, ...this.temporarySessions.values()]
+  }
 
-    const transcriptEntries = await Promise.all(
-      this.sessions.map(async (session) => {
-        if (session.transient) return [session.id, [] as AgentMessage[]] as const
-        return [session.id, await this.provider.readTranscript(session.id)] as const
-      }),
-    )
-    if (generation !== this.refreshGeneration || this.stopping) return false
-    const previousRootSessionId = this.currentRootSessionId
-    const previousNodeId = this.selectedGraphNodeId
-    const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
-    this.transcripts = new Map(transcriptEntries)
-    this.forest = buildConversationForest(this.sessions, this.transcripts, this.relations)
-    this.graphViewportOffset = null
-    this.graphNavigationIntent = null
+  private async refreshData(focusSessionId?: string, showWarnings = true): Promise<boolean> {
+    const effectiveFocusSessionId = focusSessionId ?? this.activeRefresh?.focusSessionId
+    this.cancelActiveRefresh()
+    const generation = ++this.refreshGeneration
+    const controller = new AbortController()
+    const refresh: ActiveRefresh = {
+      generation,
+      controller,
+      ...(effectiveFocusSessionId === undefined
+        ? {}
+        : { focusSessionId: effectiveFocusSessionId }),
+    }
+    this.activeRefresh = refresh
+    const pendingCompletions = new Map(this.pendingCompletionRefreshes)
+    this.render()
 
-    const focusedGraph = focusSessionId ? this.forest.graphBySessionId.get(focusSessionId) : undefined
-    const preservedGraph = previousRootSessionId
-      ? this.forest.graphBySessionId.get(previousRootSessionId)
-      : undefined
-    const graph = focusedGraph ?? preservedGraph
-    if (graph) {
-      this.selectedRootIndex = this.forest.graphs.indexOf(graph)
-      const requestedNodeId =
-        (focusSessionId ? graph.endpointBySessionId.get(focusSessionId) : undefined) ??
-        (previousNodeId && graph.nodes.has(previousNodeId) ? previousNodeId : graph.rootNodeId)
-      const selectedNodeId =
-        visibleGraphNodeId(graph, requestedNodeId, runningIds) ??
-        initialVisibleGraphNodeId(graph, runningIds)
-      if (selectedNodeId) {
-        this.currentRootSessionId = graph.rootSessionId
-        this.selectedGraphNodeId = selectedNodeId
-        if (focusSessionId) this.view = "graph"
+    try {
+      const discovered = await abortable(this.provider.listSessions(), controller.signal)
+      if (!this.refreshCurrent(refresh)) return false
+
+      const discoveredIds = new Set(discovered.map((session) => session.id))
+      const runningIds = this.terminalManager.runningSessionIds()
+      const retainedTemporarySessions = [...this.temporarySessions.values()].filter(
+        (session) =>
+          !discoveredIds.has(session.id) && (!session.transient || runningIds.has(session.id)),
+      )
+      const sessions = [...discovered, ...retainedTemporarySessions]
+
+      const transcriptEntries = await Promise.all(
+        sessions.map(async (session) => {
+          if (session.transient) return [session.id, [] as AgentMessage[]] as const
+          const transcript = await abortable(
+            this.provider.readTranscript(session.id),
+            controller.signal,
+          )
+          return [session.id, transcript] as const
+        }),
+      )
+      if (!this.refreshCurrent(refresh)) return false
+      const previousRootSessionId = this.currentRootSessionId
+      const previousNodeId = this.selectedGraphNodeId
+      const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
+      const retainedTemporarySessionIds = new Set(
+        retainedTemporarySessions.map((session) => session.id),
+      )
+      for (const sessionId of this.temporarySessions.keys()) {
+        if (!retainedTemporarySessionIds.has(sessionId)) {
+          this.temporarySessions.delete(sessionId)
+        }
+      }
+      this.sessions = sessions
+      this.transcripts = new Map(transcriptEntries)
+      this.forest = buildConversationForest(this.sessions, this.transcripts, this.relations)
+      this.graphViewportOffset = null
+      this.graphNavigationIntent = null
+
+      const focusedGraph = effectiveFocusSessionId
+        ? this.forest.graphBySessionId.get(effectiveFocusSessionId)
+        : undefined
+      const preservedGraph = previousRootSessionId
+        ? this.forest.graphBySessionId.get(previousRootSessionId)
+        : undefined
+      const graph = focusedGraph ?? preservedGraph
+      if (graph) {
+        this.selectedRootIndex = this.forest.graphs.indexOf(graph)
+        const requestedNodeId =
+          (effectiveFocusSessionId
+            ? graph.endpointBySessionId.get(effectiveFocusSessionId)
+            : undefined) ??
+          (previousNodeId && graph.nodes.has(previousNodeId) ? previousNodeId : graph.rootNodeId)
+        const selectedNodeId =
+          visibleGraphNodeId(graph, requestedNodeId, runningIds) ??
+          initialVisibleGraphNodeId(graph, runningIds)
+        if (selectedNodeId) {
+          this.currentRootSessionId = graph.rootSessionId
+          this.selectedGraphNodeId = selectedNodeId
+          if (effectiveFocusSessionId) this.view = "graph"
+        } else {
+          this.currentRootSessionId = null
+          this.selectedGraphNodeId = null
+          this.view = "roots"
+        }
       } else {
         this.currentRootSessionId = null
         this.selectedGraphNodeId = null
         this.view = "roots"
+        const preservedRootIndex = previousSelectedRoot
+          ? this.forest.graphs.findIndex(
+              (candidate) => candidate.rootSessionId === previousSelectedRoot,
+            )
+          : -1
+        this.selectedRootIndex = preservedRootIndex >= 0 ? preservedRootIndex : 0
       }
-    } else {
-      this.currentRootSessionId = null
-      this.selectedGraphNodeId = null
-      this.view = "roots"
-      const preservedRootIndex = previousSelectedRoot
-        ? this.forest.graphs.findIndex((candidate) => candidate.rootSessionId === previousSelectedRoot)
-        : -1
-      this.selectedRootIndex = preservedRootIndex >= 0 ? preservedRootIndex : 0
-    }
 
-    if (updateStatus) {
-      this.status =
-        this.forest.warnings[0] ??
-        (this.forest.graphs.length === 0
-          ? `No ${this.provider.displayName} conversations found. Press n to start one.`
-          : "Refreshed")
+      this.clearPendingCompletions(pendingCompletions)
+      if (showWarnings && this.forest.warnings[0]) this.showError(this.forest.warnings[0])
+      return true
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) return false
+      throw error
+    } finally {
+      if (this.activeRefresh === refresh) {
+        this.activeRefresh = null
+        this.render()
+        this.scheduleCompletionRefresh()
+      }
     }
-    this.clearPendingCompletions(pendingCompletions)
-    return true
+  }
+
+  private refreshCurrent(refresh: ActiveRefresh): boolean {
+    return (
+      this.activeRefresh === refresh &&
+      refresh.generation === this.refreshGeneration &&
+      !refresh.controller.signal.aborted &&
+      !this.stopping
+    )
+  }
+
+  private cancelActiveRefresh(): void {
+    this.activeRefresh?.controller.abort()
+    this.activeRefresh = null
+    this.refreshGeneration += 1
   }
 
   private async newSession(): Promise<void> {
@@ -942,7 +1208,7 @@ export class AgentTreeApp {
           : endpoints[0]
     }
     if (endpoint?.kind !== "endpoint") {
-      this.status = `This message is not the end of a ${this.provider.displayName} session`
+      this.showError(`This message is not the end of a ${this.provider.displayName} session`)
       return
     }
 
@@ -962,7 +1228,7 @@ export class AgentTreeApp {
       throw new Error(`The selected ${this.provider.displayName} session is no longer running`)
     }
 
-    this.refreshGeneration += 1
+    this.cancelActiveRefresh()
     this.pendingCompletionRefreshes.delete(sessionId)
     if (this.pendingCompletionRefreshes.size === 0 && this.completionRefreshTimer) {
       clearTimeout(this.completionRefreshTimer)
@@ -990,7 +1256,6 @@ export class AgentTreeApp {
     if (this.stopping) return
     const refreshed = await this.refreshData(sessionId, false)
     if (!refreshed) return
-    this.status = `${this.provider.displayName} session killed`
     this.preferredOpenSession = this.selectedGraphNodeId
       ? { nodeId: this.selectedGraphNodeId, sessionId }
       : null
@@ -1001,16 +1266,14 @@ export class AgentTreeApp {
     if (!graph || !this.selectedGraphNodeId) return
     const target = resolveForkTarget(graph, this.selectedGraphNodeId)
     if (!target) {
-      this.status = "This node has no historical message to fork"
+      this.showError("This node has no historical message to fork")
       return
     }
     if (!this.provider.branchFrom) {
-      this.status = `${this.provider.displayName} does not support historical branching`
+      this.showError(`${this.provider.displayName} does not support historical branching`)
       return
     }
 
-    this.status = "Forking conversation..."
-    this.render()
     const prepared = await this.provider.branchFrom(target)
 
     let relation: BranchRelation
@@ -1041,7 +1304,7 @@ export class AgentTreeApp {
     const sessionId = this.terminalManager.hideActive()
     this.view = "roots"
     this.navigator.visible = true
-    await this.runAction(() => this.refreshData(sessionId ?? undefined))
+    await this.requestRefresh(sessionId ?? undefined)
   }
 
   private currentGraph(): ConversationGraph | undefined {
@@ -1062,6 +1325,7 @@ export class AgentTreeApp {
     this.updateSpinnerAnimation()
     if (this.view === "terminal") {
       this.killOverlay.visible = false
+      this.infoOverlay.visible = false
       return
     }
     const tooSmall =
@@ -1079,8 +1343,10 @@ export class AgentTreeApp {
     this.footerSeparator.visible = !tooSmall
     this.footer.visible = !tooSmall
     this.killOverlay.visible = false
+    this.infoOverlay.visible = false
     if (tooSmall) {
       this.killConfirmation = null
+      this.infoModal = null
       this.graphLayout = null
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
@@ -1143,6 +1409,7 @@ export class AgentTreeApp {
       this.footerHitRegions = footer.hitRegions
     }
     this.renderKillOverlay()
+    this.renderInfoOverlay()
   }
 
   private renderKillOverlay(): void {
@@ -1168,6 +1435,49 @@ export class AgentTreeApp {
     this.killOverlay.visible = true
   }
 
+  private renderInfoOverlay(): void {
+    const modal = this.infoModal
+    if (!modal) {
+      this.infoOverlay.visible = false
+      return
+    }
+
+    const horizontalMargin = 4
+    const verticalMargin = 2
+    const about = modal.kind === "about"
+    const width = Math.max(
+      1,
+      Math.min(about ? 76 : 60, this.renderer.terminalWidth - horizontalMargin),
+    )
+    const height = Math.max(
+      1,
+      Math.min(about ? 22 : 9, this.renderer.terminalHeight - verticalMargin),
+    )
+    this.infoDialog.width = width
+    this.infoDialog.height = height
+    this.infoTitle.content = about ? "Settings" : "Error"
+    this.infoTab.visible = about
+    this.infoTabSeparator.visible = about
+    this.infoTabSeparator.content = "─".repeat(Math.max(1, width - 4))
+    this.infoBody.content = about ? this.aboutContent() : modal.message
+    this.infoOverlay.visible = true
+  }
+
+  private aboutContent(): StyledText {
+    const background = theme.element
+    const chunks = [
+      chunk(PROGRAM_NAME, theme.text, TextAttributes.BOLD, background),
+      chunk(`\nVersion ${PROGRAM_VERSION}`, theme.textMuted, TextAttributes.NONE, background),
+      chunk(
+        "\n\nNote: Branches are not isolated. All conversations share this working directory and can modify the same files.",
+        theme.warning,
+        TextAttributes.NONE,
+        background,
+      ),
+    ]
+    return styledText(chunks)
+  }
+
   private renderHeader(): StyledText {
     const identity = [
       chunk("󰙅 claude-tree", theme.primary, TextAttributes.BOLD),
@@ -1179,9 +1489,7 @@ export class AgentTreeApp {
       return styledText([...identity, chunk("Conversation roots", theme.text, TextAttributes.BOLD)])
     }
     const graph = this.currentGraph()
-    const rootEndpointId = graph?.endpointBySessionId.get(graph.rootSessionId)
-    const rootEndpoint = rootEndpointId ? graph?.nodes.get(rootEndpointId) : undefined
-    const title = rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
+    const title = graph ? graphTitle(graph) : "Conversation"
     return styledText([
       ...identity,
       chunk(truncateToWidth(title, Math.max(1, this.renderer.terminalWidth - 18)), theme.text, TextAttributes.BOLD),
@@ -1190,41 +1498,49 @@ export class AgentTreeApp {
   }
 
   private renderRootFooter(): RenderedFooter {
-    const controls = renderControls(ROOT_FOOTER_CONTROLS)
+    const controls = renderControls(ROOT_FOOTER_CONTROLS, this.refreshSpinnerFrame())
+    const selected = this.forest.graphs[this.selectedRootIndex]
+    const runningSessionIds = this.terminalManager.runningSessionIds()
+    const live = selected
+      ? [...selected.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
+      : false
+    const prefixWidth = live ? displayWidth("● Live · ") : 0
+    const title = truncateToWidth(
+      selected ? graphTitle(selected) : "",
+      Math.max(1, this.renderer.terminalWidth - NAVIGATOR_HORIZONTAL_MARGIN * 2 - prefixWidth),
+    )
     return {
       content: styledText([
         ...controls.chunks,
-        chunk("\nAll branches share this working tree.", theme.warning),
         chunk("\n", theme.text),
-        ...this.statusChunks(),
+        ...(live
+          ? [
+              chunk("● Live", theme.success, TextAttributes.BOLD),
+              chunk(" · ", theme.textMuted),
+            ]
+          : []),
+        chunk(title, theme.textMuted),
       ]),
       hitRegions: controls.hitRegions,
     }
   }
 
   private renderGraphFooter(): RenderedFooter {
-    const controls = renderControls(GRAPH_FOOTER_CONTROLS)
+    const controls = renderControls(GRAPH_FOOTER_CONTROLS, this.refreshSpinnerFrame())
     return {
       content: styledText([
         ...controls.chunks,
         chunk("\n", theme.text),
         chunk(this.selectedDescription(), theme.textMuted),
-        chunk("\n", theme.text),
-        ...this.statusChunks(),
       ]),
       hitRegions: controls.hitRegions,
     }
   }
 
-  private statusChunks(): TextChunk[] {
-    const status = this.busy ? this.busyStatus : this.status
-    const result = [
-      chunk(status, this.busy ? theme.primary : theme.text, this.busy ? TextAttributes.BOLD : TextAttributes.NONE),
-    ]
-    if (this.provider.compatibilityWarning) {
-      result.push(chunk("  ·  ", theme.textMuted), chunk(this.provider.compatibilityWarning, theme.warning))
-    }
-    return result
+  private refreshSpinnerFrame(): string | undefined {
+    return this.activeRefresh
+      ? REFRESH_SPINNER_FRAMES[this.spinnerFrame % REFRESH_SPINNER_FRAMES.length]
+      : undefined
   }
 
   private selectedDescription(): string {
@@ -1255,19 +1571,22 @@ export class AgentTreeApp {
   private updateSpinnerAnimation(): void {
     const graph = this.currentGraph()
     const workingSessionIds = this.displayedWorkingSessionIds()
-    const shouldAnimate =
+    const graphShouldAnimate =
       this.view === "graph" &&
-      this.renderer.terminalWidth >= MINIMUM_WIDTH &&
-      this.renderer.terminalHeight >= MINIMUM_HEIGHT &&
       graph !== undefined &&
       [...graph.sessionIds].some((sessionId) => workingSessionIds.has(sessionId))
+    const shouldAnimate =
+      this.view !== "terminal" &&
+      this.renderer.terminalWidth >= MINIMUM_WIDTH &&
+      this.renderer.terminalHeight >= MINIMUM_HEIGHT &&
+      (this.activeRefresh !== null || graphShouldAnimate)
     if (!shouldAnimate) {
       this.stopSpinnerAnimation()
       return
     }
     if (this.spinnerTimer) return
     this.spinnerTimer = setInterval(() => {
-      this.spinnerFrame = (this.spinnerFrame + 1) % BRAILLE_SPINNER_FRAMES.length
+      this.spinnerFrame += 1
       this.render()
     }, SPINNER_INTERVAL_MS)
   }
@@ -1291,6 +1610,7 @@ export class AgentTreeApp {
     if (
       this.stopping ||
       this.busy ||
+      this.activeRefresh !== null ||
       this.completionRefreshRunning ||
       this.completionRefreshTimer ||
       this.pendingCompletionRefreshes.size === 0
@@ -1299,6 +1619,10 @@ export class AgentTreeApp {
     }
     this.completionRefreshTimer = setTimeout(() => {
       this.completionRefreshTimer = undefined
+      if (this.busy || this.activeRefresh) {
+        this.scheduleCompletionRefresh()
+        return
+      }
       void this.refreshCompletedSessions()
     }, COMPLETION_REFRESH_DELAY_MS)
   }
@@ -1313,7 +1637,7 @@ export class AgentTreeApp {
       await this.refreshData(undefined, false)
     } catch (error) {
       failed = true
-      this.status = `Refresh failed: ${error instanceof Error ? error.message : String(error)}`
+      this.showError(`Refresh failed: ${error instanceof Error ? error.message : String(error)}`)
     } finally {
       if (failed) this.clearPendingCompletions(refreshes)
       this.completionRefreshRunning = false
@@ -1344,7 +1668,7 @@ function styledText(chunks: TextChunk[]): StyledText {
   return new StyledText(chunks)
 }
 
-function renderControls(controls: FooterControl[]): {
+function renderControls(controls: FooterControl[], refreshKey?: string): {
   chunks: TextChunk[]
   hitRegions: FooterHitRegion[]
 } {
@@ -1353,19 +1677,54 @@ function renderControls(controls: FooterControl[]): {
   let x = 0
   for (const [index, control] of controls.entries()) {
     if (index > 0) {
-      chunks.push(chunk("  ", theme.textMuted))
-      x += 2
+      chunks.push(chunk(" ", theme.textMuted))
+      x += 1
     }
-    const text = `${control.key} ${control.description}`
+    const key = control.action === "refresh" && refreshKey ? refreshKey : control.key
+    const text = `${key} ${control.description}`
     const endX = x + displayWidth(text)
     chunks.push(
-      chunk(control.key, theme.text, TextAttributes.BOLD),
+      chunk(key, theme.text, TextAttributes.BOLD),
       chunk(` ${control.description}`, theme.textMuted),
     )
     if (control.action) hitRegions.push({ startX: x, endX, action: control.action })
     x = endX
   }
   return { chunks, hitRegions }
+}
+
+function graphTitle(graph: ConversationGraph): string {
+  const rootEndpointId = graph.endpointBySessionId.get(graph.rootSessionId)
+  const rootEndpoint = rootEndpointId ? graph.nodes.get(rootEndpointId) : undefined
+  return rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortError())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError())
+    signal.addEventListener("abort", onAbort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort)
+        reject(error)
+      },
+    )
+  })
+}
+
+function abortError(): Error {
+  const error = new Error("Refresh aborted")
+  error.name = "AbortError"
+  return error
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError"
 }
 
 function sameMouseAction(left: PendingMouseAction, right: PendingMouseAction): boolean {
