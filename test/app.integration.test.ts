@@ -56,6 +56,7 @@ test("renders navigator chrome against the terminal edges in both views", async 
     )
     expectNavigatorChrome(graph, "Graph ready")
     expect(coordinateOf(graph, "question").x).toBe(26)
+    expect(coordinateOf(graph, "question").y).toBe(11)
   } finally {
     await app.stop()
     await running

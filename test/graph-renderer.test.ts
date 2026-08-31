@@ -103,7 +103,7 @@ describe("renderConversationGraph", () => {
     const rendered = renderConversationGraph(graph, selected, 40, 4, new Set())
 
     expect(rendered.offsetX).toBeGreaterThan(0)
-    expect(rendered.offsetY).toBeGreaterThan(0)
+    expect(rendered.offsetY).toBe(2)
     expect(rendered.text).toContain("fork answer")
     expect(rendered.text).not.toContain("Draft")
     expect(rendered.layout.nodes.has(graph.endpointBySessionId.get(ROOT)!)).toBeFalse()
@@ -162,6 +162,29 @@ describe("renderConversationGraph", () => {
     expect(rendered.offsetX).toBe(-Math.floor((viewportWidth - rendered.worldWidth) / 2))
     expect(leftGutter).toBe(16)
     expect(rightGutter).toBe(17)
+  })
+
+  test("centers a short graph even when given a previous vertical offset", () => {
+    const graph = branchGraph()
+    const viewportHeight = 31
+    const rendered = renderConversationGraph(
+      graph,
+      graph.rootNodeId,
+      40,
+      viewportHeight,
+      new Set(),
+      new Map(),
+      new Set(),
+      0,
+      { x: 0, y: 0 },
+    )
+    const topGutter = -rendered.offsetY
+    const bottomGutter = viewportHeight - rendered.worldHeight - topGutter
+
+    expect(rendered.worldHeight).toBeLessThan(viewportHeight)
+    expect(rendered.offsetY).toBe(-Math.floor((viewportHeight - rendered.worldHeight) / 2))
+    expect(topGutter).toBe(12)
+    expect(bottomGutter).toBe(13)
   })
 
   test("hit-tests only graph card rectangles", () => {
@@ -338,9 +361,11 @@ describe("spatial graph navigation", () => {
 
     expect(saved.layout.nodes.size).toBe(0)
     expect(saved.offsetX).toBe(0)
+    expect(saved.offsetY).toBe(0)
     expect(saved.text).not.toContain("Draft")
     expect(initialVisibleGraphNodeId(graph, new Set())).toBeUndefined()
     expect(live.layout.nodes.has(endpointId)).toBeTrue()
+    expect(live.offsetY).toBe(-3)
     expect(live.text).toContain("Draft")
     expect(initialVisibleGraphNodeId(graph, new Set([ROOT]))).toBe(endpointId)
   })
