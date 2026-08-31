@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import {
   buildConversationForest,
+  reachableSessionEndpoints,
   resolveForkTarget,
   type MessageGraphNode,
 } from "../src/message-graph"
@@ -144,6 +145,128 @@ describe("message ordering", () => {
     expect(graph.nodes.get(nodeIds[1]!)?.parentId).toBe(nodeIds[0])
     expect(graph.nodes.get(nodeIds[2]!)?.parentId).toBe(nodeIds[1])
     expect(graph.nodes.get(nodeIds[3]!)?.parentId).toBe(nodeIds[2])
+  })
+})
+
+describe("reachableSessionEndpoints", () => {
+  test("finds the only endpoint below an interior message", () => {
+    const messages = [
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "first", 0),
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "second", 1),
+    ]
+    const graph = buildConversationForest(
+      [session(ROOT, "Root", 10)],
+      new Map([[ROOT, messages]]),
+      [],
+    ).graphs[0]!
+
+    expect(
+      reachableSessionEndpoints(graph, graph.rootNodeId).map(({ endpoint, distance }) => ({
+        sessionId: endpoint.session.id,
+        distance,
+      })),
+    ).toEqual([{ sessionId: ROOT, distance: 2 }])
+  })
+
+  test("orders endpoints by downward distance before recency", () => {
+    const rootMessages = [
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0),
+    ]
+    const childMessages = [
+      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "source", 0),
+      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "agent", "fork answer", 1),
+    ]
+    const graph = buildConversationForest(
+      [session(ROOT, "Root", 10), session(CHILD, "Newer fork", 20)],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childMessages],
+      ]),
+      [relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, childMessages, 1))],
+    ).graphs[0]!
+
+    expect(
+      reachableSessionEndpoints(graph, graph.rootNodeId).map(({ endpoint, distance }) => ({
+        sessionId: endpoint.session.id,
+        distance,
+      })),
+    ).toEqual([
+      { sessionId: ROOT, distance: 1 },
+      { sessionId: CHILD, distance: 2 },
+    ])
+  })
+
+  test("orders equally distant endpoints by recency and session id", () => {
+    const rootMessages = [
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0),
+    ]
+    const childMessages = [
+      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "source", 0),
+    ]
+    const grandchildMessages = [
+      message("cccccccc-cccc-4ccc-8ccc-ccccccccccc1", "user", "source", 0),
+    ]
+    const graph = buildConversationForest(
+      [
+        session(ROOT, "Root", 10),
+        session(CHILD, "Older fork", 20),
+        session(GRANDCHILD, "Newer fork", 30),
+      ],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childMessages],
+        [GRANDCHILD, grandchildMessages],
+      ]),
+      [
+        relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, childMessages, 1), 1),
+        relation(
+          GRANDCHILD,
+          ROOT,
+          rootMessages[0]!.id,
+          shared(rootMessages, grandchildMessages, 1),
+          2,
+        ),
+      ],
+    ).graphs[0]!
+
+    expect(
+      reachableSessionEndpoints(graph, graph.rootNodeId).map(({ endpoint }) =>
+        endpoint.session.id
+      ),
+    ).toEqual([GRANDCHILD, CHILD, ROOT])
+  })
+
+  test("does not cross the synthetic origin into sibling root chains", () => {
+    const rootMessage = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root", 0)
+    const replayMessage = message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "replay", 0)
+    const graph = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Replay", 10)],
+      new Map([
+        [ROOT, [rootMessage]],
+        [CHILD, [replayMessage]],
+      ]),
+      [
+        {
+          schemaVersion: 1,
+          childSessionId: CHILD,
+          parentSessionId: ROOT,
+          sourceMessageId: rootMessage.id,
+          sharedMessages: [],
+          createdAt: "2026-08-30T12:00:00.000Z",
+        },
+      ],
+    ).graphs[0]!
+
+    expect(
+      reachableSessionEndpoints(graph, graph.rootNodeId).map(({ endpoint }) =>
+        endpoint.session.id
+      ),
+    ).toEqual([ROOT])
+    expect(
+      reachableSessionEndpoints(graph, graph.endpointBySessionId.get(CHILD)!).map(
+        ({ endpoint, distance }) => ({ sessionId: endpoint.session.id, distance }),
+      ),
+    ).toEqual([{ sessionId: CHILD, distance: 0 }])
   })
 })
 

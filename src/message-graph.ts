@@ -47,6 +47,11 @@ export interface ConversationForest {
   warnings: string[]
 }
 
+export interface ReachableSessionEndpoint {
+  endpoint: SessionEndpointNode
+  distance: number
+}
+
 interface SessionGraphContext {
   transcript: AgentMessage[]
   rawLogicalNodeIds: Array<string | undefined>
@@ -131,6 +136,40 @@ export function buildConversationForest(
   for (const session of [...sessions].sort(compareSessions)) buildRoot(session)
 
   return { graphs, graphBySessionId, warnings }
+}
+
+export function reachableSessionEndpoints(
+  graph: ConversationGraph,
+  nodeId: string,
+): ReachableSessionEndpoint[] {
+  const selected = graph.nodes.get(nodeId)
+  if (!selected || selected.kind === "origin") return []
+
+  const endpoints: ReachableSessionEndpoint[] = []
+  const queue = [{ nodeId, distance: 0 }]
+  const visited = new Set<string>()
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index]!
+    if (visited.has(current.nodeId)) continue
+    visited.add(current.nodeId)
+
+    const node = graph.nodes.get(current.nodeId)
+    if (!node || node.kind === "origin") continue
+    if (node.kind === "endpoint") {
+      endpoints.push({ endpoint: node, distance: current.distance })
+      continue
+    }
+    for (const childId of node.childIds) {
+      queue.push({ nodeId: childId, distance: current.distance + 1 })
+    }
+  }
+
+  return endpoints.sort(
+    (left, right) =>
+      left.distance - right.distance ||
+      right.endpoint.session.lastModified - left.endpoint.session.lastModified ||
+      left.endpoint.session.id.localeCompare(right.endpoint.session.id),
+  )
 }
 
 const sessionContextByGraph = new WeakMap<ConversationGraph, Map<string, SessionGraphContext>>()
