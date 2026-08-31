@@ -1,6 +1,12 @@
-import type {
-  ConversationGraph,
-} from "./message-graph"
+import {
+  StyledText,
+  TextAttributes,
+  type RGBA,
+  type TextChunk,
+} from "@opentui/core"
+
+import { displayWidth, graphemes, truncateToWidth } from "./display-text"
+import type { ConversationGraph } from "./message-graph"
 import {
   GRAPH_NODE_HEIGHT,
   type ConversationGraphLayout,
@@ -8,15 +14,58 @@ import {
   layoutConversationGraph,
 } from "./graph-layout"
 import type { DraftPreview } from "./terminal-manager"
+import { theme } from "./theme"
 
-export interface RenderedGraph {
+export interface RenderedText {
+  content: StyledText
   text: string
+}
+
+export interface RenderedGraph extends RenderedText {
   worldWidth: number
   worldHeight: number
   offsetX: number
   offsetY: number
   layout: ConversationGraphLayout
 }
+
+interface CellStyle {
+  fg: RGBA
+  bg: RGBA
+  attributes: number
+}
+
+interface CanvasCell {
+  text: string
+  width: number
+  continuation: boolean
+  style: CellStyle
+}
+
+const DEFAULT_STYLE: CellStyle = {
+  fg: theme.text,
+  bg: theme.background,
+  attributes: TextAttributes.NONE,
+}
+
+const CONNECTOR_STYLE: CellStyle = {
+  fg: theme.connector,
+  bg: theme.background,
+  attributes: TextAttributes.NONE,
+}
+
+const NORTH = 1
+const EAST = 2
+const SOUTH = 4
+const WEST = 8
+
+const ICONS = {
+  user: "󰭹",
+  assistant: "󰚩",
+  branch: "󰘬",
+  system: "󰒓",
+  session: "󰆍",
+} as const
 
 export function renderConversationGraph(
   graph: ConversationGraph,
@@ -49,8 +98,8 @@ export function renderConversationGraph(
   const worldWidth = Math.max(layout.worldWidth, canvas.width)
   const worldHeight = Math.max(layout.worldHeight, canvas.height)
   const selected = positioned.get(selectedNodeId) ?? positioned.get(graph.rootNodeId)
-  const selectedCenterX = (selected?.x ?? 0) + Math.floor(nodeWidth / 2)
-  const selectedCenterY = (selected?.y ?? 0) + 1
+  const selectedCenterX = (selected?.x ?? 0) + Math.floor((selected?.width ?? nodeWidth) / 2)
+  const selectedCenterY = (selected?.y ?? 0) + Math.floor((selected?.height ?? GRAPH_NODE_HEIGHT) / 2)
   const offsetX = clamp(
     selectedCenterX - Math.floor(safeWidth / 2),
     0,
@@ -61,9 +110,10 @@ export function renderConversationGraph(
     0,
     Math.max(0, worldHeight - safeHeight),
   )
+  const viewport = canvas.viewport(offsetX, offsetY, safeWidth, safeHeight)
 
   return {
-    text: canvas.viewport(offsetX, offsetY, safeWidth, safeHeight),
+    ...viewport,
     worldWidth,
     worldHeight,
     offsetX,
@@ -78,25 +128,58 @@ export function renderRootPicker(
   height: number,
   width: number,
   runningSessionIds: Set<string>,
-): string {
-  if (graphs.length === 0) return "No conversations. Press n to start one."
-  const { start, end } = windowAround(graphs.length, selectedIndex, height)
-  return graphs
-    .slice(start, end)
-    .map((graph, offset) => {
-      const index = start + offset
-      const rootEndpointId = graph.endpointBySessionId.get(graph.rootSessionId)
-      const rootEndpoint = rootEndpointId ? graph.nodes.get(rootEndpointId) : undefined
-      const title = rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
-      const live = [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
-      const messageCount = [...graph.nodes.values()].filter((node) => node.kind === "message").length
-      const branchCount = graph.endpointBySessionId.size
-      return truncate(
-        `${index === selectedIndex ? ">" : " "} ${live ? "*" : "o"} ${title}  (${messageCount} messages, ${branchCount} ${branchCount === 1 ? "leaf" : "leaves"})`,
-        width,
-      )
+): RenderedText {
+  const safeWidth = Math.max(1, width)
+  if (graphs.length === 0) {
+    const canvas = new SparseCanvas()
+    canvas.write(0, 0, truncateToWidth("No conversations · press n to start one", safeWidth), {
+      ...DEFAULT_STYLE,
+      fg: theme.textMuted,
     })
-    .join("\n")
+    return canvas.viewport(0, 0, safeWidth, Math.max(1, height))
+  }
+
+  const canvas = new SparseCanvas()
+  const { start, end } = windowAround(graphs.length, selectedIndex, height)
+  for (let index = start; index < end; index += 1) {
+    const graph = graphs[index]!
+    const row = index - start
+    const selected = index === selectedIndex
+    const background = selected ? theme.selected : theme.background
+    const foreground = selected ? theme.selectedText : theme.text
+    const rootEndpointId = graph.endpointBySessionId.get(graph.rootSessionId)
+    const rootEndpoint = rootEndpointId ? graph.nodes.get(rootEndpointId) : undefined
+    const title = rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
+    const live = [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
+    const messageCount = [...graph.nodes.values()].filter((node) => node.kind === "message").length
+    const branchCount = graph.endpointBySessionId.size
+    const status = live ? "● Live" : "○ Saved"
+    const metadata = `${messageCount} messages · ${branchCount} ${branchCount === 1 ? "leaf" : "leaves"}`
+    const rowStyle = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
+    const statusStyle = {
+      ...rowStyle,
+      fg: selected ? theme.selectedText : live ? theme.success : theme.textMuted,
+      attributes: TextAttributes.BOLD,
+    }
+
+    canvas.paint(0, row, safeWidth, 1, rowStyle)
+    canvas.write(1, row, status, statusStyle)
+    const titleX = 1 + displayWidth(status) + 2
+    const metadataWidth = displayWidth(metadata)
+    const metadataX = Math.max(titleX, safeWidth - metadataWidth - 1)
+    const titleWidth = Math.max(0, metadataX - titleX - 2)
+    canvas.write(titleX, row, truncateToWidth(title, titleWidth), {
+      ...rowStyle,
+      attributes: selected ? TextAttributes.BOLD : TextAttributes.NONE,
+    })
+    if (metadataX > titleX) {
+      canvas.write(metadataX, row, truncateToWidth(metadata, safeWidth - metadataX - 1), {
+        ...rowStyle,
+        fg: selected ? theme.selectedText : theme.textMuted,
+      })
+    }
+  }
+  return canvas.viewport(0, 0, safeWidth, Math.max(1, height))
 }
 
 function drawConnections(
@@ -113,16 +196,16 @@ function drawConnections(
   const parentCenter = parent.x + Math.floor(nodeWidth / 2)
   const branchY = parent.y + GRAPH_NODE_HEIGHT
   const childCenters = children.map((child) => child.x + Math.floor(nodeWidth / 2))
-  if (children.length > 1) {
-    canvas.horizontal(Math.min(...childCenters, parentCenter), Math.max(...childCenters, parentCenter), branchY)
-  }
-  canvas.set(parentCenter, branchY, "+")
+  const minimumX = Math.min(parentCenter, ...childCenters)
+  const maximumX = Math.max(parentCenter, ...childCenters)
 
+  canvas.connectHorizontal(minimumX, maximumX, branchY)
+  canvas.connect(parentCenter, branchY, NORTH)
   for (let index = 0; index < children.length; index += 1) {
     const child = children[index]!
     const center = childCenters[index]!
-    canvas.set(center, branchY, "+")
-    canvas.vertical(center, branchY + 1, child.y - 1)
+    canvas.connect(center, branchY, SOUTH)
+    canvas.connectVertical(center, branchY + 1, child.y - 1)
   }
 }
 
@@ -135,97 +218,224 @@ function drawNode(
   draftPreviews: Map<string, DraftPreview>,
 ): void {
   const { node, x, y } = positioned
-  const top = `+${"-".repeat(width - 2)}+`
-  let label: string
+  const background = selected
+    ? theme.selected
+    : node.kind === "endpoint"
+      ? theme.sessionElement
+      : node.internal
+        ? theme.branchElement
+        : theme.element
+  const foreground = selected ? theme.selectedText : theme.text
+  const baseStyle = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
+  const headerStyle = { ...baseStyle, attributes: TextAttributes.BOLD }
+  const contentWidth = Math.max(0, width - 4)
+
+  canvas.paint(x, y, width, GRAPH_NODE_HEIGHT, baseStyle)
+
   if (node.kind === "message") {
-    const role = node.internal
-      ? "I"
+    const kind = node.internal
+      ? { icon: ICONS.branch, label: "Branch point", accent: theme.accent }
       : node.role === "assistant"
-        ? "A"
+        ? { icon: ICONS.assistant, label: "Assistant", accent: theme.primary }
         : node.role === "user"
-          ? "U"
-          : "S"
-    label = `${selected ? ">" : " "} ${role} ${node.preview}`
-  } else {
-    const running = runningSessionIds.has(node.session.sessionId)
-    const status = running ? "* live" : "o saved"
-    const draft = draftPreviews.get(node.session.sessionId)
-    const description = draft
-      ? `${draft.exact ? "draft" : "~ draft"}: ${normalizePreview(draft.text)}`
-      : running
-        ? "[no draft observed]"
-        : "[no live draft]"
-    label = `${selected ? ">" : " "} @ ${status} ${description}`
+          ? { icon: ICONS.user, label: "User", accent: theme.secondary }
+          : { icon: ICONS.system, label: "System", accent: theme.warning }
+    drawHeading(canvas, x + 2, y, kind.icon, kind.label, contentWidth, {
+      ...headerStyle,
+      fg: selected ? theme.selectedText : kind.accent,
+    }, headerStyle)
+    canvas.write(x + 2, y + 1, truncateToWidth(node.preview, contentWidth), baseStyle)
+    return
   }
-  const middle = `|${padOrTruncate(label, width - 2)}|`
-  canvas.text(x, y, top)
-  canvas.text(x, y + 1, middle)
-  canvas.text(x, y + 2, top)
+
+  const running = runningSessionIds.has(node.session.sessionId)
+  const status = running ? "● Live" : "○ Saved"
+  const statusStyle = {
+    ...headerStyle,
+    fg: selected ? theme.selectedText : running ? theme.success : theme.textMuted,
+  }
+  const heading = `${ICONS.session} Claude session`
+  const statusX = x + width - 2 - displayWidth(status)
+  canvas.write(x + 2, y, truncateToWidth(heading, Math.max(0, statusX - x - 3)), {
+    ...headerStyle,
+    fg: selected ? theme.selectedText : theme.info,
+  })
+  canvas.write(statusX, y, status, statusStyle)
+
+  const draft = draftPreviews.get(node.session.sessionId)
+  const description = draft
+    ? `${draft.exact ? "Draft" : "Observed draft"}: ${normalizePreview(draft.text)}`
+    : running
+      ? "No draft observed"
+      : "No live draft"
+  canvas.write(x + 2, y + 1, truncateToWidth(description, contentWidth), {
+    ...baseStyle,
+    fg: selected ? theme.selectedText : draft && !draft.exact ? theme.warning : theme.text,
+  })
+}
+
+function drawHeading(
+  canvas: SparseCanvas,
+  x: number,
+  y: number,
+  icon: string,
+  label: string,
+  width: number,
+  iconStyle: CellStyle,
+  labelStyle: CellStyle,
+): void {
+  if (width <= 0) return
+  const iconText = truncateToWidth(icon, width)
+  canvas.write(x, y, iconText, iconStyle)
+  const labelX = x + displayWidth(iconText) + 1
+  const remaining = width - displayWidth(iconText) - 1
+  if (remaining > 0) canvas.write(labelX, y, truncateToWidth(label, remaining), labelStyle)
 }
 
 class SparseCanvas {
-  private readonly cells = new Map<string, string>()
+  private readonly cells = new Map<string, CanvasCell>()
+  private readonly connections = new Map<string, number>()
   width = 0
   height = 0
 
-  set(x: number, y: number, value: string): void {
+  paint(x: number, y: number, width: number, height: number, style: CellStyle): void {
+    for (let row = y; row < y + height; row += 1) {
+      for (let column = x; column < x + width; column += 1) {
+        this.set(column, row, { text: " ", width: 1, continuation: false, style })
+      }
+    }
+  }
+
+  write(x: number, y: number, value: string, style: CellStyle): void {
+    let column = x
+    for (const grapheme of graphemes(value)) {
+      const width = displayWidth(grapheme)
+      if (width <= 0) continue
+      this.set(column, y, { text: grapheme, width, continuation: false, style })
+      for (let offset = 1; offset < width; offset += 1) {
+        this.set(column + offset, y, { text: "", width: 0, continuation: true, style })
+      }
+      column += width
+    }
+  }
+
+  connect(x: number, y: number, directions: number): void {
     if (x < 0 || y < 0) return
-    const key = `${x}:${y}`
-    const existing = this.cells.get(key)
-    const next =
-      existing &&
-      ((existing === "-" && value === "|") ||
-        (existing === "|" && value === "-") ||
-        existing === "+" ||
-        value === "+")
-        ? "+"
-        : value
-    this.cells.set(key, next)
+    const key = cellKey(x, y)
+    this.connections.set(key, (this.connections.get(key) ?? 0) | directions)
     this.width = Math.max(this.width, x + 1)
     this.height = Math.max(this.height, y + 1)
   }
 
-  text(x: number, y: number, value: string): void {
-    for (let index = 0; index < value.length; index += 1) {
-      this.set(x + index, y, value[index]!)
+  connectHorizontal(startX: number, endX: number, y: number): void {
+    for (let x = startX; x <= endX; x += 1) {
+      this.connect(x, y, (x > startX ? WEST : 0) | (x < endX ? EAST : 0))
     }
   }
 
-  horizontal(startX: number, endX: number, y: number): void {
-    for (let x = startX; x <= endX; x += 1) this.set(x, y, "-")
+  connectVertical(x: number, startY: number, endY: number): void {
+    for (let y = startY; y <= endY; y += 1) this.connect(x, y, NORTH | SOUTH)
   }
 
-  vertical(x: number, startY: number, endY: number): void {
-    for (let y = startY; y <= endY; y += 1) this.set(x, y, "|")
-  }
-
-  viewport(offsetX: number, offsetY: number, width: number, height: number): string {
-    const lines: string[] = []
+  viewport(offsetX: number, offsetY: number, width: number, height: number): RenderedText {
+    const chunks: TextChunk[] = []
+    const plainLines: string[] = []
     for (let y = offsetY; y < offsetY + height; y += 1) {
-      let line = ""
-      for (let x = offsetX; x < offsetX + width; x += 1) {
-        line += this.cells.get(`${x}:${y}`) ?? " "
+      let plainLine = ""
+      let x = offsetX
+      while (x < offsetX + width) {
+        const cell = this.cell(x, y)
+        if (cell.continuation || cell.width > offsetX + width - x) {
+          appendChunk(chunks, " ", cell.style)
+          plainLine += " "
+          x += 1
+          continue
+        }
+        appendChunk(chunks, cell.text, cell.style)
+        plainLine += cell.text
+        x += cell.width
       }
-      lines.push(line.trimEnd())
+      plainLines.push(plainLine.trimEnd())
+      if (y < offsetY + height - 1) appendChunk(chunks, "\n", DEFAULT_STYLE)
     }
-    return lines.join("\n")
+    return { content: new StyledText(chunks), text: plainLines.join("\n") }
   }
+
+  private set(x: number, y: number, cell: CanvasCell): void {
+    if (x < 0 || y < 0) return
+    this.cells.set(cellKey(x, y), cell)
+    this.width = Math.max(this.width, x + Math.max(1, cell.width))
+    this.height = Math.max(this.height, y + 1)
+  }
+
+  private cell(x: number, y: number): CanvasCell {
+    const key = cellKey(x, y)
+    const cell = this.cells.get(key)
+    if (cell) return cell
+    const connection = this.connections.get(key)
+    if (connection) {
+      return {
+        text: connectorGlyph(connection),
+        width: 1,
+        continuation: false,
+        style: CONNECTOR_STYLE,
+      }
+    }
+    return { text: " ", width: 1, continuation: false, style: DEFAULT_STYLE }
+  }
+}
+
+function appendChunk(chunks: TextChunk[], text: string, style: CellStyle): void {
+  const previous = chunks[chunks.length - 1]
+  if (
+    previous &&
+    previous.fg === style.fg &&
+    previous.bg === style.bg &&
+    previous.attributes === style.attributes
+  ) {
+    previous.text += text
+    return
+  }
+  chunks.push({
+    __isChunk: true,
+    text,
+    fg: style.fg,
+    bg: style.bg,
+    attributes: style.attributes,
+  })
+}
+
+function connectorGlyph(directions: number): string {
+  const glyphs: Record<number, string> = {
+    [NORTH]: "╵",
+    [EAST]: "╶",
+    [SOUTH]: "╷",
+    [WEST]: "╴",
+    [NORTH | SOUTH]: "│",
+    [EAST | WEST]: "─",
+    [EAST | SOUTH]: "┌",
+    [SOUTH | WEST]: "┐",
+    [NORTH | EAST]: "└",
+    [NORTH | WEST]: "┘",
+    [EAST | SOUTH | WEST]: "┬",
+    [NORTH | SOUTH | WEST]: "┤",
+    [NORTH | EAST | WEST]: "┴",
+    [NORTH | EAST | SOUTH]: "├",
+    [NORTH | EAST | SOUTH | WEST]: "┼",
+  }
+  const glyph = glyphs[directions]
+  if (!glyph) throw new Error(`Unsupported connector topology: ${directions}`)
+  return glyph
+}
+
+function cellKey(x: number, y: number): string {
+  return `${x}:${y}`
 }
 
 function windowAround(total: number, selected: number, height: number): { start: number; end: number } {
   const safeHeight = Math.max(1, height)
   const start = clamp(selected - Math.floor(safeHeight / 2), 0, Math.max(0, total - safeHeight))
   return { start, end: Math.min(total, start + safeHeight) }
-}
-
-function padOrTruncate(value: string, width: number): string {
-  const truncated = truncate(value, width)
-  return truncated.padEnd(width)
-}
-
-function truncate(value: string, width: number): string {
-  if (value.length <= width) return value
-  return width <= 3 ? value.slice(0, width) : `${value.slice(0, width - 3)}...`
 }
 
 function normalizePreview(value: string): string {

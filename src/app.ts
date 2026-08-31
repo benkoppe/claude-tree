@@ -3,11 +3,16 @@ import { randomUUID } from "node:crypto"
 import {
   BoxRenderable,
   CliRenderEvents,
+  StyledText,
+  TextAttributes,
   TextRenderable,
   type CliRenderer,
   type KeyEvent,
+  type RGBA,
+  type TextChunk,
 } from "@opentui/core"
 
+import { truncateToWidth } from "./display-text"
 import { renderConversationGraph, renderRootPicker } from "./graph-renderer"
 import {
   directionalMove,
@@ -35,6 +40,7 @@ import {
   type TerminalExitEvent,
   type TerminalLaunch,
 } from "./terminal-manager"
+import { theme } from "./theme"
 
 const MINIMUM_WIDTH = 50
 const MINIMUM_HEIGHT = 12
@@ -96,25 +102,34 @@ export class ClaudeTreeApp {
       height: "100%",
       flexDirection: "column",
       padding: 1,
-      backgroundColor: "#0b1020",
+      backgroundColor: theme.background,
       zIndex: 1,
     })
     this.header = new TextRenderable(renderer, {
       id: "header",
       height: 2,
-      fg: "#dbeafe",
+      fg: theme.text,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
       content: "",
     })
     this.content = new TextRenderable(renderer, {
       id: "graph-content",
       flexGrow: 1,
-      fg: "#e2e8f0",
+      fg: theme.text,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
       content: "",
     })
     this.footer = new TextRenderable(renderer, {
       id: "footer",
       height: 4,
-      fg: "#94a3b8",
+      fg: theme.textMuted,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
       content: "",
     })
     this.navigator.add(this.header)
@@ -417,7 +432,7 @@ export class ClaudeTreeApp {
       }
     }
     if (endpoint?.kind !== "endpoint") {
-      this.status = "Select an @ session leaf to enter Claude"
+      this.status = "Select a Claude session leaf to enter Claude"
       return
     }
 
@@ -524,7 +539,12 @@ export class ClaudeTreeApp {
     const tooSmall =
       this.renderer.terminalWidth < MINIMUM_WIDTH || this.renderer.terminalHeight < MINIMUM_HEIGHT
     this.header.content = tooSmall
-      ? `claude-tree\nResize to at least ${MINIMUM_WIDTH}x${MINIMUM_HEIGHT} (current ${this.renderer.terminalWidth}x${this.renderer.terminalHeight})`
+      ? styledText([
+          chunk("󰙅 claude-tree", theme.primary, TextAttributes.BOLD),
+          chunk("\nResize to at least ", theme.textMuted),
+          chunk(`${MINIMUM_WIDTH}×${MINIMUM_HEIGHT}`, theme.warning),
+          chunk(` · current ${this.renderer.terminalWidth}×${this.renderer.terminalHeight}`, theme.textMuted),
+        ])
       : this.renderHeader()
     this.content.visible = !tooSmall
     this.footer.visible = !tooSmall
@@ -538,17 +558,15 @@ export class ClaudeTreeApp {
     if (this.view === "roots") {
       this.graphLayout = null
       this.graphNavigationIntent = null
-      this.content.content = renderRootPicker(
+      const rendered = renderRootPicker(
         this.forest.graphs,
         this.selectedRootIndex,
         contentHeight,
         this.renderer.terminalWidth - 2,
         this.terminalManager.runningSessionIds(),
       )
-      this.footer.content =
-        `j/k or Up/Down select  Enter graph  n new  r refresh  q quit\n` +
-        `All branches share this working tree.\n` +
-        `${this.busy ? "Working..." : this.status}${this.compatibilityWarning ? ` | ${this.compatibilityWarning}` : ""}`
+      this.content.content = rendered.content
+      this.footer.content = this.renderRootFooter()
     } else {
       const graph = this.currentGraph()
       if (!graph || !this.selectedGraphNodeId) {
@@ -564,23 +582,73 @@ export class ClaudeTreeApp {
         this.terminalManager.draftPreviews(),
       )
       this.graphLayout = rendered.layout
-      this.content.content = rendered.text
-      this.footer.content =
-        `k/j graph edges  h/l across branches  Enter open leaf  f fork  r refresh  q roots\n` +
-        `${this.selectedDescription()}\n` +
-        `${this.busy ? "Working..." : this.status}${this.compatibilityWarning ? ` | ${this.compatibilityWarning}` : ""}`
+      this.content.content = rendered.content
+      this.footer.content = this.renderGraphFooter()
     }
   }
 
-  private renderHeader(): string {
+  private renderHeader(): StyledText {
+    const identity = [
+      chunk("󰙅 claude-tree", theme.primary, TextAttributes.BOLD),
+      chunk("  ", theme.textMuted),
+      chunk(this.metadata.projectPath, theme.textMuted),
+      chunk("\n", theme.text),
+    ]
     if (this.view === "roots") {
-      return `claude-tree  ${this.metadata.projectPath}\nConversation roots`
+      return styledText([...identity, chunk("Conversation roots", theme.text, TextAttributes.BOLD)])
     }
     const graph = this.currentGraph()
     const rootEndpointId = graph?.endpointBySessionId.get(graph.rootSessionId)
     const rootEndpoint = rootEndpointId ? graph?.nodes.get(rootEndpointId) : undefined
     const title = rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
-    return `claude-tree  ${this.metadata.projectPath}\n${title}  message graph`
+    return styledText([
+      ...identity,
+      chunk(truncateToWidth(title, Math.max(1, this.renderer.terminalWidth - 18)), theme.text, TextAttributes.BOLD),
+      chunk("  Message graph", theme.textMuted),
+    ])
+  }
+
+  private renderRootFooter(): StyledText {
+    return styledText([
+      ...controlChunks([
+        ["↑↓ / jk", "select"],
+        ["Enter", "graph"],
+        ["n", "new"],
+        ["r", "refresh"],
+        ["q", "quit"],
+      ]),
+      chunk("\nAll branches share this working tree.", theme.warning),
+      chunk("\n", theme.text),
+      ...this.statusChunks(),
+    ])
+  }
+
+  private renderGraphFooter(): StyledText {
+    return styledText([
+      ...controlChunks([
+        ["↑↓ / kj", "edges"],
+        ["←→ / hl", "branches"],
+        ["Enter", "open"],
+        ["f", "fork"],
+        ["r", "refresh"],
+        ["q", "roots"],
+      ]),
+      chunk("\n", theme.text),
+      chunk(this.selectedDescription(), theme.textMuted),
+      chunk("\n", theme.text),
+      ...this.statusChunks(),
+    ])
+  }
+
+  private statusChunks(): TextChunk[] {
+    const status = this.busy ? "Working…" : this.status
+    const result = [
+      chunk(status, this.busy ? theme.primary : theme.text, this.busy ? TextAttributes.BOLD : TextAttributes.NONE),
+    ]
+    if (this.compatibilityWarning) {
+      result.push(chunk("  ·  ", theme.textMuted), chunk(this.compatibilityWarning, theme.warning))
+    }
+    return result
   }
 
   private selectedDescription(): string {
@@ -589,15 +657,15 @@ export class ClaudeTreeApp {
     if (selected.kind === "endpoint") {
       const draft = this.terminalManager.draftPreviews().get(selected.session.sessionId)
       const draftDescription = draft
-        ? `${draft.exact ? "draft" : "~ draft"}: ${draft.text.replace(/\s+/g, " ").trim()}`
+        ? `${draft.exact ? "Draft" : "Observed draft"}: ${draft.text.replace(/\s+/g, " ").trim()}`
         : this.terminalManager.isRunning(selected.session.sessionId)
-          ? "no draft observed"
-          : "no live draft"
-      const description = truncate(
+          ? "No draft observed"
+          : "No live draft"
+      const description = truncateToWidth(
         draftDescription,
         Math.max(20, this.renderer.terminalWidth - 32),
       )
-      return `Selected: @ ${description} (${selected.session.sessionId.slice(0, 8)})`
+      return `Selected session · ${description} · ${selected.session.sessionId.slice(0, 8)}`
     }
     const role = selected.internal
       ? "internal"
@@ -606,13 +674,29 @@ export class ClaudeTreeApp {
         : selected.role === "user"
           ? "user"
           : "system"
-    return `Selected: ${role} - ${truncate(selected.preview, Math.max(20, this.renderer.terminalWidth - 24))}`
+    return `Selected ${role} · ${truncateToWidth(selected.preview, Math.max(20, this.renderer.terminalWidth - 24))}`
   }
 }
 
-function truncate(value: string, width: number): string {
-  if (value.length <= width) return value
-  return width <= 3 ? value.slice(0, width) : `${value.slice(0, width - 3)}...`
+function chunk(
+  text: string,
+  fg: RGBA,
+  attributes: number = TextAttributes.NONE,
+  bg: RGBA = theme.background,
+): TextChunk {
+  return { __isChunk: true, text, fg, bg, attributes }
+}
+
+function styledText(chunks: TextChunk[]): StyledText {
+  return new StyledText(chunks)
+}
+
+function controlChunks(controls: Array<readonly [key: string, description: string]>): TextChunk[] {
+  return controls.flatMap(([key, description], index) => [
+    ...(index === 0 ? [] : [chunk("  ", theme.textMuted)]),
+    chunk(key, theme.text, TextAttributes.BOLD),
+    chunk(` ${description}`, theme.textMuted),
+  ])
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

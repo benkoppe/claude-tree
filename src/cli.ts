@@ -3,6 +3,7 @@
 import { createCliRenderer } from "@opentui/core"
 
 import { ClaudeTreeApp } from "./app"
+import { theme } from "./theme"
 
 const EXPECTED_CLAUDE_VERSION = "2.1.239"
 
@@ -37,7 +38,7 @@ async function main(): Promise<void> {
     exitOnCtrlC: false,
     exitSignals: [],
     useKittyKeyboard: { events: true },
-    backgroundColor: "#0b1020",
+    backgroundColor: theme.background,
   })
   let app: ClaudeTreeApp | undefined
   let stopRequested = false

@@ -3,7 +3,7 @@ import type {
   MessageGraphNodeOrEndpoint,
 } from "./message-graph"
 
-export const GRAPH_NODE_HEIGHT = 3
+export const GRAPH_NODE_HEIGHT = 2
 export const GRAPH_HORIZONTAL_GAP = 4
 export const GRAPH_VERTICAL_GAP = 2
 

@@ -9,6 +9,7 @@ All conversations use the same working tree. Running branches can observe and ed
 - Linux or macOS on x86_64 or arm64
 - Bun 1.3 or newer
 - Claude Code 2.1.239 for the validated compatibility baseline
+- A truecolor terminal using a Nerd Font
 
 User-message replay relies on Claude Code 2.1.239's hidden `--prefill` option. Upgrading Claude Code requires revalidating that option as well as SDK session compatibility.
 
@@ -57,7 +58,7 @@ Message graph:
 | `Down` / `j` | Move to a visible child, preserving the cursor column |
 | `Left` / `h` | Move to the nearest node on the left, preserving depth |
 | `Right` / `l` | Move to the nearest node on the right, preserving depth |
-| `Enter` | Open the selected `@` session leaf |
+| `Enter` | Open the selected Claude session leaf |
 | `f` | Fork an assistant message, or replay a selected user message |
 | `n` | Start a new root conversation |
 | `r` | Refresh the graph |
@@ -72,11 +73,11 @@ Claude terminal:
 
 Every other terminal key belongs to Claude Code. Slash commands, permissions, hooks, MCP servers, plugins, mouse input, paste handling, and Claude's own keybindings are not reimplemented by `claude-tree`.
 
-Message nodes are labeled `U` for user, `A` for assistant, and `I` for an internal branch point. Adjacent messages may have the same role; graph structure follows transcript order rather than assuming that user and assistant messages alternate. Copied history from a fork is shown once as shared graph nodes rather than duplicated for every session.
+Message nodes are filled cards labeled with Nerd Font icons and readable roles such as User, Assistant, and Branch point. The selected card uses a contrasting background instead of a cursor symbol. Adjacent messages may have the same role; graph structure follows transcript order rather than assuming that user and assistant messages alternate. Copied history from a fork is shown once as shared graph nodes rather than duplicated for every session.
 
-Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
+Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
-Session leaves are labeled `@`; `* live` means that session already has a running Claude process, while `o saved` means it will be resumed from its persisted transcript. Leaves show their observed unsent draft instead of the conversation title. `draft:` is an exact prompt initially prefilled by `claude-tree`; `~ draft:` is a best-effort preview read from Claude's visible composer when returning to the graph. Claude exposes no composer-state API, so long, scrolled, or unrecognized drafts may appear as `[no draft observed]`. Saved sessions have no live composer and appear as `[no live draft]`.
+Session leaves are labeled Claude session. `● Live` means that session already has a running Claude process, while `○ Saved` means it will be resumed from its persisted transcript. Leaves show their observed unsent draft instead of the conversation title. `Draft` is an exact prompt initially prefilled by `claude-tree`; `Observed draft` is a best-effort preview read from Claude's visible composer when returning to the graph. Claude exposes no composer-state API, so long, scrolled, or unrecognized drafts may appear as `No draft observed`. Saved sessions have no live composer and appear as `No live draft`.
 
 ## Fork Behavior
 
