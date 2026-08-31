@@ -37,7 +37,6 @@ On musl Linux, set `OPENTUI_LIBC=musl` when running `claude-tree`.
 ### Nix
 
 ```sh
-cd /path/to/project
 nix run github:benkoppe/claude-tree
 ```
 
