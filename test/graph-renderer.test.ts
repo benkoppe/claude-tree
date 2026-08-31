@@ -22,6 +22,7 @@ import { theme } from "../src/theme"
 
 const ROOT = "11111111-1111-4111-8111-111111111111"
 const CHILD = "22222222-2222-4222-8222-222222222222"
+const SECOND_CHILD = "33333333-3333-4333-8333-333333333333"
 
 describe("renderConversationGraph", () => {
   test("draws branches and only the live session endpoint", () => {
@@ -117,6 +118,77 @@ describe("renderConversationGraph", () => {
     )
     expect(selectedPreview).toBeDefined()
     expect(rendered.text.split("\n")).toHaveLength(4)
+  })
+
+  test("materializes a saved empty fork beside another visible child", () => {
+    const graph = emptyForkGraph(true)
+    const endpointId = graph.endpointBySessionId.get(CHILD)!
+    const rendered = renderConversationGraph(graph, endpointId, 100, 30, new Set())
+
+    expect(rendered.layout.nodes.has(endpointId)).toBeTrue()
+    expect(rendered.text).toContain("󰘬 Fork")
+    expect(rendered.text).not.toContain("Fork 1")
+    expect(rendered.text).not.toContain("Draft")
+    expect(visibleGraphNodeId(graph, endpointId, new Set())).toBe(endpointId)
+    const selectedFork = rendered.content.chunks.find(
+      (chunk) => chunk.text.includes("Fork") && chunk.bg?.equals(theme.selected),
+    )
+    expect(selectedFork).toBeDefined()
+  })
+
+  test("numbers multiple materialized empty forks", () => {
+    const graph = multipleEmptyForkGraph()
+    const selected = graph.endpointBySessionId.get(CHILD)!
+    const rendered = renderConversationGraph(graph, selected, 140, 30, new Set())
+
+    expect(rendered.text).toContain("󰘬 Fork 1")
+    expect(rendered.text).toContain("󰘬 Fork 2")
+  })
+
+  test("keeps a lone empty fork collapsed into its source", () => {
+    const graph = emptyForkGraph(false)
+    const endpointId = graph.endpointBySessionId.get(CHILD)!
+    const rendered = renderConversationGraph(graph, graph.rootNodeId, 100, 30, new Set())
+
+    expect(rendered.layout.nodes.has(endpointId)).toBeFalse()
+    expect(rendered.text).not.toContain("󰘬 Fork")
+    expect(visibleGraphNodeId(graph, endpointId, new Set())).toBe(graph.rootNodeId)
+  })
+
+  test("materializes a persisted zero-prefix fork without connecting it to shared history", () => {
+    const graph = zeroPrefixEmptyForkGraph()
+    const endpointId = graph.endpointBySessionId.get(CHILD)!
+    const rendered = renderConversationGraph(graph, endpointId, 100, 30, new Set())
+
+    expect(rendered.layout.nodes.has(endpointId)).toBeTrue()
+    expect(rendered.layout.nodes.get(endpointId)?.y).toBe(0)
+    expect(rendered.text).toContain("󰘬 Fork")
+    expect(rendered.text).not.toContain("Fork 1")
+    expect(directionalMove(rendered.layout, endpointId, "up")).toBeUndefined()
+  })
+
+  test("collapses a lone zero-prefix fork selection to its recorded source", () => {
+    const graph = loneZeroPrefixEmptyForkGraph()
+    const endpointId = graph.endpointBySessionId.get(CHILD)!
+    const sourceId = nodeIdByPreview(graph, "selected source")
+    const rendered = renderConversationGraph(graph, sourceId, 100, 30, new Set())
+
+    expect(rendered.layout.nodes.has(endpointId)).toBeFalse()
+    expect(rendered.text).not.toContain("󰘬 Fork")
+    expect(visibleGraphNodeId(graph, endpointId, new Set())).toBe(sourceId)
+  })
+
+  test("renders a live empty fork as one Draft before restoring its Fork leaf", () => {
+    const graph = emptyForkGraph(true)
+    const endpointId = graph.endpointBySessionId.get(CHILD)!
+    const live = renderConversationGraph(graph, endpointId, 100, 30, new Set([CHILD]))
+    const stopped = renderConversationGraph(graph, endpointId, 100, 30, new Set())
+
+    expect(live.text).toContain("󰆍 Draft")
+    expect(live.text).not.toContain("󰘬 Fork")
+    expect(stopped.text).toContain("󰘬 Fork")
+    expect(stopped.text).not.toContain("Fork 1")
+    expect(stopped.text).not.toContain("Draft")
   })
 
   test("preserves an explicit viewport offset when mouse selection changes", () => {
@@ -451,6 +523,132 @@ function branchGraph() {
     new Map([
       [ROOT, parentMessages],
       [CHILD, childMessages],
+    ]),
+    [relation],
+  ).graphs[0]!
+}
+
+function emptyForkGraph(parentContinues: boolean) {
+  const source = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0)
+  const parentMessages = parentContinues
+    ? [source, message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "main path", 1)]
+    : [source]
+  const childMessages = [
+    message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "source", 0),
+  ]
+  const relation: BranchRelation = {
+    schemaVersion: 1,
+    childSessionId: CHILD,
+    parentSessionId: ROOT,
+    sourceMessageId: source.id,
+    sharedMessages: [{
+      parentMessageId: source.id,
+      childMessageId: childMessages[0]!.id,
+    }],
+    createdAt: "2026-08-30T12:00:00.000Z",
+  }
+  return buildConversationForest(
+    [session(ROOT, "Root", 20), session(CHILD, "Empty fork", 10)],
+    new Map([
+      [ROOT, parentMessages],
+      [CHILD, childMessages],
+    ]),
+    [relation],
+  ).graphs[0]!
+}
+
+function multipleEmptyForkGraph() {
+  const source = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0)
+  const parentMessages = [
+    source,
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "main path", 1),
+  ]
+  const firstChildMessages = [
+    message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "source", 0),
+  ]
+  const secondChildMessages = [
+    message("cccccccc-cccc-4ccc-8ccc-ccccccccccc1", "user", "source", 0),
+  ]
+  return buildConversationForest(
+    [
+      session(ROOT, "Root", 30),
+      session(CHILD, "First empty fork", 20),
+      session(SECOND_CHILD, "Second empty fork", 10),
+    ],
+    new Map([
+      [ROOT, parentMessages],
+      [CHILD, firstChildMessages],
+      [SECOND_CHILD, secondChildMessages],
+    ]),
+    [
+      {
+        schemaVersion: 1,
+        childSessionId: CHILD,
+        parentSessionId: ROOT,
+        sourceMessageId: source.id,
+        sharedMessages: [{
+          parentMessageId: source.id,
+          childMessageId: firstChildMessages[0]!.id,
+        }],
+        createdAt: "2026-08-30T12:00:00.000Z",
+      },
+      {
+        schemaVersion: 1,
+        childSessionId: SECOND_CHILD,
+        parentSessionId: ROOT,
+        sourceMessageId: source.id,
+        sharedMessages: [{
+          parentMessageId: source.id,
+          childMessageId: secondChildMessages[0]!.id,
+        }],
+        createdAt: "2026-08-30T12:00:01.000Z",
+      },
+    ],
+  ).graphs[0]!
+}
+
+function zeroPrefixEmptyForkGraph() {
+  const source = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0)
+  const parentMessages = [
+    source,
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "main path", 1),
+  ]
+  const relation: BranchRelation = {
+    schemaVersion: 1,
+    childSessionId: CHILD,
+    parentSessionId: ROOT,
+    sourceMessageId: source.id,
+    sharedMessages: [],
+    createdAt: "2026-08-30T12:00:00.000Z",
+  }
+  return buildConversationForest(
+    [session(ROOT, "Root", 20), session(CHILD, "Empty replay", 10)],
+    new Map([
+      [ROOT, parentMessages],
+      [CHILD, []],
+    ]),
+    [relation],
+  ).graphs[0]!
+}
+
+function loneZeroPrefixEmptyForkGraph() {
+  const parentMessages = [
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "earlier", 0),
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "user", "selected source", 1),
+  ]
+  const relation: BranchRelation = {
+    schemaVersion: 1,
+    childSessionId: CHILD,
+    parentSessionId: ROOT,
+    sourceMessageId: parentMessages[1]!.id,
+    sharedMessages: [],
+    createdAt: "2026-08-30T12:00:00.000Z",
+  }
+  return buildConversationForest(
+    [session(ROOT, "Root", 20), session(CHILD, "Empty replay", 10)],
+    new Map([
+      [ROOT, parentMessages],
+      [CHILD, []],
     ]),
     [relation],
   ).graphs[0]!

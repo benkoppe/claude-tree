@@ -76,7 +76,7 @@ Stopping one live endpoint uses the same bounded process-group cleanup but leave
 
 Before persisting a navigator removal, stop every affected live session with this same bounded cleanup. Do not apply the removal while an affected session remains live.
 
-After an intentional stop, rebuild the graph from a fresh provider transcript read. A Draft with no persisted message disappears. A working response is frozen only to the extent the provider persisted it, and later resume creates a fresh Draft after that persisted boundary. Never reconstruct or append transcript history from terminal emulator cells.
+After an intentional stop, rebuild the graph from a fresh provider transcript read. A Draft with no persisted message disappears. When that Draft belonged to a recorded fork with no child-specific visible node, retain its session endpoint as a Fork leaf only if the source already has another visible child; number the Fork leaves when more than one needs materialization at that source. Otherwise the source remains the compact leaf for that path. A working response is frozen only to the extent the provider persisted it, and later resume creates a fresh Draft after that persisted boundary. Never reconstruct or append transcript history from terminal emulator cells.
 
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 

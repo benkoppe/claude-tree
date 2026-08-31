@@ -1135,6 +1135,111 @@ test("killing a draft removes it without fabricating transcript history", async 
   }
 })
 
+test("killing an empty branched draft restores a resumable Fork leaf", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, "#!/bin/sh\nsleep 30\n")
+  await chmod(executable, 0o755)
+
+  const rootSessionId = "root-session"
+  const childSessionId = "child-session"
+  const sessions: AgentSession[] = [
+    { id: rootSessionId, title: "Root conversation", lastModified: 2 },
+    { id: childSessionId, title: "Empty branch", lastModified: 1 },
+  ]
+  const rootTranscript: AgentMessage[] = [
+    { id: "root-source", role: "user", preview: "branch source", ordinal: 0, visible: true },
+    { id: "root-answer", role: "agent", preview: "main path", ordinal: 1, visible: true },
+  ]
+  const childTranscript: AgentMessage[] = [
+    { id: "child-source", role: "user", preview: "branch source", ordinal: 0, visible: true },
+  ]
+  const transcripts = new Map([
+    [rootSessionId, rootTranscript],
+    [childSessionId, childTranscript],
+  ])
+  const metadata = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+  await metadata.saveRelation({
+    childSessionId,
+    parentSessionId: rootSessionId,
+    sourceMessageId: rootTranscript[0]!.id,
+    sharedMessages: [{
+      parentMessageId: rootTranscript[0]!.id,
+      childMessageId: childTranscript[0]!.id,
+    }],
+  })
+
+  const resumedSessionIds: string[] = []
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      return sessions
+    },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, transcripts.get(sessionId) ?? []]))
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume(session) {
+      resumedSessionIds.push(session.id)
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Root conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("branch source") && frame.includes("main path") && frame.includes("󰘬 Fork"),
+    )
+    setup.mockInput.pressArrow("down")
+    await waitForFrame(setup, () => isSelected(setup, "main path"))
+    setup.mockInput.pressArrow("right")
+    await waitForFrame(setup, () => isSelected(setup, "Fork"))
+
+    setup.mockInput.pressEnter()
+    await waitUntil(() => resumedSessionIds.length === 1)
+    expect(resumedSessionIds).toEqual([childSessionId])
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Draft") && isSelected(setup, "Draft"))
+
+    setup.mockInput.pressKey("x")
+    setup.mockInput.pressEnter()
+    const stopped = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("󰘬 Fork") &&
+        frame.includes("Selected fork") &&
+        !frame.includes("Draft") &&
+        !frame.includes("Kill live session"),
+    )
+    expect(stopped).toContain("main path")
+    expect(isSelected(setup, "Fork")).toBeTrue()
+
+    setup.mockInput.pressEnter()
+    await waitUntil(() => resumedSessionIds.length === 2)
+    expect(resumedSessionIds).toEqual([childSessionId, childSessionId])
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("removes a live root only after confirmation and keeps it removed after refresh and restart", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")

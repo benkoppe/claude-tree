@@ -1054,6 +1054,9 @@ export class AgentTreeApp {
               sessionId: selected.session.id,
               afterMessageId: selected.forkTarget?.messageId ?? null,
             }
+      const fallbackNodeId = selected.kind === "endpoint" && selected.fork?.empty
+        ? selected.fork.sourceNodeId
+        : selected.parentId
       this.confirmation = {
         kind: "removal",
         scope: "subtree",
@@ -1063,7 +1066,7 @@ export class AgentTreeApp {
           .filter((sessionId) => ownedSessionIds.has(sessionId)),
         rootSessionId: graph.rootSessionId,
         rootIndex: this.selectedRootIndex,
-        ...(selected.parentId === null ? {} : { parentNodeId: selected.parentId }),
+        ...(fallbackNodeId === null ? {} : { parentNodeId: fallbackNodeId }),
         choice: "cancel",
       }
     } else {
@@ -1884,6 +1887,13 @@ export class AgentTreeApp {
     if (selected.kind === "endpoint") {
       if (this.displayedWorkingSessionIds().has(selected.session.id)) {
         return `Selected agent · generating · ${selected.session.id.slice(0, 8)}`
+      }
+      if (
+        !this.terminalManager.runningSessionIds().has(selected.session.id) &&
+        selected.fork?.empty
+      ) {
+        const label = selected.fork.number === undefined ? "fork" : `fork ${selected.fork.number}`
+        return `Selected ${label} · ${selected.session.id.slice(0, 8)}`
       }
       const draft = this.terminalManager.draftPreviews().get(selected.session.id)
       const draftDescription = draft ? draft.text.replace(/\s+/g, " ").trim() : "blank"
