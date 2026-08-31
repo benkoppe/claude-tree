@@ -1,152 +1,20 @@
 # claude-tree
 
-`claude-tree` is a full-screen terminal navigator for Claude Code conversations. It merges related sessions into message graphs while every opened conversation remains the stock Claude Code interface in its own PTY.
+`/tree` (from `pi` agent) for Claude Code.
 
-All conversations use the same working tree. Running branches can observe and edit the same files.
+`claude-tree` turns a project's agent conversations into a navigable message tree, making it much easier to manage long & winding sessions without a long, linear history. Sessions that are out of view keep running in the background.
 
-## Requirements
+`claude-tree` does not create Git worktrees or restore files to their state at the fork point.
 
-- Linux or macOS on x86_64 or arm64
-- Bun 1.3 or newer
-- Claude Code
-- A truecolor terminal using a Nerd Font
+Claude's local slash-command bookkeeping is retained internally for transcript integrity but omitted from message trees. Command-only conversations remain visible while active and disappear after their final process exits.
 
-The included Nix flake provides Bun and Claude Code:
+## Quick Start (Development)
+
+Requires Linux or macOS, Bun 1.3 or newer, Claude Code, and a truecolor terminal using a Nerd Font.
+
+Run:
 
 ```sh
-direnv allow
 bun install --frozen-lockfile
-```
-
-Without direnv:
-
-```sh
-nix develop
-bun install --frozen-lockfile
-```
-
-## Run
-
-Start from the project whose Claude sessions you want to explore:
-
-```sh
 bun run start
 ```
-
-To expose the `claude-tree` executable from a development checkout, run `bun link` once and then invoke `claude-tree` from a project directory.
-
-## Controls
-
-Conversation roots:
-
-| Key | Action |
-| --- | --- |
-| `Up` / `k` / `Ctrl+P` | Select the previous conversation family |
-| `Down` / `j` / `Ctrl+N` | Select the next conversation family |
-| `Enter` | Open the selected message graph |
-| `n` | Start a new root conversation |
-| `r` | Refresh sessions and messages |
-| `?` | Open About |
-| `q` or `Ctrl+C` | Exit |
-| Mouse wheel | Select the previous or next conversation family |
-| Left click a row | Select it; click it again while selected to open its graph |
-| Left click a footer action | Run that action |
-
-Message graph:
-
-| Key | Action |
-| --- | --- |
-| `Up` / `k` | Move to the visible parent |
-| `Down` / `j` | Move to a visible child, preserving the cursor column |
-| `Left` / `h` | Move to the nearest node on the left, preserving depth |
-| `Right` / `l` | Move to the nearest node on the right, preserving depth |
-| `Enter` | Open a reachable leaf, or choose one when several are reachable |
-| `f` | Fork an agent message, or replay a selected user message |
-| `x` | Kill the selected live Draft or working Agent after confirmation |
-| `n` | Start a new root conversation |
-| `r` | Refresh the graph |
-| `?` | Open About |
-| `q` or `Escape` | Return to conversation roots |
-| `Ctrl+C` | Exit |
-| Left click a card | Select it; click it again while selected to open or resume |
-| Left click a footer action | Run that action |
-
-Open leaf picker:
-
-| Key | Action |
-| --- | --- |
-| `Up` / `k` / `Ctrl+P` | Select the previous leaf |
-| `Down` / `j` / `Ctrl+N` | Select the next leaf |
-| `Enter` | Open or resume the selected leaf |
-| `Escape` | Close the picker |
-| Mouse wheel | Scroll the leaf list |
-| Left click a row | Open or resume that leaf |
-
-Claude terminal:
-
-| Key | Action |
-| --- | --- |
-| `Ctrl+Space` | Return to the navigator |
-
-Every other terminal key belongs to Claude Code. Slash commands, permissions, hooks, MCP servers, plugins, mouse input, paste handling, and Claude's own keybindings are not reimplemented by `claude-tree`.
-
-Message nodes are filled cards labeled with Nerd Font icons and readable roles such as User, Agent, and Branch point. The selected card uses a contrasting background instead of a cursor symbol. Adjacent messages may have the same role; graph structure follows transcript order rather than assuming that user and agent messages alternate. Copied history from a fork is shown once as shared graph nodes rather than duplicated for every session.
-
-Claude's local slash-command bookkeeping, such as command envelopes, local stdout, and synthetic no-response completions, is retained internally for transcript integrity but omitted from message graphs. A family containing only that bookkeeping remains visible while it has a live Draft or Agent endpoint and disappears from the conversation-root list after its final process exits.
-
-Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
-
-Saved sessions end at their latest message. Pressing `Enter` on any message follows its descendants to the reachable session leaves. A single leaf opens immediately; multiple leaves appear in an `Open leaf` picker ordered by their distance below the selected message. The picker uses a small `•` beside leaves that already have a live session and leaves the same gutter blank for inactive sessions. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. Conversation-root rows use `●` for live families and `○` for saved families. The footer identifies a live selection as `● Live · <name>` and otherwise shows only its name.
-
-Navigator footers contain only the keybindings and selection details. While a refresh is active, the `r` in `r refresh` becomes a rotating `|` `/` `-` `\` spinner. Starting another refresh aborts the previous application-level refresh immediately; any provider read that cannot be cancelled is prevented from committing a late result.
-
-Press `?` from either navigator view to open About. Its tabbed popup shows the program version and shared-working-tree notice. `?`, `q`, or `Escape` closes it. These keys remain ordinary provider input while its terminal owns the screen.
-
-Pressing `x` on a live Draft or working Agent opens a confirmation popup with `Kill` selected by default. Use the arrow keys, `h`/`j`/`k`/`l`, or `Tab` to choose; `Enter` confirms, while `q` or `Escape` cancels. Killing a Draft discards its in-memory composer preview. Killing a working Agent interrupts only that session, then refreshes Claude's persisted transcript. Any partial response Claude persisted appears as a completed Agent message; terminal screen cells are never copied into history. Resuming afterward starts a fresh Draft from the last persisted message. In Claude terminal mode, `x` remains ordinary Claude input.
-
-## Fork Behavior
-
-Forking an agent message copies history through that exact message and opens the child with a blank composer. Forking a user message instead copies history through the nearest earlier agent and opens the child with the selected user prompt already in the composer but not submitted. Intervening user messages are not copied. If the selected user message has no earlier agent, its replay remains in the same conversation family as another top-level root. These roots share an invisible empty-history origin, so no false message edge is drawn between them. Prompts containing non-text content cannot be replayed because Claude's prefill option accepts text only.
-
-Dragging across text in an embedded Claude terminal copies the selection through OSC52. OSC52 clipboard writes emitted by Claude itself, such as the login URL copy shortcut, are also forwarded to the outer terminal. The outer terminal must allow OSC52 clipboard writes.
-
-## State
-
-Claude transcripts remain Claude's source of truth. `claude-tree` stores only branch relationships under:
-
-```text
-$XDG_STATE_HOME/claude-tree/projects/<project-hash>/providers/claude/
-```
-
-When `XDG_STATE_HOME` is unset, the base directory is `~/.local/state`.
-
-The canonical project path is recorded and checked before state is used. Relationship files are provider-scoped, validated strictly, and replaced atomically. Sessions without recorded ancestry appear as independent roots. Incompatible earlier state schemas fail closed rather than being silently reused.
-
-Observed unsent drafts are process-local UI state. They are kept only in memory while `claude-tree` is running and are never written to application state.
-
-Generation status is also process-local UI state. It is detected passively from Claude's OSC terminal-title activity indicator, with the last visible Claude screen as a fallback; no Claude plugin or hook is installed.
-
-## Development
-
-```sh
-bun run typecheck
-bun test
-bun run check
-nix flake check --no-update-lock-file
-```
-
-Tests use temporary state, Anthropic's in-memory session store, fixture PTYs, and OpenTUI's in-memory renderer. They do not call a model or modify real Claude transcripts.
-
-The application core depends on an agent-provider contract for session discovery, transcript reads, launch preparation, branching, and terminal observation. Claude-specific SDK types, CLI flags, replay rules, and screen heuristics live in the Claude provider adapter. Claude remains the only shipped provider; future providers are selected one per application invocation.
-
-## MVP Limits
-
-- Live PTYs exist only while the foreground `claude-tree` process is running. Exiting terminates child processes; persisted Claude sessions remain resumable.
-- The application prevents two child processes for the same session inside one instance. It cannot prevent an external Claude process or another `claude-tree` instance from resuming that session concurrently.
-- Forking copies conversation history through the selected message, not historical files or Claude file-history snapshots.
-- Branches intentionally share the current working tree; no Git worktrees are created.
-- A fork can be created before relationship metadata fails to save. In that case the Claude session is preserved and appears as an independent root.
-- OpenTUI's embedded terminal renders character cells, not Kitty graphics or Sixel images.
-- Clipboard forwarding depends on OSC52 support in the outer terminal and any intervening SSH or multiplexer configuration.
-- Draft observation is a conservative parse of Claude's visible input box, not a semantic composer API. It may be unavailable when the prompt is scrolled or visually abbreviated.
-- Generation detection follows Claude's terminal title and visible activity UI rather than a semantic API. Disabling Claude's terminal title or changing these UI signals can make a hidden session's status unavailable or stale.
