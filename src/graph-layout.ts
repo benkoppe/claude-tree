@@ -1,5 +1,6 @@
 import type {
   ConversationGraph,
+  ConversationGraphNode,
   MessageGraphNodeOrEndpoint,
 } from "./message-graph"
 
@@ -38,9 +39,35 @@ export interface ConversationGraphLayout {
   worldHeight: number
 }
 
+export function visibleGraphNodeId(
+  graph: ConversationGraph,
+  nodeId: string | undefined,
+  visibleEndpointSessionIds: ReadonlySet<string>,
+): string | undefined {
+  const node = nodeId ? graph.nodes.get(nodeId) : undefined
+  if (!node || node.kind === "origin") return undefined
+  if (node.kind === "message" || visibleEndpointSessionIds.has(node.session.sessionId)) {
+    return node.id
+  }
+  return visibleGraphNodeId(graph, node.parentId ?? undefined, visibleEndpointSessionIds)
+}
+
+export function initialVisibleGraphNodeId(
+  graph: ConversationGraph,
+  visibleEndpointSessionIds: ReadonlySet<string>,
+): string | undefined {
+  const origin = graph.nodes.get(graph.originNodeId)
+  for (const childId of origin?.childIds ?? []) {
+    const visibleNodeId = visibleGraphNodeId(graph, childId, visibleEndpointSessionIds)
+    if (visibleNodeId) return visibleNodeId
+  }
+  return undefined
+}
+
 export function layoutConversationGraph(
   graph: ConversationGraph,
   viewportWidth: number,
+  visibleEndpointSessionIds: ReadonlySet<string> = new Set(),
 ): ConversationGraphLayout {
   const safeWidth = Math.max(1, viewportWidth)
   const nodeWidth = Math.max(22, Math.min(32, safeWidth - 2))
@@ -51,13 +78,20 @@ export function layoutConversationGraph(
   const position = (nodeId: string, depth: number): number => {
     const node = graph.nodes.get(nodeId)
     if (!node || node.kind === "origin") return 0
+    if (!isPositionedNode(node, visibleEndpointSessionIds)) {
+      return 0
+    }
 
     let center: number
-    if (node.childIds.length === 0) {
+    const visibleChildIds = node.childIds.filter((childId) => {
+      const child = graph.nodes.get(childId)
+      return child ? isPositionedNode(child, visibleEndpointSessionIds) : false
+    })
+    if (visibleChildIds.length === 0) {
       center = nextLeaf * stride + Math.floor(nodeWidth / 2)
       nextLeaf += 1
     } else {
-      const childCenters = node.childIds.map((childId) => position(childId, depth + 1))
+      const childCenters = visibleChildIds.map((childId) => position(childId, depth + 1))
       center = Math.round((childCenters[0]! + childCenters[childCenters.length - 1]!) / 2)
     }
     positioned.set(nodeId, {
@@ -71,15 +105,30 @@ export function layoutConversationGraph(
   }
 
   const origin = graph.nodes.get(graph.originNodeId)
-  for (const rootId of origin?.childIds ?? []) position(rootId, 0)
+  for (const rootId of origin?.childIds ?? []) {
+    const root = graph.nodes.get(rootId)
+    if (root && isPositionedNode(root, visibleEndpointSessionIds)) {
+      position(rootId, 0)
+    }
+  }
 
-  let worldWidth = nodeWidth
-  let worldHeight = GRAPH_NODE_HEIGHT
+  let worldWidth = positioned.size > 0 ? nodeWidth : 0
+  let worldHeight = positioned.size > 0 ? GRAPH_NODE_HEIGHT : 0
   for (const node of positioned.values()) {
     worldWidth = Math.max(worldWidth, node.x + node.width)
     worldHeight = Math.max(worldHeight, node.y + node.height)
   }
   return { nodes: positioned, nodeWidth, worldWidth, worldHeight }
+}
+
+function isPositionedNode(
+  node: ConversationGraphNode,
+  visibleEndpointSessionIds: ReadonlySet<string>,
+): boolean {
+  return (
+    node.kind === "message" ||
+    (node.kind === "endpoint" && visibleEndpointSessionIds.has(node.session.sessionId))
+  )
 }
 
 export function directionalMove(

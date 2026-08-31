@@ -10,7 +10,7 @@ const EXPECTED_CLAUDE_VERSION = "2.1.239"
 async function main(): Promise<void> {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     process.stdout.write(
-      "claude-tree\n\nExplore and run this project's Claude Code conversations.\n\nRoot picker:\n  Up/Down or k/j  select a conversation family\n  Enter           open its message graph\n  n               start a new conversation\n  q               quit\n\nMessage graph:\n  Up/Down or k/j  move along graph edges\n  Left/Right or h/l move across branches\n  Enter           open a session leaf\n  f               fork or replay the selected message\n  q or Escape     return to roots\n\nClaude terminal:\n  Ctrl+Space      return to the message graph\n",
+      "claude-tree\n\nExplore and run this project's Claude Code conversations.\n\nRoot picker:\n  Up/Down or k/j  select a conversation family\n  Enter           open its message graph\n  n               start a new conversation\n  q               quit\n\nMessage graph:\n  Up/Down or k/j  move along graph edges\n  Left/Right or h/l move across branches\n  Enter           open or resume the session ending at the selected node\n  f               fork or replay the selected message\n  q or Escape     return to roots\n\nClaude terminal:\n  Ctrl+Space      return to the message graph\n",
     )
     return
   }

@@ -90,10 +90,6 @@ export class TerminalManager {
     return previous
   }
 
-  isRunning(sessionId: string): boolean {
-    return this.terminals.get(sessionId)?.exitCode === null
-  }
-
   runningSessionIds(): Set<string> {
     return new Set(
       [...this.terminals.values()]

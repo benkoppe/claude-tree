@@ -58,7 +58,7 @@ Message graph:
 | `Down` / `j` | Move to a visible child, preserving the cursor column |
 | `Left` / `h` | Move to the nearest node on the left, preserving depth |
 | `Right` / `l` | Move to the nearest node on the right, preserving depth |
-| `Enter` | Open the selected Claude session leaf |
+| `Enter` | Open or resume the session ending at the selected node |
 | `f` | Fork an assistant message, or replay a selected user message |
 | `n` | Start a new root conversation |
 | `r` | Refresh the graph |
@@ -77,7 +77,7 @@ Message nodes are filled cards labeled with Nerd Font icons and readable roles s
 
 Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
-Session leaves are labeled Claude session. `● Live` means that session already has a running Claude process, while `○ Saved` means it will be resumed from its persisted transcript. Leaves show their observed unsent draft instead of the conversation title. `Draft` is an exact prompt initially prefilled by `claude-tree`; `Observed draft` is a best-effort preview read from Claude's visible composer when returning to the graph. Claude exposes no composer-state API, so long, scrolled, or unrecognized drafts may appear as `No draft observed`. Saved sessions have no live composer and appear as `No live draft`.
+Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A Claude session card appears after the latest message only while that session has a running Claude process. Live cards show their observed unsent draft: `Draft` is an exact prompt initially prefilled by `claude-tree`, while `Observed draft` is a best-effort preview read from Claude's visible composer when returning to the graph. Claude exposes no composer-state API, so long, scrolled, or unrecognized drafts may appear as `No draft observed`. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
 
 ## Fork Behavior
 

@@ -3,7 +3,12 @@ import { TextRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 
 import { displayWidth, truncateToWidth } from "../src/display-text"
-import { directionalMove, layoutConversationGraph } from "../src/graph-layout"
+import {
+  directionalMove,
+  initialVisibleGraphNodeId,
+  layoutConversationGraph,
+  visibleGraphNodeId,
+} from "../src/graph-layout"
 import { renderConversationGraph, renderRootPicker } from "../src/graph-renderer"
 import { buildConversationForest } from "../src/message-graph"
 import type { BranchRelation } from "../src/metadata"
@@ -14,7 +19,7 @@ const ROOT = "11111111-1111-4111-8111-111111111111"
 const CHILD = "22222222-2222-4222-8222-222222222222"
 
 describe("renderConversationGraph", () => {
-  test("draws branches, endpoints, and selection status", () => {
+  test("draws branches and only the live session endpoint", () => {
     const graph = branchGraph()
     const selected = graph.endpointBySessionId.get(CHILD)!
     const rendered = renderConversationGraph(
@@ -32,7 +37,9 @@ describe("renderConversationGraph", () => {
     expect(rendered.text).toContain("main answer")
     expect(rendered.text).toContain("fork answer")
     expect(rendered.text).toContain("󰆍 Claude session")
+    expect(rendered.text.match(/Claude session/g)).toHaveLength(1)
     expect(rendered.text).toContain("● Live")
+    expect(rendered.text).not.toContain("○ Saved")
     expect(rendered.text).toContain("Draft: fix the tests")
     expect(rendered.text).not.toContain("Fork")
     expect(rendered.text).not.toContain(">")
@@ -84,17 +91,26 @@ describe("renderConversationGraph", () => {
     }
   })
 
-  test("centers a selected node inside a clipped viewport", () => {
+  test("uses saved sessions' final messages as selected leaves", () => {
     const graph = branchGraph()
-    const selected = graph.endpointBySessionId.get(CHILD)!
-    const rendered = renderConversationGraph(graph, selected, 40, 6, new Set())
+    const selected = nodeIdByPreview(graph, "fork answer")
+    const rendered = renderConversationGraph(graph, selected, 40, 4, new Set())
 
     expect(rendered.offsetX).toBeGreaterThan(0)
     expect(rendered.offsetY).toBeGreaterThan(0)
-    expect(rendered.text).toContain("󰆍 Claude session")
-    expect(rendered.text).toContain("○ Saved")
-    expect(rendered.text).toContain("No live draft")
-    expect(rendered.text.split("\n")).toHaveLength(6)
+    expect(rendered.text).toContain("fork answer")
+    expect(rendered.text).not.toContain("Claude session")
+    expect(rendered.layout.nodes.has(graph.endpointBySessionId.get(ROOT)!)).toBeFalse()
+    expect(rendered.layout.nodes.has(graph.endpointBySessionId.get(CHILD)!)).toBeFalse()
+    expect(visibleGraphNodeId(graph, graph.endpointBySessionId.get(CHILD), new Set())).toBe(
+      selected,
+    )
+    expect(initialVisibleGraphNodeId(graph, new Set())).toBe(graph.rootNodeId)
+    const selectedPreview = rendered.content.chunks.find(
+      (chunk) => chunk.text.includes("fork answer") && chunk.bg?.equals(theme.selected),
+    )
+    expect(selectedPreview).toBeDefined()
+    expect(rendered.text.split("\n")).toHaveLength(4)
   })
 
   test("marks screen-derived drafts as approximate", () => {
@@ -119,12 +135,12 @@ describe("renderConversationGraph", () => {
 })
 
 describe("renderRootPicker", () => {
-  test("summarizes logical messages, leaves, and live families", () => {
+  test("summarizes logical messages, sessions, and live families", () => {
     const graph = branchGraph()
     const rendered = renderRootPicker([graph], 0, 5, 80, new Set([CHILD]))
 
     expect(rendered.text.split("\n")[0]).toBe(
-      " ● Live  Root                                             3 messages · 2 leaves",
+      " ● Live  Root                                           3 messages · 2 sessions",
     )
     expect(rendered.text).not.toContain(">")
     const selectedTitle = rendered.content.chunks.find((chunk) => chunk.text === "Root")
@@ -145,7 +161,7 @@ describe("display text", () => {
 describe("spatial graph navigation", () => {
   test("moves in all four directions across different parent chains", () => {
     const graph = branchGraph()
-    const layout = layoutConversationGraph(graph, 100)
+    const layout = layoutConversationGraph(graph, 100, new Set([ROOT, CHILD]))
     const rootId = graph.rootNodeId
     const mainId = [...graph.nodes.values()].find(
       (node) => node.kind === "message" && node.preview === "main answer",
@@ -168,7 +184,7 @@ describe("spatial graph navigation", () => {
   test("moves naturally between roots and falls back across disconnected chains", () => {
     const graph = rootReplayGraph()
     const childEndpointId = graph.endpointBySessionId.get(CHILD)!
-    const rendered = renderConversationGraph(graph, childEndpointId, 40, 8, new Set())
+    const rendered = renderConversationGraph(graph, childEndpointId, 40, 8, new Set([CHILD]))
 
     expect(rendered.layout.nodes.has(graph.originNodeId)).toBeFalse()
     expect(rendered.layout.nodes.get(graph.rootNodeId)?.y).toBe(0)
@@ -179,9 +195,27 @@ describe("spatial graph navigation", () => {
     expect(rendered.offsetX).toBeGreaterThan(0)
   })
 
+  test("shows an empty session endpoint only while its process is live", () => {
+    const graph = buildConversationForest(
+      [session(ROOT, "Empty", 20)],
+      new Map([[ROOT, []]]),
+      [],
+    ).graphs[0]!
+    const endpointId = graph.endpointBySessionId.get(ROOT)!
+    const saved = renderConversationGraph(graph, endpointId, 40, 8, new Set())
+    const live = renderConversationGraph(graph, endpointId, 40, 8, new Set([ROOT]))
+
+    expect(saved.layout.nodes.size).toBe(0)
+    expect(saved.text).not.toContain("Claude session")
+    expect(initialVisibleGraphNodeId(graph, new Set())).toBeUndefined()
+    expect(live.layout.nodes.has(endpointId)).toBeTrue()
+    expect(live.text).toContain("Claude session")
+    expect(initialVisibleGraphNodeId(graph, new Set([ROOT]))).toBe(endpointId)
+  })
+
   test("does not move down from a short branch into a taller neighboring branch", () => {
     const graph = unevenBranchGraph()
-    const layout = layoutConversationGraph(graph, 100)
+    const layout = layoutConversationGraph(graph, 100, new Set([ROOT, CHILD]))
     const shortEndpointId = graph.endpointBySessionId.get(CHILD)!
     const tallAtSameDepthId = nodeIdByPreview(graph, "tall two")
 
@@ -202,7 +236,7 @@ describe("spatial graph navigation", () => {
 
   test("preserves depth when crossing a shorter branch and ignores blocked moves", () => {
     const graph = unevenBranchGraph()
-    const layout = layoutConversationGraph(graph, 100)
+    const layout = layoutConversationGraph(graph, 100, new Set([ROOT, CHILD]))
     const tallDeepId = nodeIdByPreview(graph, "tall three")
     const shortEndpointId = graph.endpointBySessionId.get(CHILD)!
     const across = directionalMove(layout, tallDeepId, "right")!

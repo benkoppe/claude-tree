@@ -16,9 +16,11 @@ import { truncateToWidth } from "./display-text"
 import { renderConversationGraph, renderRootPicker } from "./graph-renderer"
 import {
   directionalMove,
+  initialVisibleGraphNodeId,
   type ConversationGraphLayout,
   type GraphDirection,
   type GraphNavigationIntent,
+  visibleGraphNodeId,
 } from "./graph-layout"
 import {
   buildConversationForest,
@@ -309,8 +311,18 @@ export class ClaudeTreeApp {
   private enterSelectedRoot(): void {
     const graph = this.forest.graphs[this.selectedRootIndex]
     if (!graph) return
+    const runningSessionIds = this.terminalManager.runningSessionIds()
+    const selectedNodeId = initialVisibleGraphNodeId(graph, runningSessionIds)
+    if (!selectedNodeId) {
+      const endpointId = graph.endpointBySessionId.get(graph.rootSessionId)
+      const endpoint = endpointId ? graph.nodes.get(endpointId) : undefined
+      if (endpoint?.kind === "endpoint") {
+        void this.runAction(() => this.openEndpoint(endpoint))
+      }
+      return
+    }
     this.currentRootSessionId = graph.rootSessionId
-    this.selectedGraphNodeId = graph.rootNodeId
+    this.selectedGraphNodeId = selectedNodeId
     this.graphNavigationIntent = null
     this.view = "graph"
     this.status = graph.warnings[0] ?? "Graph ready"
@@ -364,12 +376,22 @@ export class ClaudeTreeApp {
       : undefined
     const graph = focusedGraph ?? preservedGraph
     if (graph) {
-      this.currentRootSessionId = graph.rootSessionId
       this.selectedRootIndex = this.forest.graphs.indexOf(graph)
-      this.selectedGraphNodeId =
+      const requestedNodeId =
         (focusSessionId ? graph.endpointBySessionId.get(focusSessionId) : undefined) ??
         (previousNodeId && graph.nodes.has(previousNodeId) ? previousNodeId : graph.rootNodeId)
-      if (focusSessionId) this.view = "graph"
+      const selectedNodeId =
+        visibleGraphNodeId(graph, requestedNodeId, runningIds) ??
+        initialVisibleGraphNodeId(graph, runningIds)
+      if (selectedNodeId) {
+        this.currentRootSessionId = graph.rootSessionId
+        this.selectedGraphNodeId = selectedNodeId
+        if (focusSessionId) this.view = "graph"
+      } else {
+        this.currentRootSessionId = null
+        this.selectedGraphNodeId = null
+        this.view = "roots"
+      }
     } else {
       this.currentRootSessionId = null
       this.selectedGraphNodeId = null
@@ -421,21 +443,20 @@ export class ClaudeTreeApp {
 
     let endpoint = selected.kind === "endpoint" ? selected : undefined
     if (!endpoint) {
-      const endpointChildren = selected.childIds
+      endpoint = selected.childIds
         .map((childId) => graph.nodes.get(childId))
         .filter((node): node is SessionEndpointNode => node?.kind === "endpoint")
-      const messageChildren = selected.childIds.filter(
-        (childId) => graph.nodes.get(childId)?.kind === "message",
-      )
-      if (endpointChildren.length === 1 && messageChildren.length === 0) {
-        endpoint = endpointChildren[0]
-      }
+        .sort(compareSessionEndpoints)[0]
     }
     if (endpoint?.kind !== "endpoint") {
-      this.status = "Select a Claude session leaf to enter Claude"
+      this.status = "This message is not the end of a Claude session"
       return
     }
 
+    await this.openEndpoint(endpoint)
+  }
+
+  private async openEndpoint(endpoint: SessionEndpointNode): Promise<void> {
     await this.openTerminal({
       kind: endpoint.session.transient ? "new" : "resume",
       sessionId: endpoint.session.sessionId,
@@ -658,9 +679,7 @@ export class ClaudeTreeApp {
       const draft = this.terminalManager.draftPreviews().get(selected.session.sessionId)
       const draftDescription = draft
         ? `${draft.exact ? "Draft" : "Observed draft"}: ${draft.text.replace(/\s+/g, " ").trim()}`
-        : this.terminalManager.isRunning(selected.session.sessionId)
-          ? "No draft observed"
-          : "No live draft"
+        : "No draft observed"
       const description = truncateToWidth(
         draftDescription,
         Math.max(20, this.renderer.terminalWidth - 32),
@@ -697,6 +716,13 @@ function controlChunks(controls: Array<readonly [key: string, description: strin
     chunk(key, theme.text, TextAttributes.BOLD),
     chunk(` ${description}`, theme.textMuted),
   ])
+}
+
+function compareSessionEndpoints(left: SessionEndpointNode, right: SessionEndpointNode): number {
+  return (
+    right.session.lastModified - left.session.lastModified ||
+    left.session.sessionId.localeCompare(right.session.sessionId)
+  )
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

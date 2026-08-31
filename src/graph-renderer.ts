@@ -77,7 +77,7 @@ export function renderConversationGraph(
 ): RenderedGraph {
   const safeWidth = Math.max(1, viewportWidth)
   const safeHeight = Math.max(1, viewportHeight)
-  const layout = layoutConversationGraph(graph, safeWidth)
+  const layout = layoutConversationGraph(graph, safeWidth, runningSessionIds)
   const { nodes: positioned, nodeWidth } = layout
   const canvas = new SparseCanvas()
 
@@ -90,14 +90,13 @@ export function renderConversationGraph(
       positionedNode,
       nodeWidth,
       positionedNode.node.id === selectedNodeId,
-      runningSessionIds,
       draftPreviews,
     )
   }
 
   const worldWidth = Math.max(layout.worldWidth, canvas.width)
   const worldHeight = Math.max(layout.worldHeight, canvas.height)
-  const selected = positioned.get(selectedNodeId) ?? positioned.get(graph.rootNodeId)
+  const selected = positioned.get(selectedNodeId) ?? positioned.values().next().value
   const selectedCenterX = (selected?.x ?? 0) + Math.floor((selected?.width ?? nodeWidth) / 2)
   const selectedCenterY = (selected?.y ?? 0) + Math.floor((selected?.height ?? GRAPH_NODE_HEIGHT) / 2)
   const offsetX = clamp(
@@ -152,9 +151,9 @@ export function renderRootPicker(
     const title = rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
     const live = [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
     const messageCount = [...graph.nodes.values()].filter((node) => node.kind === "message").length
-    const branchCount = graph.endpointBySessionId.size
+    const sessionCount = graph.endpointBySessionId.size
     const status = live ? "● Live" : "○ Saved"
-    const metadata = `${messageCount} messages · ${branchCount} ${branchCount === 1 ? "leaf" : "leaves"}`
+    const metadata = `${messageCount} messages · ${sessionCount} ${sessionCount === 1 ? "session" : "sessions"}`
     const rowStyle = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     const statusStyle = {
       ...rowStyle,
@@ -214,7 +213,6 @@ function drawNode(
   positioned: PositionedGraphNode,
   width: number,
   selected: boolean,
-  runningSessionIds: Set<string>,
   draftPreviews: Map<string, DraftPreview>,
 ): void {
   const { node, x, y } = positioned
@@ -248,11 +246,10 @@ function drawNode(
     return
   }
 
-  const running = runningSessionIds.has(node.session.sessionId)
-  const status = running ? "● Live" : "○ Saved"
+  const status = "● Live"
   const statusStyle = {
     ...headerStyle,
-    fg: selected ? theme.selectedText : running ? theme.success : theme.textMuted,
+    fg: selected ? theme.selectedText : theme.success,
   }
   const heading = `${ICONS.session} Claude session`
   const statusX = x + width - 2 - displayWidth(status)
@@ -265,9 +262,7 @@ function drawNode(
   const draft = draftPreviews.get(node.session.sessionId)
   const description = draft
     ? `${draft.exact ? "Draft" : "Observed draft"}: ${normalizePreview(draft.text)}`
-    : running
-      ? "No draft observed"
-      : "No live draft"
+    : "No draft observed"
   canvas.write(x + 2, y + 1, truncateToWidth(description, contentWidth), {
     ...baseStyle,
     fg: selected ? theme.selectedText : draft && !draft.exact ? theme.warning : theme.text,
