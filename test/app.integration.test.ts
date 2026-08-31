@@ -186,6 +186,116 @@ sleep 30
   }
 })
 
+test("forwards every key except Ctrl+Space while the terminal owns input", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const inputMarker = join(root, "input")
+  const readyMarker = join(root, "ready")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(
+    fakeAgent,
+    `#!/usr/bin/env bun
+import { appendFileSync, writeFileSync } from "node:fs"
+
+process.stdin.setRawMode?.(true)
+writeFileSync(${JSON.stringify(inputMarker)}, "")
+writeFileSync(${JSON.stringify(readyMarker)}, "")
+process.stdout.write("AGENT_READY\\r\\n")
+process.stdin.on("data", (data) => appendFileSync(${JSON.stringify(inputMarker)}, data))
+setInterval(() => undefined, 1_000)
+`,
+  )
+  await chmod(fakeAgent, 0o755)
+
+  let newSessionCalls = 0
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return []
+    },
+    async readTranscript() {
+      return []
+    },
+    async prepareNewSession() {
+      newSessionCalls += 1
+      const id = `new-session-${newSessionCalls}`
+      return {
+        session: { id, title: "New conversation", lastModified: Date.now(), transient: true },
+        launch: {
+          sessionId: id,
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [fakeAgent],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 24,
+    kittyKeyboard: true,
+    exitOnCtrlC: false,
+  })
+  const focusRenderable = setup.renderer.focusRenderable.bind(setup.renderer)
+  let sentActivationKey = false
+  setup.renderer.focusRenderable = (renderable) => {
+    focusRenderable(renderable)
+    if (!sentActivationKey && renderable.id.startsWith("agent-session-")) {
+      sentActivationKey = true
+      queueMicrotask(() => setup.mockInput.pressKey("n", { ctrl: true }))
+    }
+  }
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitUntil(() => Bun.file(readyMarker).exists())
+    await waitUntil(async () => (await readFile(inputMarker)).includes(0x0e))
+
+    const pressAgentKey = async (press: () => void) => {
+      const previousLength = (await readFile(inputMarker)).length
+      press()
+      await waitUntil(async () => (await readFile(inputMarker)).length > previousLength)
+      expect(setup.renderer.isDestroyed).toBeFalse()
+    }
+    for (const key of ["n", "r", "q", "f", "x", "h", "j", "k", "l"]) {
+      await pressAgentKey(() => setup.mockInput.pressKey(key))
+    }
+    for (const direction of ["up", "down", "left", "right"] as const) {
+      await pressAgentKey(() => setup.mockInput.pressArrow(direction))
+    }
+    await pressAgentKey(() => setup.mockInput.pressEscape())
+    await pressAgentKey(() => setup.mockInput.pressEnter())
+    await pressAgentKey(() => setup.mockInput.pressCtrlC())
+    await pressAgentKey(() => setup.mockInput.pressKey("p", { ctrl: true }))
+    await pressAgentKey(() => setup.mockInput.pressKey(" ", { ctrl: true, shift: true }))
+
+    expect(newSessionCalls).toBe(1)
+
+    const inputBeforeHostEscape = await readFile(inputMarker)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("claude-tree"))
+    await Bun.sleep(50)
+    expect(await readFile(inputMarker)).toEqual(inputBeforeHostEscape)
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("quit closes the UI immediately while live sessions finish shutting down", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -458,7 +568,12 @@ sleep 30
       throw new Error("not used")
     },
   })
-  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 24,
+    kittyKeyboard: true,
+    exitOnCtrlC: false,
+  })
   const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
@@ -489,6 +604,29 @@ sleep 30
       .lines.flatMap((line) => line.spans)
       .find((span) => span.text.includes("Kill") && span.bg.equals(theme.selected))
     expect(defaultKill).toBeDefined()
+
+    const modifiedKillKeys = [
+      () => setup.mockInput.pressKey("q", { ctrl: true }),
+      () => setup.mockInput.pressEscape({ shift: true }),
+      () => setup.mockInput.pressTab({ ctrl: true }),
+      () => setup.mockInput.pressArrow("right", { shift: true }),
+      () => setup.mockInput.pressKey("h", { meta: true }),
+      () => setup.mockInput.pressEnter({ ctrl: true }),
+      () => setup.mockInput.pressKey("c", { ctrl: true, shift: true }),
+    ]
+    for (const press of modifiedKillKeys) {
+      press()
+      await Bun.sleep(10)
+      await setup.renderOnce()
+      expect(setup.captureCharFrame()).toContain("Kill live session")
+      expect(setup.renderer.isDestroyed).toBeFalse()
+      expect(
+        setup
+          .captureSpans()
+          .lines.flatMap((line) => line.spans)
+          .some((span) => span.text.includes("Kill") && span.bg.equals(theme.selected)),
+      ).toBeTrue()
+    }
 
     setup.mockInput.pressArrow("right")
     await setup.renderOnce()
@@ -973,7 +1111,12 @@ test("shows About from both navigator views and uses the same modal language as 
       throw new Error("not used")
     },
   }
-  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 24,
+    kittyKeyboard: true,
+    exitOnCtrlC: false,
+  })
   const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
@@ -982,7 +1125,12 @@ test("shows About from both navigator views and uses the same modal language as 
     expect(roots).not.toContain("All branches share this working tree.")
     expect(roots).not.toContain("Refreshed")
 
-    setup.mockInput.pressKey("?")
+    setup.mockInput.pressKey("?", { ctrl: true })
+    await Bun.sleep(10)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Settings")
+
+    setup.mockInput.pressKey("?", { shift: true })
     const about = await waitForFrame(
       setup,
       (frame) =>
@@ -1001,6 +1149,21 @@ test("shows About from both navigator views and uses the same modal language as 
         .lines.flatMap((line) => line.spans)
         .some((span) => span.text.includes("About") && span.bg.equals(theme.selected)),
     ).toBeTrue()
+
+    const modifiedInfoKeys = [
+      () => setup.mockInput.pressKey("q", { ctrl: true }),
+      () => setup.mockInput.pressEscape({ shift: true }),
+      () => setup.mockInput.pressEnter({ meta: true }),
+      () => setup.mockInput.pressKey("?", { ctrl: true }),
+      () => setup.mockInput.pressKey("c", { ctrl: true, shift: true }),
+    ]
+    for (const press of modifiedInfoKeys) {
+      press()
+      await Bun.sleep(10)
+      await setup.renderOnce()
+      expect(setup.captureCharFrame()).toContain("Settings")
+      expect(setup.renderer.isDestroyed).toBeFalse()
+    }
 
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressEscape()

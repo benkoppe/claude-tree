@@ -83,9 +83,15 @@ export class TerminalManager {
       if (active) active.terminal.visible = false
     }
 
-    managed.terminal.visible = true
-    managed.terminal.focus()
     this.activeSessionId = managed.sessionId
+    managed.terminal.visible = true
+    try {
+      managed.terminal.focus()
+    } catch (error) {
+      this.activeSessionId = null
+      managed.terminal.visible = false
+      throw error
+    }
   }
 
   hideActive(): string | null {
@@ -100,6 +106,10 @@ export class TerminalManager {
     }
     this.pruneExited()
     return previous
+  }
+
+  ownsInput(): boolean {
+    return this.activeSessionId !== null
   }
 
   runningSessionIds(): Set<string> {
