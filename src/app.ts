@@ -214,6 +214,9 @@ export class ClaudeTreeApp {
       selectable: false,
       wrapMode: "none",
       content: "",
+      onMouseDown: this.onContentMouseDown,
+      onMouseUp: this.onContentMouseUp,
+      onMouseScroll: this.onContentMouseScroll,
     })
     this.footerSeparator = new TextRenderable(renderer, {
       id: "footer-separator",
@@ -224,9 +227,6 @@ export class ClaudeTreeApp {
       selectable: false,
       wrapMode: "none",
       content: "",
-      onMouseDown: this.onContentMouseDown,
-      onMouseUp: this.onContentMouseUp,
-      onMouseScroll: this.onContentMouseScroll,
     })
     this.footer = new TextRenderable(renderer, {
       id: "footer",

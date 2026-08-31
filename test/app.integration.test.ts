@@ -288,7 +288,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
       throw new Error("not used")
     },
   })
-  const setup = await createTestRenderer({ width: 100, height: 16 })
+  const setup = await createTestRenderer({ width: 100, height: 15 })
   const app = await ClaudeTreeApp.create(
     setup.renderer,
     project,
