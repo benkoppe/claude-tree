@@ -49,6 +49,9 @@ Conversation roots:
 | `n` | Start a new root conversation |
 | `r` | Refresh sessions and messages |
 | `q` or `Ctrl+C` | Exit |
+| Mouse wheel | Select the previous or next conversation family |
+| Left click a row | Select it; click it again while selected to open its graph |
+| Left click a footer action | Run that action |
 
 Message graph:
 
@@ -64,6 +67,8 @@ Message graph:
 | `r` | Refresh the graph |
 | `q` or `Escape` | Return to conversation roots |
 | `Ctrl+C` | Exit |
+| Left click a card | Select it; click it again while selected to open or resume |
+| Left click a footer action | Run that action |
 
 Claude terminal:
 

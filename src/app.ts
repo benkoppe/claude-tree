@@ -8,18 +8,21 @@ import {
   TextRenderable,
   type CliRenderer,
   type KeyEvent,
+  type MouseEvent,
   type RGBA,
   type TextChunk,
 } from "@opentui/core"
 
-import { truncateToWidth } from "./display-text"
+import { displayWidth, truncateToWidth } from "./display-text"
 import {
   BRAILLE_SPINNER_FRAMES,
   renderConversationGraph,
   renderRootPicker,
+  type ViewportOffset,
 } from "./graph-renderer"
 import {
   directionalMove,
+  graphNodeAt,
   initialVisibleGraphNodeId,
   type ConversationGraphLayout,
   type GraphDirection,
@@ -54,6 +57,55 @@ const MINIMUM_HEIGHT = 12
 const SPINNER_INTERVAL_MS = 80
 const COMPLETION_REFRESH_DELAY_MS = 75
 
+type FooterAction =
+  | "enter-root"
+  | "new"
+  | "refresh"
+  | "quit"
+  | "open"
+  | "fork"
+  | "roots"
+
+interface FooterControl {
+  key: string
+  description: string
+  action?: FooterAction
+}
+
+interface FooterHitRegion {
+  startX: number
+  endX: number
+  action: FooterAction
+}
+
+interface RenderedFooter {
+  content: StyledText
+  hitRegions: FooterHitRegion[]
+}
+
+type ContentMouseAction =
+  | { kind: "root"; rootIndex: number }
+  | { kind: "graph"; nodeId: string }
+type FooterMouseAction = { kind: "footer"; action: FooterAction }
+type PendingMouseAction = ContentMouseAction | FooterMouseAction
+
+const ROOT_FOOTER_CONTROLS: FooterControl[] = [
+  { key: "↑↓ / jk", description: "select" },
+  { key: "Enter", description: "graph", action: "enter-root" },
+  { key: "n", description: "new", action: "new" },
+  { key: "r", description: "refresh", action: "refresh" },
+  { key: "q", description: "quit", action: "quit" },
+]
+
+const GRAPH_FOOTER_CONTROLS: FooterControl[] = [
+  { key: "↑↓ / kj", description: "edges" },
+  { key: "←→ / hl", description: "branches" },
+  { key: "Enter", description: "open", action: "open" },
+  { key: "f", description: "fork", action: "fork" },
+  { key: "r", description: "refresh", action: "refresh" },
+  { key: "q", description: "roots", action: "roots" },
+]
+
 export class ClaudeTreeApp {
   private readonly navigator: BoxRenderable
   private readonly header: TextRenderable
@@ -74,8 +126,12 @@ export class ClaudeTreeApp {
   private selectedRootIndex = 0
   private currentRootSessionId: string | null = null
   private selectedGraphNodeId: string | null = null
+  private rootViewportStart = 0
   private graphLayout: ConversationGraphLayout | null = null
+  private graphViewportOffset: ViewportOffset | null = null
   private graphNavigationIntent: GraphNavigationIntent | null = null
+  private footerHitRegions: FooterHitRegion[] = []
+  private pendingMouseAction: PendingMouseAction | null = null
   private status: string
   private busy = false
   private stopping = false
@@ -140,6 +196,9 @@ export class ClaudeTreeApp {
       selectable: false,
       wrapMode: "none",
       content: "",
+      onMouseDown: this.onContentMouseDown,
+      onMouseUp: this.onContentMouseUp,
+      onMouseScroll: this.onContentMouseScroll,
     })
     this.footer = new TextRenderable(renderer, {
       id: "footer",
@@ -149,6 +208,8 @@ export class ClaudeTreeApp {
       selectable: false,
       wrapMode: "none",
       content: "",
+      onMouseDown: this.onFooterMouseDown,
+      onMouseUp: this.onFooterMouseUp,
     })
     this.navigator.add(this.header)
     this.navigator.add(this.content)
@@ -215,6 +276,7 @@ export class ClaudeTreeApp {
   }
 
   private readonly onResize = () => {
+    this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.render()
   }
@@ -272,6 +334,119 @@ export class ClaudeTreeApp {
     }
   }
 
+  private readonly onContentMouseDown = (event: MouseEvent) => {
+    this.pendingMouseAction = null
+    if (event.button !== 0 || this.busy || this.view === "terminal") return
+    const action = this.contentMouseActionAt(event)
+    if (!action) return
+    event.preventDefault()
+    event.stopPropagation()
+    this.pendingMouseAction = action
+  }
+
+  private readonly onContentMouseUp = (event: MouseEvent) => {
+    const pending = this.pendingMouseAction
+    this.pendingMouseAction = null
+    if (event.button !== 0 || this.busy || this.view === "terminal" || !pending) return
+    const action = this.contentMouseActionAt(event)
+    if (!action || !sameMouseAction(pending, action)) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (action.kind === "root") {
+      if (action.rootIndex === this.selectedRootIndex) {
+        this.enterSelectedRoot()
+      } else {
+        this.selectedRootIndex = action.rootIndex
+        this.render()
+      }
+    } else if (action.nodeId === this.selectedGraphNodeId) {
+      void this.runAction(() => this.openSelectedLeaf())
+    } else {
+      this.selectedGraphNodeId = action.nodeId
+      this.graphNavigationIntent = null
+      this.render()
+    }
+  }
+
+  private contentMouseActionAt(event: MouseEvent): ContentMouseAction | undefined {
+    const localX = event.x - this.content.screenX
+    const localY = event.y - this.content.screenY
+    if (localX < 0 || localY < 0) return undefined
+    if (this.view === "roots") {
+      const rootIndex = this.rootViewportStart + localY
+      return rootIndex >= this.rootViewportStart && rootIndex < this.forest.graphs.length
+        ? { kind: "root", rootIndex }
+        : undefined
+    }
+    if (!this.graphLayout || !this.graphViewportOffset) return undefined
+    const positioned = graphNodeAt(
+      this.graphLayout,
+      this.graphViewportOffset.x + localX,
+      this.graphViewportOffset.y + localY,
+    )
+    return positioned ? { kind: "graph", nodeId: positioned.node.id } : undefined
+  }
+
+  private readonly onContentMouseScroll = (event: MouseEvent) => {
+    if (this.busy || this.view !== "roots") return
+    const direction = event.scroll?.direction
+    if (direction !== "up" && direction !== "down") return
+    event.preventDefault()
+    event.stopPropagation()
+    const distance = Math.max(1, Math.round(event.scroll?.delta ?? 1))
+    this.moveRoot(direction === "up" ? -distance : distance)
+  }
+
+  private readonly onFooterMouseDown = (event: MouseEvent) => {
+    this.pendingMouseAction = null
+    if (event.button !== 0 || this.view === "terminal") return
+    const action = this.footerMouseActionAt(event)
+    if (!action || (this.busy && action.action !== "quit")) return
+    event.preventDefault()
+    event.stopPropagation()
+    this.pendingMouseAction = action
+  }
+
+  private readonly onFooterMouseUp = (event: MouseEvent) => {
+    const pending = this.pendingMouseAction
+    this.pendingMouseAction = null
+    if (event.button !== 0 || this.view === "terminal" || pending?.kind !== "footer") return
+    const action = this.footerMouseActionAt(event)
+    if (!action || action.action !== pending.action || (this.busy && action.action !== "quit")) return
+    event.preventDefault()
+    event.stopPropagation()
+    this.runFooterAction(action.action)
+  }
+
+  private footerMouseActionAt(event: MouseEvent): FooterMouseAction | undefined {
+    const localX = event.x - this.footer.screenX
+    const localY = event.y - this.footer.screenY
+    if (localY !== 0) return undefined
+    const hit = this.footerHitRegions.find(
+      (region) => localX >= region.startX && localX < region.endX,
+    )
+    return hit ? { kind: "footer", action: hit.action } : undefined
+  }
+
+  private runFooterAction(action: FooterAction): void {
+    if (action === "enter-root") {
+      this.enterSelectedRoot()
+    } else if (action === "new") {
+      void this.runAction(() => this.newSession())
+    } else if (action === "refresh") {
+      void this.runAction(() => this.refreshData())
+    } else if (action === "quit") {
+      void this.stop()
+    } else if (action === "open") {
+      void this.runAction(() => this.openSelectedLeaf())
+    } else if (action === "fork") {
+      void this.runAction(() => this.forkSelectedNode())
+    } else if (action === "roots") {
+      this.showRoots()
+    }
+  }
+
   private handleRootKey(key: KeyEvent): void {
     const quit = key.name === "q" || (key.name === "c" && key.ctrl)
     const recognized =
@@ -313,9 +488,7 @@ export class ClaudeTreeApp {
     } else if (this.busy) {
       return
     } else if (back) {
-      this.view = "roots"
-      this.graphNavigationIntent = null
-      this.render()
+      this.showRoots()
     } else if (key.name === "up" || key.name === "k") {
       this.moveSelection("up")
     } else if (key.name === "down" || key.name === "j") {
@@ -374,6 +547,7 @@ export class ClaudeTreeApp {
     }
     this.currentRootSessionId = graph.rootSessionId
     this.selectedGraphNodeId = selectedNodeId
+    this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.view = "graph"
     this.status = graph.warnings[0] ?? "Graph ready"
@@ -390,7 +564,15 @@ export class ClaudeTreeApp {
     )
     if (!move) return
     this.selectedGraphNodeId = move.nodeId
+    this.graphViewportOffset = null
     this.graphNavigationIntent = move.intent
+    this.render()
+  }
+
+  private showRoots(): void {
+    this.view = "roots"
+    this.graphViewportOffset = null
+    this.graphNavigationIntent = null
     this.render()
   }
 
@@ -420,6 +602,7 @@ export class ClaudeTreeApp {
     const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
     this.transcripts = new Map(transcriptEntries)
     this.forest = buildConversationForest(this.sessions, this.transcripts, this.relations)
+    this.graphViewportOffset = null
     this.graphNavigationIntent = null
 
     const focusedGraph = focusSessionId ? this.forest.graphBySessionId.get(focusSessionId) : undefined
@@ -630,13 +813,16 @@ export class ClaudeTreeApp {
     this.footer.visible = !tooSmall
     if (tooSmall) {
       this.graphLayout = null
+      this.graphViewportOffset = null
       this.graphNavigationIntent = null
+      this.footerHitRegions = []
       return
     }
 
     const contentHeight = Math.max(1, this.renderer.terminalHeight - 8)
     if (this.view === "roots") {
       this.graphLayout = null
+      this.graphViewportOffset = null
       this.graphNavigationIntent = null
       const rendered = renderRootPicker(
         this.forest.graphs,
@@ -644,13 +830,19 @@ export class ClaudeTreeApp {
         contentHeight,
         this.renderer.terminalWidth - 2,
         this.terminalManager.runningSessionIds(),
+        this.rootViewportStart,
       )
+      this.rootViewportStart = rendered.startIndex
       this.content.content = rendered.content
-      this.footer.content = this.renderRootFooter()
+      const footer = this.renderRootFooter()
+      this.footer.content = footer.content
+      this.footerHitRegions = footer.hitRegions
     } else {
       const graph = this.currentGraph()
       if (!graph || !this.selectedGraphNodeId) {
         this.graphLayout = null
+        this.graphViewportOffset = null
+        this.footerHitRegions = []
         return
       }
       const rendered = renderConversationGraph(
@@ -662,10 +854,14 @@ export class ClaudeTreeApp {
         this.terminalManager.draftPreviews(),
         this.displayedGeneratingSessionIds(),
         this.spinnerFrame,
+        this.graphViewportOffset ?? undefined,
       )
       this.graphLayout = rendered.layout
+      this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
       this.content.content = rendered.content
-      this.footer.content = this.renderGraphFooter()
+      const footer = this.renderGraphFooter()
+      this.footer.content = footer.content
+      this.footerHitRegions = footer.hitRegions
     }
   }
 
@@ -690,36 +886,31 @@ export class ClaudeTreeApp {
     ])
   }
 
-  private renderRootFooter(): StyledText {
-    return styledText([
-      ...controlChunks([
-        ["↑↓ / jk", "select"],
-        ["Enter", "graph"],
-        ["n", "new"],
-        ["r", "refresh"],
-        ["q", "quit"],
+  private renderRootFooter(): RenderedFooter {
+    const controls = renderControls(ROOT_FOOTER_CONTROLS)
+    return {
+      content: styledText([
+        ...controls.chunks,
+        chunk("\nAll branches share this working tree.", theme.warning),
+        chunk("\n", theme.text),
+        ...this.statusChunks(),
       ]),
-      chunk("\nAll branches share this working tree.", theme.warning),
-      chunk("\n", theme.text),
-      ...this.statusChunks(),
-    ])
+      hitRegions: controls.hitRegions,
+    }
   }
 
-  private renderGraphFooter(): StyledText {
-    return styledText([
-      ...controlChunks([
-        ["↑↓ / kj", "edges"],
-        ["←→ / hl", "branches"],
-        ["Enter", "open"],
-        ["f", "fork"],
-        ["r", "refresh"],
-        ["q", "roots"],
+  private renderGraphFooter(): RenderedFooter {
+    const controls = renderControls(GRAPH_FOOTER_CONTROLS)
+    return {
+      content: styledText([
+        ...controls.chunks,
+        chunk("\n", theme.text),
+        chunk(this.selectedDescription(), theme.textMuted),
+        chunk("\n", theme.text),
+        ...this.statusChunks(),
       ]),
-      chunk("\n", theme.text),
-      chunk(this.selectedDescription(), theme.textMuted),
-      chunk("\n", theme.text),
-      ...this.statusChunks(),
-    ])
+      hitRegions: controls.hitRegions,
+    }
   }
 
   private statusChunks(): TextChunk[] {
@@ -850,12 +1041,35 @@ function styledText(chunks: TextChunk[]): StyledText {
   return new StyledText(chunks)
 }
 
-function controlChunks(controls: Array<readonly [key: string, description: string]>): TextChunk[] {
-  return controls.flatMap(([key, description], index) => [
-    ...(index === 0 ? [] : [chunk("  ", theme.textMuted)]),
-    chunk(key, theme.text, TextAttributes.BOLD),
-    chunk(` ${description}`, theme.textMuted),
-  ])
+function renderControls(controls: FooterControl[]): {
+  chunks: TextChunk[]
+  hitRegions: FooterHitRegion[]
+} {
+  const chunks: TextChunk[] = []
+  const hitRegions: FooterHitRegion[] = []
+  let x = 0
+  for (const [index, control] of controls.entries()) {
+    if (index > 0) {
+      chunks.push(chunk("  ", theme.textMuted))
+      x += 2
+    }
+    const text = `${control.key} ${control.description}`
+    const endX = x + displayWidth(text)
+    chunks.push(
+      chunk(control.key, theme.text, TextAttributes.BOLD),
+      chunk(` ${control.description}`, theme.textMuted),
+    )
+    if (control.action) hitRegions.push({ startX: x, endX, action: control.action })
+    x = endX
+  }
+  return { chunks, hitRegions }
+}
+
+function sameMouseAction(left: PendingMouseAction, right: PendingMouseAction): boolean {
+  if (left.kind === "root" && right.kind === "root") return left.rootIndex === right.rootIndex
+  if (left.kind === "graph" && right.kind === "graph") return left.nodeId === right.nodeId
+  if (left.kind === "footer" && right.kind === "footer") return left.action === right.action
+  return false
 }
 
 function compareSessionEndpoints(left: SessionEndpointNode, right: SessionEndpointNode): number {

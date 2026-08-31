@@ -5,6 +5,7 @@ import { createTestRenderer } from "@opentui/core/testing"
 import { displayWidth, truncateToWidth } from "../src/display-text"
 import {
   directionalMove,
+  graphNodeAt,
   initialVisibleGraphNodeId,
   layoutConversationGraph,
   visibleGraphNodeId,
@@ -118,6 +119,45 @@ describe("renderConversationGraph", () => {
     expect(rendered.text.split("\n")).toHaveLength(4)
   })
 
+  test("preserves an explicit viewport offset when mouse selection changes", () => {
+    const graph = branchGraph()
+    const branchId = nodeIdByPreview(graph, "fork answer")
+    const initial = renderConversationGraph(graph, branchId, 40, 4, new Set())
+    const selectedRoot = renderConversationGraph(
+      graph,
+      graph.rootNodeId,
+      40,
+      4,
+      new Set(),
+      new Map(),
+      new Set(),
+      0,
+      { x: initial.offsetX, y: initial.offsetY },
+    )
+
+    expect(initial.offsetX).toBeGreaterThan(0)
+    expect(initial.offsetY).toBeGreaterThan(0)
+    expect(selectedRoot.offsetX).toBe(initial.offsetX)
+    expect(selectedRoot.offsetY).toBe(initial.offsetY)
+  })
+
+  test("hit-tests only graph card rectangles", () => {
+    const graph = branchGraph()
+    const rendered = renderConversationGraph(graph, graph.rootNodeId, 100, 30, new Set())
+    const root = rendered.layout.nodes.get(graph.rootNodeId)!
+
+    expect(graphNodeAt(rendered.layout, root.x, root.y)?.node.id).toBe(root.node.id)
+    expect(
+      graphNodeAt(
+        rendered.layout,
+        root.x + root.width - 1,
+        root.y + root.height - 1,
+      )?.node.id,
+    ).toBe(root.node.id)
+    expect(graphNodeAt(rendered.layout, root.x + root.width, root.y)).toBeUndefined()
+    expect(graphNodeAt(rendered.layout, root.x, root.y + root.height)).toBeUndefined()
+  })
+
   test("shows screen-derived draft text without an observation prefix", () => {
     const graph = branchGraph()
     const selected = graph.endpointBySessionId.get(CHILD)!
@@ -203,6 +243,18 @@ describe("renderRootPicker", () => {
     expect(selectedTitle?.bg?.equals(theme.selected)).toBeTrue()
     expect(selectedTitle?.fg?.equals(theme.selectedText)).toBeTrue()
     expect(renderRootPicker([], 0, 5, 80, new Set()).text).toContain("press n")
+  })
+
+  test("keeps a stable viewport and scrolls only to reveal the selection", () => {
+    const graphs = Array.from({ length: 10 }, () => branchGraph())
+
+    expect(renderRootPicker(graphs, 2, 3, 80, new Set(), 0).startIndex).toBe(0)
+    expect(renderRootPicker(graphs, 3, 3, 80, new Set(), 0).startIndex).toBe(1)
+    expect(renderRootPicker(graphs, 2, 3, 80, new Set(), 1).startIndex).toBe(1)
+    expect(renderRootPicker(graphs, 0, 3, 80, new Set(), 1).startIndex).toBe(0)
+    const finalWindow = renderRootPicker(graphs, 9, 3, 80, new Set(), 1)
+    expect(finalWindow.startIndex).toBe(7)
+    expect(finalWindow.endIndex).toBe(10)
   })
 })
 

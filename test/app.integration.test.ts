@@ -3,10 +3,11 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { createTestRenderer } from "@opentui/core/testing"
+import { createTestRenderer, MouseButtons } from "@opentui/core/testing"
 import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-sdk"
 
 import { ClaudeTreeApp } from "../src/app"
+import { displayWidth } from "../src/display-text"
 import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
 import { SessionService } from "../src/sessions"
 import { theme } from "../src/theme"
@@ -112,9 +113,14 @@ wait "$child"
     setup.mockInput.pressKey("n")
     const processIds = await readProcessIds(processMarker)
     setup.mockInput.pressKey(" ", { ctrl: true })
+    const busyFrame = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Working") && frame.includes("q quit"),
+    )
 
     const startedAt = performance.now()
-    setup.mockInput.pressKey("q")
+    const quitAction = coordinateOf(busyFrame, "q quit")
+    await setup.mockMouse.click(quitAction.x, quitAction.y)
     expect(setup.renderer.isDestroyed).toBeTrue()
 
     await running
@@ -168,6 +174,141 @@ test("shutdown does not wait for an initial session refresh", async () => {
   } finally {
     finishRefresh([])
     await app.stop()
+  }
+})
+
+test("supports mouse selection, scrolling, activation, and footer actions", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(fakeClaude, "#!/bin/sh\nsleep 30\n")
+  await chmod(fakeClaude, 0o755)
+
+  const sessions = Array.from({ length: 10 }, (_, index): SDKSessionInfo => {
+    const ordinal = index + 1
+    return {
+      sessionId: testUuid(ordinal),
+      summary: `Root ${ordinal}`,
+      firstPrompt: `question ${ordinal}`,
+      lastModified: 100 - ordinal,
+    }
+  })
+  const transcripts = new Map(
+    sessions.map((session, index) => {
+      const messages = [
+        sessionMessage(session.sessionId, testUuid(100 + index * 2), "user", `question ${index + 1}`),
+        sessionMessage(
+          session.sessionId,
+          testUuid(101 + index * 2),
+          "assistant",
+          `answer ${index + 1}`,
+        ),
+      ]
+      if (index === 7) {
+        messages.push(
+          sessionMessage(session.sessionId, testUuid(300), "user", "follow-up 8"),
+          sessionMessage(session.sessionId, testUuid(301), "assistant", "final 8"),
+        )
+      }
+      return [session.sessionId, messages] as const
+    }),
+  )
+  let listCalls = 0
+  const sessionService = new SessionService(project, {
+    async list(): Promise<SDKSessionInfo[]> {
+      listCalls += 1
+      return sessions
+    },
+    async messages(sessionId): Promise<SessionMessage[]> {
+      return transcripts.get(sessionId) ?? []
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 100, height: 16 })
+  const app = await ClaudeTreeApp.create(
+    setup.renderer,
+    project,
+    fakeClaude,
+    undefined,
+    state,
+    sessionService,
+  )
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Root 1"))
+    const rootList = coordinateOf(setup.captureCharFrame(), "Root 1")
+    for (let index = 0; index < 8; index += 1) {
+      await setup.mockMouse.scroll(rootList.x, rootList.y, "down")
+      await setup.renderOnce()
+    }
+    let frame = setup.captureCharFrame()
+    expect(frame).not.toContain("Root 1")
+    expect(isSelected(setup, "Root 9")).toBeTrue()
+
+    const rootEight = coordinateOf(frame, "Root 8")
+    const rootNine = coordinateOf(frame, "Root 9")
+    await setup.mockMouse.drag(rootNine.x, rootNine.y, rootEight.x, rootEight.y)
+    await setup.renderOnce()
+    expect(isSelected(setup, "Root 9")).toBeTrue()
+
+    await setup.mockMouse.click(rootEight.x, rootEight.y, MouseButtons.RIGHT)
+    await setup.renderOnce()
+    expect(isSelected(setup, "Root 9")).toBeTrue()
+
+    await setup.mockMouse.click(rootEight.x, rootEight.y)
+    await setup.renderOnce()
+    frame = setup.captureCharFrame()
+    expect(isSelected(setup, "Root 8")).toBeTrue()
+    expect(coordinateOf(frame, "Root 8")).toEqual(rootEight)
+
+    await setup.mockMouse.click(rootEight.x, rootEight.y)
+    frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Message graph") && candidate.includes("answer 8"),
+    )
+    setup.mockInput.pressArrow("down")
+    await waitForFrame(setup, () => isSelected(setup, "answer 8"))
+    setup.mockInput.pressArrow("down")
+    frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("follow-up 8") && isSelected(setup, "follow-up 8"),
+    )
+    const assistant = coordinateOf(frame, "Assistant")
+    await setup.mockMouse.click(assistant.x, assistant.y)
+    await setup.renderOnce()
+    frame = setup.captureCharFrame()
+    expect(isSelected(setup, "Assistant")).toBeTrue()
+    expect(coordinateOf(frame, "Assistant")).toEqual(assistant)
+
+    await setup.mockMouse.click(assistant.x, assistant.y)
+    await waitForFrame(setup, (candidate) => !candidate.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    frame = await waitForFrame(setup, (candidate) => candidate.includes("Message graph"))
+
+    const rootsAction = coordinateOf(frame, "q roots")
+    await setup.mockMouse.click(rootsAction.x, rootsAction.y)
+    frame = await waitForFrame(setup, (candidate) => candidate.includes("Conversation roots"))
+
+    const refreshAction = coordinateOf(frame, "r refresh")
+    const beforeHover = frame
+    await setup.mockMouse.moveTo(refreshAction.x, refreshAction.y)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toBe(beforeHover)
+
+    const callsBeforeRefresh = listCalls
+    await setup.mockMouse.click(refreshAction.x, refreshAction.y)
+    await waitForFrame(
+      setup,
+      (candidate) => listCalls > callsBeforeRefresh && candidate.includes("Refreshed"),
+    )
+  } finally {
+    await app.stop()
+    await running
   }
 })
 
@@ -295,6 +436,30 @@ function sessionMessage(
     parent_tool_use_id: null,
     parent_agent_id: null,
   }
+}
+
+function testUuid(value: number): string {
+  const suffix = value.toString().padStart(12, "0")
+  return `00000000-0000-4000-8000-${suffix}`
+}
+
+function coordinateOf(frame: string, text: string): { x: number; y: number } {
+  const lines = frame.split("\n")
+  for (const [y, line] of lines.entries()) {
+    const index = line.indexOf(text)
+    if (index >= 0) return { x: displayWidth(line.slice(0, index)), y }
+  }
+  throw new Error(`Missing text in frame: ${text}\n${frame}`)
+}
+
+function isSelected(
+  setup: Awaited<ReturnType<typeof createTestRenderer>>,
+  text: string,
+): boolean {
+  return setup
+    .captureSpans()
+    .lines.flatMap((line) => line.spans)
+    .some((span) => span.text.includes(text) && span.bg.equals(theme.selected))
 }
 
 async function waitForFrame(

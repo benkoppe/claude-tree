@@ -39,6 +39,24 @@ export interface ConversationGraphLayout {
   worldHeight: number
 }
 
+export function graphNodeAt(
+  layout: ConversationGraphLayout,
+  worldX: number,
+  worldY: number,
+): PositionedGraphNode | undefined {
+  for (const positioned of layout.nodes.values()) {
+    if (
+      worldX >= positioned.x &&
+      worldX < positioned.x + positioned.width &&
+      worldY >= positioned.y &&
+      worldY < positioned.y + positioned.height
+    ) {
+      return positioned
+    }
+  }
+  return undefined
+}
+
 export function visibleGraphNodeId(
   graph: ConversationGraph,
   nodeId: string | undefined,

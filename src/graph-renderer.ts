@@ -29,6 +29,16 @@ export interface RenderedGraph extends RenderedText {
   layout: ConversationGraphLayout
 }
 
+export interface RenderedRootPicker extends RenderedText {
+  startIndex: number
+  endIndex: number
+}
+
+export interface ViewportOffset {
+  x: number
+  y: number
+}
+
 interface CellStyle {
   fg: RGBA
   bg: RGBA
@@ -78,6 +88,7 @@ export function renderConversationGraph(
   draftPreviews: Map<string, DraftPreview> = new Map(),
   generatingSessionIds: Set<string> = new Set(),
   spinnerFrame = 0,
+  viewportOffset?: ViewportOffset,
 ): RenderedGraph {
   const safeWidth = Math.max(1, viewportWidth)
   const safeHeight = Math.max(1, viewportHeight)
@@ -106,12 +117,12 @@ export function renderConversationGraph(
   const selectedCenterX = (selected?.x ?? 0) + Math.floor((selected?.width ?? nodeWidth) / 2)
   const selectedCenterY = (selected?.y ?? 0) + Math.floor((selected?.height ?? GRAPH_NODE_HEIGHT) / 2)
   const offsetX = clamp(
-    selectedCenterX - Math.floor(safeWidth / 2),
+    viewportOffset?.x ?? selectedCenterX - Math.floor(safeWidth / 2),
     0,
     Math.max(0, worldWidth - safeWidth),
   )
   const offsetY = clamp(
-    selectedCenterY - Math.floor(safeHeight / 2),
+    viewportOffset?.y ?? selectedCenterY - Math.floor(safeHeight / 2),
     0,
     Math.max(0, worldHeight - safeHeight),
   )
@@ -133,7 +144,8 @@ export function renderRootPicker(
   height: number,
   width: number,
   runningSessionIds: Set<string>,
-): RenderedText {
+  viewportStart = 0,
+): RenderedRootPicker {
   const safeWidth = Math.max(1, width)
   if (graphs.length === 0) {
     const canvas = new SparseCanvas()
@@ -141,11 +153,15 @@ export function renderRootPicker(
       ...DEFAULT_STYLE,
       fg: theme.textMuted,
     })
-    return canvas.viewport(0, 0, safeWidth, Math.max(1, height))
+    return {
+      ...canvas.viewport(0, 0, safeWidth, Math.max(1, height)),
+      startIndex: 0,
+      endIndex: 0,
+    }
   }
 
   const canvas = new SparseCanvas()
-  const { start, end } = windowAround(graphs.length, selectedIndex, height)
+  const { start, end } = visibleWindow(graphs.length, selectedIndex, height, viewportStart)
   for (let index = start; index < end; index += 1) {
     const graph = graphs[index]!
     const row = index - start
@@ -184,7 +200,11 @@ export function renderRootPicker(
       })
     }
   }
-  return canvas.viewport(0, 0, safeWidth, Math.max(1, height))
+  return {
+    ...canvas.viewport(0, 0, safeWidth, Math.max(1, height)),
+    startIndex: start,
+    endIndex: end,
+  }
 }
 
 function drawConnections(
@@ -438,9 +458,18 @@ function cellKey(x: number, y: number): string {
   return `${x}:${y}`
 }
 
-function windowAround(total: number, selected: number, height: number): { start: number; end: number } {
+function visibleWindow(
+  total: number,
+  selected: number,
+  height: number,
+  viewportStart: number,
+): { start: number; end: number } {
   const safeHeight = Math.max(1, height)
-  const start = clamp(selected - Math.floor(safeHeight / 2), 0, Math.max(0, total - safeHeight))
+  const maximumStart = Math.max(0, total - safeHeight)
+  let start = clamp(viewportStart, 0, maximumStart)
+  if (selected < start) start = selected
+  if (selected >= start + safeHeight) start = selected - safeHeight + 1
+  start = clamp(start, 0, maximumStart)
   return { start, end: Math.min(total, start + safeHeight) }
 }
 
