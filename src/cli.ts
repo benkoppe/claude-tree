@@ -1,0 +1,94 @@
+#!/usr/bin/env bun
+
+import { createCliRenderer } from "@opentui/core"
+
+import { ClaudeTreeApp } from "./app"
+
+const EXPECTED_CLAUDE_VERSION = "2.1.239"
+
+async function main(): Promise<void> {
+  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+    process.stdout.write(
+      "claude-tree\n\nExplore and run this project's Claude Code conversations.\n\nRoot picker:\n  Up/Down or k/j  select a conversation family\n  Enter           open its message graph\n  n               start a new conversation\n  q               quit\n\nMessage graph:\n  Up/Down or k/j  move along graph edges\n  Left/Right or h/l move across branches\n  Enter           open a session leaf\n  f               fork or replay the selected message\n  q or Escape     return to roots\n\nClaude terminal:\n  Ctrl+Space      return to the message graph\n",
+    )
+    return
+  }
+  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+    process.stdout.write("claude-tree 0.1.0\n")
+    return
+  }
+  if (process.argv.length > 2) {
+    throw new Error(`Unknown argument: ${process.argv[2]}`)
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("claude-tree requires an interactive terminal")
+  }
+
+  const claudeExecutable = Bun.which("claude")
+  if (!claudeExecutable) {
+    throw new Error("Claude Code was not found on PATH")
+  }
+  const installedVersion = await readClaudeVersion(claudeExecutable)
+  const compatibilityWarning = installedVersion.includes(EXPECTED_CLAUDE_VERSION)
+    ? undefined
+    : `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found ${installedVersion}`
+
+  const renderer = await createCliRenderer({
+    exitOnCtrlC: false,
+    exitSignals: [],
+    useKittyKeyboard: { events: true },
+    backgroundColor: "#0b1020",
+  })
+  let app: ClaudeTreeApp | undefined
+  let stopRequested = false
+  const stop = () => {
+    stopRequested = true
+    if (app) void app.stop()
+  }
+  process.on("SIGTERM", stop)
+  process.on("SIGINT", stop)
+  process.on("SIGHUP", stop)
+  process.on("SIGQUIT", stop)
+
+  try {
+    app = await ClaudeTreeApp.create(
+      renderer,
+      process.cwd(),
+      claudeExecutable,
+      compatibilityWarning,
+    )
+    if (stopRequested) {
+      await app.stop()
+      return
+    }
+    await app.run()
+  } finally {
+    process.off("SIGTERM", stop)
+    process.off("SIGINT", stop)
+    process.off("SIGHUP", stop)
+    process.off("SIGQUIT", stop)
+    if (app) await app.stop()
+    else renderer.destroy()
+  }
+}
+
+async function readClaudeVersion(executable: string): Promise<string> {
+  const process = Bun.spawn([executable, "--version"], {
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    process.exited,
+    new Response(process.stdout).text(),
+    new Response(process.stderr).text(),
+  ])
+  if (exitCode !== 0) {
+    throw new Error(`Unable to run Claude Code: ${stderr.trim() || `exit ${exitCode}`}`)
+  }
+  return stdout.trim()
+}
+
+void main().catch((error) => {
+  process.stderr.write(`claude-tree: ${error instanceof Error ? error.message : String(error)}\n`)
+  process.exitCode = 1
+})

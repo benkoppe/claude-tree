@@ -1,5 +1,5 @@
 {
-  description = "Description for the project";
+  description = "Explore and run Claude Code conversations as a tree";
 
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -32,6 +32,7 @@
         {
           devShells.default = pkgs.mkShellNoCC {
             packages = [
+              pkgs.bun
               inputs'.llm-agents.packages.claude-code
             ];
           };
