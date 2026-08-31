@@ -9,6 +9,9 @@ import {
 import { Osc52Forwarder } from "./clipboard"
 import { OscSequenceParser } from "./osc"
 
+const SHUTDOWN_GRACE_PERIOD_MS = 200
+const FORCED_SHUTDOWN_PERIOD_MS = 200
+
 interface ManagedTerminal {
   sessionId: string
   process: Bun.Subprocess
@@ -44,6 +47,7 @@ export class TerminalManager {
   private readonly terminals = new Map<string, ManagedTerminal>()
   private activeSessionId: string | null = null
   private shuttingDown = false
+  private shutdownPromise: Promise<void> | undefined
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -122,33 +126,38 @@ export class TerminalManager {
     )
   }
 
-  async shutdown(gracePeriodMs = 1_500): Promise<void> {
-    if (this.shuttingDown) return
+  shutdown(gracePeriodMs = SHUTDOWN_GRACE_PERIOD_MS): Promise<void> {
+    this.shutdownPromise ??= this.performShutdown(gracePeriodMs)
+    return this.shutdownPromise
+  }
+
+  private async performShutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true
     this.renderer.off(CliRenderEvents.SELECTION, this.onSelection)
-    this.hideActive()
+    this.activeSessionId = null
+    this.renderer.clearSelection()
 
-    const running = [...this.terminals.values()].filter((managed) => managed.exitCode === null)
-    for (const managed of running) managed.process.kill("SIGTERM")
+    const owned = [...this.terminals.values()]
+    const errors: unknown[] = []
+    try {
+      signalProcessGroups(owned, "SIGTERM", errors)
+      for (const managed of owned) this.destroyEmulator(managed)
+      this.terminals.clear()
 
-    if (running.length > 0) {
-      let timeout: ReturnType<typeof setTimeout> | undefined
-      await Promise.race([
-        Promise.allSettled(running.map((managed) => managed.process.exited)),
-        new Promise<void>((resolve) => {
-          timeout = setTimeout(resolve, gracePeriodMs)
-        }),
-      ])
-      if (timeout) clearTimeout(timeout)
+      await waitForProcessGroups(owned, gracePeriodMs)
+
+      const survivors = owned.filter((managed) => isProcessGroupAlive(managed.process.pid))
+      signalProcessGroups(survivors, "SIGKILL", errors)
+      await waitForProcessGroups(survivors, FORCED_SHUTDOWN_PERIOD_MS)
+    } finally {
+      for (const managed of owned) {
+        if (!managed.pty.closed) managed.pty.close()
+        this.destroyEmulator(managed)
+        if (managed.process.exitCode === null) managed.process.unref()
+      }
     }
 
-    for (const managed of running) {
-      if (managed.exitCode === null) managed.process.kill("SIGKILL")
-    }
-    await Promise.allSettled(running.map((managed) => managed.process.exited))
-
-    for (const managed of this.terminals.values()) this.destroyTerminal(managed)
-    this.terminals.clear()
+    if (errors.length > 0) throw new AggregateError(errors, "Unable to stop every Claude process")
   }
 
   private spawn(launch: TerminalLaunch): ManagedTerminal {
@@ -205,6 +214,7 @@ export class TerminalManager {
     try {
       process = Bun.spawn(args, {
         cwd: this.projectPath,
+        detached: true,
         env: {
           ...globalThis.process.env,
           TERM: "xterm-256color",
@@ -214,6 +224,7 @@ export class TerminalManager {
           cols,
           rows,
           data(childPty, data) {
+            if (manager.shuttingDown) return
             pty = childPty
             const clipboardWrites = osc52.observe(data)
             const generating = activityObserver.observe(data)
@@ -297,10 +308,14 @@ export class TerminalManager {
   }
 
   private destroyTerminal(managed: ManagedTerminal): void {
-    managed.terminal.blur()
     if (!managed.pty.closed) managed.pty.close()
+    this.destroyEmulator(managed)
+  }
+
+  private destroyEmulator(managed: ManagedTerminal): void {
+    managed.terminal.blur()
     if (managed.terminal.parent) managed.terminal.parent.remove(managed.terminal)
-    managed.terminal.destroy()
+    if (!managed.terminal.isDestroyed) managed.terminal.destroy()
   }
 
   private readonly onSelection = (selection: Selection | null) => {
@@ -407,4 +422,63 @@ async function waitForPtyDrain(ptyClosed: Promise<void>, timeoutMs = 250): Promi
     }),
   ])
   if (timeout) clearTimeout(timeout)
+}
+
+async function waitForProcessGroups(
+  terminals: ManagedTerminal[],
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (
+    terminals.some((managed) => isProcessGroupAlive(managed.process.pid)) &&
+    performance.now() < deadline
+  ) {
+    await Bun.sleep(Math.min(10, Math.max(0, deadline - performance.now())))
+  }
+}
+
+function signalProcessGroups(
+  terminals: ManagedTerminal[],
+  signal: NodeJS.Signals,
+  errors: unknown[],
+): void {
+  for (const managed of terminals) {
+    try {
+      signalProcessGroup(managed.process, signal)
+    } catch (error) {
+      errors.push(error)
+    }
+  }
+}
+
+function signalProcessGroup(process: Bun.Subprocess, signal: NodeJS.Signals): void {
+  try {
+    globalThis.process.kill(-process.pid, signal)
+  } catch (error) {
+    if (isNoSuchProcessError(error)) return
+    try {
+      process.kill(signal)
+    } catch (fallbackError) {
+      if (!isNoSuchProcessError(fallbackError)) throw fallbackError
+    }
+  }
+}
+
+function isProcessGroupAlive(processGroupId: number): boolean {
+  try {
+    globalThis.process.kill(-processGroupId, 0)
+    return true
+  } catch (error) {
+    if (isNoSuchProcessError(error)) return false
+    return true
+  }
+}
+
+function isNoSuchProcessError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "ESRCH"
+  )
 }

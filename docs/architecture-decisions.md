@@ -50,6 +50,8 @@ Navigation retains a preferred world-space column for vertical movement and dept
 
 Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child Claude processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
 
+Shutdown releases the navigator and terminal emulators immediately, then remains in the foreground for a short, bounded cleanup of each owned Claude process group. Keep PTYs open during the graceful termination window so Claude can finish its signal handling; escalate surviving process groups and close their PTYs before the application exits.
+
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 
 Do not run two live processes against the same Claude session ID, because concurrent transcript ownership is unsafe. Different branches may run concurrently.

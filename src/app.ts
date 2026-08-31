@@ -64,6 +64,7 @@ export class ClaudeTreeApp {
   private readonly temporarySessions = new Map<string, SessionSummary>()
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
+  private stopPromise: Promise<void> | undefined
 
   private relations: BranchRelation[]
   private sessions: SessionSummary[] = []
@@ -179,25 +180,38 @@ export class ClaudeTreeApp {
     this.renderer.keyInput.on("keypress", this.onKeyPress)
     this.renderer.keyInput.on("keyrelease", this.onKeyRelease)
     this.renderer.on(CliRenderEvents.RESIZE, this.onResize)
-    await this.refreshData()
+    await Promise.race([this.refreshData(), this.stopped])
+    if (this.stopping) return
     this.renderer.start()
     this.render()
     await this.stopped
   }
 
-  async stop(): Promise<void> {
-    if (this.stopping) return this.stopped
+  stop(): Promise<void> {
+    this.stopPromise ??= this.performStop()
+    void this.stopPromise.catch(() => undefined)
+    return this.stopPromise
+  }
+
+  private async performStop(): Promise<void> {
     this.stopping = true
-    this.renderer.keyInput.off("keypress", this.onKeyPress)
-    this.renderer.keyInput.off("keyrelease", this.onKeyRelease)
-    this.renderer.off(CliRenderEvents.RESIZE, this.onResize)
-    this.stopSpinnerAnimation()
-    if (this.completionRefreshTimer) clearTimeout(this.completionRefreshTimer)
-    this.completionRefreshTimer = undefined
-    this.pendingCompletionRefreshes.clear()
-    await this.terminalManager.shutdown()
-    this.renderer.destroy()
-    this.resolveStopped()
+    this.refreshGeneration += 1
+    try {
+      this.renderer.keyInput.off("keypress", this.onKeyPress)
+      this.renderer.keyInput.off("keyrelease", this.onKeyRelease)
+      this.renderer.off(CliRenderEvents.RESIZE, this.onResize)
+      this.stopSpinnerAnimation()
+      if (this.completionRefreshTimer) clearTimeout(this.completionRefreshTimer)
+      this.completionRefreshTimer = undefined
+      this.pendingCompletionRefreshes.clear()
+
+      const terminalShutdown = this.terminalManager.shutdown()
+      this.renderer.destroy()
+      await terminalShutdown
+    } finally {
+      if (!this.renderer.isDestroyed) this.renderer.destroy()
+      this.resolveStopped()
+    }
   }
 
   private readonly onResize = () => {
@@ -264,10 +278,11 @@ export class ClaudeTreeApp {
       quit || ["up", "down", "k", "j", "return", "n", "r"].includes(key.name)
     if (!recognized) return
     key.stopPropagation()
-    if (this.busy) return
 
     if (quit) {
       void this.stop()
+    } else if (this.busy) {
+      return
     } else if (key.name === "up" || key.name === "k") {
       this.moveRoot(-1)
     } else if (key.name === "down" || key.name === "j") {
@@ -292,10 +307,11 @@ export class ClaudeTreeApp {
       )
     if (!recognized) return
     key.stopPropagation()
-    if (this.busy) return
 
     if (exit) {
       void this.stop()
+    } else if (this.busy) {
+      return
     } else if (back) {
       this.view = "roots"
       this.graphNavigationIntent = null

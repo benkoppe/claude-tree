@@ -42,6 +42,80 @@ test("terminal ownership closes permanently when shutdown starts", async () => {
   }
 })
 
+test("shutdown releases emulators immediately and terminates the owned process group", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const directory = await mkdtemp(join(tmpdir(), "claude-tree-shutdown-test-"))
+  temporaryDirectories.push(directory)
+  const processMarker = join(directory, "processes")
+  const fakeClaude = await createFakeClaude(
+    `trap 'exit 0' HUP TERM
+    (trap '' HUP TERM; sleep 30) &
+    child=$!
+    printf '%s %s\n' "$$" "$child" > ${JSON.stringify(processMarker)}
+    wait "$child"`,
+  )
+  const manager = new TerminalManager(
+    setup.renderer,
+    process.cwd(),
+    fakeClaude,
+    () => undefined,
+  )
+
+  try {
+    await manager.show({
+      kind: "new",
+      sessionId: "11111111-1111-4111-8111-111111111111",
+    })
+    const processIds = await readProcessIds(processMarker)
+
+    const startedAt = performance.now()
+    const shutdown = manager.shutdown(75)
+    expect(manager.shutdown()).toBe(shutdown)
+    expect(setup.renderer.root.getChildrenCount()).toBe(0)
+
+    await shutdown
+    expect(performance.now() - startedAt).toBeLessThan(750)
+    await waitUntil(() => processIds.every((processId) => !isProcessAlive(processId)))
+  } finally {
+    await manager.shutdown(0)
+    setup.renderer.destroy()
+  }
+})
+
+test("shutdown keeps the PTY open for graceful process cleanup", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const directory = await mkdtemp(join(tmpdir(), "claude-tree-graceful-shutdown-test-"))
+  temporaryDirectories.push(directory)
+  const readyMarker = join(directory, "ready")
+  const resultMarker = join(directory, "result")
+  const fakeClaude = await createFakeClaude(
+    `trap 'sleep 0.05; printf term > ${JSON.stringify(resultMarker)}; exit 0' TERM
+    trap 'printf hup > ${JSON.stringify(resultMarker)}; exit 1' HUP
+    printf '%s\n' "$$" > ${JSON.stringify(readyMarker)}
+    while :; do sleep 30 & wait "$!"; done`,
+  )
+  const manager = new TerminalManager(
+    setup.renderer,
+    process.cwd(),
+    fakeClaude,
+    () => undefined,
+  )
+
+  try {
+    await manager.show({
+      kind: "new",
+      sessionId: "11111111-1111-4111-8111-111111111111",
+    })
+    await readProcessIds(readyMarker)
+
+    await manager.shutdown(200)
+    expect((await readFile(resultMarker, "utf8")).trim()).toBe("term")
+  } finally {
+    await manager.shutdown(0)
+    setup.renderer.destroy()
+  }
+})
+
 test("passes a prefill only when spawning a Claude process", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-prefill-test-"))
@@ -383,4 +457,28 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<v
   const deadline = performance.now() + timeoutMs
   while (!condition() && performance.now() < deadline) await Bun.sleep(10)
   expect(condition()).toBeTrue()
+}
+
+async function readProcessIds(path: string): Promise<number[]> {
+  let contents = ""
+  const deadline = performance.now() + 2_000
+  while (performance.now() < deadline) {
+    try {
+      contents = await readFile(path, "utf8")
+      break
+    } catch {
+      await Bun.sleep(10)
+    }
+  }
+  expect(contents).not.toBe("")
+  return contents.trim().split(/\s+/).map(Number)
+}
+
+function isProcessAlive(processId: number): boolean {
+  try {
+    process.kill(processId, 0)
+    return true
+  } catch {
+    return false
+  }
 }

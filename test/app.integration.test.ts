@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -56,6 +56,117 @@ test("returns to the navigator when the visible Claude process exits", async () 
     setup.mockInput.pressKey("q")
     await running
   } finally {
+    await app.stop()
+  }
+})
+
+test("quit closes the UI immediately while live sessions finish shutting down", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const processMarker = join(root, "processes")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+trap '' HUP TERM
+sleep 30 &
+child=$!
+printf '%s %s\n' "$$" "$child" > ${JSON.stringify(processMarker)}
+wait "$child"
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  let listCalls = 0
+  let finishRefresh!: (sessions: SDKSessionInfo[]) => void
+  const blockedRefresh = new Promise<SDKSessionInfo[]>((resolve) => {
+    finishRefresh = resolve
+  })
+  const sessionService = new SessionService(project, {
+    async list(): Promise<SDKSessionInfo[]> {
+      listCalls += 1
+      return listCalls === 1 ? [] : blockedRefresh
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return []
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await ClaudeTreeApp.create(
+    setup.renderer,
+    project,
+    fakeClaude,
+    undefined,
+    state,
+    sessionService,
+  )
+  const running = app.run()
+
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("n")
+    const processIds = await readProcessIds(processMarker)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+
+    const startedAt = performance.now()
+    setup.mockInput.pressKey("q")
+    expect(setup.renderer.isDestroyed).toBeTrue()
+
+    await running
+    expect(performance.now() - startedAt).toBeLessThan(750)
+    await waitUntil(() => processIds.every((processId) => !isProcessAlive(processId)))
+  } finally {
+    finishRefresh([])
+    await app.stop()
+  }
+})
+
+test("shutdown does not wait for an initial session refresh", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+
+  let finishRefresh!: (sessions: SDKSessionInfo[]) => void
+  const blockedRefresh = new Promise<SDKSessionInfo[]>((resolve) => {
+    finishRefresh = resolve
+  })
+  const sessionService = new SessionService(project, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return blockedRefresh
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return []
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await ClaudeTreeApp.create(
+    setup.renderer,
+    project,
+    process.execPath,
+    undefined,
+    state,
+    sessionService,
+  )
+  const running = app.run()
+
+  try {
+    await Bun.sleep(0)
+    const startedAt = performance.now()
+    await Promise.all([app.stop(), running])
+
+    expect(setup.renderer.isDestroyed).toBeTrue()
+    expect(performance.now() - startedAt).toBeLessThan(250)
+  } finally {
+    finishRefresh([])
     await app.stop()
   }
 })
@@ -200,4 +311,34 @@ async function waitForFrame(
     if (predicate(frame)) return frame
   }
   throw new Error(`Timed out waiting for frame:\n${frame}`)
+}
+
+async function readProcessIds(path: string): Promise<number[]> {
+  let contents = ""
+  const deadline = performance.now() + 2_000
+  while (performance.now() < deadline) {
+    try {
+      contents = await readFile(path, "utf8")
+      break
+    } catch {
+      await Bun.sleep(10)
+    }
+  }
+  expect(contents).not.toBe("")
+  return contents.trim().split(/\s+/).map(Number)
+}
+
+async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (!condition() && performance.now() < deadline) await Bun.sleep(10)
+  expect(condition()).toBeTrue()
+}
+
+function isProcessAlive(processId: number): boolean {
+  try {
+    process.kill(processId, 0)
+    return true
+  } catch {
+    return false
+  }
 }
