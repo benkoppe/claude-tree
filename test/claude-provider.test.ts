@@ -53,6 +53,65 @@ describe("Claude message normalization", () => {
 
     expect((await provider.readTranscript(ROOT))[0]?.role).toBe("agent")
   })
+
+  test("retains local command records internally but hides them from the graph", async () => {
+    const command = stringMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "user",
+      "<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>",
+    )
+    const output = stringMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "user",
+      "<local-command-stdout>Goodbye!</local-command-stdout>",
+    )
+    const noResponse = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      "assistant",
+      "No response requested.",
+      "<synthetic>",
+    )
+    const realResponse = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+      "assistant",
+      "No response requested.",
+      "claude-sonnet-5",
+    )
+    const syntheticError = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
+      "assistant",
+      "Login expired · Please run /login",
+      "<synthetic>",
+    )
+    const prose = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
+      "user",
+      "Why does <local-command-stdout> appear in transcripts?",
+    )
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({
+      parent: [command, output, noResponse, realResponse, syntheticError, prose],
+    }))
+
+    const transcript = await provider.readTranscript(ROOT)
+
+    expect(transcript.map(({ id, ordinal, visible }) => ({ id, ordinal, visible }))).toEqual([
+      { id: command.uuid, ordinal: 0, visible: false },
+      { id: output.uuid, ordinal: 1, visible: false },
+      { id: noResponse.uuid, ordinal: 2, visible: false },
+      { id: realResponse.uuid, ordinal: 3, visible: true },
+      { id: syntheticError.uuid, ordinal: 4, visible: true },
+      { id: prose.uuid, ordinal: 5, visible: true },
+    ])
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: command.uuid }),
+    ).rejects.toThrow("This user message contains content that Claude Code cannot prefill")
+  })
 })
 
 describe("Claude branching", () => {
@@ -134,6 +193,51 @@ describe("Claude branching", () => {
       provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
     ).rejects.toThrow(`Fork ${CHILD} was created, but its copied prefix does not match the source`)
   })
+
+  test("preserves hidden local command records in fork correspondence", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(
+        ROOT,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+        "user",
+        "<command-name>/login</command-name>",
+      ),
+      message(
+        ROOT,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+        "user",
+        "<local-command-stdout>Login successful</local-command-stdout>",
+      ),
+      message(
+        ROOT,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+        "assistant",
+        "No response requested.",
+        "<synthetic>",
+      ),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(
+        CHILD,
+        `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`,
+        entry.type,
+        textOf(entry),
+        modelOf(entry),
+      ),
+    )
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({ parent, child }))
+
+    const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[4]!.uuid })
+
+    expect(prepared.derivation.sharedMessages).toEqual(
+      parent.map((entry, index) => ({
+        parentMessageId: entry.uuid,
+        childMessageId: child[index]!.uuid,
+      })),
+    )
+  })
 })
 
 function sdk(options: {
@@ -160,12 +264,32 @@ function message(
   uuid: string,
   type: SessionMessage["type"],
   text: string,
+  model?: string,
 ): SessionMessage {
   return {
     type,
     uuid,
     session_id: sessionId,
-    message: { content: [{ type: "text", text }] },
+    message: {
+      ...(model === undefined ? {} : { model }),
+      content: [{ type: "text", text }],
+    },
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+  }
+}
+
+function stringMessage(
+  sessionId: string,
+  uuid: string,
+  type: SessionMessage["type"],
+  text: string,
+): SessionMessage {
+  return {
+    type,
+    uuid,
+    session_id: sessionId,
+    message: { role: type, content: text },
     parent_tool_use_id: null,
     parent_agent_id: null,
   }
@@ -174,4 +298,9 @@ function message(
 function textOf(message: SessionMessage): string {
   const payload = message.message as { content: Array<{ text?: string }> }
   return payload.content[0]?.text ?? ""
+}
+
+function modelOf(message: SessionMessage): string | undefined {
+  const payload = message.message as { model?: unknown }
+  return typeof payload.model === "string" ? payload.model : undefined
 }

@@ -144,6 +144,187 @@ test("returns to the navigator when the visible Claude process exits", async () 
   }
 })
 
+test("shows an empty family while live and removes it after the terminal exits", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const exitMarker = join(root, "exit")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(
+    fakeAgent,
+    `#!/usr/bin/env bun
+import { existsSync } from "node:fs"
+
+process.stdout.write("EMPTY_SESSION_ACTIVE\\r\\n")
+const timer = setInterval(() => {
+  if (!existsSync(${JSON.stringify(exitMarker)})) return
+  clearInterval(timer)
+  process.exit(0)
+}, 10)
+`,
+  )
+  await chmod(fakeAgent, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  let started = false
+  const savedSession: AgentSession = {
+    id: sessionId,
+    title: "Command-only session",
+    lastModified: Date.now(),
+  }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return started ? [savedSession] : []
+    },
+    async readTranscript() {
+      return [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+          role: "user",
+          preview: "<command-name>/exit</command-name>",
+          ordinal: 0,
+          visible: false,
+        },
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+          role: "user",
+          preview: "<local-command-stdout>Goodbye!</local-command-stdout>",
+          ordinal: 1,
+          visible: false,
+        },
+      ]
+    },
+    async prepareNewSession() {
+      started = true
+      return {
+        session: { ...savedSession, transient: true },
+        launch: {
+          sessionId,
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume() {
+      throw new Error("not used")
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitForFrame(setup, (frame) => frame.includes("EMPTY_SESSION_ACTIVE"))
+
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const liveGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("Draft"),
+    )
+    expect(liveGraph).not.toContain("command-name")
+    expect(liveGraph).not.toContain("Goodbye!")
+
+    await writeFile(exitMarker, "exit")
+    const roots = await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    expect(roots).not.toContain("Command-only session")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("shows a Draft after a local command follows valid conversation history", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(fakeClaude, '#!/bin/sh\nprintf "CLAUDE_ACTIVE\\r\\n"\nsleep 30\n')
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const transcript = [
+    sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "assistant",
+      "real answer",
+      "claude-sonnet-5",
+    ),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      "user",
+      "<command-name>/status</command-name>\n<command-message>status</command-message>\n<command-args></command-args>",
+    ),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+      "user",
+      "<local-command-stdout>Status shown</local-command-stdout>",
+    ),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
+      "assistant",
+      "No response requested.",
+      "<synthetic>",
+    ),
+  ]
+  const provider = new ClaudeProvider(project, fakeClaude, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [{
+        sessionId,
+        summary: "Conversation with command",
+        firstPrompt: "question",
+        lastModified: Date.now(),
+      }]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Conversation with command"))
+    setup.mockInput.pressEnter()
+    const savedGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("real answer"),
+    )
+    expect(savedGraph).not.toContain("No response requested")
+    expect(savedGraph).not.toContain("command-name")
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("CLAUDE_ACTIVE"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const liveGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("Draft"),
+    )
+
+    expect(liveGraph).toContain("real answer")
+    expect(liveGraph).not.toContain("No response requested")
+    expect(liveGraph.match(/󰚩 Agent/g)).toHaveLength(1)
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("forwards navigator shortcuts to Claude while the terminal owns input", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -186,6 +367,116 @@ sleep 30
     setup.mockInput.pressEnter()
     await waitUntil(() => Bun.file(inputMarker).exists())
     expect(await readFile(inputMarker, "utf8")).toBe("x?d")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("forwards every key except Ctrl+Space while the terminal owns input", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const inputMarker = join(root, "input")
+  const readyMarker = join(root, "ready")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(
+    fakeAgent,
+    `#!/usr/bin/env bun
+import { appendFileSync, writeFileSync } from "node:fs"
+
+process.stdin.setRawMode?.(true)
+writeFileSync(${JSON.stringify(inputMarker)}, "")
+writeFileSync(${JSON.stringify(readyMarker)}, "")
+process.stdout.write("AGENT_READY\\r\\n")
+process.stdin.on("data", (data) => appendFileSync(${JSON.stringify(inputMarker)}, data))
+setInterval(() => undefined, 1_000)
+`,
+  )
+  await chmod(fakeAgent, 0o755)
+
+  let newSessionCalls = 0
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return []
+    },
+    async readTranscript() {
+      return []
+    },
+    async prepareNewSession() {
+      newSessionCalls += 1
+      const id = `new-session-${newSessionCalls}`
+      return {
+        session: { id, title: "New conversation", lastModified: Date.now(), transient: true },
+        launch: {
+          sessionId: id,
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [fakeAgent],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 24,
+    kittyKeyboard: true,
+    exitOnCtrlC: false,
+  })
+  const focusRenderable = setup.renderer.focusRenderable.bind(setup.renderer)
+  let sentActivationKey = false
+  setup.renderer.focusRenderable = (renderable) => {
+    focusRenderable(renderable)
+    if (!sentActivationKey && renderable.id.startsWith("agent-session-")) {
+      sentActivationKey = true
+      queueMicrotask(() => setup.mockInput.pressKey("n", { ctrl: true }))
+    }
+  }
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitUntil(() => Bun.file(readyMarker).exists())
+    await waitUntil(async () => (await readFile(inputMarker)).includes(0x0e))
+
+    const pressAgentKey = async (press: () => void) => {
+      const previousLength = (await readFile(inputMarker)).length
+      press()
+      await waitUntil(async () => (await readFile(inputMarker)).length > previousLength)
+      expect(setup.renderer.isDestroyed).toBeFalse()
+    }
+    for (const key of ["n", "r", "q", "f", "x", "h", "j", "k", "l"]) {
+      await pressAgentKey(() => setup.mockInput.pressKey(key))
+    }
+    for (const direction of ["up", "down", "left", "right"] as const) {
+      await pressAgentKey(() => setup.mockInput.pressArrow(direction))
+    }
+    await pressAgentKey(() => setup.mockInput.pressEscape())
+    await pressAgentKey(() => setup.mockInput.pressEnter())
+    await pressAgentKey(() => setup.mockInput.pressCtrlC())
+    await pressAgentKey(() => setup.mockInput.pressKey("p", { ctrl: true }))
+    await pressAgentKey(() => setup.mockInput.pressKey(" ", { ctrl: true, shift: true }))
+
+    expect(newSessionCalls).toBe(1)
+
+    const inputBeforeHostEscape = await readFile(inputMarker)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("claude-tree"))
+    await Bun.sleep(50)
+    expect(await readFile(inputMarker)).toEqual(inputBeforeHostEscape)
   } finally {
     await app.stop()
     await running
@@ -464,7 +755,12 @@ sleep 30
       throw new Error("not used")
     },
   })
-  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 24,
+    kittyKeyboard: true,
+    exitOnCtrlC: false,
+  })
   const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
@@ -495,6 +791,29 @@ sleep 30
       .lines.flatMap((line) => line.spans)
       .find((span) => span.text.includes("Kill") && span.bg.equals(theme.selected))
     expect(defaultKill).toBeDefined()
+
+    const modifiedKillKeys = [
+      () => setup.mockInput.pressKey("q", { ctrl: true }),
+      () => setup.mockInput.pressEscape({ shift: true }),
+      () => setup.mockInput.pressTab({ ctrl: true }),
+      () => setup.mockInput.pressArrow("right", { shift: true }),
+      () => setup.mockInput.pressKey("h", { meta: true }),
+      () => setup.mockInput.pressEnter({ ctrl: true }),
+      () => setup.mockInput.pressKey("c", { ctrl: true, shift: true }),
+    ]
+    for (const press of modifiedKillKeys) {
+      press()
+      await Bun.sleep(10)
+      await setup.renderOnce()
+      expect(setup.captureCharFrame()).toContain("Kill live session")
+      expect(setup.renderer.isDestroyed).toBeFalse()
+      expect(
+        setup
+          .captureSpans()
+          .lines.flatMap((line) => line.spans)
+          .some((span) => span.text.includes("Kill") && span.bg.equals(theme.selected)),
+      ).toBeTrue()
+    }
 
     setup.mockInput.pressArrow("right")
     await setup.renderOnce()
@@ -1360,7 +1679,12 @@ test("shows About from both navigator views and uses the same modal language as 
       throw new Error("not used")
     },
   }
-  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 24,
+    kittyKeyboard: true,
+    exitOnCtrlC: false,
+  })
   const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
@@ -1369,7 +1693,12 @@ test("shows About from both navigator views and uses the same modal language as 
     expect(roots).not.toContain("All branches share this working tree.")
     expect(roots).not.toContain("Refreshed")
 
-    setup.mockInput.pressKey("?")
+    setup.mockInput.pressKey("?", { ctrl: true })
+    await Bun.sleep(10)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Settings")
+
+    setup.mockInput.pressKey("?", { shift: true })
     const about = await waitForFrame(
       setup,
       (frame) =>
@@ -1388,6 +1717,21 @@ test("shows About from both navigator views and uses the same modal language as 
         .lines.flatMap((line) => line.spans)
         .some((span) => span.text.includes("About") && span.bg.equals(theme.selected)),
     ).toBeTrue()
+
+    const modifiedInfoKeys = [
+      () => setup.mockInput.pressKey("q", { ctrl: true }),
+      () => setup.mockInput.pressEscape({ shift: true }),
+      () => setup.mockInput.pressEnter({ meta: true }),
+      () => setup.mockInput.pressKey("?", { ctrl: true }),
+      () => setup.mockInput.pressKey("c", { ctrl: true, shift: true }),
+    ]
+    for (const press of modifiedInfoKeys) {
+      press()
+      await Bun.sleep(10)
+      await setup.renderOnce()
+      expect(setup.captureCharFrame()).toContain("Settings")
+      expect(setup.renderer.isDestroyed).toBeFalse()
+    }
 
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressEscape()
@@ -1560,12 +1904,16 @@ function sessionMessage(
   uuid: string,
   type: SessionMessage["type"],
   text: string,
+  model?: string,
 ): SessionMessage {
   return {
     type,
     uuid,
     session_id: sessionId,
-    message: { content: [{ type: "text", text }] },
+    message: {
+      ...(model === undefined ? {} : { model }),
+      content: [{ type: "text", text }],
+    },
     parent_tool_use_id: null,
     parent_agent_id: null,
   }
@@ -1620,8 +1968,16 @@ function testProvider(
     id: "test-agent",
     displayName: "Test Agent",
     listSessions,
-    async readTranscript() {
-      return []
+    async readTranscript(sessionId) {
+      return [
+        {
+          id: `message-${sessionId}`,
+          role: "user",
+          preview: "test message",
+          ordinal: 0,
+          visible: true,
+        },
+      ]
     },
     async prepareNewSession() {
       const id = "new-session"

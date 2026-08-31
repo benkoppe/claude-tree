@@ -279,6 +279,28 @@ function collectDescendantNodeIds(
   }
 }
 
+export function visibleConversationForest(
+  forest: ConversationForest,
+  runningSessionIds: ReadonlySet<string>,
+): ConversationForest {
+  const graphs = forest.graphs.filter(
+    (graph) =>
+      [...graph.nodes.values()].some((node) => node.kind === "message" && !node.internal) ||
+      [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId)),
+  )
+  const visibleGraphs = new Set(graphs)
+  return {
+    graphs,
+    graphBySessionId: new Map(
+      [...forest.graphBySessionId].filter(([, graph]) => visibleGraphs.has(graph)),
+    ),
+    graphByRootSessionId: new Map(
+      [...forest.graphByRootSessionId].filter(([, graph]) => visibleGraphs.has(graph)),
+    ),
+    warnings: graphs.flatMap((graph) => graph.warnings),
+  }
+}
+
 export function reachableSessionEndpoints(
   graph: ConversationGraph,
   nodeId: string,

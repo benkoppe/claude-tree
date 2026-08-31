@@ -39,6 +39,12 @@ const defaultSdk: ClaudeSdk = {
   fork: forkSession,
 }
 
+const LOCAL_COMMAND_INVOCATION_PATTERN =
+  /^<command-name>.*?<\/command-name>(?:\s*<command-message>.*?<\/command-message>)?(?:\s*<command-args>.*?<\/command-args>)?$/s
+const LOCAL_COMMAND_OUTPUT_PATTERN =
+  /^<local-command-(stdout|stderr|caveat)>.*<\/local-command-\1>$/s
+const NO_RESPONSE_REQUESTED = "No response requested."
+
 interface ClaudeMessage extends AgentMessage {
   replayText?: string
   rawMessage: unknown
@@ -194,13 +200,17 @@ export class ClaudeProvider implements AgentProvider {
   private async readClaudeTranscript(sessionId: string): Promise<ClaudeMessage[]> {
     const messages = await this.sdk.messages(sessionId, { dir: this.projectPath })
     return messages.map((message, ordinal) => {
-      const replayText = message.type === "user" ? extractUserPromptText(message.message) : undefined
+      const localCommandArtifact = isLocalCommandArtifact(message)
+      const replayText =
+        message.type === "user" && !localCommandArtifact
+          ? extractUserPromptText(message.message)
+          : undefined
       return {
         id: message.uuid,
         role: message.type === "assistant" ? "agent" : message.type,
         preview: formatMessage(message.message),
         ordinal,
-        visible: isVisibleMessage(message),
+        visible: !localCommandArtifact && isVisibleMessage(message),
         rawMessage: message.message,
         ...(replayText === undefined ? {} : { replayText }),
       }
@@ -266,6 +276,23 @@ export function extractUserPromptText(message: unknown): string | undefined {
   }
   const text = parts.join("\n")
   return text.trim().length > 0 ? text : undefined
+}
+
+function isLocalCommandArtifact(message: Pick<SessionMessage, "type" | "message">): boolean {
+  const text = extractUserPromptText(message.message)?.trim()
+  if (!text) return false
+  // Historical SDK messages omit Claude's synthetic-message metadata.
+  if (message.type === "assistant") {
+    return (
+      isRecord(message.message) &&
+      message.message.model === "<synthetic>" &&
+      text === NO_RESPONSE_REQUESTED
+    )
+  }
+  return (
+    message.type === "user" &&
+    (LOCAL_COMMAND_INVOCATION_PATTERN.test(text) || LOCAL_COMMAND_OUTPUT_PATTERN.test(text))
+  )
 }
 
 function toSessionSummary(session: SDKSessionInfo): AgentSession {

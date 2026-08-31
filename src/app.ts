@@ -37,6 +37,7 @@ import {
   buildConversationForest,
   reachableSessionEndpoints,
   resolveForkTarget,
+  visibleConversationForest,
   type ConversationForest,
   type ConversationGraph,
   type MessageGraphNodeOrEndpoint,
@@ -184,7 +185,7 @@ export class AgentTreeApp {
   private readonly terminalManager: TerminalManager
   private readonly openLeafPicker: OpenLeafPicker
   private readonly temporarySessions = new Map<string, AgentSession>()
-  private readonly consumedNavigatorKeyReleases = new Set<string>()
+  private readonly consumedKeyReleases = new Set<string>()
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
   private stopPromise: Promise<void> | undefined
@@ -671,19 +672,17 @@ export class AgentTreeApp {
   }
 
   private readonly onKeyRelease = (key: KeyEvent) => {
-    if (isHostEscape(key)) {
-      key.stopPropagation()
-      return
-    }
     const identity = keyIdentity(key)
-    if (!this.consumedNavigatorKeyReleases.delete(identity)) return
+    if (!this.consumedKeyReleases.delete(identity)) return
     key.stopPropagation()
   }
 
   private readonly onKeyPress = (key: KeyEvent) => {
-    if (isHostEscape(key)) {
+    if (this.terminalManager.ownsInput()) {
+      if (!isHostEscape(key)) return
       key.stopPropagation()
-      if (this.view === "terminal" && !key.repeated) void this.returnToGraph()
+      this.rememberConsumedKeyRelease(key)
+      if (!key.repeated) void this.returnToGraph()
       return
     }
     if (this.view === "terminal") return
@@ -695,7 +694,7 @@ export class AgentTreeApp {
       this.handleConfirmationKey(key)
       return
     }
-    if (key.name === "?" && !key.repeated) {
+    if (isQuestionMarkKey(key) && !key.repeated) {
       key.stopPropagation()
       this.showAbout()
       return
@@ -703,7 +702,7 @@ export class AgentTreeApp {
 
     if (this.openLeafPicker.isOpen) {
       key.stopPropagation()
-      this.rememberNavigatorKeyRelease(key)
+      this.rememberConsumedKeyRelease(key)
       if (isExitKey(key)) {
         void this.stop()
       } else {
@@ -717,11 +716,11 @@ export class AgentTreeApp {
     } else {
       this.handleGraphKey(key)
     }
-    if (key.propagationStopped) this.rememberNavigatorKeyRelease(key)
+    if (key.propagationStopped) this.rememberConsumedKeyRelease(key)
   }
 
-  private rememberNavigatorKeyRelease(key: KeyEvent): void {
-    if (key.source === "kitty") this.consumedNavigatorKeyReleases.add(keyIdentity(key))
+  private rememberConsumedKeyRelease(key: KeyEvent): void {
+    if (key.source === "kitty") this.consumedKeyReleases.add(keyIdentity(key))
   }
 
   private readonly onContentMouseDown = (event: MouseEvent) => {
@@ -945,15 +944,15 @@ export class AgentTreeApp {
 
   private handleInfoModalKey(key: KeyEvent): void {
     key.stopPropagation()
-    if (key.name === "c" && key.ctrl) {
+    if (isExitKey(key)) {
       void this.stop()
       return
     }
     if (
-      key.name === "escape" ||
-      key.name === "q" ||
-      key.name === "return" ||
-      (key.name === "?" && !key.repeated)
+      isUnmodifiedKey(key, "escape") ||
+      isUnmodifiedKey(key, "q") ||
+      isEnterKey(key) ||
+      (isQuestionMarkKey(key) && !key.repeated)
     ) {
       this.closeInfoModal()
     }
@@ -972,7 +971,7 @@ export class AgentTreeApp {
       return
     }
     if (["tab", "left", "right", "up", "down", "h", "j", "k", "l"].some((name) =>
-      isUnmodifiedKey(key, name)
+      isUnmodifiedKey(key, name),
     )) {
       confirmation.choice = confirmation.choice === "confirm" ? "cancel" : "confirm"
       this.render()
@@ -1244,7 +1243,7 @@ export class AgentTreeApp {
       }
       this.sessions = sessions
       this.transcripts = new Map(transcriptEntries)
-      this.rebuildForest()
+      this.rebuildForest(runningIds)
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
 
@@ -1461,12 +1460,17 @@ export class AgentTreeApp {
     this.repairSelectionAfterRemoval(confirmation)
   }
 
-  private rebuildForest(): void {
-    this.forest = buildConversationForest(
-      this.sessions,
-      this.transcripts,
-      this.relations,
-      this.removals,
+  private rebuildForest(
+    runningSessionIds = this.terminalManager.runningSessionIds(),
+  ): void {
+    this.forest = visibleConversationForest(
+      buildConversationForest(
+        this.sessions,
+        this.transcripts,
+        this.relations,
+        this.removals,
+      ),
+      runningSessionIds,
     )
   }
 
@@ -2055,6 +2059,17 @@ function isExitKey(key: KeyEvent): boolean {
     key.name === "c" &&
     key.ctrl &&
     !key.shift &&
+    !key.meta &&
+    !key.option &&
+    !key.super &&
+    !key.hyper
+  )
+}
+
+function isQuestionMarkKey(key: KeyEvent): boolean {
+  return (
+    key.name === "?" &&
+    !key.ctrl &&
     !key.meta &&
     !key.option &&
     !key.super &&
