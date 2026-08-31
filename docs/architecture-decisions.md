@@ -28,6 +28,22 @@ Store only the missing relationship data, such as the child session, parent sess
 
 Sessions and forks not created or recorded by `claude-tree` should still be usable. When their ancestry cannot be established reliably, show them as independent roots rather than guessing from message content.
 
+## User Messages Replay From The Previous Assistant
+
+Forking an assistant message copies the transcript through that exact SDK message. Forking a user message has different semantics: copy through its nearest earlier assistant, then open the child with the selected user text in Claude's composer without submitting it. Transcript order is authoritative, and adjacent messages may have the same role.
+
+A user replay with no assistant ancestor copies a zero-message prefix but remains in the same conversation family. The graph represents all top-level roots as children of one synthetic empty-history origin. That origin is application state rather than a Claude message or session: it is never rendered, selected, counted, or used as a fork target, and no connectors are drawn from it.
+
+The validated Claude Code 2.1.239 baseline provides a hidden `--prefill` option that initializes the stock interactive composer. It is preferable to timing simulated PTY keystrokes, but it is not a public compatibility surface. Claude Code upgrades must explicitly revalidate it. Prompts that cannot be represented as text fail closed rather than silently losing content.
+
+Claude Code does not expose semantic composer state. The application may show a conservative, in-memory preview parsed from the visible input box when leaving a live terminal, but it must mark that preview as approximate and never persist it as transcript or relationship state.
+
+## Graph Navigation Preserves Cursor Intent
+
+Vertical navigation follows visible graph edges: up selects the parent and down selects a child. It never falls diagonally into a neighboring branch. Horizontal navigation uses the same world-space node layout as rendering and may cross branches, root chains, and viewport boundaries.
+
+Navigation retains a preferred world-space column for vertical movement and depth for horizontal movement, plus the exact source of the latest transition. This mirrors a text-editor cursor: moving through an ambiguous parent or a shorter neighboring branch and then reversing returns to the node that was left. Blocked movement does not discard that intent. Rebuilding or resizing the graph resets it. The synthetic family origin does not participate in navigation.
+
 ## One Process For The Initial Product
 
 Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child Claude processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
