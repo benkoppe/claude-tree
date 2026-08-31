@@ -93,7 +93,7 @@ export class ClaudeProvider implements AgentProvider {
       }
       forkIndex = -1
       for (let index = selectedIndex - 1; index >= 0; index -= 1) {
-        if (parentTranscript[index]?.role === "assistant") {
+        if (parentTranscript[index]?.role === "agent") {
           forkIndex = index
           break
         }
@@ -200,7 +200,7 @@ export class ClaudeProvider implements AgentProvider {
       const replayText = message.type === "user" ? extractUserPromptText(message.message) : undefined
       return {
         id: message.uuid,
-        role: message.type,
+        role: message.type === "assistant" ? "agent" : message.type,
         preview: formatMessage(message.message),
         ordinal,
         visible: isVisibleMessage(message),

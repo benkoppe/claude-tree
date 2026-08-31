@@ -38,7 +38,7 @@ describe("renderConversationGraph", () => {
 
     expect(rendered.text).toContain("󰭹 User")
     expect(rendered.text).toContain("root question")
-    expect(rendered.text).toContain("󰚩 Assistant")
+    expect(rendered.text).toContain("󰚩 Agent")
     expect(rendered.text).toContain("main answer")
     expect(rendered.text).toContain("fork answer")
     expect(rendered.text).toContain("󰆍 Draft")
@@ -197,7 +197,7 @@ describe("renderConversationGraph", () => {
     expect(rendered.text).not.toContain("Observed draft")
   })
 
-  test("replaces a live draft with an animated assistant card while generating", () => {
+  test("replaces a live draft with an animated agent card while generating", () => {
     const graph = branchGraph()
     const selected = graph.endpointBySessionId.get(CHILD)!
     const first = renderConversationGraph(
@@ -221,7 +221,7 @@ describe("renderConversationGraph", () => {
       1,
     )
 
-    expect(first.text).toContain("󰚩 Assistant")
+    expect(first.text).toContain("󰚩 Agent")
     expect(first.text).toContain(BRAILLE_SPINNER_FRAMES[0])
     expect(first.text).not.toContain("Draft")
     expect(first.text).not.toContain("queued text")
@@ -242,13 +242,13 @@ describe("renderConversationGraph", () => {
       new Set([ROOT]),
     )
 
-    const assistant = rendered.content.chunks.find(
-      (chunk) => chunk.text.includes("Assistant") && chunk.bg?.equals(theme.sessionElement),
+    const agent = rendered.content.chunks.find(
+      (chunk) => chunk.text.includes("Agent") && chunk.bg?.equals(theme.sessionElement),
     )
     const draft = rendered.content.chunks.find(
       (chunk) => chunk.text.includes("Draft") && chunk.bg?.equals(theme.selected),
     )
-    expect(assistant).toBeDefined()
+    expect(agent).toBeDefined()
     expect(draft).toBeDefined()
   })
 })
@@ -384,11 +384,11 @@ describe("spatial graph navigation", () => {
 function branchGraph() {
   const parentMessages = [
     message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root question", 0),
-    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "main answer", 1),
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "main answer", 1),
   ]
   const childMessages = [
     message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "root question", 0),
-    message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "fork answer", 1),
+    message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "agent", "fork answer", 1),
   ]
   const relation: BranchRelation = {
     schemaVersion: 1,
@@ -439,13 +439,13 @@ function rootReplayGraph() {
 function unevenBranchGraph() {
   const parentMessages = [
     message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root", 0),
-    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "tall one", 1),
-    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "assistant", "tall two", 2),
-    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "assistant", "tall three", 3),
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "tall one", 1),
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "agent", "tall two", 2),
+    message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "agent", "tall three", 3),
   ]
   const childMessages = [
     message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "root", 0),
-    message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "short", 1),
+    message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "agent", "short", 1),
   ]
   const relation: BranchRelation = {
     schemaVersion: 1,

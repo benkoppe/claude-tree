@@ -895,7 +895,7 @@ export class AgentTreeApp {
     if (!selected) return "No node selected"
     if (selected.kind === "endpoint") {
       if (this.displayedWorkingSessionIds().has(selected.session.id)) {
-        return `Selected assistant · generating · ${selected.session.id.slice(0, 8)}`
+        return `Selected agent · generating · ${selected.session.id.slice(0, 8)}`
       }
       const draft = this.terminalManager.draftPreviews().get(selected.session.id)
       const draftDescription = draft ? draft.text.replace(/\s+/g, " ").trim() : "blank"
@@ -907,8 +907,8 @@ export class AgentTreeApp {
     }
     const role = selected.internal
       ? "internal"
-      : selected.role === "assistant"
-        ? "assistant"
+      : selected.role === "agent"
+        ? "agent"
         : selected.role === "user"
           ? "user"
           : "system"

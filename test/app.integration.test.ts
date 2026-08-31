@@ -313,15 +313,15 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
       setup,
       (candidate) => candidate.includes("follow-up 8") && isSelected(setup, "follow-up 8"),
     )
-    const assistant = coordinateOf(frame, "Assistant")
-    expect(assistant.x).toBeGreaterThan(30)
-    await setup.mockMouse.click(assistant.x, assistant.y)
+    const agent = coordinateOf(frame, "Agent")
+    expect(agent.x).toBeGreaterThan(30)
+    await setup.mockMouse.click(agent.x, agent.y)
     await setup.renderOnce()
     frame = setup.captureCharFrame()
-    expect(isSelected(setup, "Assistant")).toBeTrue()
-    expect(coordinateOf(frame, "Assistant")).toEqual(assistant)
+    expect(isSelected(setup, "Agent")).toBeTrue()
+    expect(coordinateOf(frame, "Agent")).toEqual(agent)
 
-    await setup.mockMouse.click(assistant.x, assistant.y)
+    await setup.mockMouse.click(agent.x, agent.y)
     await waitForFrame(setup, (candidate) => !candidate.includes("claude-tree"))
     setup.mockInput.pressKey(" ", { ctrl: true })
     frame = await waitForFrame(setup, (candidate) => candidate.includes("Message graph"))
@@ -348,7 +348,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
   }
 })
 
-test("replaces a completed assistant spinner with a message and new draft leaf", async () => {
+test("replaces a completed agent spinner with a message and new draft leaf", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
   const state = join(root, "state")
@@ -373,7 +373,7 @@ sleep 30
     "user",
     "question",
   )
-  const assistantMessage = sessionMessage(
+  const agentMessage = sessionMessage(
     sessionId,
     "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
     "assistant",
@@ -418,18 +418,18 @@ sleep 30
     const generating = await waitForFrame(
       setup,
       (frame) =>
-        frame.includes("Assistant") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
+        frame.includes("Agent") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
     )
     expect(generating).not.toContain("completed answer")
     expect(generating).not.toContain("Draft")
 
-    transcript = [userMessage, assistantMessage]
+    transcript = [userMessage, agentMessage]
     await writeFile(finishMarker, "")
     const completed = await waitForFrame(
       setup,
       (frame) => {
         if (frame.includes("Draft") && !frame.includes("completed answer")) {
-          throw new Error(`Rendered Draft before committing the assistant message:\n${frame}`)
+          throw new Error(`Rendered Draft before committing the agent message:\n${frame}`)
         }
         return (
           frame.includes("completed answer") &&

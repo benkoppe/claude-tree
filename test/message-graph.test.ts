@@ -16,12 +16,12 @@ describe("buildConversationForest", () => {
   test("collapses remapped fork prefixes into shared logical message nodes", () => {
     const parentMessages = [
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root question", 0),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "root answer", 1),
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "root answer", 1),
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "user", "original path", 2),
     ]
     const childMessages = [
       message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "root question", 0),
-      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "root answer", 1),
+      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "agent", "root answer", 1),
       message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3", "user", "fork path", 2),
     ]
     const forest = buildConversationForest(
@@ -63,15 +63,15 @@ describe("buildConversationForest", () => {
   test("attaches empty and nested forks through session-specific UUID aliases", () => {
     const parentMessages = [
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "first", 0),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "second", 1),
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "second", 1),
     ]
     const childMessages = [
       message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "first", 0),
-      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "second", 1),
+      message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "agent", "second", 1),
     ]
     const grandchildMessages = [
       message("cccccccc-cccc-4ccc-8ccc-ccccccccccc1", "user", "first", 0),
-      message("cccccccc-cccc-4ccc-8ccc-ccccccccccc2", "assistant", "alternate", 1),
+      message("cccccccc-cccc-4ccc-8ccc-ccccccccccc2", "agent", "alternate", 1),
     ]
     const forest = buildConversationForest(
       [session(ROOT, "Root", 30), session(CHILD, "Empty fork", 20), session(GRANDCHILD, "Nested", 10)],
@@ -131,8 +131,8 @@ describe("message ordering", () => {
     const messages = [
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "first user", 0),
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "user", "second user", 1),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "assistant", "first assistant", 2),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "assistant", "second assistant", 3),
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "agent", "first agent", 2),
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "agent", "second agent", 3),
     ]
     const graph = buildConversationForest(
       [session(ROOT, "Root", 10)],
@@ -151,7 +151,7 @@ describe("fork targets", () => {
   test("uses an endpoint's exact final message even when that message is hidden", () => {
     const messages = [
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "visible", 0),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "tool call", 1, false),
+      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "agent", "tool call", 1, false),
     ]
     const graph = buildConversationForest(
       [session(ROOT, "Root", 10)],

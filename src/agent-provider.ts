@@ -10,7 +10,7 @@ export interface AgentSession {
 
 export interface AgentMessage {
   id: string
-  role: "user" | "assistant" | "system"
+  role: "user" | "agent" | "system"
   preview: string
   ordinal: number
   visible: boolean

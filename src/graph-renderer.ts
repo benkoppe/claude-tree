@@ -73,7 +73,7 @@ export const BRAILLE_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴",
 
 const ICONS = {
   user: "󰭹",
-  assistant: "󰚩",
+  agent: "󰚩",
   branch: "󰘬",
   system: "󰒓",
   session: "󰆍",
@@ -263,8 +263,8 @@ function drawNode(
   if (node.kind === "message") {
     const kind = node.internal
       ? { icon: ICONS.branch, label: "Branch point", accent: theme.accent }
-      : node.role === "assistant"
-        ? { icon: ICONS.assistant, label: "Assistant", accent: theme.primary }
+      : node.role === "agent"
+        ? { icon: ICONS.agent, label: "Agent", accent: theme.primary }
         : node.role === "user"
           ? { icon: ICONS.user, label: "User", accent: theme.secondary }
           : { icon: ICONS.system, label: "System", accent: theme.warning }
@@ -278,7 +278,7 @@ function drawNode(
 
   const sessionId = node.session.id
   if (workingSessionIds.has(sessionId)) {
-    drawHeading(canvas, x + 2, y, ICONS.assistant, "Assistant", contentWidth, {
+    drawHeading(canvas, x + 2, y, ICONS.agent, "Agent", contentWidth, {
       ...headerStyle,
       fg: selected ? theme.selectedText : theme.primary,
     }, headerStyle)

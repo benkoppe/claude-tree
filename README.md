@@ -62,7 +62,7 @@ Message graph:
 | `Left` / `h` | Move to the nearest node on the left, preserving depth |
 | `Right` / `l` | Move to the nearest node on the right, preserving depth |
 | `Enter` | Open or resume the session ending at the selected node |
-| `f` | Fork an assistant message, or replay a selected user message |
+| `f` | Fork an agent message, or replay a selected user message |
 | `n` | Start a new root conversation |
 | `r` | Refresh the graph |
 | `q` or `Escape` | Return to conversation roots |
@@ -78,15 +78,15 @@ Claude terminal:
 
 Every other terminal key belongs to Claude Code. Slash commands, permissions, hooks, MCP servers, plugins, mouse input, paste handling, and Claude's own keybindings are not reimplemented by `claude-tree`.
 
-Message nodes are filled cards labeled with Nerd Font icons and readable roles such as User, Assistant, and Branch point. The selected card uses a contrasting background instead of a cursor symbol. Adjacent messages may have the same role; graph structure follows transcript order rather than assuming that user and assistant messages alternate. Copied history from a fork is shown once as shared graph nodes rather than duplicated for every session.
+Message nodes are filled cards labeled with Nerd Font icons and readable roles such as User, Agent, and Branch point. The selected card uses a contrasting background instead of a cursor symbol. Adjacent messages may have the same role; graph structure follows transcript order rather than assuming that user and agent messages alternate. Copied history from a fork is shown once as shared graph nodes rather than duplicated for every session.
 
 Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
-Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Assistant` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed assistant message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
+Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
 
 ## Fork Behavior
 
-Forking an assistant message copies history through that exact message and opens the child with a blank composer. Forking a user message instead copies history through the nearest earlier assistant and opens the child with the selected user prompt already in the composer but not submitted. Intervening user messages are not copied. If the selected user message has no earlier assistant, its replay remains in the same conversation family as another top-level root. These roots share an invisible empty-history origin, so no false message edge is drawn between them. Prompts containing non-text content cannot be replayed because Claude's prefill option accepts text only.
+Forking an agent message copies history through that exact message and opens the child with a blank composer. Forking a user message instead copies history through the nearest earlier agent and opens the child with the selected user prompt already in the composer but not submitted. Intervening user messages are not copied. If the selected user message has no earlier agent, its replay remains in the same conversation family as another top-level root. These roots share an invisible empty-history origin, so no false message edge is drawn between them. Prompts containing non-text content cannot be replayed because Claude's prefill option accepts text only.
 
 Dragging across text in an embedded Claude terminal copies the selection through OSC52. OSC52 clipboard writes emitted by Claude itself, such as the login URL copy shortcut, are also forwarded to the outer terminal. The outer terminal must allow OSC52 clipboard writes.
 

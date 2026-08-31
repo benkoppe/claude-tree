@@ -45,10 +45,18 @@ describe("Claude message normalization", () => {
       }),
     ).toBeUndefined()
   })
+
+  test("normalizes Claude's assistant role to the core agent role", async () => {
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", undefined, sdk({
+      parent: [message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "assistant", "answer")],
+    }))
+
+    expect((await provider.readTranscript(ROOT))[0]?.role).toBe("agent")
+  })
 })
 
 describe("Claude branching", () => {
-  test("forks a user message at its nearest assistant and seeds the selected prompt", async () => {
+  test("forks a user message at its nearest agent and seeds the selected prompt", async () => {
     const parent = [
       message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root prompt"),
       message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),

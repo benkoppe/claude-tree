@@ -11,7 +11,7 @@ test("the pinned SDK forks through a selected historical UUID", async () => {
   const store = new InMemorySessionStore()
   const sourceSessionId = crypto.randomUUID()
   const userId = crypto.randomUUID()
-  const assistantId = crypto.randomUUID()
+  const agentId = crypto.randomUUID()
   const timestamp = "2026-08-30T12:00:00.000Z"
   const projectKey = process.cwd().replaceAll("/", "-")
   const entries: SessionStoreEntry[] = [
@@ -26,7 +26,7 @@ test("the pinned SDK forks through a selected historical UUID", async () => {
     },
     {
       type: "assistant",
-      uuid: assistantId,
+      uuid: agentId,
       parentUuid: userId,
       sessionId: sourceSessionId,
       timestamp,
@@ -48,7 +48,7 @@ test("the pinned SDK forks through a selected historical UUID", async () => {
   const result = await forkSession(sourceSessionId, {
     dir: process.cwd(),
     sessionStore: store,
-    upToMessageId: assistantId,
+    upToMessageId: agentId,
   })
   const sourceMessages = await getSessionMessages(sourceSessionId, {
     dir: process.cwd(),
@@ -60,9 +60,9 @@ test("the pinned SDK forks through a selected historical UUID", async () => {
   })
 
   expect(result.sessionId).not.toBe(sourceSessionId)
-  expect(sourceMessages.map((message) => message.uuid)).toEqual([userId, assistantId])
+  expect(sourceMessages.map((message) => message.uuid)).toEqual([userId, agentId])
   expect(childMessages).toHaveLength(2)
-  expect(childMessages.map((message) => message.uuid)).not.toEqual([userId, assistantId])
+  expect(childMessages.map((message) => message.uuid)).not.toEqual([userId, agentId])
   expect(childMessages.map((message) => message.type)).toEqual(["user", "assistant"])
 })
 
@@ -71,22 +71,22 @@ test("the pinned SDK preserves consecutive message roles at an exact fork bounda
   const sourceSessionId = crypto.randomUUID()
   const userOneId = crypto.randomUUID()
   const userTwoId = crypto.randomUUID()
-  const assistantOneId = crypto.randomUUID()
-  const assistantTwoId = crypto.randomUUID()
+  const agentOneId = crypto.randomUUID()
+  const agentTwoId = crypto.randomUUID()
   const timestamp = "2026-08-30T12:00:00.000Z"
   const projectKey = process.cwd().replaceAll("/", "-")
   const entries: SessionStoreEntry[] = [
     userEntry(sourceSessionId, userOneId, null, "first", timestamp),
     userEntry(sourceSessionId, userTwoId, userOneId, "second", timestamp),
-    assistantEntry(sourceSessionId, assistantOneId, userTwoId, "first answer", timestamp),
-    assistantEntry(sourceSessionId, assistantTwoId, assistantOneId, "second answer", timestamp),
+    agentEntry(sourceSessionId, agentOneId, userTwoId, "first answer", timestamp),
+    agentEntry(sourceSessionId, agentTwoId, agentOneId, "second answer", timestamp),
   ]
   await store.append({ projectKey, sessionId: sourceSessionId }, entries)
 
   const result = await forkSession(sourceSessionId, {
     dir: process.cwd(),
     sessionStore: store,
-    upToMessageId: assistantOneId,
+    upToMessageId: agentOneId,
   })
   const childMessages = await getSessionMessages(result.sessionId, {
     dir: process.cwd(),
@@ -96,7 +96,7 @@ test("the pinned SDK preserves consecutive message roles at an exact fork bounda
   expect(childMessages.map((message) => message.type)).toEqual(["user", "user", "assistant"])
   expect(childMessages.map((message) => message.uuid)).not.toContain(userOneId)
   expect(childMessages.map((message) => message.uuid)).not.toContain(userTwoId)
-  expect(childMessages.map((message) => message.uuid)).not.toContain(assistantOneId)
+  expect(childMessages.map((message) => message.uuid)).not.toContain(agentOneId)
 })
 
 function userEntry(
@@ -117,7 +117,7 @@ function userEntry(
   }
 }
 
-function assistantEntry(
+function agentEntry(
   sessionId: string,
   uuid: string,
   parentUuid: string,
