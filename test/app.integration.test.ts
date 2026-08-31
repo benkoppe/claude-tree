@@ -139,6 +139,187 @@ test("returns to the navigator when the visible Claude process exits", async () 
   }
 })
 
+test("shows an empty family while live and removes it after the terminal exits", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const exitMarker = join(root, "exit")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(
+    fakeAgent,
+    `#!/usr/bin/env bun
+import { existsSync } from "node:fs"
+
+process.stdout.write("EMPTY_SESSION_ACTIVE\\r\\n")
+const timer = setInterval(() => {
+  if (!existsSync(${JSON.stringify(exitMarker)})) return
+  clearInterval(timer)
+  process.exit(0)
+}, 10)
+`,
+  )
+  await chmod(fakeAgent, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  let started = false
+  const savedSession: AgentSession = {
+    id: sessionId,
+    title: "Command-only session",
+    lastModified: Date.now(),
+  }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return started ? [savedSession] : []
+    },
+    async readTranscript() {
+      return [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+          role: "user",
+          preview: "<command-name>/exit</command-name>",
+          ordinal: 0,
+          visible: false,
+        },
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+          role: "user",
+          preview: "<local-command-stdout>Goodbye!</local-command-stdout>",
+          ordinal: 1,
+          visible: false,
+        },
+      ]
+    },
+    async prepareNewSession() {
+      started = true
+      return {
+        session: { ...savedSession, transient: true },
+        launch: {
+          sessionId,
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume() {
+      throw new Error("not used")
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitForFrame(setup, (frame) => frame.includes("EMPTY_SESSION_ACTIVE"))
+
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const liveGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("Draft"),
+    )
+    expect(liveGraph).not.toContain("command-name")
+    expect(liveGraph).not.toContain("Goodbye!")
+
+    await writeFile(exitMarker, "exit")
+    const roots = await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    expect(roots).not.toContain("Command-only session")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("shows a Draft after a local command follows valid conversation history", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(fakeClaude, '#!/bin/sh\nprintf "CLAUDE_ACTIVE\\r\\n"\nsleep 30\n')
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const transcript = [
+    sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "assistant",
+      "real answer",
+      "claude-sonnet-5",
+    ),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      "user",
+      "<command-name>/status</command-name>\n<command-message>status</command-message>\n<command-args></command-args>",
+    ),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+      "user",
+      "<local-command-stdout>Status shown</local-command-stdout>",
+    ),
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
+      "assistant",
+      "No response requested.",
+      "<synthetic>",
+    ),
+  ]
+  const provider = new ClaudeProvider(project, fakeClaude, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [{
+        sessionId,
+        summary: "Conversation with command",
+        firstPrompt: "question",
+        lastModified: Date.now(),
+      }]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Conversation with command"))
+    setup.mockInput.pressEnter()
+    const savedGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("real answer"),
+    )
+    expect(savedGraph).not.toContain("No response requested")
+    expect(savedGraph).not.toContain("command-name")
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("CLAUDE_ACTIVE"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const liveGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("Draft"),
+    )
+
+    expect(liveGraph).toContain("real answer")
+    expect(liveGraph).not.toContain("No response requested")
+    expect(liveGraph.match(/󰚩 Agent/g)).toHaveLength(1)
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("forwards navigator shortcuts to Claude while the terminal owns input", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -1336,12 +1517,16 @@ function sessionMessage(
   uuid: string,
   type: SessionMessage["type"],
   text: string,
+  model?: string,
 ): SessionMessage {
   return {
     type,
     uuid,
     session_id: sessionId,
-    message: { content: [{ type: "text", text }] },
+    message: {
+      ...(model === undefined ? {} : { model }),
+      content: [{ type: "text", text }],
+    },
     parent_tool_use_id: null,
     parent_agent_id: null,
   }
@@ -1396,8 +1581,16 @@ function testProvider(
     id: "test-agent",
     displayName: "Test Agent",
     listSessions,
-    async readTranscript() {
-      return []
+    async readTranscript(sessionId) {
+      return [
+        {
+          id: `message-${sessionId}`,
+          role: "user",
+          preview: "test message",
+          ordinal: 0,
+          visible: true,
+        },
+      ]
     },
     async prepareNewSession() {
       const id = "new-session"

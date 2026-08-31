@@ -37,6 +37,7 @@ import {
   buildConversationForest,
   reachableSessionEndpoints,
   resolveForkTarget,
+  visibleConversationForest,
   type ConversationForest,
   type ConversationGraph,
   type MessageGraphNodeOrEndpoint,
@@ -1141,7 +1142,10 @@ export class AgentTreeApp {
       }
       this.sessions = sessions
       this.transcripts = new Map(transcriptEntries)
-      this.forest = buildConversationForest(this.sessions, this.transcripts, this.relations)
+      this.forest = visibleConversationForest(
+        buildConversationForest(this.sessions, this.transcripts, this.relations),
+        runningIds,
+      )
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
 

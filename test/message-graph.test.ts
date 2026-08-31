@@ -4,6 +4,7 @@ import {
   buildConversationForest,
   reachableSessionEndpoints,
   resolveForkTarget,
+  visibleConversationForest,
   type MessageGraphNode,
 } from "../src/message-graph"
 import type { AgentMessage, AgentSession, SharedMessage } from "../src/agent-provider"
@@ -288,6 +289,62 @@ describe("fork targets", () => {
       sessionId: ROOT,
       messageId: messages[1]!.id,
     })
+  })
+})
+
+describe("visibleConversationForest", () => {
+  test("omits inactive families with no visible messages", () => {
+    const hidden = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "command", 0, false)
+    const forest = buildConversationForest(
+      [session(ROOT, "Command only", 10)],
+      new Map([[ROOT, [hidden]]]),
+      [],
+    )
+
+    const inactive = visibleConversationForest(forest, new Set())
+    const active = visibleConversationForest(forest, new Set([ROOT]))
+
+    expect(inactive.graphs).toEqual([])
+    expect(inactive.graphBySessionId.size).toBe(0)
+    expect(active.graphs).toEqual(forest.graphs)
+    expect(active.graphBySessionId.get(ROOT)).toBe(forest.graphBySessionId.get(ROOT))
+  })
+
+  test("keeps a family when any related session has a visible message", () => {
+    const parentHidden = message(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "user",
+      "command",
+      0,
+      false,
+    )
+    const childHidden = message(
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
+      "user",
+      "command",
+      0,
+      false,
+    )
+    const childVisible = message(
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+      "user",
+      "question",
+      1,
+    )
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, [parentHidden]],
+        [CHILD, [childHidden, childVisible]],
+      ]),
+      [relation(CHILD, ROOT, parentHidden.id, shared([parentHidden], [childHidden], 1))],
+    )
+
+    const visible = visibleConversationForest(forest, new Set())
+
+    expect(visible.graphs).toHaveLength(1)
+    expect(visible.graphBySessionId.has(ROOT)).toBeTrue()
+    expect(visible.graphBySessionId.has(CHILD)).toBeTrue()
   })
 })
 
