@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -35,7 +35,9 @@ describe("CLI options", () => {
       await symlink(join(root, "project"), join(root, "linked-project"))
       await writeFile(join(root, "file"), "not a project")
 
-      expect(await resolveProjectDirectory("linked-project", root)).toBe(join(root, "project"))
+      expect(await resolveProjectDirectory("linked-project", root)).toBe(
+        await realpath(join(root, "project")),
+      )
       await expect(resolveProjectDirectory("file", root)).rejects.toThrow(
         "Project path is not a directory: file",
       )

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -30,7 +30,7 @@ describe("BranchMetadataStore", () => {
     })
 
     expect(await store.loadRelations()).toEqual([relation])
-    expect(store.projectPath).toBe(project)
+    expect(store.projectPath).toBe(await realpath(project))
   })
 
   test("rejects malformed metadata rather than silently dropping it", async () => {
