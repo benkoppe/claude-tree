@@ -19,7 +19,7 @@ claude-tree --codex /path/to/project
 
 ### Bun
 
-Requires Linux or macOS, Bun 1.3.13 or newer, Claude Code or Codex on `$PATH`, and a truecolor terminal using a nerdfont.
+Requires Linux or macOS, Bun, Claude Code or Codex on `$PATH`, and a truecolor terminal using a nerdfont.
 
 ```sh
 bun add --global github:benkoppe/claude-tree
@@ -58,6 +58,6 @@ bun run check # or nix flake check
 bun run start
 ```
 
-Without Nix, install Bun 1.3.13 or newer and at least one supported provider CLI before running the last three commands.
+Without Nix, install Bun and at least one supported provider CLI before running the last three commands.
 
 After changing `bun.lock`, regenerate the Nix dependency set with `nix develop -c bun2nix -o bun.nix`.
