@@ -35,13 +35,16 @@ import {
 } from "./graph-layout"
 import {
   buildConversationForest,
+  reachableSessionEndpoints,
   resolveForkTarget,
   type ConversationForest,
   type ConversationGraph,
   type MessageGraphNodeOrEndpoint,
   type SessionEndpointNode,
 } from "./message-graph"
+import { isEnterKey, isUnmodifiedKey, listNavigationDelta } from "./list-navigation"
 import { BranchMetadataStore, type BranchRelation } from "./metadata"
+import { OpenLeafPicker } from "./open-leaf-picker"
 import {
   TerminalManager,
   type TerminalActivityEvent,
@@ -136,7 +139,9 @@ export class AgentTreeApp {
   private readonly killConfirmButton: BoxRenderable
   private readonly killConfirmLabel: TextRenderable
   private readonly terminalManager: TerminalManager
+  private readonly openLeafPicker: OpenLeafPicker
   private readonly temporarySessions = new Map<string, AgentSession>()
+  private readonly consumedNavigatorKeyReleases = new Set<string>()
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
   private stopPromise: Promise<void> | undefined
@@ -382,6 +387,9 @@ export class AgentTreeApp {
     this.killDialog.add(killContent)
     this.killOverlay.add(this.killDialog)
     renderer.root.add(this.killOverlay)
+    this.openLeafPicker = new OpenLeafPicker(renderer, ({ endpoint }) => {
+      void this.runAction(() => this.openEndpoint(endpoint))
+    })
   }
 
   static async create(
@@ -436,6 +444,7 @@ export class AgentTreeApp {
   private readonly onResize = () => {
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
+    this.openLeafPicker.updateDimensions()
     this.render()
   }
 
@@ -477,7 +486,13 @@ export class AgentTreeApp {
   }
 
   private readonly onKeyRelease = (key: KeyEvent) => {
-    if (isHostEscape(key)) key.stopPropagation()
+    if (isHostEscape(key)) {
+      key.stopPropagation()
+      return
+    }
+    const identity = keyIdentity(key)
+    if (!this.consumedNavigatorKeyReleases.delete(identity)) return
+    key.stopPropagation()
   }
 
   private readonly onKeyPress = (key: KeyEvent) => {
@@ -492,11 +507,27 @@ export class AgentTreeApp {
       return
     }
 
+    if (this.openLeafPicker.isOpen) {
+      key.stopPropagation()
+      this.rememberNavigatorKeyRelease(key)
+      if (isExitKey(key)) {
+        void this.stop()
+      } else {
+        this.openLeafPicker.handleKeyPress(key)
+      }
+      return
+    }
+
     if (this.view === "roots") {
       this.handleRootKey(key)
     } else {
       this.handleGraphKey(key)
     }
+    if (key.propagationStopped) this.rememberNavigatorKeyRelease(key)
+  }
+
+  private rememberNavigatorKeyRelease(key: KeyEvent): void {
+    if (key.source === "kitty") this.consumedNavigatorKeyReleases.add(keyIdentity(key))
   }
 
   private readonly onContentMouseDown = (event: MouseEvent) => {
@@ -638,9 +669,14 @@ export class AgentTreeApp {
   }
 
   private handleRootKey(key: KeyEvent): void {
-    const quit = key.name === "q" || (key.name === "c" && key.ctrl)
+    const quit = isUnmodifiedKey(key, "q") || isExitKey(key)
+    const movement = listNavigationDelta(key)
     const recognized =
-      quit || ["up", "down", "k", "j", "return", "n", "r"].includes(key.name)
+      quit ||
+      movement !== undefined ||
+      isEnterKey(key) ||
+      isUnmodifiedKey(key, "n") ||
+      isUnmodifiedKey(key, "r")
     if (!recognized) return
     key.stopPropagation()
 
@@ -648,28 +684,31 @@ export class AgentTreeApp {
       void this.stop()
     } else if (this.busy) {
       return
-    } else if (key.name === "up" || key.name === "k") {
-      this.moveRoot(-1)
-    } else if (key.name === "down" || key.name === "j") {
-      this.moveRoot(1)
-    } else if (key.name === "return" && !key.repeated) {
+    } else if (movement !== undefined) {
+      this.moveRoot(movement)
+    } else if (isEnterKey(key) && !key.repeated) {
       this.enterSelectedRoot()
-    } else if (key.name === "n" && !key.repeated) {
+    } else if (isUnmodifiedKey(key, "n") && !key.repeated) {
       void this.runAction(() => this.newSession())
-    } else if (key.name === "r" && !key.repeated) {
+    } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
       void this.runAction(() => this.refreshData())
     }
   }
 
   private handleGraphKey(key: KeyEvent): void {
-    const exit = key.name === "c" && key.ctrl
-    const back = key.name === "q" || key.name === "escape"
+    const exit = isExitKey(key)
+    const back = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape")
     const recognized =
       exit ||
       back ||
-      ["up", "down", "left", "right", "k", "j", "h", "l", "return", "f", "x", "n", "r"].includes(
-        key.name,
-      )
+      ["up", "down", "left", "right", "k", "j", "h", "l"].some((name) =>
+        isUnmodifiedKey(key, name),
+      ) ||
+      isEnterKey(key) ||
+      isUnmodifiedKey(key, "f") ||
+      isUnmodifiedKey(key, "x") ||
+      isUnmodifiedKey(key, "n") ||
+      isUnmodifiedKey(key, "r")
     if (!recognized) return
     key.stopPropagation()
 
@@ -679,23 +718,23 @@ export class AgentTreeApp {
       return
     } else if (back) {
       this.showRoots()
-    } else if (key.name === "up" || key.name === "k") {
+    } else if (isUnmodifiedKey(key, "up") || isUnmodifiedKey(key, "k")) {
       this.moveSelection("up")
-    } else if (key.name === "down" || key.name === "j") {
+    } else if (isUnmodifiedKey(key, "down") || isUnmodifiedKey(key, "j")) {
       this.moveSelection("down")
-    } else if (key.name === "left" || key.name === "h") {
+    } else if (isUnmodifiedKey(key, "left") || isUnmodifiedKey(key, "h")) {
       this.moveSelection("left")
-    } else if (key.name === "right" || key.name === "l") {
+    } else if (isUnmodifiedKey(key, "right") || isUnmodifiedKey(key, "l")) {
       this.moveSelection("right")
-    } else if (key.name === "return" && !key.repeated) {
+    } else if (isEnterKey(key) && !key.repeated) {
       void this.runAction(() => this.openSelectedLeaf())
-    } else if (key.name === "f" && !key.repeated) {
+    } else if (isUnmodifiedKey(key, "f") && !key.repeated) {
       void this.runAction(() => this.forkSelectedNode())
-    } else if (key.name === "x" && !key.repeated) {
+    } else if (isUnmodifiedKey(key, "x") && !key.repeated) {
       this.showKillConfirmation()
-    } else if (key.name === "n" && !key.repeated) {
+    } else if (isUnmodifiedKey(key, "n") && !key.repeated) {
       void this.runAction(() => this.newSession())
-    } else if (key.name === "r" && !key.repeated) {
+    } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
       void this.runAction(() => this.refreshData())
     }
   }
@@ -837,6 +876,7 @@ export class AgentTreeApp {
   }
 
   private showRoots(): void {
+    this.openLeafPicker.close()
     this.view = "roots"
     this.preferredOpenSession = null
     this.graphViewportOffset = null
@@ -845,6 +885,7 @@ export class AgentTreeApp {
   }
 
   private async refreshData(focusSessionId?: string, updateStatus = true): Promise<boolean> {
+    this.openLeafPicker.close()
     const generation = ++this.refreshGeneration
     const pendingCompletions = new Map(this.pendingCompletionRefreshes)
     const discovered = await this.provider.listSessions()
@@ -927,26 +968,24 @@ export class AgentTreeApp {
     const selected = this.selectedGraphNode()
     if (!graph || !selected) return
 
-    let endpoint = selected.kind === "endpoint" ? selected : undefined
-    if (!endpoint) {
-      const endpoints = selected.childIds
-        .map((childId) => graph.nodes.get(childId))
-        .filter((node): node is SessionEndpointNode => node?.kind === "endpoint")
-        .sort(compareSessionEndpoints)
-      const preferred = this.preferredOpenSession
-      endpoint =
-        preferred?.nodeId === selected.id
-          ? endpoints.find(
-              (candidate) => candidate.session.id === preferred.sessionId,
-            ) ?? endpoints[0]
-          : endpoints[0]
+    const endpoints = reachableSessionEndpoints(graph, selected.id)
+    if (endpoints.length === 0) {
+      this.status = `No ${this.provider.displayName} session is reachable from this node`
+      return
     }
-    if (endpoint?.kind !== "endpoint") {
-      this.status = `This message is not the end of a ${this.provider.displayName} session`
+    const preferred = this.preferredOpenSession
+    const preferredSessionId =
+      preferred?.nodeId === selected.id ? preferred.sessionId : undefined
+    if (endpoints.length > 1) {
+      this.openLeafPicker.open(
+        endpoints,
+        preferredSessionId,
+        this.terminalManager.runningSessionIds(),
+      )
       return
     }
 
-    await this.openEndpoint(endpoint)
+    await this.openEndpoint(endpoints[0]!.endpoint)
   }
 
   private async openEndpoint(endpoint: SessionEndpointNode): Promise<void> {
@@ -1031,6 +1070,7 @@ export class AgentTreeApp {
 
   private async openTerminal(launch: TerminalLaunch): Promise<void> {
     if (this.stopping) throw new Error("claude-tree is shutting down")
+    this.openLeafPicker.close()
     await this.terminalManager.show(launch)
     this.view = "terminal"
     this.navigator.visible = false
@@ -1081,6 +1121,7 @@ export class AgentTreeApp {
     this.killOverlay.visible = false
     if (tooSmall) {
       this.killConfirmation = null
+      this.openLeafPicker.close()
       this.graphLayout = null
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
@@ -1375,15 +1416,32 @@ function sameMouseAction(left: PendingMouseAction, right: PendingMouseAction): b
   return false
 }
 
-function compareSessionEndpoints(left: SessionEndpointNode, right: SessionEndpointNode): number {
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value))
+}
+
+function isExitKey(key: KeyEvent): boolean {
   return (
-    right.session.lastModified - left.session.lastModified ||
-    left.session.id.localeCompare(right.session.id)
+    key.name === "c" &&
+    key.ctrl &&
+    !key.shift &&
+    !key.meta &&
+    !key.option &&
+    !key.super &&
+    !key.hyper
   )
 }
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value))
+function keyIdentity(key: KeyEvent): string {
+  return [
+    key.name,
+    key.ctrl,
+    key.shift,
+    key.meta,
+    key.option,
+    key.super,
+    key.hyper,
+  ].join(":")
 }
 
 function isHostEscape(key: KeyEvent): boolean {

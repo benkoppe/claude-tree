@@ -43,8 +43,8 @@ Conversation roots:
 
 | Key | Action |
 | --- | --- |
-| `Up` / `k` | Select the previous conversation family |
-| `Down` / `j` | Select the next conversation family |
+| `Up` / `k` / `Ctrl+P` | Select the previous conversation family |
+| `Down` / `j` / `Ctrl+N` | Select the next conversation family |
 | `Enter` | Open the selected message graph |
 | `n` | Start a new root conversation |
 | `r` | Refresh sessions and messages |
@@ -61,7 +61,7 @@ Message graph:
 | `Down` / `j` | Move to a visible child, preserving the cursor column |
 | `Left` / `h` | Move to the nearest node on the left, preserving depth |
 | `Right` / `l` | Move to the nearest node on the right, preserving depth |
-| `Enter` | Open or resume the session ending at the selected node |
+| `Enter` | Open a reachable leaf, or choose one when several are reachable |
 | `f` | Fork an agent message, or replay a selected user message |
 | `x` | Kill the selected live Draft or working Agent after confirmation |
 | `n` | Start a new root conversation |
@@ -70,6 +70,17 @@ Message graph:
 | `Ctrl+C` | Exit |
 | Left click a card | Select it; click it again while selected to open or resume |
 | Left click a footer action | Run that action |
+
+Open leaf picker:
+
+| Key | Action |
+| --- | --- |
+| `Up` / `k` / `Ctrl+P` | Select the previous leaf |
+| `Down` / `j` / `Ctrl+N` | Select the next leaf |
+| `Enter` | Open or resume the selected leaf |
+| `Escape` | Close the picker |
+| Mouse wheel | Scroll the leaf list |
+| Left click a row | Open or resume that leaf |
 
 Claude terminal:
 
@@ -83,7 +94,7 @@ Message nodes are filled cards labeled with Nerd Font icons and readable roles s
 
 Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
-Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
+Saved sessions end at their latest message. Pressing `Enter` on any message follows its descendants to the reachable session leaves. A single leaf opens immediately; multiple leaves appear in an `Open leaf` picker ordered by their distance below the selected message. The picker uses a small `•` beside leaves that already have a live session and leaves the same gutter blank for inactive sessions. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
 
 Pressing `x` on a live Draft or working Agent opens a confirmation popup with `Kill` selected by default. Use the arrow keys, `h`/`j`/`k`/`l`, or `Tab` to choose; `Enter` confirms, while `q` or `Escape` cancels. Killing a Draft discards its in-memory composer preview. Killing a working Agent interrupts only that session, then refreshes Claude's persisted transcript. Any partial response Claude persisted appears as a completed Agent message; terminal screen cells are never copied into history. Resuming afterward starts a fresh Draft from the last persisted message. In Claude terminal mode, `x` remains ordinary Claude input.
 

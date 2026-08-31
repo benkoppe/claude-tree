@@ -10,6 +10,7 @@ import { NullTerminalObserver, type AgentProvider, type AgentSession } from "../
 import { AgentTreeApp } from "../src/app"
 import { displayWidth } from "../src/display-text"
 import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
+import { BranchMetadataStore } from "../src/metadata"
 import { ClaudeProvider } from "../src/providers/claude"
 import { theme } from "../src/theme"
 
@@ -596,6 +597,235 @@ test("killing a draft removes it without fabricating transcript history", async 
   }
 })
 
+test("uses Ctrl+N and Ctrl+P to move through conversation roots", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+
+  const sessions = Array.from({ length: 3 }, (_, index): SDKSessionInfo => ({
+    sessionId: testUuid(index + 1),
+    summary: `Root ${index + 1}`,
+    firstPrompt: `question ${index + 1}`,
+    lastModified: 100 - index,
+  }))
+  const provider = new ClaudeProvider(project, join(root, "unused-claude"), undefined, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return sessions
+    },
+    async messages(sessionId): Promise<SessionMessage[]> {
+      const index = sessions.findIndex((session) => session.sessionId === sessionId)
+      return [sessionMessage(sessionId, testUuid(100 + index), "user", `question ${index + 1}`)]
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Root 1"))
+    expect(isSelected(setup, "Root 1")).toBeTrue()
+
+    setup.mockInput.pressKey("n", { ctrl: true })
+    await waitForFrame(setup, () => isSelected(setup, "Root 2"))
+
+    setup.mockInput.pressKey("p", { ctrl: true })
+    const frame = await waitForFrame(setup, () => isSelected(setup, "Root 1"))
+    expect(frame).toContain("Conversation roots")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("opens the only descendant leaf from an interior message", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const launchMarker = join(root, "launch")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+printf '%s\n' "$@" > ${JSON.stringify(launchMarker)}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const transcript = [
+    sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "first"),
+    sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "second"),
+    sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "user", "third"),
+  ]
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [
+        {
+          sessionId,
+          summary: "Linear conversation",
+          firstPrompt: "first",
+          lastModified: 10,
+        },
+      ]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Linear conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("Message graph") && frame.includes("first"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+
+    expect(await readMarker(launchMarker)).toEqual(["--resume", sessionId])
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("opens a picker for multiple descendant leaves and resumes the chosen session", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const launchMarker = join(root, "launch")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+printf '%s\n' "$@" > ${JSON.stringify(launchMarker)}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const rootSessionId = "11111111-1111-4111-8111-111111111111"
+  const childSessionId = "22222222-2222-4222-8222-222222222222"
+  const sourceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+  const copiedSourceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1"
+  const rootTranscript = [sessionMessage(rootSessionId, sourceId, "user", "branch source")]
+  const childTranscript = [
+    sessionMessage(childSessionId, copiedSourceId, "user", "branch source"),
+    sessionMessage(
+      childSessionId,
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+      "assistant",
+      "branch answer",
+    ),
+  ]
+  const metadata = await BranchMetadataStore.openForProvider(project, "claude", state)
+  await metadata.saveRelation({
+    childSessionId,
+    parentSessionId: rootSessionId,
+    sourceMessageId: sourceId,
+    sharedMessages: [{ parentMessageId: sourceId, childMessageId: copiedSourceId }],
+  })
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [
+        {
+          sessionId: rootSessionId,
+          summary: "Root leaf",
+          firstPrompt: "branch source",
+          lastModified: 10,
+        },
+        {
+          sessionId: childSessionId,
+          summary: "Child leaf",
+          firstPrompt: "branch source",
+          lastModified: 20,
+        },
+      ]
+    },
+    async messages(sessionId): Promise<SessionMessage[]> {
+      return sessionId === rootSessionId ? rootTranscript : childTranscript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Root leaf"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("branch source"),
+    )
+    setup.mockInput.pressEnter()
+    let frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Open leaf") && candidate.includes("Child leaf"),
+    )
+    expect(frame).toContain("esc")
+    expect(frame).not.toContain("┌")
+    expect(setup.captureSpans().lines[0]?.spans[0]?.bg.equals(theme.background)).toBeFalse()
+    expect(isSelected(setup, "Root leaf")).toBeTrue()
+
+    setup.resize(40, 8)
+    await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Resize to at least") && !candidate.includes("Open leaf"),
+    )
+    setup.resize(80, 24)
+    await waitForFrame(setup, (candidate) => candidate.includes("Message graph"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (candidate) => candidate.includes("Open leaf"))
+
+    setup.mockInput.pressKey("n", { ctrl: true })
+    frame = await waitForFrame(setup, () => isSelected(setup, "Child leaf"))
+    expect(frame).toContain("2 nodes down")
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (candidate) => !candidate.includes("claude-tree"))
+    expect(await readMarker(launchMarker)).toEqual(["--resume", childSessionId])
+
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Message graph") && candidate.includes("branch answer"),
+    )
+    setup.mockInput.pressArrow("up")
+    await waitForFrame(setup, () => isSelected(setup, "branch answer"))
+    setup.mockInput.pressArrow("up")
+    await waitForFrame(setup, () => isSelected(setup, "branch source"))
+    setup.mockInput.pressEnter()
+    frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Open leaf") && candidate.includes("• Child leaf"),
+    )
+    expect(frame).not.toContain("●")
+    const optionLines = frame.split("\n").filter((line) => line.includes("node") && line.includes("down"))
+    const rootOption = optionLines.find((line) => line.includes("Root leaf"))!
+    const childOption = optionLines.find((line) => line.includes("Child leaf"))!
+    expect(displayWidth(rootOption.slice(0, rootOption.indexOf("Root leaf")))).toBe(
+      displayWidth(childOption.slice(0, childOption.indexOf("Child leaf"))),
+    )
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("replaces a completed agent spinner with a message and new draft leaf", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -809,6 +1039,21 @@ async function readProcessIds(path: string): Promise<number[]> {
   }
   expect(contents).not.toBe("")
   return contents.trim().split(/\s+/).map(Number)
+}
+
+async function readMarker(path: string): Promise<string[]> {
+  let contents = ""
+  const deadline = performance.now() + 2_000
+  while (performance.now() < deadline) {
+    try {
+      contents = await readFile(path, "utf8")
+      break
+    } catch {
+      await Bun.sleep(10)
+    }
+  }
+  expect(contents).not.toBe("")
+  return contents.trim().split("\n")
 }
 
 async function waitUntil(condition: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
