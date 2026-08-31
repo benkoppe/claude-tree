@@ -350,7 +350,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
     setup.mockInput.pressKey(" ", { ctrl: true })
     frame = await waitForFrame(setup, (candidate) => candidate.includes("Message graph"))
 
-    const rootsAction = coordinateOf(frame, "q roots")
+    const rootsAction = coordinateOf(frame, "q quit")
     await setup.mockMouse.click(rootsAction.x, rootsAction.y)
     frame = await waitForFrame(setup, (candidate) => candidate.includes("Conversation roots"))
 

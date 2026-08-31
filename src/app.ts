@@ -108,7 +108,7 @@ const GRAPH_FOOTER_CONTROLS: FooterControl[] = [
   { key: "Enter", description: "open", action: "open" },
   { key: "f", description: "fork", action: "fork" },
   { key: "r", description: "refresh", action: "refresh" },
-  { key: "q", description: "roots", action: "roots" },
+  { key: "q", description: "quit", action: "roots" },
 ]
 
 export class ClaudeTreeApp {
