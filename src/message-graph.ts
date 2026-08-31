@@ -1,5 +1,5 @@
 import type { AgentMessage, AgentSession, MessageRef } from "./agent-provider"
-import type { BranchRelation } from "./metadata"
+import type { BranchRelation, ConversationRemoval } from "./metadata"
 
 export type ForkTarget = MessageRef
 
@@ -33,6 +33,7 @@ export type ConversationGraphNode = FamilyOriginNode | MessageGraphNodeOrEndpoin
 
 export interface ConversationGraph {
   rootSessionId: string
+  rootSession: AgentSession
   originNodeId: string
   rootNodeId: string
   nodes: Map<string, ConversationGraphNode>
@@ -44,6 +45,7 @@ export interface ConversationGraph {
 export interface ConversationForest {
   graphs: ConversationGraph[]
   graphBySessionId: Map<string, ConversationGraph>
+  graphByRootSessionId: Map<string, ConversationGraph>
   warnings: string[]
 }
 
@@ -62,6 +64,7 @@ export function buildConversationForest(
   sessions: AgentSession[],
   transcripts: Map<string, AgentMessage[]>,
   relations: BranchRelation[],
+  removals: ConversationRemoval[] = [],
 ): ConversationForest {
   const sessionsById = new Map(sessions.map((session) => [session.id, session]))
   const relationsByParent = groupRelationsByParent(relations)
@@ -81,6 +84,7 @@ export function buildConversationForest(
     const originNodeId = `origin:${encodeURIComponent(rootSession.id)}`
     const graph: ConversationGraph = {
       rootSessionId: rootSession.id,
+      rootSession,
       originNodeId,
       rootNodeId: "",
       nodes: new Map(),
@@ -135,7 +139,144 @@ export function buildConversationForest(
   for (const root of roots) buildRoot(root)
   for (const session of [...sessions].sort(compareSessions)) buildRoot(session)
 
-  return { graphs, graphBySessionId, warnings }
+  return applyConversationRemovals(graphs, graphBySessionId, removals)
+}
+
+interface IndexedMessageNode {
+  graph: ConversationGraph
+  nodeId: string
+}
+
+function applyConversationRemovals(
+  rawGraphs: ConversationGraph[],
+  rawGraphBySessionId: Map<string, ConversationGraph>,
+  removals: ConversationRemoval[],
+): ConversationForest {
+  const messageNodesBySessionId = new Map<
+    string,
+    Map<string, IndexedMessageNode[]>
+  >()
+  for (const graph of rawGraphs) {
+    for (const node of graph.nodes.values()) {
+      if (node.kind !== "message") continue
+      for (const alias of node.aliases) {
+        const nodesByMessageId = messageNodesBySessionId.get(alias.sessionId) ?? new Map()
+        const matches = nodesByMessageId.get(alias.messageId) ?? []
+        matches.push({ graph, nodeId: node.id })
+        nodesByMessageId.set(alias.messageId, matches)
+        messageNodesBySessionId.set(alias.sessionId, nodesByMessageId)
+      }
+    }
+  }
+
+  const removedGraphs = new Set<ConversationGraph>()
+  const targetNodeIdsByGraph = new Map<ConversationGraph, Set<string>>()
+  const addTarget = (graph: ConversationGraph, nodeId: string) => {
+    const nodeIds = targetNodeIdsByGraph.get(graph) ?? new Set()
+    nodeIds.add(nodeId)
+    targetNodeIdsByGraph.set(graph, nodeIds)
+  }
+
+  for (const removal of removals) {
+    if (removal.kind === "tree") {
+      const memberSessionIds = new Set(removal.memberSessionIds)
+      for (const graph of rawGraphs) {
+        if (
+          graph.rootSessionId === removal.rootSessionId ||
+          intersects(graph.sessionIds, memberSessionIds)
+        ) {
+          removedGraphs.add(graph)
+        }
+      }
+      continue
+    }
+
+    if (removal.target.kind === "message") {
+      for (const alias of removal.target.aliases) {
+        const matches = messageNodesBySessionId.get(alias.sessionId)?.get(alias.messageId) ?? []
+        for (const match of matches) addTarget(match.graph, match.nodeId)
+      }
+      continue
+    }
+
+    const target = removal.target
+    const graph = rawGraphBySessionId.get(target.sessionId)
+    const endpointId = graph?.endpointBySessionId.get(target.sessionId)
+    if (!graph || !endpointId) continue
+
+    const context = sessionContextByGraph.get(graph)?.get(target.sessionId)
+    const anchorIndex =
+      target.afterMessageId === null
+        ? -1
+        : (context?.transcript.findIndex(
+            (message) => message.id === target.afterMessageId,
+          ) ?? -1)
+    if (context && (target.afterMessageId === null || anchorIndex >= 0)) {
+      const appendedNodeId = firstDefined(context.rawLogicalNodeIds.slice(anchorIndex + 1))
+      if (appendedNodeId) addTarget(graph, appendedNodeId)
+    }
+    addTarget(graph, endpointId)
+  }
+
+  const graphs: ConversationGraph[] = []
+  for (const graph of rawGraphs) {
+    if (removedGraphs.has(graph)) continue
+
+    const removedNodeIds = new Set<string>()
+    for (const targetNodeId of targetNodeIdsByGraph.get(graph) ?? []) {
+      collectDescendantNodeIds(graph, targetNodeId, removedNodeIds)
+    }
+    for (const nodeId of removedNodeIds) graph.nodes.delete(nodeId)
+    for (const node of graph.nodes.values()) {
+      node.childIds = node.childIds.filter((childId) => graph.nodes.has(childId))
+    }
+    for (const [sessionId, endpointId] of graph.endpointBySessionId) {
+      if (!graph.nodes.has(endpointId)) graph.endpointBySessionId.delete(sessionId)
+    }
+    graph.sessionIds = new Set(graph.endpointBySessionId.keys())
+
+    const origin = graph.nodes.get(graph.originNodeId)
+    graph.rootNodeId = origin?.kind === "origin" ? (origin.childIds[0] ?? "") : ""
+    if (graph.nodes.size > 1) graphs.push(graph)
+  }
+
+  const graphBySessionId = new Map<string, ConversationGraph>()
+  const graphByRootSessionId = new Map<string, ConversationGraph>()
+  for (const graph of graphs) {
+    graphByRootSessionId.set(graph.rootSessionId, graph)
+    for (const sessionId of graph.sessionIds) graphBySessionId.set(sessionId, graph)
+  }
+
+  return {
+    graphs,
+    graphBySessionId,
+    graphByRootSessionId,
+    warnings: graphs.flatMap((graph) => graph.warnings),
+  }
+}
+
+function intersects(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) return true
+  }
+  return false
+}
+
+function collectDescendantNodeIds(
+  graph: ConversationGraph,
+  nodeId: string,
+  removedNodeIds: Set<string>,
+): void {
+  const pending = [nodeId]
+  while (pending.length > 0) {
+    const currentNodeId = pending.pop()!
+    if (currentNodeId === graph.originNodeId || removedNodeIds.has(currentNodeId)) continue
+    const node = graph.nodes.get(currentNodeId)
+    if (!node) continue
+
+    removedNodeIds.add(currentNodeId)
+    pending.push(...node.childIds)
+  }
 }
 
 export function reachableSessionEndpoints(

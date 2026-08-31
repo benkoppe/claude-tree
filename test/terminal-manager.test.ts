@@ -124,6 +124,7 @@ test("stops one session process group without disturbing another", async () => {
     expect(request?.wasActive).toBeFalse()
     expect(manager.stopSession(firstSessionId)).toBe(request)
     expect(manager.runningSessionIds()).toEqual(new Set([secondSessionId]))
+    expect(manager.ownedSessionIds()).toEqual(new Set([firstSessionId, secondSessionId]))
     expect(setup.renderer.root.getChildrenCount()).toBe(1)
     await expect(manager.show(launch(fakeClaude, firstSessionId))).rejects.toThrow(
       "still stopping",
@@ -131,6 +132,7 @@ test("stops one session process group without disturbing another", async () => {
 
     await request?.completion
     await waitUntil(() => firstProcessIds.every((processId) => !isProcessAlive(processId)))
+    expect(manager.ownedSessionIds()).toEqual(new Set([secondSessionId]))
     expect(secondProcessIds.every(isProcessAlive)).toBeTrue()
     expect(exitEvents).toEqual([])
 

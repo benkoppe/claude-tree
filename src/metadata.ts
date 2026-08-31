@@ -42,11 +42,93 @@ const relationSchema = z
     }
   })
 
+const messageRefSchema = z
+  .object({
+    sessionId: z.string().min(1),
+    messageId: z.string().min(1),
+  })
+  .strict()
+
+const messageRemovalTargetSchema = z
+  .object({
+    kind: z.literal("message"),
+    aliases: z.array(messageRefSchema).min(1),
+  })
+  .strict()
+  .superRefine((target, context) => {
+    const messageIdsBySession = new Map<string, Set<string>>()
+    for (const alias of target.aliases) {
+      const messageIds = messageIdsBySession.get(alias.sessionId) ?? new Set<string>()
+      if (messageIds.has(alias.messageId)) {
+        context.addIssue({ code: "custom", message: "message aliases must be unique" })
+        break
+      }
+      messageIds.add(alias.messageId)
+      messageIdsBySession.set(alias.sessionId, messageIds)
+    }
+  })
+
+const endpointRemovalTargetSchema = z
+  .object({
+    kind: z.literal("endpoint"),
+    sessionId: z.string().min(1),
+    afterMessageId: z.string().min(1).nullable(),
+  })
+  .strict()
+
+const subtreeRemovalTargetSchema = z.discriminatedUnion("kind", [
+  messageRemovalTargetSchema,
+  endpointRemovalTargetSchema,
+])
+
+const treeRemovalSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    kind: z.literal("tree"),
+    rootSessionId: z.string().min(1),
+    memberSessionIds: z.array(z.string().min(1)).min(1),
+    createdAt: z.iso.datetime(),
+  })
+  .strict()
+  .superRefine((removal, context) => {
+    if (new Set(removal.memberSessionIds).size !== removal.memberSessionIds.length) {
+      context.addIssue({ code: "custom", message: "tree member session IDs must be unique" })
+    }
+    if (!removal.memberSessionIds.includes(removal.rootSessionId)) {
+      context.addIssue({ code: "custom", message: "tree members must include the root session" })
+    }
+  })
+
+const subtreeRemovalSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    kind: z.literal("subtree"),
+    target: subtreeRemovalTargetSchema,
+    createdAt: z.iso.datetime(),
+  })
+  .strict()
+
+const removalSchema = z.discriminatedUnion("kind", [treeRemovalSchema, subtreeRemovalSchema])
+
 export type BranchRelation = z.infer<typeof relationSchema>
 
 export type NewBranchRelation = Omit<BranchRelation, "schemaVersion" | "createdAt"> & {
   createdAt?: string
 }
+
+export type MessageRemovalTarget = z.infer<typeof messageRemovalTargetSchema>
+export type EndpointRemovalTarget = z.infer<typeof endpointRemovalTargetSchema>
+export type SubtreeRemovalTarget = z.infer<typeof subtreeRemovalTargetSchema>
+export type ConversationRemovalTarget = SubtreeRemovalTarget
+export type TreeConversationRemoval = z.infer<typeof treeRemovalSchema>
+export type SubtreeConversationRemoval = z.infer<typeof subtreeRemovalSchema>
+export type ConversationRemoval = z.infer<typeof removalSchema>
+
+type NewPersistedRecord<T> = T extends unknown
+  ? Omit<T, "schemaVersion" | "createdAt"> & { createdAt?: string }
+  : never
+
+export type NewConversationRemoval = NewPersistedRecord<ConversationRemoval>
 
 export class BranchMetadataStore {
   readonly projectPath: string
@@ -72,6 +154,7 @@ export class BranchMetadataStore {
     const projectRootDirectory = join(baseStateDirectory, "claude-tree", "projects", projectKey)
     const projectStateDirectory = join(projectRootDirectory, "providers", providerId)
     const relationDirectory = join(projectStateDirectory, "branches")
+    const removalDirectory = join(projectStateDirectory, "removals")
 
     await mkdir(projectRootDirectory, { recursive: true, mode: 0o700 })
 
@@ -92,6 +175,7 @@ export class BranchMetadataStore {
     }
 
     await mkdir(relationDirectory, { recursive: true, mode: 0o700 })
+    await mkdir(removalDirectory, { recursive: true, mode: 0o700 })
     return new BranchMetadataStore(projectPath, projectStateDirectory)
   }
 
@@ -144,10 +228,121 @@ export class BranchMetadataStore {
     await writeJsonAtomically(targetPath, relation)
     return relation
   }
+
+  async loadRemovals(): Promise<ConversationRemoval[]> {
+    const removalDirectory = join(this.projectStateDirectory, "removals")
+    const entries = await readdir(removalDirectory, { withFileTypes: true })
+    const removals: ConversationRemoval[] = []
+
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) {
+        throw new Error(`Invalid removal metadata filename: ${entry.name}`)
+      }
+
+      const removal = removalSchema.parse(
+        JSON.parse(await readFile(join(removalDirectory, entry.name), "utf8")),
+      )
+      if (!isCanonicalRemoval(removal)) {
+        throw new Error(`Removal metadata ${entry.name} is not canonically ordered`)
+      }
+      const expectedName = removalFileName(removal)
+      if (entry.name !== expectedName) {
+        throw new Error(`Removal metadata ${entry.name} belongs in ${expectedName}`)
+      }
+      removals.push(removal)
+    }
+
+    return removals
+  }
+
+  async saveRemoval(input: NewConversationRemoval): Promise<ConversationRemoval> {
+    const removal = canonicalizeRemoval(
+      removalSchema.parse({
+        ...input,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: input.createdAt ?? new Date().toISOString(),
+      }),
+    )
+    const fileName = removalFileName(removal)
+    const existing = (await this.loadRemovals()).find(
+      (candidate) => removalFileName(candidate) === fileName,
+    )
+    if (existing) return existing
+
+    await writeJsonAtomically(join(this.projectStateDirectory, "removals", fileName), removal)
+    return removal
+  }
 }
 
 function relationFileName(childSessionId: string): string {
   return `${createHash("sha256").update(childSessionId).digest("hex")}.json`
+}
+
+function removalFileName(removal: ConversationRemoval): string {
+  const identity =
+    removal.kind === "tree"
+      ? {
+          schemaVersion: removal.schemaVersion,
+          kind: removal.kind,
+          rootSessionId: removal.rootSessionId,
+          memberSessionIds: removal.memberSessionIds,
+        }
+      : {
+          schemaVersion: removal.schemaVersion,
+          kind: removal.kind,
+          target: removal.target,
+        }
+  return `${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}.json`
+}
+
+function canonicalizeRemoval(removal: ConversationRemoval): ConversationRemoval {
+  if (removal.kind === "tree") {
+    return {
+      ...removal,
+      memberSessionIds: [...removal.memberSessionIds].sort(compareOpaqueIds),
+    }
+  }
+  if (removal.target.kind === "endpoint") return removal
+  return {
+    ...removal,
+    target: {
+      ...removal.target,
+      aliases: [...removal.target.aliases].sort(
+        (left, right) =>
+          compareOpaqueIds(left.sessionId, right.sessionId) ||
+          compareOpaqueIds(left.messageId, right.messageId),
+      ),
+    },
+  }
+}
+
+function isCanonicalRemoval(removal: ConversationRemoval): boolean {
+  const canonical = canonicalizeRemoval(removal)
+  if (removal.kind === "tree" && canonical.kind === "tree") {
+    return removal.memberSessionIds.every(
+      (sessionId, index) => sessionId === canonical.memberSessionIds[index],
+    )
+  }
+  if (
+    removal.kind === "subtree" &&
+    removal.target.kind === "message" &&
+    canonical.kind === "subtree" &&
+    canonical.target.kind === "message"
+  ) {
+    const canonicalAliases = canonical.target.aliases
+    return removal.target.aliases.every((alias, index) => {
+      const canonicalAlias = canonicalAliases[index]
+      if (!canonicalAlias) return false
+      return alias.sessionId === canonicalAlias.sessionId && alias.messageId === canonicalAlias.messageId
+    })
+  }
+  return true
+}
+
+function compareOpaqueIds(left: string, right: string): number {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
 }
 
 export function validateRelations(relations: BranchRelation[]): void {

@@ -6,7 +6,12 @@ import { join } from "node:path"
 import { createTestRenderer, MouseButtons } from "@opentui/core/testing"
 import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-sdk"
 
-import { NullTerminalObserver, type AgentProvider, type AgentSession } from "../src/agent-provider"
+import {
+  NullTerminalObserver,
+  type AgentMessage,
+  type AgentProvider,
+  type AgentSession,
+} from "../src/agent-provider"
 import { AgentTreeApp } from "../src/app"
 import { displayWidth } from "../src/display-text"
 import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
@@ -177,9 +182,10 @@ sleep 30
     await Bun.sleep(30)
     setup.mockInput.pressKey("x")
     setup.mockInput.pressKey("?")
+    setup.mockInput.pressKey("d")
     setup.mockInput.pressEnter()
     await waitUntil(() => Bun.file(inputMarker).exists())
-    expect(await readFile(inputMarker, "utf8")).toBe("x?")
+    expect(await readFile(inputMarker, "utf8")).toBe("x?d")
   } finally {
     await app.stop()
     await running
@@ -595,6 +601,387 @@ test("killing a draft removes it without fabricating transcript history", async 
     )
     expect(killed).not.toContain("Draft")
     expect(killed).not.toContain("Agent")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("removes a live root only after confirmation and keeps it removed after refresh and restart", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const processMarker = join(root, "root-process")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(
+    executable,
+    `#!/bin/sh
+printf '%s' "$$" > ${JSON.stringify(processMarker)}
+sleep 30
+`,
+  )
+  await chmod(executable, 0o755)
+
+  const sessions: AgentSession[] = [
+    { id: "root-a", title: "Root A", lastModified: 2 },
+    { id: "root-b", title: "Root B", lastModified: 1 },
+  ]
+  let listCalls = 0
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      listCalls += 1
+      return sessions
+    },
+    async readTranscript(sessionId) {
+      return [
+        {
+          id: `${sessionId}-message`,
+          role: "user",
+          preview: `${sessionId} question`,
+          ordinal: 0,
+          visible: true,
+        },
+      ]
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Root A") && frame.includes("Root B"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("root-a question"))
+    setup.mockInput.pressEnter()
+    const [processId] = await readProcessIds(processMarker)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    setup.mockInput.pressKey("q")
+    await waitForFrame(setup, (frame) => frame.includes("Conversation roots"))
+
+    setup.mockInput.pressKey("d")
+    const confirmation = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("Delete conversation tree") &&
+        frame.includes("Delete this conversation tree?") &&
+        frame.includes("• Deletion cannot be undone.") &&
+        frame.includes("• Transcripts and project files are not deleted.") &&
+        frame.includes("• 1 live session will be stopped first."),
+    )
+    expect(confirmation).toContain("Cancel  Delete")
+    const confirmationLines = confirmation.split("\n")
+    const questionLine = confirmationLines.findIndex((line) =>
+      line.includes("Delete this conversation tree?"),
+    )
+    const warningLine = confirmationLines.findIndex((line) =>
+      line.includes("• Deletion cannot be undone."),
+    )
+    expect(warningLine).toBe(questionLine + 2)
+    expect(
+      setup
+        .captureSpans()
+        .lines.flatMap((line) => line.spans)
+        .some(
+          (span) => span.text.includes("Deletion cannot be undone.") && span.fg.equals(theme.danger),
+        ),
+    ).toBeTrue()
+    expect(
+      setup
+        .captureSpans()
+        .lines.flatMap((line) => line.spans)
+        .some((span) => span.text.includes("Cancel") && span.bg.equals(theme.selected)),
+    ).toBeTrue()
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("Root A") && !frame.includes("Delete conversation tree"),
+    )
+    expect(isProcessAlive(processId!)).toBeTrue()
+
+    setup.mockInput.pressKey("d")
+    await waitForFrame(setup, (frame) => frame.includes("Delete conversation tree"))
+    setup.mockInput.pressArrow("right")
+    setup.mockInput.pressEnter()
+    const removed = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Root B") && !frame.includes("Root A"),
+    )
+    expect(removed).toContain("Conversation roots")
+    expect(isProcessAlive(processId!)).toBeFalse()
+
+    const callsBeforeRefresh = listCalls
+    setup.mockInput.pressKey("r")
+    await waitForFrame(
+      setup,
+      (frame) => listCalls > callsBeforeRefresh && frame.includes("Root B") && !frame.includes("Root A"),
+    )
+  } finally {
+    await app.stop()
+    await running
+  }
+
+  const restartedSetup = await createTestRenderer({ width: 80, height: 24 })
+  const restartedApp = await AgentTreeApp.create(
+    restartedSetup.renderer,
+    project,
+    provider,
+    state,
+  )
+  const restarted = restartedApp.run()
+  try {
+    const frame = await waitForFrame(
+      restartedSetup,
+      (candidate) => candidate.includes("Root B"),
+    )
+    expect(frame).not.toContain("Root A")
+  } finally {
+    await restartedApp.stop()
+    await restarted
+  }
+})
+
+test("removes a branched conversation path and leaves its nearest parent usable", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const launchMarker = join(root, "path-launch")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(
+    executable,
+    `#!/bin/sh
+printf '%s' "$1" > ${JSON.stringify(launchMarker)}
+sleep 30
+`,
+  )
+  await chmod(executable, 0o755)
+
+  const sessions: AgentSession[] = [
+    { id: "session-a", title: "Conversation A", lastModified: 1 },
+    { id: "session-b", title: "Conversation B", lastModified: 2 },
+    { id: "session-c", title: "Conversation C", lastModified: 3 },
+  ]
+  const transcripts = new Map([
+    [
+      "session-a",
+      [{ id: "a-1", role: "user" as const, preview: "path A", ordinal: 0, visible: true }],
+    ],
+    [
+      "session-b",
+      [
+        { id: "b-1", role: "user" as const, preview: "path A", ordinal: 0, visible: true },
+        { id: "b-2", role: "agent" as const, preview: "path B", ordinal: 1, visible: true },
+      ],
+    ],
+    [
+      "session-c",
+      [
+        { id: "c-1", role: "user" as const, preview: "path A", ordinal: 0, visible: true },
+        { id: "c-2", role: "agent" as const, preview: "path B", ordinal: 1, visible: true },
+        { id: "c-3", role: "user" as const, preview: "path C", ordinal: 2, visible: true },
+      ],
+    ],
+  ])
+  const metadata = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+  await metadata.saveRelation({
+    childSessionId: "session-b",
+    parentSessionId: "session-a",
+    sourceMessageId: "a-1",
+    sharedMessages: [{ parentMessageId: "a-1", childMessageId: "b-1" }],
+  })
+  await metadata.saveRelation({
+    childSessionId: "session-c",
+    parentSessionId: "session-b",
+    sourceMessageId: "b-2",
+    sharedMessages: [
+      { parentMessageId: "b-1", childMessageId: "c-1" },
+      { parentMessageId: "b-2", childMessageId: "c-2" },
+    ],
+  })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return sessions
+    },
+    async readTranscript(sessionId) {
+      return transcripts.get(sessionId) ?? []
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [executable, session.id],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Conversation A"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("path A") && frame.includes("path B") && frame.includes("path C"),
+    )
+    setup.mockInput.pressArrow("down")
+    await waitForFrame(setup, () => isSelected(setup, "path B"))
+    setup.mockInput.pressKey("d")
+    const confirmation = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("Delete conversation path") &&
+        frame.includes("Delete this node and all descendents?") &&
+        frame.includes("• Deletion cannot be undone.") &&
+        frame.includes("• Transcripts and project files are not deleted."),
+    )
+    expect(confirmation).toContain("Cancel  Delete")
+    setup.mockInput.pressArrow("right")
+    setup.mockInput.pressEnter()
+
+    const pruned = await waitForFrame(
+      setup,
+      (frame) => frame.includes("path A") && !frame.includes("path B") && !frame.includes("path C"),
+    )
+    expect(pruned).toContain("Message graph")
+    expect(isSelected(setup, "path A")).toBeTrue()
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    await waitUntil(() => Bun.file(launchMarker).exists())
+    expect(await readFile(launchMarker, "utf8")).toBe("session-a")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("stops a live endpoint before removing its path and prevents resuming it", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const processMarker = join(root, "path-process")
+  const persistedMarker = join(root, "path-persisted")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(
+    executable,
+    `#!/bin/sh
+trap 'touch ${JSON.stringify(persistedMarker)}; exit 0' TERM
+printf '%s' "$$" > ${JSON.stringify(processMarker)}
+sleep 30
+`,
+  )
+  await chmod(executable, 0o755)
+
+  const session: AgentSession = { id: "live-path", title: "Live path", lastModified: 1 }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return [session]
+    },
+    async readTranscript() {
+      const messages: AgentMessage[] = [
+        {
+          id: "kept-message",
+          role: "user",
+          preview: "kept ancestor",
+          ordinal: 0,
+          visible: true,
+        },
+      ]
+      if (await Bun.file(persistedMarker).exists()) {
+        messages.push({
+          id: "persisted-while-stopping",
+          role: "agent",
+          preview: "persisted while stopping",
+          ordinal: 1,
+          visible: true,
+        })
+      }
+      return messages
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume(resumed) {
+      return {
+        sessionId: resumed.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Live path"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("kept ancestor"))
+    setup.mockInput.pressEnter()
+    const [processId] = await readProcessIds(processMarker)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Draft"))
+
+    setup.mockInput.pressKey("d")
+    await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("Delete conversation path") &&
+        frame.includes("1 live session will be stopped first"),
+    )
+    setup.mockInput.pressArrow("right")
+    setup.mockInput.pressEnter()
+    const removed = await waitForFrame(
+      setup,
+      (frame) => {
+        if (frame.includes("persisted while stopping")) {
+          throw new Error(`Rendered content below the removed endpoint:\n${frame}`)
+        }
+        return frame.includes("kept ancestor") && !frame.includes("Draft") && isSelected(setup, "kept ancestor")
+      },
+    )
+    expect(removed).toContain("Message graph")
+    expect(isProcessAlive(processId!)).toBeFalse()
+
+    setup.mockInput.pressKey("r")
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("kept ancestor") && !frame.includes("persisted while stopping"),
+    )
+
+    await Bun.sleep(20)
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("No Test Agent session is reachable from this node"),
+    )
   } finally {
     await app.stop()
     await running

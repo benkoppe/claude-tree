@@ -19,4 +19,5 @@ export const theme = {
   info: RGBA.fromHex("#67e8f9"),
   success: RGBA.fromHex("#4ade80"),
   warning: RGBA.fromHex("#fbbf24"),
+  danger: RGBA.fromHex("#f87171"),
 } as const

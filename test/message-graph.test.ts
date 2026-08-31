@@ -4,10 +4,11 @@ import {
   buildConversationForest,
   reachableSessionEndpoints,
   resolveForkTarget,
+  type ConversationGraph,
   type MessageGraphNode,
 } from "../src/message-graph"
-import type { AgentMessage, AgentSession, SharedMessage } from "../src/agent-provider"
-import type { BranchRelation } from "../src/metadata"
+import type { AgentMessage, AgentSession, MessageRef, SharedMessage } from "../src/agent-provider"
+import type { BranchRelation, ConversationRemoval } from "../src/metadata"
 
 const ROOT = "11111111-1111-4111-8111-111111111111"
 const CHILD = "22222222-2222-4222-8222-222222222222"
@@ -124,6 +125,329 @@ describe("buildConversationForest", () => {
     expect(forest.graphs).toHaveLength(2)
     expect(forest.graphBySessionId.get(CHILD)?.rootSessionId).toBe(CHILD)
     expect(forest.warnings[0]).toContain("shared history does not match")
+  })
+})
+
+describe("persisted removals", () => {
+  test("prunes a message and all later descendants while retaining its ancestor", () => {
+    const messages = [
+      message("message-a", "user", "A", 0),
+      message("message-b", "agent", "B", 1),
+      message("message-c", "user", "C", 2),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 10)],
+      new Map([[ROOT, messages]]),
+      [],
+      [messageRemoval([{ sessionId: ROOT, messageId: messages[1]!.id }])],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    const graph = forest.graphs[0]!
+    expect(messagePreviews(graph)).toEqual(["A"])
+    expect(graph.endpointBySessionId.size).toBe(0)
+    expect([...graph.sessionIds]).toEqual([])
+    expect(graph.rootNodeId).toBe(`message:${ROOT}:${messages[0]!.id}`)
+  })
+
+  test("removes only an endpoint when the endpoint is targeted", () => {
+    const messages = [message("endpoint-parent", "user", "still visible", 0)]
+    const graph = buildConversationForest(
+      [session(ROOT, "Root", 10)],
+      new Map([[ROOT, messages]]),
+      [],
+      [endpointRemoval(ROOT, messages[0]!.id)],
+    ).graphs[0]!
+
+    expect(messagePreviews(graph)).toEqual(["still visible"])
+    expect(graph.endpointBySessionId.has(ROOT)).toBe(false)
+    expect(graph.nodes.has(`endpoint:${ROOT}`)).toBe(false)
+  })
+
+  test("prunes every branch below a shared branch-point alias", () => {
+    const rootMessages = [
+      message("root-source", "user", "source", 0),
+      message("root-branch", "agent", "branch point", 1),
+      message("root-tail", "user", "root tail", 2),
+    ]
+    const childMessages = [
+      message("child-source", "user", "source", 0),
+      message("child-branch", "agent", "branch point", 1),
+      message("child-tail", "user", "child tail", 2),
+    ]
+    const graph = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childMessages],
+      ]),
+      [relation(CHILD, ROOT, rootMessages[1]!.id, shared(rootMessages, childMessages, 2))],
+      [messageRemoval([{ sessionId: CHILD, messageId: childMessages[1]!.id }])],
+    ).graphs[0]!
+
+    expect(messagePreviews(graph)).toEqual(["source"])
+    expect(graph.endpointBySessionId.size).toBe(0)
+  })
+
+  test("preserves ordinary and zero-prefix siblings outside the removed subtree", () => {
+    const rootMessages = [
+      message("sibling-source", "user", "source", 0),
+      message("removed-original", "agent", "removed", 1),
+    ]
+    const childMessages = [
+      message("copied-source", "user", "source", 0),
+      message("fork-tail", "agent", "fork", 1),
+    ]
+    const replayMessages = [message("replay-root", "user", "replay", 0)]
+    const graph = buildConversationForest(
+      [
+        session(ROOT, "Root", 30),
+        session(CHILD, "Sibling", 20),
+        session(GRANDCHILD, "Replay", 10),
+      ],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childMessages],
+        [GRANDCHILD, replayMessages],
+      ]),
+      [
+        relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, childMessages, 1), 1),
+        relation(GRANDCHILD, ROOT, rootMessages[0]!.id, [], 2),
+      ],
+      [messageRemoval([{ sessionId: ROOT, messageId: rootMessages[1]!.id }])],
+    ).graphs[0]!
+
+    expect(messagePreviews(graph)).toEqual(["source", "fork", "replay"])
+    expect([...graph.sessionIds]).toEqual([CHILD, GRANDCHILD])
+    expect(graph.nodes.get(graph.originNodeId)?.childIds).toEqual([
+      `message:${ROOT}:${rootMessages[0]!.id}`,
+      `message:${GRANDCHILD}:${replayMessages[0]!.id}`,
+    ])
+  })
+
+  test("resolves every persisted alias after a shared node splits", () => {
+    const rootMessages = [
+      message("split-root-source", "user", "source", 0),
+      message("split-root-target", "agent", "target", 1),
+    ]
+    const childMessages = [
+      message("split-child-source", "user", "source", 0),
+      message("split-child-target", "agent", "target", 1),
+    ]
+    const originallyShared = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childMessages],
+      ]),
+      [relation(CHILD, ROOT, rootMessages[1]!.id, shared(rootMessages, childMessages, 2))],
+    ).graphs[0]!
+    const aliases = messageNodes(originallyShared).find((node) => node.preview === "target")!.aliases
+
+    const splitGraph = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childMessages],
+      ]),
+      [relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, childMessages, 1))],
+      [messageRemoval(aliases)],
+    ).graphs[0]!
+
+    expect(messagePreviews(splitGraph)).toEqual(["source"])
+    expect(splitGraph.endpointBySessionId.size).toBe(0)
+  })
+
+  test("resolves opaque alias pairs without delimiter collisions", () => {
+    const firstSessionId = "opaque:session"
+    const secondSessionId = "opaque"
+    const firstMessage = message("message", "user", "remove me", 0)
+    const secondMessage = message("session:message", "user", "keep me", 0)
+    const forest = buildConversationForest(
+      [session(firstSessionId, "First", 20), session(secondSessionId, "Second", 10)],
+      new Map([
+        [firstSessionId, [firstMessage]],
+        [secondSessionId, [secondMessage]],
+      ]),
+      [],
+      [messageRemoval([{ sessionId: firstSessionId, messageId: firstMessage.id }])],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.graphs[0]!.rootSessionId).toBe(secondSessionId)
+    expect(messagePreviews(forest.graphs[0]!)).toEqual(["keep me"])
+  })
+
+  test("applies overlapping removals independently of record order", () => {
+    const messages = [
+      message("order-a", "user", "A", 0),
+      message("order-b", "agent", "B", 1),
+      message("order-c", "user", "C", 2),
+    ]
+    const removeB = messageRemoval([{ sessionId: ROOT, messageId: messages[1]!.id }])
+    const removeC = messageRemoval([{ sessionId: ROOT, messageId: messages[2]!.id }])
+    const build = (removals: ConversationRemoval[]) =>
+      buildConversationForest(
+        [session(ROOT, "Root", 10)],
+        new Map([[ROOT, messages]]),
+        [],
+        removals,
+      ).graphs[0]!
+
+    expect(graphShape(build([removeB, removeC]))).toEqual(graphShape(build([removeC, removeB])))
+    expect(messagePreviews(build([removeB, removeC]))).toEqual(["A"])
+  })
+
+  test("removes whole trees by current root or a recorded member fallback", () => {
+    const rootMessage = message("tree-root", "user", "root", 0)
+    const childMessage = message("tree-child", "user", "root", 0)
+    const build = (removal: ConversationRemoval) =>
+      buildConversationForest(
+        [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+        new Map([
+          [ROOT, [rootMessage]],
+          [CHILD, [childMessage]],
+        ]),
+        [relation(CHILD, ROOT, rootMessage.id, shared([rootMessage], [childMessage], 1))],
+        [removal],
+      )
+
+    expect(build(treeRemoval(ROOT, [ROOT, CHILD])).graphs).toEqual([])
+    expect(build(treeRemoval("former-root", ["former-root", CHILD])).graphs).toEqual([])
+  })
+
+  test("drops a graph reduced to only its synthetic origin", () => {
+    const forest = buildConversationForest(
+      [session(ROOT, "Empty", 10)],
+      new Map([[ROOT, []]]),
+      [],
+      [endpointRemoval(ROOT, null)],
+    )
+
+    expect(forest.graphs).toEqual([])
+    expect(forest.graphBySessionId.size).toBe(0)
+    expect(forest.graphByRootSessionId.size).toBe(0)
+  })
+
+  test("retains the root session title after pruning its endpoint", () => {
+    const rootSession = session(ROOT, "Persistent title", 10)
+    const graph = buildConversationForest(
+      [rootSession],
+      new Map([[ROOT, [message("title-message", "user", "message", 0)]]]),
+      [],
+      [endpointRemoval(ROOT, "title-message")],
+    ).graphs[0]!
+
+    expect(graph.rootSession).toEqual(rootSession)
+    expect(graph.rootSession.title).toBe("Persistent title")
+  })
+
+  test("rebuilds endpoint, session, and root indexes from surviving nodes", () => {
+    const rootMessage = message("index-root", "user", "source", 0)
+    const childMessages = [
+      message("index-child-source", "user", "source", 0),
+      message("index-child-tail", "agent", "tail", 1),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, [rootMessage]],
+        [CHILD, childMessages],
+      ]),
+      [relation(CHILD, ROOT, rootMessage.id, shared([rootMessage], childMessages, 1))],
+      [endpointRemoval(ROOT, rootMessage.id)],
+    )
+    const graph = forest.graphs[0]!
+
+    expect([...graph.endpointBySessionId.keys()]).toEqual([CHILD])
+    expect([...graph.sessionIds]).toEqual([CHILD])
+    expect(forest.graphBySessionId.has(ROOT)).toBe(false)
+    expect(forest.graphBySessionId.get(CHILD)).toBe(graph)
+    expect(forest.graphByRootSessionId.get(ROOT)).toBe(graph)
+  })
+
+  test("retains warnings only from surviving graphs", () => {
+    const rootMessage = message("warning-root", "user", "root", 0)
+    const childMessage = message("warning-child", "user", "child", 0)
+    const invalidRelation = relation(
+      CHILD,
+      ROOT,
+      rootMessage.id,
+      [{ parentMessageId: rootMessage.id, childMessageId: "wrong-child-message" }],
+    )
+    const rawForest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, [rootMessage]],
+        [CHILD, [childMessage]],
+      ]),
+      [invalidRelation],
+    )
+    expect(rawForest.warnings).toHaveLength(1)
+
+    const filteredForest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, [rootMessage]],
+        [CHILD, [childMessage]],
+      ]),
+      [invalidRelation],
+      [treeRemoval(ROOT, [ROOT])],
+    )
+
+    expect(filteredForest.graphs.map((graph) => graph.rootSessionId)).toEqual([CHILD])
+    expect(filteredForest.warnings).toEqual([])
+  })
+
+  test("keeps descendants appended after removal persistence hidden on rebuild", () => {
+    const originalMessages = [
+      message("append-a", "user", "A", 0),
+      message("append-b", "agent", "B", 1),
+    ]
+    const originalGraph = buildConversationForest(
+      [session(ROOT, "Root", 10)],
+      new Map([[ROOT, originalMessages]]),
+      [],
+    ).graphs[0]!
+    const aliases = messageNodes(originalGraph).find((node) => node.preview === "B")!.aliases
+    const appendedMessages = [
+      ...originalMessages,
+      message("append-c", "user", "C", 2),
+      message("append-d", "agent", "D", 3),
+    ]
+
+    const rebuilt = buildConversationForest(
+      [session(ROOT, "Root", 20)],
+      new Map([[ROOT, appendedMessages]]),
+      [],
+      [
+        messageRemoval(aliases),
+        messageRemoval([{ sessionId: "unresolved:session", messageId: "unresolved:message" }]),
+      ],
+    ).graphs[0]!
+
+    expect(messagePreviews(rebuilt)).toEqual(["A"])
+    expect(rebuilt.endpointBySessionId.size).toBe(0)
+  })
+
+  test("keeps responses persisted while stopping a removed endpoint hidden", () => {
+    const originalMessage = message("endpoint-boundary", "user", "kept", 0)
+    const removal = endpointRemoval(ROOT, originalMessage.id)
+    const rebuilt = buildConversationForest(
+      [session(ROOT, "Root", 20)],
+      new Map([[
+        ROOT,
+        [
+          originalMessage,
+          message("stopped-partial", "agent", "persisted while stopping", 1),
+        ],
+      ]]),
+      [],
+      [removal],
+    ).graphs[0]!
+
+    expect(messagePreviews(rebuilt)).toEqual(["kept"])
+    expect(rebuilt.endpointBySessionId.size).toBe(0)
   })
 })
 
@@ -398,5 +722,51 @@ function shared(parent: AgentMessage[], child: AgentMessage[], length: number): 
   return parent.slice(0, length).map((message, index) => ({
     parentMessageId: message.id,
     childMessageId: child[index]!.id,
+  }))
+}
+
+function messageRemoval(aliases: MessageRef[]): ConversationRemoval {
+  return {
+    schemaVersion: 1,
+    kind: "subtree",
+    target: { kind: "message", aliases },
+    createdAt: "2026-08-30T12:01:00.000Z",
+  }
+}
+
+function endpointRemoval(sessionId: string, afterMessageId: string | null): ConversationRemoval {
+  return {
+    schemaVersion: 1,
+    kind: "subtree",
+    target: { kind: "endpoint", sessionId, afterMessageId },
+    createdAt: "2026-08-30T12:01:00.000Z",
+  }
+}
+
+function treeRemoval(rootSessionId: string, memberSessionIds: string[]): ConversationRemoval {
+  return {
+    schemaVersion: 1,
+    kind: "tree",
+    rootSessionId,
+    memberSessionIds,
+    createdAt: "2026-08-30T12:01:00.000Z",
+  }
+}
+
+function messageNodes(graph: ConversationGraph): MessageGraphNode[] {
+  return [...graph.nodes.values()].filter(
+    (node): node is MessageGraphNode => node.kind === "message",
+  )
+}
+
+function messagePreviews(graph: ConversationGraph): string[] {
+  return messageNodes(graph).map((node) => node.preview)
+}
+
+function graphShape(graph: ConversationGraph): unknown {
+  return [...graph.nodes.values()].map((node) => ({
+    id: node.id,
+    parentId: node.parentId,
+    childIds: node.childIds,
   }))
 }

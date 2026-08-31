@@ -293,6 +293,24 @@ describe("renderRootPicker", () => {
     expect(renderRootPicker([], 0, 5, 80, new Set()).text).toContain("press n")
   })
 
+  test("keeps the root title after its endpoint is removed", () => {
+    const graph = buildConversationForest(
+      [session(ROOT, "Historical root", 20)],
+      new Map([[ROOT, [message("survivor", "user", "still visible", 0)]]]),
+      [],
+      [{
+        schemaVersion: 1,
+        kind: "subtree",
+        target: { kind: "endpoint", sessionId: ROOT, afterMessageId: "survivor" },
+        createdAt: "2026-08-30T12:00:00.000Z",
+      }],
+    ).graphs[0]!
+    const rendered = renderRootPicker([graph], 0, 5, 80, new Set())
+
+    expect(rendered.text).toContain("Historical root")
+    expect(rendered.text).toContain("0 sessions")
+  })
+
   test("keeps a stable viewport and scrolls only to reveal the selection", () => {
     const graphs = Array.from({ length: 10 }, () => branchGraph())
 

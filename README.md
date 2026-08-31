@@ -44,6 +44,7 @@ Conversation roots:
 | `Up` / `k` / `Ctrl+P` | Select the previous conversation family |
 | `Down` / `j` / `Ctrl+N` | Select the next conversation family |
 | `Enter` | Open the selected message graph |
+| `d` | Delete the selected whole tree from conversation roots |
 | `n` | Start a new root conversation |
 | `r` | Refresh sessions and messages |
 | `?` | Open About |
@@ -62,6 +63,7 @@ Message graph:
 | `Right` / `l` | Move to the nearest node on the right, preserving depth |
 | `Enter` | Open a reachable leaf, or choose one when several are reachable |
 | `f` | Fork an agent message, or replay a selected user message |
+| `d` | Delete the selected node and its visual descendants from the graph |
 | `x` | Kill the selected live Draft or working Agent after confirmation |
 | `n` | Start a new root conversation |
 | `r` | Refresh the graph |
@@ -102,6 +104,8 @@ Press `?` from either navigator view to open About. Its tabbed popup shows the p
 
 Pressing `x` on a live Draft or working Agent opens a confirmation popup with `Kill` selected by default. Use the arrow keys, `h`/`j`/`k`/`l`, or `Tab` to choose; `Enter` confirms, while `q` or `Escape` cancels. Killing a Draft discards its in-memory composer preview. Killing a working Agent interrupts only that session, then refreshes Claude's persisted transcript. Any partial response Claude persisted appears as a completed Agent message; terminal screen cells are never copied into history. Resuming afterward starts a fresh Draft from the last persisted message. In Claude terminal mode, `x` remains ordinary Claude input.
 
+Pressing `d` in conversation roots deletes the selected whole tree from the navigator. In a message graph, it deletes the selected node and all visual descendants. The confirmation defaults to `Cancel`; use the arrow keys, `h`/`j`/`k`/`l`, or `Tab` to choose, then `Enter` to confirm. `q` or `Escape` cancels. Navigator deletion cannot be undone in `claude-tree`, but provider transcripts and project files remain unchanged. Undeleted ancestors remain forkable, while a deleted original leaf can no longer be opened from that path. Affected live sessions are stopped before deletion. In Claude terminal mode, `d` remains ordinary Claude input.
+
 ## Fork Behavior
 
 Forking an agent message copies history through that exact message and opens the child with a blank composer. Forking a user message instead copies history through the nearest earlier agent and opens the child with the selected user prompt already in the composer but not submitted. Intervening user messages are not copied. If the selected user message has no earlier agent, its replay remains in the same conversation family as another top-level root. These roots share an invisible empty-history origin, so no false message edge is drawn between them. Prompts containing non-text content cannot be replayed because Claude's prefill option accepts text only.
@@ -110,7 +114,7 @@ Dragging across text in an embedded Claude terminal copies the selection through
 
 ## State
 
-Claude transcripts remain Claude's source of truth. `claude-tree` stores only branch relationships under:
+Claude transcripts remain Claude's source of truth. `claude-tree` stores only branch relationships and navigator-removal UI state under:
 
 ```text
 $XDG_STATE_HOME/claude-tree/projects/<project-hash>/providers/claude/
@@ -118,7 +122,7 @@ $XDG_STATE_HOME/claude-tree/projects/<project-hash>/providers/claude/
 
 When `XDG_STATE_HOME` is unset, the base directory is `~/.local/state`.
 
-The canonical project path is recorded and checked before state is used. Relationship files are provider-scoped, validated strictly, and replaced atomically. Sessions without recorded ancestry appear as independent roots. Incompatible earlier state schemas fail closed rather than being silently reused.
+The canonical project path is recorded and checked before state is used. Relationship files are provider-scoped, validated strictly, and replaced atomically. Navigator removals use strict, atomic, provider-scoped records under `removals/`; they hide graph content without changing provider transcripts. Sessions without recorded ancestry appear as independent roots. Incompatible earlier state schemas fail closed rather than being silently reused.
 
 Observed unsent drafts are process-local UI state. They are kept only in memory while `claude-tree` is running and are never written to application state.
 

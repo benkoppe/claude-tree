@@ -110,6 +110,10 @@ export class TerminalManager {
     )
   }
 
+  ownedSessionIds(): Set<string> {
+    return new Set(this.terminals.keys())
+  }
+
   draftPreviews(): Map<string, DraftPreview> {
     return new Map(
       [...this.terminals.values()]

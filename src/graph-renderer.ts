@@ -172,9 +172,7 @@ export function renderRootPicker(
     const selected = index === selectedIndex
     const background = selected ? theme.selected : theme.background
     const foreground = selected ? theme.selectedText : theme.text
-    const rootEndpointId = graph.endpointBySessionId.get(graph.rootSessionId)
-    const rootEndpoint = rootEndpointId ? graph.nodes.get(rootEndpointId) : undefined
-    const title = rootEndpoint?.kind === "endpoint" ? rootEndpoint.session.title : "Conversation"
+    const title = graph.rootSession.title
     const live = [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
     const messageCount = [...graph.nodes.values()].filter((node) => node.kind === "message").length
     const sessionCount = graph.endpointBySessionId.size

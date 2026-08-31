@@ -26,11 +26,13 @@ Use supported provider APIs for session discovery, message reads, and historical
 
 Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
 
-## Branch Relationships Need Application Metadata
+## Relationships And Navigator Removals Need Application Metadata
 
 Claude sessions are persisted independently. Historical forking remaps message UUIDs and does not retain enough source-branch information for this application to reconstruct a reliable cross-session tree later.
 
-Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Keep it outside the repository under the user's XDG state directory, scoped by project and provider. Write it defensively so a failed or partial update cannot damage provider transcripts.
+Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Persist navigator-removal records as application-owned UI state. Keep both outside the repository under the user's XDG state directory, scoped by project and provider, with strict validation and atomic writes.
+
+Apply navigator removals after constructing the complete graph so relationship and message-alias resolution still use intact provider history. Prune only the selected tree or the selected node and its visual descendants from the navigator. Never edit or delete provider transcripts to implement removal.
 
 Sessions and forks not created or recorded by `claude-tree` should still be usable. When their ancestry cannot be established reliably, show them as independent roots rather than guessing from message content.
 
@@ -59,6 +61,8 @@ Live PTYs belong to the foreground `claude-tree` process. Closing the applicatio
 Shutdown releases the navigator and terminal emulators immediately, then remains in the foreground for a short, bounded cleanup of each owned agent process group. Keep PTYs open during the graceful termination window so the agent can finish its signal handling; escalate surviving process groups and close their PTYs before the application exits.
 
 Stopping one live endpoint uses the same bounded process-group cleanup but leaves every unrelated endpoint running. Mark the session as stopping and reserve its session ID before signaling it, so graph actions cannot start a second owner while cleanup is in progress. Keep that ownership reserved if cleanup cannot be proven complete; application shutdown is the final cleanup boundary.
+
+Before persisting a navigator removal, stop every affected live session with this same bounded cleanup. Do not apply the removal while an affected session remains live.
 
 After an intentional stop, rebuild the graph from a fresh provider transcript read. A Draft with no persisted message disappears. A working response is frozen only to the extent the provider persisted it, and later resume creates a fresh Draft after that persisted boundary. Never reconstruct or append transcript history from terminal emulator cells.
 
