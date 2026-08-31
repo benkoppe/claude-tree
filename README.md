@@ -2,7 +2,7 @@
 
 `/tree` (from `pi` agent) for Claude Code and other agents.
 
-`claude-tree` turns a project's agent conversations into a navigable message tree, making it much easier to manage long & winding sessions without a long, linear history. Sessions that are out of view keep running in the background in their provider's stock TUI.
+`claude-tree` turns a project's agent conversations into a navigable message tree, making it much easier to manage large & winding sessions without a long, linear history. Sessions that are out of view keep running in the background in their provider's native interface.
 
 Claude Code is selected by default. Pass `--codex` to use Codex, and optionally pass the project directory:
 
@@ -19,7 +19,7 @@ claude-tree --codex /path/to/project
 
 ### Bun
 
-Requires Linux or macOS, Bun 1.3.13 or newer, Claude Code 2.1.251 or Codex 0.150.1 on `$PATH`, and a truecolor terminal using a Nerd Font.
+Requires Linux or macOS, Bun 1.3.13 or newer, Claude Code or Codex on `$PATH`, and a truecolor terminal using a nerdfont.
 
 ```sh
 bun add --global github:benkoppe/claude-tree
