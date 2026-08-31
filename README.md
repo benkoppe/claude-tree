@@ -47,8 +47,6 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
-On macOS, the pinned Claude Code package requires the Nix sandbox to be relaxed or disabled so its embedded Bun runtime can read system ICU data.
-
 ## Development
 
 The development shell includes Bun and the validated provider CLIs available for the platform:
