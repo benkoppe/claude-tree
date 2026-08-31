@@ -5,9 +5,17 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+    bun2nix = {
+      url = "github:nix-community/bun2nix";
+      inputs.flake-parts.follows = "flake-parts";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     llm-agents = {
       url = "github:numtide/llm-agents.nix";
+      inputs.bun2nix.follows = "bun2nix";
       inputs.flake-parts.follows = "flake-parts";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
@@ -20,30 +28,12 @@
     inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
-
+        ./nix/package.nix
       ];
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
-        "x86_64-darwin"
       ];
-      perSystem =
-        {
-          inputs',
-          pkgs,
-          ...
-        }:
-        {
-          devShells.default = pkgs.mkShellNoCC {
-            packages = [
-              pkgs.bun
-              inputs'.llm-agents.packages.claude-code
-            ]
-            ++ pkgs.lib.optionals (inputs'.llm-agents.packages ? codex) [
-              inputs'.llm-agents.packages.codex
-            ];
-          };
-        };
     };
 }
