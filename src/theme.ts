@@ -11,6 +11,7 @@ export const theme = {
   selectedText: RGBA.fromHex("#082f49"),
   text: RGBA.fromHex("#e2e8f0"),
   textMuted: RGBA.fromHex("#94a3b8"),
+  separator: RGBA.fromHex("#334155"),
   connector: RGBA.fromHex("#64748b"),
   primary,
   secondary: RGBA.fromHex("#93c5fd"),
