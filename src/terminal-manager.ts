@@ -23,6 +23,8 @@ interface ManagedTerminal {
   draftPreview?: DraftPreview
   inputObserved: boolean
   activity: AgentActivity
+  cleanup?: () => Promise<void>
+  cleanupPromise?: Promise<void>
 }
 
 export interface TerminalExitEvent {
@@ -58,10 +60,12 @@ export class TerminalManager {
 
   async show(launch: TerminalLaunch): Promise<void> {
     if (this.shuttingDown) {
+      await launch.cleanup?.()
       throw new Error("Cannot open an agent session while claude-tree is shutting down")
     }
     let managed = this.terminals.get(launch.sessionId)
     if (managed && managed.state !== "running") {
+      await launch.cleanup?.()
       throw new Error(`Agent session ${launch.sessionId} is still stopping`)
     }
     if (managed && managed.exitCode !== null) {
@@ -70,8 +74,19 @@ export class TerminalManager {
       managed = undefined
     }
     if (!managed) {
-      managed = this.spawn(launch)
+      try {
+        managed = this.spawn(launch)
+      } catch (error) {
+        try {
+          await launch.cleanup?.()
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], "Unable to start the agent session")
+        }
+        throw error
+      }
       this.terminals.set(launch.sessionId, managed)
+    } else {
+      await launch.cleanup?.()
     }
 
     if (this.activeSessionId) {
@@ -122,6 +137,20 @@ export class TerminalManager {
 
   ownedSessionIds(): Set<string> {
     return new Set(this.terminals.keys())
+  }
+
+  replaceSessionId(previousSessionId: string, sessionId: string): boolean {
+    const managed = this.terminals.get(previousSessionId)
+    if (!managed) return false
+    const existing = this.terminals.get(sessionId)
+    if (existing && existing !== managed) {
+      throw new Error(`Agent session ${sessionId} already has an owned terminal`)
+    }
+    this.terminals.delete(previousSessionId)
+    managed.sessionId = sessionId
+    this.terminals.set(sessionId, managed)
+    if (this.activeSessionId === previousSessionId) this.activeSessionId = sessionId
+    return true
   }
 
   draftPreviews(): Map<string, DraftPreview> {
@@ -201,6 +230,10 @@ export class TerminalManager {
       signalProcessGroups(survivors, "SIGKILL", errors)
       await waitForProcessGroups(survivors, FORCED_SHUTDOWN_PERIOD_MS)
       await Promise.allSettled(pendingStops)
+      const cleanups = await Promise.allSettled(owned.map((managed) => this.cleanupManaged(managed)))
+      for (const cleanup of cleanups) {
+        if (cleanup.status === "rejected") errors.push(cleanup.reason)
+      }
     } finally {
       for (const managed of owned) {
         if (!managed.pty.closed) managed.pty.close()
@@ -232,6 +265,11 @@ export class TerminalManager {
       if (!managed.pty.closed) managed.pty.close()
       this.destroyEmulator(managed)
       if (managed.process.exitCode === null) managed.process.unref()
+      try {
+        await this.cleanupManaged(managed)
+      } catch (error) {
+        errors.push(error)
+      }
     }
 
     if (errors.length > 0) {
@@ -312,7 +350,7 @@ export class TerminalManager {
               observedActivity = activity
               if (managed) manager.setActivity(managed, activity)
             }
-            if (manager.activeSessionId === launch.sessionId) {
+            if (manager.activeSessionId === (managed?.sessionId ?? launch.sessionId)) {
               for (const text of clipboardWrites) renderer.copyToClipboardOSC52(text)
             }
             terminal.write(data)
@@ -347,10 +385,12 @@ export class TerminalManager {
       ...(launch.initialDraft === undefined ? {} : { draftPreview: launch.initialDraft }),
       inputObserved: false,
       activity: observedActivity,
+      ...(launch.cleanup === undefined ? {} : { cleanup: launch.cleanup }),
     }
     void process.exited.then(async (exitCode) => {
       managed.exitCode = exitCode
       await waitForPtyDrain(ptyClosed)
+      await this.cleanupManaged(managed).catch(() => undefined)
       if (managed.state !== "running") return
       if (this.terminals.get(managed.sessionId) !== managed) return
       const wasActive = this.activeSessionId === managed.sessionId
@@ -382,6 +422,11 @@ export class TerminalManager {
     if (managed.activity === activity) return
     managed.activity = activity
     this.onActivityChanged({ sessionId: managed.sessionId, activity })
+  }
+
+  private cleanupManaged(managed: ManagedTerminal): Promise<void> {
+    managed.cleanupPromise ??= managed.cleanup?.() ?? Promise.resolve()
+    return managed.cleanupPromise
   }
 
   private pruneExited(): void {

@@ -1,5 +1,5 @@
 {
-  description = "Explore and run Claude Code conversations as a tree";
+  description = "Explore and run coding-agent conversations as a tree";
 
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -9,6 +9,11 @@
       url = "github:numtide/llm-agents.nix";
       inputs.flake-parts.follows = "flake-parts";
     };
+  };
+
+  nixConfig = {
+    extra-substituters = [ "https://cache.numtide.com" ];
+    extra-trusted-public-keys = [ "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=" ];
   };
 
   outputs =
@@ -34,6 +39,9 @@
             packages = [
               pkgs.bun
               inputs'.llm-agents.packages.claude-code
+            ]
+            ++ pkgs.lib.optionals (inputs'.llm-agents.packages ? codex) [
+              inputs'.llm-agents.packages.codex
             ];
           };
         };

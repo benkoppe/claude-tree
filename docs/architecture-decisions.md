@@ -8,7 +8,7 @@ One provider is selected when the application starts and is injected into the ap
 
 Session and message identifiers are opaque provider strings. The core must not assume UUIDs, provider CLI flags, transcript payload formats, or a particular branching implementation. Historical branch results expose validated parent-to-child message correspondence so the graph can merge shared history without understanding how the provider created it.
 
-Branching is an explicit capability. A provider that cannot branch through a supported interface must report that limitation rather than editing transcripts or simulating fragile terminal input. The initial provider is Claude Code, and only one provider's sessions appear in a given application invocation.
+Branching is an explicit capability. A provider that cannot branch through a supported interface must report that limitation rather than editing transcripts or simulating fragile terminal input. Claude Code and Codex are shipped providers, and only one provider's sessions appear in a given application invocation.
 
 ## Stock Agent TUIs Run In Owned PTYs
 
@@ -22,7 +22,13 @@ The generic terminal manager executes provider-prepared commands and delegates a
 
 ## Provider APIs Are Session Tools, Not The Chat Runtime
 
-Use supported provider APIs for session discovery, message reads, and historical forks. For the Claude adapter, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation.
+Use supported provider APIs for session discovery, message reads, and historical forks. For the Claude adapter, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation. For Codex, short-lived `codex app-server --stdio` processes perform thread listing, reading, and forking; interactive work remains in the stock `codex resume <thread-id>` TUI.
+
+The initial SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.239 with Claude Code 2.1.239. Upgrade them deliberately and verify session compatibility together.
+
+The validated Codex baseline is 0.150.1. The app-server protocol and terminal telemetry are version-sensitive, so a different installed version is shown as a compatibility warning. One refresh batches all transcript reads through one app-server process, and every metadata operation closes its process after a bounded wait.
+
+Codex does not allocate or persist a new thread until its first user turn, so a fresh thread cannot be handed to `codex resume`. New Codex sessions instead launch the stock TUI against a dedicated authenticated loopback app-server and let the TUI call `thread/start` when the user submits that turn. The application initially owns that terminal under a temporary ID, then replaces it with the real ID reported by the sidecar's loaded-thread API. The terminal manager cleans up the sidecar with the TUI. Once the first turn is persisted, normal discovery and later resume use short-lived metadata operations and the ordinary local TUI path.
 
 Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
 
@@ -36,7 +42,7 @@ Apply navigator removals after constructing the complete graph so relationship a
 
 Sessions and forks not created or recorded by `claude-tree` should still be usable. When their ancestry cannot be established reliably, show them as independent roots rather than guessing from message content.
 
-## User Messages Replay From The Previous Agent
+## Claude User Messages Replay From The Previous Agent
 
 Forking an agent message copies the transcript through that exact SDK message. Forking a user message has different semantics: copy through its nearest earlier agent, then open the child with the selected user text in Claude's composer without submitting it. Transcript order is authoritative, and adjacent messages may have the same role.
 
@@ -48,6 +54,12 @@ Claude Code does not expose semantic composer state. The application may show a 
 
 Claude Code also does not expose semantic generation state to its terminal host. Observe its OSC terminal-title activity indicator directly from PTY output so hidden processes remain observable, with conservative matching against the last visible Claude screen as a fallback. An idle transition triggers a fresh SDK transcript read; keep the live endpoint visually pending until the rebuilt graph is ready so a completed agent message and its following draft leaf appear atomically. Keep activity state ephemeral and informational: process exit remains authoritative, and detection must not control permissions or inject input.
 
+## Codex Forks Only At Completed Turn Boundaries
+
+Codex app-server forks whole turns rather than arbitrary transcript items. A valid Codex fork target is therefore the final agent item in a completed turn. User-message replay, system-item targets, intra-turn targets, and incomplete turns fail before creating a child. After a fork, compare the copied child prefix against the source payloads and fail closed if Codex did not preserve it exactly.
+
+Codex terminal activity and draft previews are observed conservatively from its OSC title and visible composer. An action-required title remains active rather than being mistaken for completion, because the user must return to the stock TUI to resolve it.
+
 ## Graph Navigation Preserves Cursor Intent
 
 Vertical navigation follows visible graph edges: up selects the parent and down selects a child. It never falls diagonally into a neighboring branch. Horizontal navigation uses the same world-space node layout as rendering and may cross branches, root chains, and viewport boundaries.
@@ -56,7 +68,7 @@ Navigation retains a preferred world-space column for vertical movement and dept
 
 ## One Process For The Initial Product
 
-Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child Claude processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
+Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child agent processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
 
 Shutdown releases the navigator and terminal emulators immediately, then remains in the foreground for a short, bounded cleanup of each owned agent process group. Keep PTYs open during the graceful termination window so the agent can finish its signal handling; escalate surviving process groups and close their PTYs before the application exits.
 
@@ -68,7 +80,7 @@ After an intentional stop, rebuild the graph from a fresh provider transcript re
 
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 
-Do not run two live processes against the same Claude session ID, because concurrent transcript ownership is unsafe. Different branches may run concurrently.
+Do not run two live processes against the same provider session ID, because concurrent transcript ownership is unsafe. Different branches may run concurrently.
 
 ## Input And View Ownership
 

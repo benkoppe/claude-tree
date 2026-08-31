@@ -1,4 +1,4 @@
-import type { EmbeddedTerminalScreen } from "@opentui/core"
+import type { EmbeddedTerminalScreen, RGBA } from "@opentui/core"
 
 export interface AgentSession {
   id: string
@@ -41,11 +41,13 @@ export interface TerminalLaunch {
   env?: Record<string, string>
   observer: TerminalObserver
   initialDraft?: DraftPreview
+  cleanup?: () => Promise<void>
 }
 
 export interface PreparedSession {
   session: AgentSession
   launch: TerminalLaunch
+  startedSession?: Promise<AgentSession>
 }
 
 export interface SharedMessage {
@@ -65,12 +67,25 @@ export interface PreparedBranch extends PreparedSession {
   providerSessionCreated: boolean
 }
 
+export interface AgentNavigatorIdentity {
+  label: string
+  color: RGBA
+}
+
+export interface AgentSessionSnapshot {
+  sessions: AgentSession[]
+  transcripts: Map<string, AgentMessage[] | null>
+}
+
 export interface AgentProvider {
   readonly id: string
   readonly displayName: string
+  readonly navigatorIdentity: AgentNavigatorIdentity
+  readonly compatibilityWarning?: string | undefined
 
+  loadSessionSnapshot?(): Promise<AgentSessionSnapshot>
   listSessions(): Promise<AgentSession[]>
-  readTranscript(sessionId: string): Promise<AgentMessage[]>
+  readTranscripts(sessionIds: readonly string[]): Promise<Map<string, AgentMessage[] | null>>
   prepareNewSession(): Promise<PreparedSession>
   prepareResume(session: AgentSession): Promise<TerminalLaunch>
   branchFrom?(target: MessageRef): Promise<PreparedBranch>

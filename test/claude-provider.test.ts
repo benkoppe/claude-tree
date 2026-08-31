@@ -51,7 +51,7 @@ describe("Claude message normalization", () => {
       parent: [message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "assistant", "answer")],
     }))
 
-    expect((await provider.readTranscript(ROOT))[0]?.role).toBe("agent")
+    expect((await provider.readTranscripts([ROOT])).get(ROOT)?.[0]?.role).toBe("agent")
   })
 
   test("retains local command records internally but hides them from the graph", async () => {
@@ -98,7 +98,7 @@ describe("Claude message normalization", () => {
       parent: [command, output, noResponse, realResponse, syntheticError, prose],
     }))
 
-    const transcript = await provider.readTranscript(ROOT)
+    const transcript = (await provider.readTranscripts([ROOT])).get(ROOT) ?? []
 
     expect(transcript.map(({ id, ordinal, visible }) => ({ id, ordinal, visible }))).toEqual([
       { id: command.uuid, ordinal: 0, visible: false },

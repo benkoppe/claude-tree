@@ -215,6 +215,7 @@ export class AgentTreeApp {
   private preferredOpenSession: PreferredOpenSession | null = null
   private busy = false
   private stopping = false
+  private initialLoadPending = true
   private refreshGeneration = 0
   private activeRefresh: ActiveRefresh | null = null
   private spinnerFrame = 0
@@ -1208,7 +1209,13 @@ export class AgentTreeApp {
     this.render()
 
     try {
-      const discovered = await abortable(this.provider.listSessions(), controller.signal)
+      const snapshot = this.provider.loadSessionSnapshot
+        ? await abortable(this.provider.loadSessionSnapshot(), controller.signal)
+        : undefined
+      const discovered = snapshot?.sessions ?? await abortable(
+        this.provider.listSessions(),
+        controller.signal,
+      )
       if (!this.refreshCurrent(refresh)) return false
 
       const discoveredIds = new Set(discovered.map((session) => session.id))
@@ -1219,16 +1226,38 @@ export class AgentTreeApp {
       )
       const sessions = [...discovered, ...retainedTemporarySessions]
 
-      const transcriptEntries = await Promise.all(
-        sessions.map(async (session) => {
-          if (session.transient) return [session.id, [] as AgentMessage[]] as const
-          const transcript = await abortable(
-            this.provider.readTranscript(session.id),
-            controller.signal,
-          )
-          return [session.id, transcript] as const
-        }),
+      const persistedSessionIds = sessions
+        .filter((session) => !session.transient)
+        .map((session) => session.id)
+      const persistedTranscripts = new Map(snapshot?.transcripts)
+      const missingTranscriptIds = persistedSessionIds.filter(
+        (sessionId) => !persistedTranscripts.has(sessionId),
       )
+      if (missingTranscriptIds.length > 0) {
+        const missingTranscripts = await abortable(
+          this.provider.readTranscripts(missingTranscriptIds),
+          controller.signal,
+        )
+        for (const [sessionId, transcript] of missingTranscripts) {
+          persistedTranscripts.set(sessionId, transcript)
+        }
+      }
+      const availableSessions: AgentSession[] = []
+      const transcriptEntries: Array<readonly [string, AgentMessage[]]> = []
+      for (const session of sessions) {
+        if (session.transient) {
+          availableSessions.push(session)
+          transcriptEntries.push([session.id, []])
+          continue
+        }
+        const transcript = persistedTranscripts.get(session.id)
+        if (transcript === undefined) {
+          throw new Error(`${this.provider.displayName} did not return transcript ${session.id}`)
+        }
+        if (transcript === null) continue
+        availableSessions.push(session)
+        transcriptEntries.push([session.id, transcript])
+      }
       if (!this.refreshCurrent(refresh)) return false
       const previousRootSessionId = this.currentRootSessionId
       const previousNodeId = this.selectedGraphNodeId
@@ -1241,9 +1270,10 @@ export class AgentTreeApp {
           this.temporarySessions.delete(sessionId)
         }
       }
-      this.sessions = sessions
+      this.sessions = availableSessions
       this.transcripts = new Map(transcriptEntries)
       this.rebuildForest(runningIds)
+      this.initialLoadPending = false
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
 
@@ -1317,8 +1347,24 @@ export class AgentTreeApp {
 
   private async newSession(): Promise<void> {
     const prepared = await this.provider.prepareNewSession()
+    void prepared.startedSession?.catch(() => undefined)
     this.temporarySessions.set(prepared.session.id, prepared.session)
     await this.openTerminal(prepared.launch)
+    if (prepared.startedSession) {
+      void this.adoptStartedSession(prepared.session, prepared.startedSession).catch((error) => {
+        this.showError(error)
+      })
+    }
+  }
+
+  private async adoptStartedSession(
+    temporarySession: AgentSession,
+    startedSessionPromise: Promise<AgentSession>,
+  ): Promise<void> {
+    const startedSession = await startedSessionPromise
+    if (!this.terminalManager.replaceSessionId(temporarySession.id, startedSession.id)) return
+    this.temporarySessions.delete(temporarySession.id)
+    this.temporarySessions.set(startedSession.id, startedSession)
   }
 
   private async openSelectedLeaf(): Promise<void> {
@@ -1547,7 +1593,10 @@ export class AgentTreeApp {
   }
 
   private async openTerminal(launch: TerminalLaunch): Promise<void> {
-    if (this.stopping) throw new Error("claude-tree is shutting down")
+    if (this.stopping) {
+      await launch.cleanup?.()
+      throw new Error("claude-tree is shutting down")
+    }
     this.openLeafPicker.close()
     await this.terminalManager.show(launch)
     this.view = "terminal"
@@ -1587,7 +1636,7 @@ export class AgentTreeApp {
       this.renderer.terminalWidth < MINIMUM_WIDTH || this.renderer.terminalHeight < MINIMUM_HEIGHT
     this.header.content = tooSmall
       ? styledText([
-          chunk("󰙅 claude-tree", theme.primary, TextAttributes.BOLD),
+          ...this.renderAppIdentity(),
           chunk("\nResize to at least ", theme.textMuted),
           chunk(`${MINIMUM_WIDTH}×${MINIMUM_HEIGHT}`, theme.warning),
           chunk(` · current ${this.renderer.terminalWidth}×${this.renderer.terminalHeight}`, theme.textMuted),
@@ -1625,16 +1674,26 @@ export class AgentTreeApp {
       this.graphLayout = null
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
-      const rendered = renderRootPicker(
-        this.forest.graphs,
-        this.selectedRootIndex,
-        contentHeight,
-        contentWidth,
-        this.terminalManager.runningSessionIds(),
-        this.rootViewportStart,
-      )
-      this.rootViewportStart = rendered.startIndex
-      this.content.content = rendered.content
+      if (this.initialLoadPending) {
+        this.rootViewportStart = 0
+        this.content.content = styledText([
+          chunk(
+            `${BRAILLE_SPINNER_FRAMES[this.spinnerFrame % BRAILLE_SPINNER_FRAMES.length]} Loading conversations`,
+            theme.textMuted,
+          ),
+        ])
+      } else {
+        const rendered = renderRootPicker(
+          this.forest.graphs,
+          this.selectedRootIndex,
+          contentHeight,
+          contentWidth,
+          this.terminalManager.runningSessionIds(),
+          this.rootViewportStart,
+        )
+        this.rootViewportStart = rendered.startIndex
+        this.content.content = rendered.content
+      }
       const footer = this.renderRootFooter()
       this.footer.content = footer.content
       this.footerHitRegions = footer.hitRegions
@@ -1728,13 +1787,23 @@ export class AgentTreeApp {
         TextAttributes.NONE,
         background,
       ),
+      ...(this.provider.compatibilityWarning
+        ? [
+            chunk(
+              `\n\n${this.provider.compatibilityWarning}`,
+              theme.warning,
+              TextAttributes.NONE,
+              background,
+            ),
+          ]
+        : []),
     ]
     return styledText(chunks)
   }
 
   private renderHeader(): StyledText {
     const identity = [
-      chunk("󰙅 claude-tree", theme.primary, TextAttributes.BOLD),
+      ...this.renderAppIdentity(),
       chunk("  ", theme.textMuted),
       chunk(this.metadata.projectPath, theme.textMuted),
       chunk("\n", theme.text),
@@ -1749,6 +1818,18 @@ export class AgentTreeApp {
       chunk(truncateToWidth(title, Math.max(1, this.renderer.terminalWidth - 18)), theme.text, TextAttributes.BOLD),
       chunk("  Message graph", theme.textMuted),
     ])
+  }
+
+  private renderAppIdentity(): TextChunk[] {
+    return [
+      chunk("󰙅 claude-tree", theme.primary, TextAttributes.BOLD),
+      chunk("  ", theme.textMuted),
+      chunk(
+        this.provider.navigatorIdentity.label,
+        this.provider.navigatorIdentity.color,
+        TextAttributes.BOLD,
+      ),
+    ]
   }
 
   private renderRootFooter(): RenderedFooter {

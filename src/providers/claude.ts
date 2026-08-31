@@ -18,6 +18,7 @@ import type {
   PreparedSession,
   TerminalLaunch,
 } from "../agent-provider"
+import { theme } from "../theme"
 import { ClaudeTerminalObserver } from "./claude-terminal-observer"
 
 export interface ClaudeSdk {
@@ -53,6 +54,7 @@ interface ClaudeMessage extends AgentMessage {
 export class ClaudeProvider implements AgentProvider {
   readonly id = "claude"
   readonly displayName = "Claude Code"
+  readonly navigatorIdentity = { label: "Claude", color: theme.claude }
 
   constructor(
     private readonly projectPath: string,
@@ -69,8 +71,12 @@ export class ClaudeProvider implements AgentProvider {
     return sessions.map(toSessionSummary)
   }
 
-  async readTranscript(sessionId: string): Promise<AgentMessage[]> {
-    return this.readClaudeTranscript(sessionId)
+  async readTranscripts(sessionIds: readonly string[]): Promise<Map<string, AgentMessage[]>> {
+    return new Map(
+      await Promise.all(
+        sessionIds.map(async (sessionId) => [sessionId, await this.readClaudeTranscript(sessionId)] as const),
+      ),
+    )
   }
 
   async prepareNewSession(): Promise<PreparedSession> {

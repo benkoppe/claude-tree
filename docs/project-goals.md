@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`claude-tree` is a terminal application for exploring coding-agent conversations as a tree. Claude Code is the initial and currently supported provider. It should make it easy to move among related conversations, branch from an earlier message, and let several branches continue running without turning the user's terminal into a collection of panes.
+`claude-tree` is a terminal application for exploring coding-agent conversations as a tree. Claude Code and Codex are the supported providers. It should make it easy to move among related conversations, branch from an earlier provider-supported boundary, and let several branches continue running without turning the user's terminal into a collection of panes.
 
 The project exists to add navigation and orchestration around stock coding-agent interfaces, not to replace them.
 
@@ -15,7 +15,7 @@ The project exists to add navigation and orchestration around stock coding-agent
 - Allow a conversation to fork from a selected historical message while leaving the source conversation unchanged.
 - Use one shared working tree for all branches.
 
-The navigator and a selected Claude terminal are mutually exclusive views. A multipane dashboard is not the intended interface.
+The navigator and a selected agent terminal are mutually exclusive views. A multipane dashboard is not the intended interface.
 
 ## Preserve The Agent TUI
 
@@ -28,7 +28,7 @@ Provider-specific session formats, branching rules, launch arguments, and termin
 ## Reliability And Scope
 
 - The provider's own transcripts remain the source of truth for conversation content.
-- Application-owned data should be limited to relationships and UI state that Claude does not persist.
+- Application-owned data should be limited to relationships and UI state that the provider does not persist.
 - Exiting `claude-tree` may stop active child processes, but their persisted provider sessions must remain resumable later.
 - Concurrent branches are intentionally allowed to operate on the same files. Avoid hiding this fact or implying worktree isolation.
 - Prefer a small, understandable local application over daemon or distributed infrastructure unless a later requirement justifies that complexity.

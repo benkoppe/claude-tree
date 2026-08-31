@@ -11,6 +11,7 @@ import {
   type AgentMessage,
   type AgentProvider,
   type AgentSession,
+  type PreparedSession,
 } from "../src/agent-provider"
 import { AgentTreeApp } from "../src/app"
 import { displayWidth } from "../src/display-text"
@@ -55,6 +56,10 @@ test("renders navigator chrome against the terminal edges in both views", async 
     const roots = await waitForFrame(setup, (frame) => frame.includes("Layout conversation"))
     expectNavigatorChrome(roots, "Layout conversation")
     expect(roots).not.toContain("Refreshed")
+    const claudeIdentity = setup
+      .captureSpans()
+      .lines[0]?.spans.find((span) => span.text === "Claude")
+    expect(claudeIdentity?.fg.equals(theme.claude)).toBeTrue()
 
     setup.mockInput.pressEnter()
     const graph = await waitForFrame(
@@ -65,6 +70,100 @@ test("renders navigator chrome against the terminal edges in both views", async 
     expect(graph).not.toContain("Graph ready")
     expect(coordinateOf(graph, "question").x).toBe(26)
     expect(coordinateOf(graph, "question").y).toBe(12)
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("shows loading instead of an empty state during initial provider discovery", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const session: AgentSession = {
+    id: "delayed-session",
+    title: "Delayed conversation",
+    lastModified: 1,
+  }
+  let resolveSnapshot!: (snapshot: {
+    sessions: AgentSession[]
+    transcripts: Map<string, AgentMessage[] | null>
+  }) => void
+  const snapshot = new Promise<{
+    sessions: AgentSession[]
+    transcripts: Map<string, AgentMessage[] | null>
+  }>((resolve) => { resolveSnapshot = resolve })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async loadSessionSnapshot() { return snapshot },
+    async listSessions() { throw new Error("snapshot should be used") },
+    async readTranscripts() { throw new Error("snapshot should be used") },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    const loading = await waitForFrame(setup, (frame) => frame.includes("Loading conversations"))
+    expect(loading).not.toContain("No conversations")
+
+    resolveSnapshot({
+      sessions: [session],
+      transcripts: new Map([
+        [session.id, [{ id: "message", role: "user", preview: "Question", ordinal: 0, visible: true }]],
+      ]),
+    })
+    const loaded = await waitForFrame(setup, (frame) => frame.includes("Delayed conversation"))
+    expect(loaded).not.toContain("Loading conversations")
+    expect(loaded).not.toContain("No conversations")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("omits provider sessions whose persisted transcript became unavailable", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const availableId = "available-session"
+  const staleId = "stale-session"
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      return [
+        { id: availableId, title: "Available conversation", lastModified: 2 },
+        { id: staleId, title: "Stale conversation", lastModified: 1 },
+      ]
+    },
+    async readTranscripts() {
+      return new Map<string, AgentMessage[] | null>([
+        [availableId, [{ id: "message", role: "user", preview: "Question", ordinal: 0, visible: true }]],
+        [staleId, null],
+      ])
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume() {
+      throw new Error("not used")
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    const frame = await waitForFrame(setup, (candidate) => candidate.includes("Available conversation"))
+    expect(frame).not.toContain("Stale conversation")
   } finally {
     await app.stop()
     await running
@@ -87,11 +186,12 @@ test("returns to the navigator when the visible Claude process exits", async () 
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       return []
     },
-    async readTranscript() {
-      return []
+    async readTranscripts() {
+      return new Map()
     },
     async prepareNewSession() {
       const id = "new-session"
@@ -144,6 +244,112 @@ test("returns to the navigator when the visible Claude process exits", async () 
   }
 })
 
+test("replaces a temporary new-session id after the provider reports the real session", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(fakeAgent, '#!/bin/sh\nprintf "NEW_SESSION_ACTIVE\\r\\n"\nsleep 30\n')
+  await chmod(fakeAgent, 0o755)
+  let resolveStarted!: (session: AgentSession) => void
+  const startedSession = new Promise<AgentSession>((resolve) => { resolveStarted = resolve })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [] },
+    async readTranscripts() { return new Map() },
+    async prepareNewSession() {
+      return {
+        session: { id: "pending-session", title: "Pending conversation", lastModified: 1, transient: true },
+        launch: {
+          sessionId: "pending-session",
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+        startedSession,
+      }
+    },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitForFrame(setup, (frame) => frame.includes("NEW_SESSION_ACTIVE"))
+    resolveStarted({ id: "real-session", title: "Real conversation", lastModified: 2, transient: true })
+    await Bun.sleep(10)
+
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    setup.mockInput.pressKey("q")
+    const roots = await waitForFrame(setup, (frame) => frame.includes("Real conversation"))
+    expect(roots).not.toContain("Pending conversation")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("cleans a prepared terminal launch when shutdown wins the preparation race", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  let preparationStarted = false
+  let cleaned = false
+  let resolvePrepared!: (prepared: PreparedSession) => void
+  const prepared = new Promise<PreparedSession>((resolve) => { resolvePrepared = resolve })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    compatibilityWarning: undefined,
+    async listSessions() { return [] },
+    async readTranscripts() { return new Map() },
+    async prepareNewSession() {
+      preparationStarted = true
+      return prepared
+    },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitUntil(() => preparationStarted)
+    const stopping = app.stop()
+    resolvePrepared({
+      session: {
+        id: "new-session",
+        title: "New conversation",
+        lastModified: Date.now(),
+        transient: true,
+      },
+      launch: {
+        sessionId: "new-session",
+        command: [process.execPath],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+        cleanup: async () => { cleaned = true },
+      },
+    })
+    await stopping
+    await running
+    await waitUntil(() => cleaned)
+  } finally {
+    await app.stop()
+  }
+})
+
 test("shows an empty family while live and removes it after the terminal exits", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -176,11 +382,12 @@ const timer = setInterval(() => {
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       return started ? [savedSession] : []
     },
-    async readTranscript() {
-      return [
+    async readTranscripts(sessionIds) {
+      const transcript: AgentMessage[] = [
         {
           id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
           role: "user",
@@ -196,6 +403,7 @@ const timer = setInterval(() => {
           visible: false,
         },
       ]
+      return new Map(sessionIds.map((id) => [id, transcript]))
     },
     async prepareNewSession() {
       started = true
@@ -400,11 +608,12 @@ setInterval(() => undefined, 1_000)
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       return []
     },
-    async readTranscript() {
-      return []
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((id) => [id, []]))
     },
     async prepareNewSession() {
       newSessionCalls += 1
@@ -950,20 +1159,21 @@ sleep 30
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       listCalls += 1
       return sessions
     },
-    async readTranscript(sessionId) {
-      return [
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [
         {
           id: `${sessionId}-message`,
-          role: "user",
+          role: "user" as const,
           preview: `${sessionId} question`,
           ordinal: 0,
           visible: true,
         },
-      ]
+      ]]))
     },
     async prepareNewSession() {
       throw new Error("not used")
@@ -1136,11 +1346,12 @@ sleep 30
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       return sessions
     },
-    async readTranscript(sessionId) {
-      return transcripts.get(sessionId) ?? []
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, transcripts.get(sessionId) ?? []]))
     },
     async prepareNewSession() {
       throw new Error("not used")
@@ -1219,10 +1430,11 @@ sleep 30
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       return [session]
     },
-    async readTranscript() {
+    async readTranscripts(sessionIds) {
       const messages: AgentMessage[] = [
         {
           id: "kept-message",
@@ -1241,7 +1453,7 @@ sleep 30
           visible: true,
         })
       }
-      return messages
+      return new Map(sessionIds.map((sessionId) => [sessionId, messages]))
     },
     async prepareNewSession() {
       throw new Error("not used")
@@ -1658,19 +1870,20 @@ test("shows About from both navigator views and uses the same modal language as 
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       return sessions
     },
-    async readTranscript(sessionId) {
-      return [
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [
         {
           id: `${sessionId}-message`,
-          role: "user",
+          role: "user" as const,
           preview: `${sessionId} question`,
           ordinal: 0,
           visible: true,
         },
-      ]
+      ]]))
     },
     async prepareNewSession() {
       throw new Error("not used")
@@ -1840,12 +2053,13 @@ test("preserves return-to-graph focus when that refresh is restarted", async () 
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     async listSessions() {
       listCalls += 1
       return listCalls === 2 ? interruptedRefresh : [session]
     },
-    async readTranscript() {
-      return [
+    async readTranscripts(sessionIds) {
+      const transcript: AgentMessage[] = [
         {
           id: "focus-message",
           role: "user",
@@ -1854,6 +2068,7 @@ test("preserves return-to-graph focus when that refresh is restarted", async () 
           visible: true,
         },
       ]
+      return new Map(sessionIds.map((sessionId) => [sessionId, transcript]))
     },
     async prepareNewSession() {
       throw new Error("not used")
@@ -1967,9 +2182,10 @@ function testProvider(
   return {
     id: "test-agent",
     displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
     listSessions,
-    async readTranscript(sessionId) {
-      return [
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [
         {
           id: `message-${sessionId}`,
           role: "user",
@@ -1977,7 +2193,7 @@ function testProvider(
           ordinal: 0,
           visible: true,
         },
-      ]
+      ]]))
     },
     async prepareNewSession() {
       const id = "new-session"

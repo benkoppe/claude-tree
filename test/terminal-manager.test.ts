@@ -25,10 +25,32 @@ test("terminal ownership closes permanently when shutdown starts", async () => {
     const startedAt = performance.now()
     await manager.shutdown()
     expect(performance.now() - startedAt).toBeLessThan(250)
+    let cleaned = false
+    const rejectedLaunch = launch(process.execPath, "11111111-1111-4111-8111-111111111111")
+    rejectedLaunch.cleanup = async () => { cleaned = true }
     await expect(
-      manager.show(launch(process.execPath, "11111111-1111-4111-8111-111111111111")),
+      manager.show(rejectedLaunch),
     ).rejects.toThrow("shutting down")
+    expect(cleaned).toBeTrue()
   } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("runs provider cleanup when the terminal process exits", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  let cleaned = false
+  let exited = false
+  const manager = new TerminalManager(setup.renderer, () => { exited = true })
+  const terminalLaunch = launch(process.execPath, "11111111-1111-4111-8111-111111111111", ["-e", ""])
+  terminalLaunch.cleanup = async () => { cleaned = true }
+
+  try {
+    await manager.show(terminalLaunch)
+    await waitUntil(() => exited)
+    expect(cleaned).toBeTrue()
+  } finally {
+    await manager.shutdown(0)
     setup.renderer.destroy()
   }
 })
@@ -290,6 +312,39 @@ test("forwards OSC52 writes emitted by the child process", async () => {
     const deadline = performance.now() + 2_000
     while (copiedText === undefined && performance.now() < deadline) await Bun.sleep(10)
     expect(copiedText).toBe("https://example.com/login")
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("continues forwarding PTY telemetry after replacing a session id", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const fakeClaude = await createFakeClaude(
+    String.raw`sleep 0.05
+    printf '\033]0;\342\240\213 Claude Code\007'
+    printf '\033]52;c;cmVuYW1lZA==\007'
+    sleep 30`,
+  )
+  let copiedText: string | undefined
+  setup.renderer.copyToClipboardOSC52 = (text) => {
+    copiedText = text
+    return true
+  }
+  const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    (event) => activityChanges.push(event),
+  )
+
+  try {
+    await manager.show(launch(fakeClaude, "pending-session"))
+    expect(manager.replaceSessionId("pending-session", "real-session")).toBeTrue()
+    expect(manager.runningSessionIds()).toEqual(new Set(["real-session"]))
+    await waitUntil(() => copiedText !== undefined && activityChanges.length > 0)
+    expect(copiedText).toBe("renamed")
+    expect(activityChanges).toEqual([{ sessionId: "real-session", activity: "working" }])
   } finally {
     await manager.shutdown(50)
     setup.renderer.destroy()

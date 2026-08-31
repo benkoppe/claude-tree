@@ -20,4 +20,6 @@ export const theme = {
   success: RGBA.fromHex("#4ade80"),
   warning: RGBA.fromHex("#fbbf24"),
   danger: RGBA.fromHex("#f87171"),
+  claude: RGBA.fromHex("#d97757"),
+  codex: RGBA.fromHex("#8fa3b8"),
 } as const
