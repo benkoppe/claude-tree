@@ -11,6 +11,7 @@ import { AgentTreeApp } from "../src/app"
 import { displayWidth } from "../src/display-text"
 import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
 import { BranchMetadataStore } from "../src/metadata"
+import { PROGRAM_VERSION } from "../src/program"
 import { ClaudeProvider } from "../src/providers/claude"
 import { theme } from "../src/theme"
 
@@ -30,7 +31,7 @@ test("renders navigator chrome against the terminal edges in both views", async 
   const transcript = [
     sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
   ]
-  const provider = new ClaudeProvider(project, join(root, "unused-claude"), undefined, {
+  const provider = new ClaudeProvider(project, join(root, "unused-claude"), {
     async list(): Promise<SDKSessionInfo[]> {
       return [{ sessionId, summary: "Layout conversation", firstPrompt: "question", lastModified: Date.now() }]
     },
@@ -47,16 +48,18 @@ test("renders navigator chrome against the terminal edges in both views", async 
 
   try {
     const roots = await waitForFrame(setup, (frame) => frame.includes("Layout conversation"))
-    expectNavigatorChrome(roots, "Refreshed")
+    expectNavigatorChrome(roots, "Layout conversation")
+    expect(roots).not.toContain("Refreshed")
 
     setup.mockInput.pressEnter()
     const graph = await waitForFrame(
       setup,
       (frame) => frame.includes("Message graph") && frame.includes("question"),
     )
-    expectNavigatorChrome(graph, "Graph ready")
+    expectNavigatorChrome(graph, "Selected user · question")
+    expect(graph).not.toContain("Graph ready")
     expect(coordinateOf(graph, "question").x).toBe(26)
-    expect(coordinateOf(graph, "question").y).toBe(11)
+    expect(coordinateOf(graph, "question").y).toBe(12)
   } finally {
     await app.stop()
     await running
@@ -79,7 +82,6 @@ test("returns to the navigator when the visible Claude process exits", async () 
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
-    compatibilityWarning: undefined,
     async listSessions() {
       return []
     },
@@ -111,7 +113,7 @@ test("returns to the navigator when the visible Claude process exits", async () 
   const running = app.run()
 
   try {
-    await setup.renderOnce()
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
     setup.mockInput.pressKey("n")
 
     const deadline = performance.now() + 2_000
@@ -124,11 +126,11 @@ test("returns to the navigator when the visible Claude process exits", async () 
       if (frame.includes("CHILD_TERMINAL_ACTIVE") && !frame.includes("claude-tree")) {
         showedTerminal = true
       }
-      if (frame.includes("Test Agent session exited")) break
+      if (showedTerminal && frame.includes("Conversation roots")) break
     }
     expect(showedTerminal).toBeTrue()
     expect(frame).toContain("claude-tree")
-    expect(frame).toContain("Test Agent session exited")
+    expect(frame).not.toContain("session exited")
 
     setup.mockInput.pressKey("q")
     await running
@@ -137,7 +139,7 @@ test("returns to the navigator when the visible Claude process exits", async () 
   }
 })
 
-test("forwards x to Claude while the terminal owns input", async () => {
+test("forwards navigator shortcuts to Claude while the terminal owns input", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
   const state = join(root, "state")
@@ -154,7 +156,7 @@ sleep 30
   )
   await chmod(fakeClaude, 0o755)
 
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return []
     },
@@ -170,13 +172,14 @@ sleep 30
   const running = app.run()
 
   try {
-    await waitForFrame(setup, (frame) => frame.includes("No Claude Code conversations found"))
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
     setup.mockInput.pressKey("n")
     await Bun.sleep(30)
     setup.mockInput.pressKey("x")
+    setup.mockInput.pressKey("?")
     setup.mockInput.pressEnter()
     await waitUntil(() => Bun.file(inputMarker).exists())
-    expect(await readFile(inputMarker, "utf8")).toBe("x")
+    expect(await readFile(inputMarker, "utf8")).toBe("x?")
   } finally {
     await app.stop()
     await running
@@ -216,13 +219,13 @@ wait "$child"
   const running = app.run()
 
   try {
-    await setup.renderOnce()
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
     setup.mockInput.pressKey("n")
     const processIds = await readProcessIds(processMarker)
     setup.mockInput.pressKey(" ", { ctrl: true })
     const busyFrame = await waitForFrame(
       setup,
-      (frame) => frame.includes("Working") && frame.includes("q quit"),
+      (frame) => refreshSpinnerVisible(frame) && frame.includes("q quit"),
     )
 
     const startedAt = performance.now()
@@ -306,7 +309,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
     }),
   )
   let listCalls = 0
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       listCalls += 1
       return sessions
@@ -325,23 +328,23 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
   try {
     await waitForFrame(setup, (frame) => frame.includes("Root 1"))
     const rootList = coordinateOf(setup.captureCharFrame(), "Root 1")
-    for (let index = 0; index < 8; index += 1) {
+    for (let index = 0; index < 9; index += 1) {
       await setup.mockMouse.scroll(rootList.x, rootList.y, "down")
       await setup.renderOnce()
     }
     let frame = setup.captureCharFrame()
-    expect(frame).not.toContain("Root 1")
-    expect(isSelected(setup, "Root 9")).toBeTrue()
+    expect(frame).not.toContain("Root 1 ")
+    expect(isSelected(setup, "Root 10")).toBeTrue()
 
     const rootEight = coordinateOf(frame, "Root 8")
-    const rootNine = coordinateOf(frame, "Root 9")
-    await setup.mockMouse.drag(rootNine.x, rootNine.y, rootEight.x, rootEight.y)
+    const rootTen = coordinateOf(frame, "Root 10")
+    await setup.mockMouse.drag(rootTen.x, rootTen.y, rootEight.x, rootEight.y)
     await setup.renderOnce()
-    expect(isSelected(setup, "Root 9")).toBeTrue()
+    expect(isSelected(setup, "Root 10")).toBeTrue()
 
     await setup.mockMouse.click(rootEight.x, rootEight.y, MouseButtons.RIGHT)
     await setup.renderOnce()
-    expect(isSelected(setup, "Root 9")).toBeTrue()
+    expect(isSelected(setup, "Root 10")).toBeTrue()
 
     await setup.mockMouse.click(rootEight.x, rootEight.y)
     await setup.renderOnce()
@@ -388,7 +391,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
     await setup.mockMouse.click(refreshAction.x, refreshAction.y)
     await waitForFrame(
       setup,
-      (candidate) => listCalls > callsBeforeRefresh && candidate.includes("Refreshed"),
+      (candidate) => listCalls > callsBeforeRefresh && candidate.includes("r refresh"),
     )
   } finally {
     await app.stop()
@@ -435,7 +438,7 @@ sleep 30
     "assistant",
     "frozen partial response",
   )
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
         {
@@ -518,7 +521,7 @@ sleep 30
     await setup.mockMouse.click(actions.x + displayWidth("Cancel  "), actions.y)
     const frozen = await waitForFrame(
       setup,
-      (frame) => frame.includes("frozen partial response") && frame.includes("Claude Code session killed"),
+      (frame) => frame.includes("frozen partial response") && !frame.includes("Kill live session"),
     )
     expect(frozen).not.toContain("Draft")
     expect(BRAILLE_SPINNER_FRAMES.every((spinner) => !frozen.includes(spinner))).toBeTrue()
@@ -553,7 +556,7 @@ test("killing a draft removes it without fabricating transcript history", async 
     "user",
     "saved question",
   )
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
         {
@@ -588,7 +591,7 @@ test("killing a draft removes it without fabricating transcript history", async 
     setup.mockInput.pressEnter()
     const killed = await waitForFrame(
       setup,
-      (frame) => frame.includes("saved question") && frame.includes("Claude Code session killed"),
+      (frame) => frame.includes("saved question") && !frame.includes("Kill live session"),
     )
     expect(killed).not.toContain("Draft")
     expect(killed).not.toContain("Agent")
@@ -610,7 +613,7 @@ test("uses Ctrl+N and Ctrl+P to move through conversation roots", async () => {
     firstPrompt: `question ${index + 1}`,
     lastModified: 100 - index,
   }))
-  const provider = new ClaudeProvider(project, join(root, "unused-claude"), undefined, {
+  const provider = new ClaudeProvider(project, join(root, "unused-claude"), {
     async list(): Promise<SDKSessionInfo[]> {
       return sessions
     },
@@ -664,7 +667,7 @@ sleep 30
     sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "second"),
     sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "user", "third"),
   ]
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
         {
@@ -737,7 +740,7 @@ sleep 30
     sourceMessageId: sourceId,
     sharedMessages: [{ parentMessageId: sourceId, childMessageId: copiedSourceId }],
   })
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
         {
@@ -859,7 +862,7 @@ sleep 30
     "completed answer",
   )
   let transcript = [userMessage]
-  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
+  const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
         {
@@ -923,7 +926,237 @@ sleep 30
       .lines.flatMap((line) => line.spans)
       .find((span) => span.text.includes("Draft") && span.bg.equals(theme.selected))
     expect(selectedDraft).toBeDefined()
+
+    setup.mockInput.pressKey("q")
+    const roots = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Conversation roots") && frame.includes("● Live · Live conversation"),
+    )
+    expect(roots).not.toContain("Saved")
   } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("shows About from both navigator views and uses the same modal language as kill", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+
+  const sessions: AgentSession[] = [
+    { id: "about-session", title: "Primary conversation", lastModified: 2 },
+    { id: "other-session", title: "Other conversation", lastModified: 1 },
+  ]
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      return sessions
+    },
+    async readTranscript(sessionId) {
+      return [
+        {
+          id: `${sessionId}-message`,
+          role: "user",
+          preview: `${sessionId} question`,
+          ordinal: 0,
+          visible: true,
+        },
+      ]
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume() {
+      throw new Error("not used")
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    const roots = await waitForFrame(setup, (frame) => frame.includes("Primary conversation"))
+    expect(roots).not.toContain("All branches share this working tree.")
+    expect(roots).not.toContain("Refreshed")
+
+    setup.mockInput.pressKey("?")
+    const about = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("Settings") &&
+        frame.includes("About") &&
+        frame.includes("claude-tree") &&
+        frame.includes(`Version ${PROGRAM_VERSION}`) &&
+        frame.includes("Note: Branches are not isolated.") &&
+        frame.includes("can modify the same files."),
+    )
+    expect(about).not.toContain("┌")
+    expect(setup.captureSpans().lines[0]?.spans[0]?.bg.equals(theme.background)).toBeFalse()
+    expect(
+      setup
+        .captureSpans()
+        .lines.flatMap((line) => line.spans)
+        .some((span) => span.text.includes("About") && span.bg.equals(theme.selected)),
+    ).toBeTrue()
+
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEscape()
+    const closed = await waitForFrame(setup, (frame) => !frame.includes("Settings"))
+    expect(closed.split("\n")[23]?.trim()).toBe("Primary conversation")
+
+    const aboutAction = coordinateOf(closed, "? about")
+    await setup.mockMouse.click(aboutAction.x, aboutAction.y)
+    await waitForFrame(setup, (frame) => frame.includes("Settings") && frame.includes("About"))
+    setup.mockInput.pressKey("?")
+    await waitForFrame(setup, (frame) => !frame.includes("Settings"))
+
+    setup.mockInput.pressEnter()
+    const graph = await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    expect(graph).toContain("? about")
+    setup.mockInput.pressKey("?")
+    await waitForFrame(setup, (frame) => frame.includes("Settings") && frame.includes("About"))
+    await setup.mockMouse.click(0, 0)
+    await waitForFrame(setup, (frame) => frame.includes("Message graph") && !frame.includes("Settings"))
+
+    setup.mockInput.pressKey("x")
+    const error = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Error") && frame.includes("Select a live Draft or Agent to kill"),
+    )
+    expect(error).toContain("esc close")
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("Select a live Draft or Agent to kill"))
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("restarts an active refresh and ignores its late result", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+
+  let resolveStale!: (sessions: AgentSession[]) => void
+  const staleRefresh = new Promise<AgentSession[]>((resolve) => {
+    resolveStale = resolve
+  })
+  let listCalls = 0
+  const provider = testProvider(project, process.execPath, () => {
+    listCalls += 1
+    if (listCalls === 1) {
+      return Promise.resolve([{ id: "initial", title: "Initial", lastModified: 1 }])
+    }
+    if (listCalls === 2) return staleRefresh
+    return Promise.resolve([{ id: "newest", title: "Newest", lastModified: 3 }])
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Initial"))
+    setup.mockInput.pressKey("r")
+    const firstSpinner = await waitForFrame(setup, refreshSpinnerVisible)
+    const firstFrame = ["|", "/", "-", "\\"].find((spinner) =>
+      firstSpinner.includes(`${spinner} refresh`),
+    )!
+    await waitForFrame(
+      setup,
+      (frame) =>
+        refreshSpinnerVisible(frame) && !frame.includes(`${firstFrame} refresh`),
+    )
+
+    setup.mockInput.pressKey("r")
+    const newest = await waitForFrame(
+      setup,
+      (frame) => listCalls === 3 && frame.includes("Newest") && frame.includes("r refresh"),
+    )
+    expect(newest).not.toContain("Initial")
+
+    resolveStale([{ id: "stale", title: "Stale", lastModified: 2 }])
+    await Bun.sleep(20)
+    await setup.renderOnce()
+    const settled = setup.captureCharFrame()
+    expect(settled).toContain("Newest")
+    expect(settled).not.toContain("Stale")
+  } finally {
+    resolveStale([])
+    await app.stop()
+    await running
+  }
+})
+
+test("preserves return-to-graph focus when that refresh is restarted", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, "#!/bin/sh\nsleep 30\n")
+  await chmod(executable, 0o755)
+
+  const session: AgentSession = { id: "focus-session", title: "Focused", lastModified: 1 }
+  let resolveInterrupted!: (sessions: AgentSession[]) => void
+  const interruptedRefresh = new Promise<AgentSession[]>((resolve) => {
+    resolveInterrupted = resolve
+  })
+  let listCalls = 0
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    async listSessions() {
+      listCalls += 1
+      return listCalls === 2 ? interruptedRefresh : [session]
+    },
+    async readTranscript() {
+      return [
+        {
+          id: "focus-message",
+          role: "user",
+          preview: "focus question",
+          ordinal: 0,
+          visible: true,
+        },
+      ]
+    },
+    async prepareNewSession() {
+      throw new Error("not used")
+    },
+    async prepareResume(resumed) {
+      return {
+        sessionId: resumed.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Focused"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("focus question"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, refreshSpinnerVisible)
+
+    setup.mockInput.pressKey("r")
+    const graph = await waitForFrame(
+      setup,
+      (frame) => listCalls === 3 && frame.includes("Message graph") && frame.includes("focus question"),
+    )
+    expect(graph).not.toContain("Conversation roots")
+  } finally {
+    resolveInterrupted([])
     await app.stop()
     await running
   }
@@ -999,7 +1232,6 @@ function testProvider(
   return {
     id: "test-agent",
     displayName: "Test Agent",
-    compatibilityWarning: undefined,
     listSessions,
     async readTranscript() {
       return []
@@ -1075,12 +1307,16 @@ function isProcessAlive(processId: number): boolean {
   }
 }
 
-function expectNavigatorChrome(frame: string, status: string): void {
+function expectNavigatorChrome(frame: string, detail: string): void {
   const lines = frame.trimEnd().split("\n")
   const separator = "─".repeat(80)
   expect(lines).toHaveLength(24)
   expect(lines[0]).toContain("claude-tree")
   expect(lines[2]).toBe(separator)
-  expect(lines[20]).toBe(separator)
-  expect(lines[23]?.trim()).toBe(status)
+  expect(lines[21]).toBe(separator)
+  expect(lines[23]?.trim()).toBe(detail)
+}
+
+function refreshSpinnerVisible(frame: string): boolean {
+  return ["|", "/", "-", "\\"].some((spinner) => frame.includes(`${spinner} refresh`))
 }

@@ -47,7 +47,7 @@ describe("Claude message normalization", () => {
   })
 
   test("normalizes Claude's assistant role to the core agent role", async () => {
-    const provider = new ClaudeProvider("/project", "/usr/bin/claude", undefined, sdk({
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({
       parent: [message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "assistant", "answer")],
     }))
 
@@ -67,7 +67,7 @@ describe("Claude branching", () => {
       message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
     )
     let forkedAt: string | undefined
-    const provider = new ClaudeProvider("/project", "/usr/bin/claude", undefined, sdk({
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({
       parent,
       child,
       onFork(messageId) {
@@ -99,7 +99,7 @@ describe("Claude branching", () => {
 
   test("replays an initial user message as a related session with no shared history", async () => {
     const parent = [message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root prompt")]
-    const provider = new ClaudeProvider("/project", "/usr/bin/claude", undefined, sdk({ parent }))
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({ parent }))
 
     const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[0]!.uuid })
 
@@ -128,7 +128,7 @@ describe("Claude branching", () => {
       message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "question "),
       message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "answer"),
     ]
-    const provider = new ClaudeProvider("/project", "/usr/bin/claude", undefined, sdk({ parent, child }))
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({ parent, child }))
 
     await expect(
       provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),

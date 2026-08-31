@@ -68,7 +68,6 @@ export interface PreparedBranch extends PreparedSession {
 export interface AgentProvider {
   readonly id: string
   readonly displayName: string
-  readonly compatibilityWarning: string | undefined
 
   listSessions(): Promise<AgentSession[]>
   readTranscript(sessionId: string): Promise<AgentMessage[]>

@@ -20,8 +20,6 @@ import type {
 } from "../agent-provider"
 import { ClaudeTerminalObserver } from "./claude-terminal-observer"
 
-const EXPECTED_CLAUDE_VERSION = "2.1.239"
-
 export interface ClaudeSdk {
   list(options: {
     dir: string
@@ -53,7 +51,6 @@ export class ClaudeProvider implements AgentProvider {
   constructor(
     private readonly projectPath: string,
     private readonly executable: string,
-    readonly compatibilityWarning: string | undefined,
     private readonly sdk: ClaudeSdk = defaultSdk,
   ) {}
 
@@ -214,11 +211,7 @@ export class ClaudeProvider implements AgentProvider {
 export async function createClaudeProvider(projectPath: string): Promise<ClaudeProvider> {
   const executable = Bun.which("claude")
   if (!executable) throw new Error("Claude Code was not found on PATH")
-  const installedVersion = await readClaudeVersion(executable)
-  const compatibilityWarning = installedVersion.includes(EXPECTED_CLAUDE_VERSION)
-    ? undefined
-    : `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found ${installedVersion}`
-  return new ClaudeProvider(projectPath, executable, compatibilityWarning)
+  return new ClaudeProvider(projectPath, executable)
 }
 
 export function formatMessage(message: unknown): string {
@@ -291,17 +284,4 @@ function normalizePreview(value: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
-}
-
-async function readClaudeVersion(executable: string): Promise<string> {
-  const child = Bun.spawn([executable, "--version"], { stdout: "pipe", stderr: "pipe" })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (exitCode !== 0) {
-    throw new Error(`Unable to run Claude Code: ${stderr.trim() || `exit ${exitCode}`}`)
-  }
-  return stdout.trim()
 }

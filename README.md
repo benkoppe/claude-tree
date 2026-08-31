@@ -8,12 +8,10 @@ All conversations use the same working tree. Running branches can observe and ed
 
 - Linux or macOS on x86_64 or arm64
 - Bun 1.3 or newer
-- Claude Code 2.1.239 for the validated compatibility baseline
+- Claude Code
 - A truecolor terminal using a Nerd Font
 
-User-message replay relies on Claude Code 2.1.239's hidden `--prefill` option. Upgrading Claude Code requires revalidating that option as well as SDK session compatibility.
-
-The included Nix flake provides Bun and the validated Claude Code version:
+The included Nix flake provides Bun and Claude Code:
 
 ```sh
 direnv allow
@@ -48,6 +46,7 @@ Conversation roots:
 | `Enter` | Open the selected message graph |
 | `n` | Start a new root conversation |
 | `r` | Refresh sessions and messages |
+| `?` | Open About |
 | `q` or `Ctrl+C` | Exit |
 | Mouse wheel | Select the previous or next conversation family |
 | Left click a row | Select it; click it again while selected to open its graph |
@@ -66,6 +65,7 @@ Message graph:
 | `x` | Kill the selected live Draft or working Agent after confirmation |
 | `n` | Start a new root conversation |
 | `r` | Refresh the graph |
+| `?` | Open About |
 | `q` or `Escape` | Return to conversation roots |
 | `Ctrl+C` | Exit |
 | Left click a card | Select it; click it again while selected to open or resume |
@@ -94,7 +94,11 @@ Message nodes are filled cards labeled with Nerd Font icons and readable roles s
 
 Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
-Saved sessions end at their latest message. Pressing `Enter` on any message follows its descendants to the reachable session leaves. A single leaf opens immediately; multiple leaves appear in an `Open leaf` picker ordered by their distance below the selected message. The picker uses a small `•` beside leaves that already have a live session and leaves the same gutter blank for inactive sessions. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
+Saved sessions end at their latest message. Pressing `Enter` on any message follows its descendants to the reachable session leaves. A single leaf opens immediately; multiple leaves appear in an `Open leaf` picker ordered by their distance below the selected message. The picker uses a small `•` beside leaves that already have a live session and leaves the same gutter blank for inactive sessions. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Agent` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed agent message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. Conversation-root rows use `●` for live families and `○` for saved families. The footer identifies a live selection as `● Live · <name>` and otherwise shows only its name.
+
+Navigator footers contain only the keybindings and selection details. While a refresh is active, the `r` in `r refresh` becomes a rotating `|` `/` `-` `\` spinner. Starting another refresh aborts the previous application-level refresh immediately; any provider read that cannot be cancelled is prevented from committing a late result.
+
+Press `?` from either navigator view to open About. Its tabbed popup shows the program version and shared-working-tree notice. `?`, `q`, or `Escape` closes it. These keys remain ordinary provider input while its terminal owns the screen.
 
 Pressing `x` on a live Draft or working Agent opens a confirmation popup with `Kill` selected by default. Use the arrow keys, `h`/`j`/`k`/`l`, or `Tab` to choose; `Enter` confirms, while `q` or `Escape` cancels. Killing a Draft discards its in-memory composer preview. Killing a working Agent interrupts only that session, then refreshes Claude's persisted transcript. Any partial response Claude persisted appears as a completed Agent message; terminal screen cells are never copied into history. Resuming afterward starts a fresh Draft from the last persisted message. In Claude terminal mode, `x` remains ordinary Claude input.
 
@@ -142,5 +146,5 @@ The application core depends on an agent-provider contract for session discovery
 - A fork can be created before relationship metadata fails to save. In that case the Claude session is preserved and appears as an independent root.
 - OpenTUI's embedded terminal renders character cells, not Kitty graphics or Sixel images.
 - Clipboard forwarding depends on OSC52 support in the outer terminal and any intervening SSH or multiplexer configuration.
-- Draft observation is a conservative parse of Claude's visible input box, not a semantic composer API. It may be unavailable when the prompt is scrolled, visually abbreviated, or displayed by an incompatible Claude Code version.
+- Draft observation is a conservative parse of Claude's visible input box, not a semantic composer API. It may be unavailable when the prompt is scrolled or visually abbreviated.
 - Generation detection follows Claude's terminal title and visible activity UI rather than a semantic API. Disabling Claude's terminal title or changing these UI signals can make a hidden session's status unavailable or stale.

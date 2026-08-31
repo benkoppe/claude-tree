@@ -3,18 +3,19 @@
 import { createCliRenderer } from "@opentui/core"
 
 import { AgentTreeApp } from "./app"
+import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import { createClaudeProvider } from "./providers/claude"
 import { theme } from "./theme"
 
 async function main(): Promise<void> {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     process.stdout.write(
-      "claude-tree\n\nExplore and run this project's Claude Code conversations.\n\nRoot picker:\n  Up/Down or k/j  select a conversation family\n  Mouse wheel     select a conversation family\n  Click           select a row; click the selected row to open it\n  Enter           open its message graph\n  n               start a new conversation\n  q               quit\n\nMessage graph:\n  Up/Down or k/j  move along graph edges\n  Left/Right or h/l move across branches\n  Click           select a card; click the selected card to open it\n  Enter           open or resume the session ending at the selected node\n  f               fork or replay the selected message\n  x               kill the selected live endpoint after confirmation\n  q or Escape     return to roots\n\nKill confirmation:\n  Arrows, h/j/k/l, or Tab choose Kill or Cancel\n  Enter           confirm the selected choice\n  q or Escape     cancel\n\nFooter actions can also be clicked.\n\nClaude terminal:\n  Ctrl+Space      return to the message graph\n",
+      `${PROGRAM_NAME}\n\nExplore and run this project's Claude Code conversations.\n\nRoot picker:\n  Up/Down or k/j  select a conversation family\n  Mouse wheel     select a conversation family\n  Click           select a row; click the selected row to open it\n  Enter           open its message graph\n  n               start a new conversation\n  r               refresh conversations\n  ?               open About\n  q               quit\n\nMessage graph:\n  Up/Down or k/j  move along graph edges\n  Left/Right or h/l move across branches\n  Click           select a card; click the selected card to open it\n  Enter           open or resume the session ending at the selected node\n  f               fork or replay the selected message\n  x               kill the selected live endpoint after confirmation\n  n               start a new conversation\n  r               refresh the graph\n  ?               open About\n  q or Escape     return to roots\n\nKill confirmation:\n  Arrows, h/j/k/l, or Tab choose Kill or Cancel\n  Enter           confirm the selected choice\n  q or Escape     cancel\n\nFooter actions can also be clicked.\n\nClaude terminal:\n  Ctrl+Space      return to the message graph\n`,
     )
     return
   }
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
-    process.stdout.write("claude-tree 0.1.0\n")
+    process.stdout.write(`${PROGRAM_NAME} ${PROGRAM_VERSION}\n`)
     return
   }
   if (process.argv.length > 2) {
