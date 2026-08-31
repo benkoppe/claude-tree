@@ -6,6 +6,8 @@
 
 `claude-tree` does not create Git worktrees or restore files to their state at the fork point.
 
+Claude's local slash-command bookkeeping is retained internally for transcript integrity but omitted from message trees. Command-only conversations remain visible while active and disappear after their final process exits.
+
 ## Quick Start (Development)
 
 Requires Linux or macOS, Bun 1.3 or newer, Claude Code, and a truecolor terminal using a Nerd Font.
