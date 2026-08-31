@@ -26,6 +26,12 @@ export interface SessionEndpointNode extends GraphNodeBase {
   kind: "endpoint"
   session: AgentSession
   forkTarget?: ForkTarget
+  fork?: {
+    sourceNodeId: string
+    createdAt: string
+    empty: boolean
+    number?: number
+  }
 }
 
 export type MessageGraphNodeOrEndpoint = MessageGraphNode | SessionEndpointNode
@@ -237,7 +243,10 @@ function applyConversationRemovals(
 
     const origin = graph.nodes.get(graph.originNodeId)
     graph.rootNodeId = origin?.kind === "origin" ? (origin.childIds[0] ?? "") : ""
-    if (graph.nodes.size > 1) graphs.push(graph)
+    if (graph.nodes.size > 1) {
+      numberEmptyForkEndpoints(graph)
+      graphs.push(graph)
+    }
   }
 
   const graphBySessionId = new Map<string, ConversationGraph>()
@@ -400,6 +409,7 @@ function attachChildSession(
       child,
       finalMessageNodeId ?? graph.originNodeId,
       forkTargetForLastMessage(child.id, transcript),
+      { sourceNodeId, createdAt: relation.createdAt, empty: finalMessageNodeId === undefined },
     )
     contextFor(graph).set(child.id, context)
     return null
@@ -444,12 +454,14 @@ function attachChildSession(
     sourceMessageIds(relationsByParent.get(child.id)),
     context,
   )
-  const finalMessageNodeId = lastDefined(context.rawLogicalNodeIds, sharedPrefixLength) ?? sourceNodeId
+  const appendedMessageNodeId = lastDefined(context.rawLogicalNodeIds, sharedPrefixLength)
+  const finalMessageNodeId = appendedMessageNodeId ?? sourceNodeId
   appendEndpoint(
     graph,
     child,
     finalMessageNodeId,
     forkTargetForLastMessage(child.id, transcript),
+    { sourceNodeId, createdAt: relation.createdAt, empty: appendedMessageNodeId === undefined },
   )
   contextFor(graph).set(child.id, context)
   return null
@@ -493,6 +505,7 @@ function appendEndpoint(
   session: AgentSession,
   parentId: string | null,
   forkTarget?: ForkTarget,
+  fork?: SessionEndpointNode["fork"],
 ): string {
   const endpointId = `endpoint:${encodeURIComponent(session.id)}`
   graph.nodes.set(endpointId, {
@@ -502,10 +515,39 @@ function appendEndpoint(
     childIds: [],
     session,
     ...(forkTarget === undefined ? {} : { forkTarget }),
+    ...(fork === undefined ? {} : { fork }),
   })
   if (parentId) graph.nodes.get(parentId)?.childIds.push(endpointId)
   graph.endpointBySessionId.set(session.id, endpointId)
   return endpointId
+}
+
+function numberEmptyForkEndpoints(graph: ConversationGraph): void {
+  const endpointsBySource = new Map<string, SessionEndpointNode[]>()
+  for (const node of graph.nodes.values()) {
+    if (
+      node.kind !== "endpoint" ||
+      !node.fork?.empty
+    ) {
+      continue
+    }
+
+    const endpoints = endpointsBySource.get(node.fork.sourceNodeId) ?? []
+    endpoints.push(node)
+    endpointsBySource.set(node.fork.sourceNodeId, endpoints)
+  }
+
+  for (const endpoints of endpointsBySource.values()) {
+    endpoints.sort(
+      (left, right) =>
+        left.fork!.createdAt.localeCompare(right.fork!.createdAt) ||
+        left.session.id.localeCompare(right.session.id),
+    )
+    if (endpoints.length === 1) continue
+    for (let index = 0; index < endpoints.length; index += 1) {
+      endpoints[index]!.fork!.number = index + 1
+    }
+  }
 }
 
 export function resolveForkTarget(

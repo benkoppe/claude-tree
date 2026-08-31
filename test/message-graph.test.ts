@@ -104,6 +104,73 @@ describe("buildConversationForest", () => {
     })
   })
 
+  test("numbers visually empty forks in relation order and compacts after continuation", () => {
+    const parentMessages = [
+      message("source", "user", "source", 0),
+      message("continuation", "agent", "main path", 1),
+    ]
+    const firstMessages = [message("first-copy", "user", "source", 0)]
+    const secondMessages = [
+      message("second-copy", "user", "source", 0),
+      message("second-answer", "agent", "continued fork", 1),
+    ]
+    const thirdMessages = [message("third-copy", "user", "source", 0)]
+    const first = "first-fork"
+    const second = "second-fork"
+    const third = "third-fork"
+    const relations = [
+      relation(first, ROOT, parentMessages[0]!.id, shared(parentMessages, firstMessages, 1), 1),
+      relation(second, ROOT, parentMessages[0]!.id, shared(parentMessages, secondMessages, 1), 2),
+      relation(third, ROOT, parentMessages[0]!.id, shared(parentMessages, thirdMessages, 1), 3),
+    ]
+    const graph = buildConversationForest(
+      [
+        session(third, "Third", 10),
+        session(ROOT, "Root", 40),
+        session(first, "First", 30),
+        session(second, "Second", 20),
+      ],
+      new Map([
+        [ROOT, parentMessages],
+        [first, firstMessages],
+        [second, secondMessages],
+        [third, thirdMessages],
+      ]),
+      [relations[2]!, relations[0]!, relations[1]!],
+    ).graphs[0]!
+
+    const firstEndpoint = graph.nodes.get(graph.endpointBySessionId.get(first)!)
+    const secondEndpoint = graph.nodes.get(graph.endpointBySessionId.get(second)!)
+    const thirdEndpoint = graph.nodes.get(graph.endpointBySessionId.get(third)!)
+    expect(firstEndpoint?.kind === "endpoint" ? firstEndpoint.fork?.number : undefined).toBe(1)
+    expect(secondEndpoint?.kind === "endpoint" ? secondEndpoint.fork?.number : undefined).toBeUndefined()
+    expect(thirdEndpoint?.kind === "endpoint" ? thirdEndpoint.fork?.number : undefined).toBe(2)
+
+    const pruned = buildConversationForest(
+      [
+        session(third, "Third", 10),
+        session(ROOT, "Root", 40),
+        session(first, "First", 30),
+        session(second, "Second", 20),
+      ],
+      new Map([
+        [ROOT, parentMessages],
+        [first, firstMessages],
+        [second, secondMessages],
+        [third, thirdMessages],
+      ]),
+      relations,
+      [endpointRemoval(first, firstMessages[0]!.id)],
+    ).graphs[0]!
+    const survivingEndpoint = pruned.nodes.get(pruned.endpointBySessionId.get(third)!)
+    expect(
+      survivingEndpoint?.kind === "endpoint" ? survivingEndpoint.fork?.empty : undefined,
+    ).toBeTrue()
+    expect(
+      survivingEndpoint?.kind === "endpoint" ? survivingEndpoint.fork?.number : undefined,
+    ).toBeUndefined()
+  })
+
   test("fails closed and exposes a child as an independent root when its boundary is invalid", () => {
     const source = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0)
     const copied = message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "source", 0)

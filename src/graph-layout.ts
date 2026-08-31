@@ -64,10 +64,13 @@ export function visibleGraphNodeId(
 ): string | undefined {
   const node = nodeId ? graph.nodes.get(nodeId) : undefined
   if (!node || node.kind === "origin") return undefined
-  if (node.kind === "message" || visibleEndpointSessionIds.has(node.session.id)) {
+  if (isPositionedNode(graph, node, visibleEndpointSessionIds)) {
     return node.id
   }
-  return visibleGraphNodeId(graph, node.parentId ?? undefined, visibleEndpointSessionIds)
+  const fallbackNodeId = node.kind === "endpoint" && node.fork?.empty
+    ? node.fork.sourceNodeId
+    : node.parentId
+  return visibleGraphNodeId(graph, fallbackNodeId ?? undefined, visibleEndpointSessionIds)
 }
 
 export function initialVisibleGraphNodeId(
@@ -96,14 +99,14 @@ export function layoutConversationGraph(
   const position = (nodeId: string, depth: number): number => {
     const node = graph.nodes.get(nodeId)
     if (!node || node.kind === "origin") return 0
-    if (!isPositionedNode(node, visibleEndpointSessionIds)) {
+    if (!isPositionedNode(graph, node, visibleEndpointSessionIds)) {
       return 0
     }
 
     let center: number
     const visibleChildIds = node.childIds.filter((childId) => {
       const child = graph.nodes.get(childId)
-      return child ? isPositionedNode(child, visibleEndpointSessionIds) : false
+      return child ? isPositionedNode(graph, child, visibleEndpointSessionIds) : false
     })
     if (visibleChildIds.length === 0) {
       center = nextLeaf * stride + Math.floor(nodeWidth / 2)
@@ -125,7 +128,7 @@ export function layoutConversationGraph(
   const origin = graph.nodes.get(graph.originNodeId)
   for (const rootId of origin?.childIds ?? []) {
     const root = graph.nodes.get(rootId)
-    if (root && isPositionedNode(root, visibleEndpointSessionIds)) {
+    if (root && isPositionedNode(graph, root, visibleEndpointSessionIds)) {
       position(rootId, 0)
     }
   }
@@ -140,13 +143,22 @@ export function layoutConversationGraph(
 }
 
 function isPositionedNode(
+  graph: ConversationGraph,
   node: ConversationGraphNode,
   visibleEndpointSessionIds: ReadonlySet<string>,
 ): boolean {
-  return (
-    node.kind === "message" ||
-    (node.kind === "endpoint" && visibleEndpointSessionIds.has(node.session.id))
-  )
+  if (node.kind === "message") return true
+  if (node.kind === "origin") return false
+  if (visibleEndpointSessionIds.has(node.session.id)) return true
+  if (!node.fork?.empty) return false
+
+  const source = graph.nodes.get(node.fork.sourceNodeId)
+  return (source?.childIds ?? []).some((childId) => {
+    if (childId === node.id) return false
+    const child = graph.nodes.get(childId)
+    return child?.kind === "message" ||
+      (child?.kind === "endpoint" && visibleEndpointSessionIds.has(child.session.id))
+  })
 }
 
 export function directionalMove(

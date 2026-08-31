@@ -105,6 +105,7 @@ export function renderConversationGraph(
       positionedNode,
       nodeWidth,
       positionedNode.node.id === selectedNodeId,
+      runningSessionIds,
       draftPreviews,
       workingSessionIds,
       spinnerFrame,
@@ -241,6 +242,7 @@ function drawNode(
   positioned: PositionedGraphNode,
   width: number,
   selected: boolean,
+  runningSessionIds: Set<string>,
   draftPreviews: Map<string, DraftPreview>,
   workingSessionIds: Set<string>,
   spinnerFrame: number,
@@ -287,6 +289,15 @@ function drawNode(
       ...baseStyle,
       fg: selected ? theme.selectedText : theme.primary,
     })
+    return
+  }
+
+  if (!runningSessionIds.has(sessionId) && node.fork?.empty) {
+    const label = node.fork.number === undefined ? "Fork" : `Fork ${node.fork.number}`
+    drawHeading(canvas, x + 2, y, ICONS.branch, label, contentWidth, {
+      ...headerStyle,
+      fg: selected ? theme.selectedText : theme.accent,
+    }, headerStyle)
     return
   }
 
