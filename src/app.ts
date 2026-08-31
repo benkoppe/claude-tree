@@ -51,13 +51,20 @@ import { theme } from "./theme"
 
 const MINIMUM_WIDTH = 50
 const MINIMUM_HEIGHT = 12
+const NAVIGATOR_HORIZONTAL_MARGIN = 1
+const HEADER_HEIGHT = 2
+const FOOTER_HEIGHT = 3
+const SEPARATOR_HEIGHT = 1
+const NAVIGATOR_CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const COMPLETION_REFRESH_DELAY_MS = 75
 
 export class ClaudeTreeApp {
   private readonly navigator: BoxRenderable
   private readonly header: TextRenderable
+  private readonly headerSeparator: TextRenderable
   private readonly content: TextRenderable
+  private readonly footerSeparator: TextRenderable
   private readonly footer: TextRenderable
   private readonly terminalManager: TerminalManager
   private readonly sessionService: SessionService
@@ -119,14 +126,24 @@ export class ClaudeTreeApp {
       width: "100%",
       height: "100%",
       flexDirection: "column",
-      padding: 1,
       backgroundColor: theme.background,
       zIndex: 1,
     })
     this.header = new TextRenderable(renderer, {
       id: "header",
-      height: 2,
+      height: HEADER_HEIGHT,
+      marginX: NAVIGATOR_HORIZONTAL_MARGIN,
       fg: theme.text,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
+      content: "",
+    })
+    this.headerSeparator = new TextRenderable(renderer, {
+      id: "header-separator",
+      width: "100%",
+      height: SEPARATOR_HEIGHT,
+      fg: theme.separator,
       bg: theme.background,
       selectable: false,
       wrapMode: "none",
@@ -135,7 +152,18 @@ export class ClaudeTreeApp {
     this.content = new TextRenderable(renderer, {
       id: "graph-content",
       flexGrow: 1,
+      marginX: NAVIGATOR_HORIZONTAL_MARGIN,
       fg: theme.text,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
+      content: "",
+    })
+    this.footerSeparator = new TextRenderable(renderer, {
+      id: "footer-separator",
+      width: "100%",
+      height: SEPARATOR_HEIGHT,
+      fg: theme.separator,
       bg: theme.background,
       selectable: false,
       wrapMode: "none",
@@ -143,7 +171,8 @@ export class ClaudeTreeApp {
     })
     this.footer = new TextRenderable(renderer, {
       id: "footer",
-      height: 4,
+      height: FOOTER_HEIGHT,
+      marginX: NAVIGATOR_HORIZONTAL_MARGIN,
       fg: theme.textMuted,
       bg: theme.background,
       selectable: false,
@@ -151,7 +180,9 @@ export class ClaudeTreeApp {
       content: "",
     })
     this.navigator.add(this.header)
+    this.navigator.add(this.headerSeparator)
     this.navigator.add(this.content)
+    this.navigator.add(this.footerSeparator)
     this.navigator.add(this.footer)
     renderer.root.add(this.navigator)
   }
@@ -627,6 +658,8 @@ export class ClaudeTreeApp {
         ])
       : this.renderHeader()
     this.content.visible = !tooSmall
+    this.headerSeparator.visible = !tooSmall
+    this.footerSeparator.visible = !tooSmall
     this.footer.visible = !tooSmall
     if (tooSmall) {
       this.graphLayout = null
@@ -634,7 +667,17 @@ export class ClaudeTreeApp {
       return
     }
 
-    const contentHeight = Math.max(1, this.renderer.terminalHeight - 8)
+    const separator = styledText([
+      chunk("─".repeat(this.renderer.terminalWidth), theme.separator),
+    ])
+    this.headerSeparator.content = separator
+    this.footerSeparator.content = separator
+    const contentHeight = Math.max(
+      1,
+      this.renderer.terminalHeight - NAVIGATOR_CHROME_HEIGHT,
+    )
+    const contentWidth =
+      this.renderer.terminalWidth - NAVIGATOR_HORIZONTAL_MARGIN * 2
     if (this.view === "roots") {
       this.graphLayout = null
       this.graphNavigationIntent = null
@@ -642,7 +685,7 @@ export class ClaudeTreeApp {
         this.forest.graphs,
         this.selectedRootIndex,
         contentHeight,
-        this.renderer.terminalWidth - 2,
+        contentWidth,
         this.terminalManager.runningSessionIds(),
       )
       this.content.content = rendered.content
@@ -656,7 +699,7 @@ export class ClaudeTreeApp {
       const rendered = renderConversationGraph(
         graph,
         this.selectedGraphNodeId,
-        this.renderer.terminalWidth - 2,
+        contentWidth,
         contentHeight,
         this.terminalManager.runningSessionIds(),
         this.terminalManager.draftPreviews(),

@@ -17,6 +17,66 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
+test("renders navigator chrome against the terminal edges in both views", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const transcript = [
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "user",
+      "question",
+    ),
+  ]
+  const sessionService = new SessionService(project, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [
+        {
+          sessionId,
+          summary: "Layout conversation",
+          firstPrompt: "question",
+          lastModified: Date.now(),
+        },
+      ]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await ClaudeTreeApp.create(
+    setup.renderer,
+    project,
+    join(root, "unused-claude"),
+    undefined,
+    state,
+    sessionService,
+  )
+  const running = app.run()
+
+  try {
+    const roots = await waitForFrame(setup, (frame) => frame.includes("Layout conversation"))
+    expectNavigatorChrome(roots, "Refreshed")
+
+    setup.mockInput.pressEnter()
+    const graph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("question"),
+    )
+    expectNavigatorChrome(graph, "Graph ready")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("returns to the navigator when the visible Claude process exits", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -341,4 +401,14 @@ function isProcessAlive(processId: number): boolean {
   } catch {
     return false
   }
+}
+
+function expectNavigatorChrome(frame: string, status: string): void {
+  const lines = frame.trimEnd().split("\n")
+  const separator = "─".repeat(80)
+  expect(lines).toHaveLength(24)
+  expect(lines[0]).toContain("claude-tree")
+  expect(lines[2]).toBe(separator)
+  expect(lines[20]).toBe(separator)
+  expect(lines[23]?.trim()).toBe(status)
 }
