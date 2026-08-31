@@ -161,7 +161,7 @@ describe("validateRelations", () => {
 
 function relation(childSessionId: string, parentSessionId: string): BranchRelation {
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     childSessionId,
     parentSessionId,
     sourceMessageId: "33333333-3333-4333-8333-333333333333",

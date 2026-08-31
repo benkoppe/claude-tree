@@ -5,7 +5,7 @@ import { join } from "node:path"
 
 import { z } from "zod"
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 1
 
 const manifestSchema = z
   .object({

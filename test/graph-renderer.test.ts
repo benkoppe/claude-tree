@@ -391,7 +391,7 @@ function branchGraph() {
     message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "fork answer", 1),
   ]
   const relation: BranchRelation = {
-    schemaVersion: 2,
+    schemaVersion: 1,
     childSessionId: CHILD,
     parentSessionId: ROOT,
     sourceMessageId: parentMessages[0]!.id,
@@ -419,7 +419,7 @@ function rootReplayGraph() {
     0,
   )
   const relation: BranchRelation = {
-    schemaVersion: 2,
+    schemaVersion: 1,
     childSessionId: CHILD,
     parentSessionId: ROOT,
     sourceMessageId: rootMessage.id,
@@ -448,7 +448,7 @@ function unevenBranchGraph() {
     message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "short", 1),
   ]
   const relation: BranchRelation = {
-    schemaVersion: 2,
+    schemaVersion: 1,
     childSessionId: CHILD,
     parentSessionId: ROOT,
     sourceMessageId: parentMessages[0]!.id,

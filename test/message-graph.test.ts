@@ -178,7 +178,7 @@ describe("zero-prefix root replay", () => {
       true,
     )
     const relation: BranchRelation = {
-      schemaVersion: 2,
+      schemaVersion: 1,
       childSessionId: CHILD,
       parentSessionId: ROOT,
       sourceMessageId: rootMessage.id,
@@ -209,7 +209,7 @@ describe("zero-prefix root replay", () => {
     const rootMessage = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "original", 0)
     const replayMessage = message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "edited", 0)
     const relation: BranchRelation = {
-      schemaVersion: 2,
+      schemaVersion: 1,
       childSessionId: CHILD,
       parentSessionId: ROOT,
       sourceMessageId: rootMessage.id,
@@ -262,7 +262,7 @@ function relation(
   seconds = 0,
 ): BranchRelation {
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     childSessionId,
     parentSessionId,
     sourceMessageId,
