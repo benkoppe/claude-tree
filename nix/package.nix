@@ -86,10 +86,12 @@ _: {
       };
     in
     {
-      packages = {
+      packages = rec {
         claude-tree-unwrapped = claudeTreeUnwrapped;
         claude-tree = claudeTree;
-        default = claudeTree;
+
+        unwrapped = claude-tree-unwrapped;
+        default = claude-tree;
       };
 
       apps = rec {
