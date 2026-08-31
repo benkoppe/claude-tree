@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto"
-
 import {
   BoxRenderable,
   CliRenderEvents,
@@ -13,6 +11,12 @@ import {
   type TextChunk,
 } from "@opentui/core"
 
+import type {
+  AgentMessage,
+  AgentProvider,
+  AgentSession,
+  TerminalLaunch,
+} from "./agent-provider"
 import { displayWidth, truncateToWidth } from "./display-text"
 import {
   BRAILLE_SPINNER_FRAMES,
@@ -31,24 +35,17 @@ import {
 } from "./graph-layout"
 import {
   buildConversationForest,
-  resolveForkPlan,
+  resolveForkTarget,
   type ConversationForest,
   type ConversationGraph,
-  type ForkTarget,
   type MessageGraphNodeOrEndpoint,
   type SessionEndpointNode,
 } from "./message-graph"
 import { BranchMetadataStore, type BranchRelation } from "./metadata"
 import {
-  SessionService,
-  type ConversationMessage,
-  type SessionSummary,
-} from "./sessions"
-import {
   TerminalManager,
   type TerminalActivityEvent,
   type TerminalExitEvent,
-  type TerminalLaunch,
 } from "./terminal-manager"
 import { theme } from "./theme"
 
@@ -111,7 +108,7 @@ const GRAPH_FOOTER_CONTROLS: FooterControl[] = [
   { key: "q", description: "quit", action: "roots" },
 ]
 
-export class ClaudeTreeApp {
+export class AgentTreeApp {
   private readonly navigator: BoxRenderable
   private readonly header: TextRenderable
   private readonly headerSeparator: TextRenderable
@@ -119,15 +116,14 @@ export class ClaudeTreeApp {
   private readonly footerSeparator: TextRenderable
   private readonly footer: TextRenderable
   private readonly terminalManager: TerminalManager
-  private readonly sessionService: SessionService
-  private readonly temporarySessions = new Map<string, SessionSummary>()
+  private readonly temporarySessions = new Map<string, AgentSession>()
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
   private stopPromise: Promise<void> | undefined
 
   private relations: BranchRelation[]
-  private sessions: SessionSummary[] = []
-  private transcripts = new Map<string, ConversationMessage[]>()
+  private sessions: AgentSession[] = []
+  private transcripts = new Map<string, AgentMessage[]>()
   private forest: ConversationForest = { graphs: [], graphBySessionId: new Map(), warnings: [] }
   private view: "roots" | "graph" | "terminal" = "roots"
   private selectedRootIndex = 0
@@ -149,24 +145,16 @@ export class ClaudeTreeApp {
   private completionRefreshRunning = false
   private completionRefreshVersion = 0
   private readonly pendingCompletionRefreshes = new Map<string, number>()
-  private readonly compatibilityWarning: string | undefined
-
   private constructor(
     private readonly renderer: CliRenderer,
     private readonly metadata: BranchMetadataStore,
+    private readonly provider: AgentProvider,
     relations: BranchRelation[],
-    claudeExecutable: string,
-    compatibilityWarning?: string,
-    sessionService?: SessionService,
   ) {
     this.relations = relations
-    this.compatibilityWarning = compatibilityWarning
     this.status = "Ready"
-    this.sessionService = sessionService ?? new SessionService(metadata.projectPath)
     this.terminalManager = new TerminalManager(
       renderer,
-      metadata.projectPath,
-      claudeExecutable,
       (event) => this.onTerminalExited(event),
       (event) => this.onTerminalActivityChanged(event),
     )
@@ -251,21 +239,12 @@ export class ClaudeTreeApp {
   static async create(
     renderer: CliRenderer,
     projectDirectory: string,
-    claudeExecutable: string,
-    compatibilityWarning?: string,
+    provider: AgentProvider,
     stateHome?: string,
-    sessionService?: SessionService,
-  ): Promise<ClaudeTreeApp> {
-    const metadata = await BranchMetadataStore.open(projectDirectory, stateHome)
+  ): Promise<AgentTreeApp> {
+    const metadata = await BranchMetadataStore.openForProvider(projectDirectory, provider.id, stateHome)
     const relations = await metadata.loadRelations()
-    return new ClaudeTreeApp(
-      renderer,
-      metadata,
-      relations,
-      claudeExecutable,
-      compatibilityWarning,
-      sessionService,
-    )
+    return new AgentTreeApp(renderer, metadata, provider, relations)
   }
 
   async run(): Promise<void> {
@@ -317,8 +296,8 @@ export class ClaudeTreeApp {
     this.pendingCompletionRefreshes.delete(event.sessionId)
     const exitStatus =
       event.exitCode === 0
-        ? "Claude session exited"
-        : `Claude session exited with code ${event.exitCode}`
+        ? `${this.provider.displayName} session exited`
+        : `${this.provider.displayName} session exited with code ${event.exitCode}`
     if (event.wasActive) {
       this.view = "roots"
       this.navigator.visible = true
@@ -336,7 +315,7 @@ export class ClaudeTreeApp {
 
   private onTerminalActivityChanged(event: TerminalActivityEvent): void {
     if (this.stopping) return
-    if (event.generating) {
+    if (event.activity === "working") {
       this.pendingCompletionRefreshes.delete(event.sessionId)
       if (this.view !== "terminal") this.render()
       return
@@ -610,10 +589,10 @@ export class ClaudeTreeApp {
   private async refreshData(focusSessionId?: string, updateStatus = true): Promise<boolean> {
     const generation = ++this.refreshGeneration
     const pendingCompletions = new Map(this.pendingCompletionRefreshes)
-    const discovered = await this.sessionService.list()
+    const discovered = await this.provider.listSessions()
     if (generation !== this.refreshGeneration || this.stopping) return false
 
-    const discoveredIds = new Set(discovered.map((session) => session.sessionId))
+    const discoveredIds = new Set(discovered.map((session) => session.id))
     for (const sessionId of discoveredIds) this.temporarySessions.delete(sessionId)
     const runningIds = this.terminalManager.runningSessionIds()
     for (const [sessionId, session] of this.temporarySessions) {
@@ -623,8 +602,8 @@ export class ClaudeTreeApp {
 
     const transcriptEntries = await Promise.all(
       this.sessions.map(async (session) => {
-        if (session.transient) return [session.sessionId, [] as ConversationMessage[]] as const
-        return [session.sessionId, await this.sessionService.messages(session.sessionId)] as const
+        if (session.transient) return [session.id, [] as AgentMessage[]] as const
+        return [session.id, await this.provider.readTranscript(session.id)] as const
       }),
     )
     if (generation !== this.refreshGeneration || this.stopping) return false
@@ -672,38 +651,17 @@ export class ClaudeTreeApp {
       this.status =
         this.forest.warnings[0] ??
         (this.forest.graphs.length === 0
-          ? "No Claude conversations found. Press n to start one."
+          ? `No ${this.provider.displayName} conversations found. Press n to start one.`
           : "Refreshed")
     }
     this.clearPendingCompletions(pendingCompletions)
     return true
   }
 
-  private async newSession(
-    prefillText?: string,
-    replaySource?: ForkTarget,
-  ): Promise<void> {
-    const sessionId = randomUUID()
-    if (replaySource) {
-      const relation = await this.metadata.saveRelation({
-        childSessionId: sessionId,
-        parentSessionId: replaySource.sessionId,
-        sourceMessageId: replaySource.messageId,
-        copiedPrefixLength: 0,
-      })
-      this.relations.push(relation)
-    }
-    this.temporarySessions.set(sessionId, {
-      sessionId,
-      title: "New conversation",
-      lastModified: Date.now(),
-      transient: true,
-    })
-    await this.openTerminal({
-      kind: "new",
-      sessionId,
-      ...(prefillText === undefined ? {} : { prefillText }),
-    })
+  private async newSession(): Promise<void> {
+    const prepared = await this.provider.prepareNewSession()
+    this.temporarySessions.set(prepared.session.id, prepared.session)
+    await this.openTerminal(prepared.launch)
   }
 
   private async openSelectedLeaf(): Promise<void> {
@@ -719,7 +677,7 @@ export class ClaudeTreeApp {
         .sort(compareSessionEndpoints)[0]
     }
     if (endpoint?.kind !== "endpoint") {
-      this.status = "This message is not the end of a Claude session"
+      this.status = `This message is not the end of a ${this.provider.displayName} session`
       return
     }
 
@@ -727,75 +685,40 @@ export class ClaudeTreeApp {
   }
 
   private async openEndpoint(endpoint: SessionEndpointNode): Promise<void> {
-    await this.openTerminal({
-      kind: endpoint.session.transient ? "new" : "resume",
-      sessionId: endpoint.session.sessionId,
-    })
+    await this.openTerminal(await this.provider.prepareResume(endpoint.session))
   }
 
   private async forkSelectedNode(): Promise<void> {
     const graph = this.currentGraph()
     if (!graph || !this.selectedGraphNodeId) return
-    const plan = resolveForkPlan(graph, this.selectedGraphNodeId)
-    if (!plan) {
+    const target = resolveForkTarget(graph, this.selectedGraphNodeId)
+    if (!target) {
       this.status = "This node has no historical message to fork"
       return
     }
-    if (plan.kind !== "historical" && plan.prefillText === undefined) {
-      this.status = "This user message contains content that Claude cannot prefill"
+    if (!this.provider.branchFrom) {
+      this.status = `${this.provider.displayName} does not support historical branching`
       return
     }
-    if (plan.kind === "root-replay") {
-      await this.newSession(plan.prefillText, plan.source)
-      return
-    }
-
-    const target = plan.target
-
-    const parentTranscript = this.transcripts.get(target.sessionId) ?? []
-    const sourceIndex = parentTranscript.findIndex((message) => message.id === target.messageId)
-    if (sourceIndex < 0) throw new Error("The selected historical message is no longer available")
 
     this.status = "Forking conversation..."
     this.render()
-    const childSessionId = await this.sessionService.fork(target.sessionId, target.messageId)
-    const childTranscript = await this.sessionService.messages(childSessionId)
-    const copiedPrefixLength = sourceIndex + 1
-    const childPrefixEndMessageId = childTranscript[copiedPrefixLength - 1]?.id
-    if (!childPrefixEndMessageId) {
-      throw new Error(
-        `Fork ${childSessionId} was created, but its copied prefix could not be validated`,
-      )
-    }
+    const prepared = await this.provider.branchFrom(target)
 
     let relation: BranchRelation
     try {
-      relation = await this.metadata.saveRelation({
-        childSessionId,
-        parentSessionId: target.sessionId,
-        sourceMessageId: target.messageId,
-        copiedPrefixLength,
-        childPrefixEndMessageId,
-      })
+      relation = await this.metadata.saveRelation(prepared.derivation)
     } catch (error) {
+      if (!prepared.providerSessionCreated) throw error
       throw new Error(
-        `Fork ${childSessionId} was created, but ancestry could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+        `Fork ${prepared.session.id} was created, but ancestry could not be saved: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
 
     this.relations.push(relation)
-    const parentSession = this.sessions.find((session) => session.sessionId === target.sessionId)
-    this.temporarySessions.set(childSessionId, {
-      sessionId: childSessionId,
-      title: `${parentSession?.title ?? "Conversation"} (fork)`,
-      lastModified: Date.now(),
-    })
-    await this.refreshData(childSessionId)
-    await this.openTerminal({
-      kind: "resume",
-      sessionId: childSessionId,
-      ...(plan.kind === "prefilled" ? { prefillText: plan.prefillText } : {}),
-    })
+    this.temporarySessions.set(prepared.session.id, prepared.session)
+    if (!prepared.session.transient) await this.refreshData(prepared.session.id)
+    await this.openTerminal(prepared.launch)
   }
 
   private async openTerminal(launch: TerminalLaunch): Promise<void> {
@@ -895,7 +818,7 @@ export class ClaudeTreeApp {
         contentHeight,
         this.terminalManager.runningSessionIds(),
         this.terminalManager.draftPreviews(),
-        this.displayedGeneratingSessionIds(),
+        this.displayedWorkingSessionIds(),
         this.spinnerFrame,
         this.graphViewportOffset ?? undefined,
       )
@@ -961,8 +884,8 @@ export class ClaudeTreeApp {
     const result = [
       chunk(status, this.busy ? theme.primary : theme.text, this.busy ? TextAttributes.BOLD : TextAttributes.NONE),
     ]
-    if (this.compatibilityWarning) {
-      result.push(chunk("  ·  ", theme.textMuted), chunk(this.compatibilityWarning, theme.warning))
+    if (this.provider.compatibilityWarning) {
+      result.push(chunk("  ·  ", theme.textMuted), chunk(this.provider.compatibilityWarning, theme.warning))
     }
     return result
   }
@@ -971,16 +894,16 @@ export class ClaudeTreeApp {
     const selected = this.selectedGraphNode()
     if (!selected) return "No node selected"
     if (selected.kind === "endpoint") {
-      if (this.displayedGeneratingSessionIds().has(selected.session.sessionId)) {
-        return `Selected assistant · generating · ${selected.session.sessionId.slice(0, 8)}`
+      if (this.displayedWorkingSessionIds().has(selected.session.id)) {
+        return `Selected assistant · generating · ${selected.session.id.slice(0, 8)}`
       }
-      const draft = this.terminalManager.draftPreviews().get(selected.session.sessionId)
+      const draft = this.terminalManager.draftPreviews().get(selected.session.id)
       const draftDescription = draft ? draft.text.replace(/\s+/g, " ").trim() : "blank"
       const description = truncateToWidth(
         draftDescription,
         Math.max(20, this.renderer.terminalWidth - 32),
       )
-      return `Selected draft · ${description} · ${selected.session.sessionId.slice(0, 8)}`
+      return `Selected draft · ${description} · ${selected.session.id.slice(0, 8)}`
     }
     const role = selected.internal
       ? "internal"
@@ -994,13 +917,13 @@ export class ClaudeTreeApp {
 
   private updateSpinnerAnimation(): void {
     const graph = this.currentGraph()
-    const generatingSessionIds = this.displayedGeneratingSessionIds()
+    const workingSessionIds = this.displayedWorkingSessionIds()
     const shouldAnimate =
       this.view === "graph" &&
       this.renderer.terminalWidth >= MINIMUM_WIDTH &&
       this.renderer.terminalHeight >= MINIMUM_HEIGHT &&
       graph !== undefined &&
-      [...graph.sessionIds].some((sessionId) => generatingSessionIds.has(sessionId))
+      [...graph.sessionIds].some((sessionId) => workingSessionIds.has(sessionId))
     if (!shouldAnimate) {
       this.stopSpinnerAnimation()
       return
@@ -1018,13 +941,13 @@ export class ClaudeTreeApp {
     this.spinnerFrame = 0
   }
 
-  private displayedGeneratingSessionIds(): Set<string> {
+  private displayedWorkingSessionIds(): Set<string> {
     const runningSessionIds = this.terminalManager.runningSessionIds()
-    const generatingSessionIds = this.terminalManager.generatingSessionIds()
+    const workingSessionIds = this.terminalManager.workingSessionIds()
     for (const sessionId of this.pendingCompletionRefreshes.keys()) {
-      if (runningSessionIds.has(sessionId)) generatingSessionIds.add(sessionId)
+      if (runningSessionIds.has(sessionId)) workingSessionIds.add(sessionId)
     }
-    return generatingSessionIds
+    return workingSessionIds
   }
 
   private scheduleCompletionRefresh(): void {
@@ -1118,7 +1041,7 @@ function sameMouseAction(left: PendingMouseAction, right: PendingMouseAction): b
 function compareSessionEndpoints(left: SessionEndpointNode, right: SessionEndpointNode): number {
   return (
     right.session.lastModified - left.session.lastModified ||
-    left.session.sessionId.localeCompare(right.session.sessionId)
+    left.session.id.localeCompare(right.session.id)
   )
 }
 

@@ -5,7 +5,7 @@ import { join } from "node:path"
 
 import { z } from "zod"
 
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 const manifestSchema = z
   .object({
@@ -17,22 +17,28 @@ const manifestSchema = z
 const relationSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),
-    childSessionId: z.uuid(),
-    parentSessionId: z.uuid(),
-    sourceMessageId: z.uuid(),
-    copiedPrefixLength: z.number().int().nonnegative().optional(),
-    childPrefixEndMessageId: z.uuid().optional(),
+    childSessionId: z.string().min(1),
+    parentSessionId: z.string().min(1),
+    sourceMessageId: z.string().min(1),
+    sharedMessages: z.array(
+      z.object({
+        parentMessageId: z.string().min(1),
+        childMessageId: z.string().min(1),
+      }).strict(),
+    ),
     createdAt: z.iso.datetime(),
   })
   .strict()
   .superRefine((relation, context) => {
-    const hasPositivePrefix =
-      relation.copiedPrefixLength !== undefined && relation.copiedPrefixLength > 0
-    if (hasPositivePrefix !== (relation.childPrefixEndMessageId !== undefined)) {
-      context.addIssue({
-        code: "custom",
-        message: "positive copied prefixes require a child boundary message",
-      })
+    const parentIds = new Set<string>()
+    const childIds = new Set<string>()
+    for (const pair of relation.sharedMessages) {
+      if (parentIds.has(pair.parentMessageId) || childIds.has(pair.childMessageId)) {
+        context.addIssue({ code: "custom", message: "shared message mappings must be unique" })
+        break
+      }
+      parentIds.add(pair.parentMessageId)
+      childIds.add(pair.childMessageId)
     }
   })
 
@@ -52,16 +58,24 @@ export class BranchMetadataStore {
     this.projectPath = projectPath
   }
 
-  static async open(projectDirectory: string, stateHome?: string): Promise<BranchMetadataStore> {
+  static async openForProvider(
+    projectDirectory: string,
+    providerId: string,
+    stateHome?: string,
+  ): Promise<BranchMetadataStore> {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(providerId)) {
+      throw new Error(`Invalid provider ID: ${providerId}`)
+    }
     const projectPath = await realpath(projectDirectory)
     const baseStateDirectory = stateHome ?? resolveStateHome()
     const projectKey = createHash("sha256").update(projectPath).digest("hex")
-    const projectStateDirectory = join(baseStateDirectory, "claude-tree", "projects", projectKey)
+    const projectRootDirectory = join(baseStateDirectory, "claude-tree", "projects", projectKey)
+    const projectStateDirectory = join(projectRootDirectory, "providers", providerId)
     const relationDirectory = join(projectStateDirectory, "branches")
 
-    await mkdir(relationDirectory, { recursive: true, mode: 0o700 })
+    await mkdir(projectRootDirectory, { recursive: true, mode: 0o700 })
 
-    const manifestPath = join(projectStateDirectory, "project.json")
+    const manifestPath = join(projectRootDirectory, "project.json")
     const manifestFile = Bun.file(manifestPath)
     if (!(await manifestFile.exists())) {
       await writeJsonAtomically(manifestPath, {
@@ -77,6 +91,7 @@ export class BranchMetadataStore {
       )
     }
 
+    await mkdir(relationDirectory, { recursive: true, mode: 0o700 })
     return new BranchMetadataStore(projectPath, projectStateDirectory)
   }
 
@@ -91,7 +106,7 @@ export class BranchMetadataStore {
       const relation = relationSchema.parse(
         JSON.parse(await readFile(join(relationDirectory, entry.name), "utf8")),
       )
-      const expectedName = `${relation.childSessionId}.json`
+      const expectedName = relationFileName(relation.childSessionId)
       if (entry.name !== expectedName) {
         throw new Error(`Branch metadata ${entry.name} belongs in ${expectedName}`)
       }
@@ -115,7 +130,7 @@ export class BranchMetadataStore {
     const targetPath = join(
       this.projectStateDirectory,
       "branches",
-      `${relation.childSessionId}.json`,
+      relationFileName(relation.childSessionId),
     )
     if (await Bun.file(targetPath).exists()) {
       const existing = relationSchema.parse(JSON.parse(await readFile(targetPath, "utf8")))
@@ -125,9 +140,14 @@ export class BranchMetadataStore {
       return existing
     }
 
+    validateRelations([...(await this.loadRelations()), relation])
     await writeJsonAtomically(targetPath, relation)
     return relation
   }
+}
+
+function relationFileName(childSessionId: string): string {
+  return `${createHash("sha256").update(childSessionId).digest("hex")}.json`
 }
 
 export function validateRelations(relations: BranchRelation[]): void {

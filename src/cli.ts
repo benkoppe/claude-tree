@@ -2,10 +2,9 @@
 
 import { createCliRenderer } from "@opentui/core"
 
-import { ClaudeTreeApp } from "./app"
+import { AgentTreeApp } from "./app"
+import { createClaudeProvider } from "./providers/claude"
 import { theme } from "./theme"
-
-const EXPECTED_CLAUDE_VERSION = "2.1.239"
 
 async function main(): Promise<void> {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
@@ -25,14 +24,7 @@ async function main(): Promise<void> {
     throw new Error("claude-tree requires an interactive terminal")
   }
 
-  const claudeExecutable = Bun.which("claude")
-  if (!claudeExecutable) {
-    throw new Error("Claude Code was not found on PATH")
-  }
-  const installedVersion = await readClaudeVersion(claudeExecutable)
-  const compatibilityWarning = installedVersion.includes(EXPECTED_CLAUDE_VERSION)
-    ? undefined
-    : `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found ${installedVersion}`
+  const provider = await createClaudeProvider(process.cwd())
 
   const renderer = await createCliRenderer({
     exitOnCtrlC: false,
@@ -41,7 +33,7 @@ async function main(): Promise<void> {
     useKittyKeyboard: { events: true },
     backgroundColor: theme.background,
   })
-  let app: ClaudeTreeApp | undefined
+  let app: AgentTreeApp | undefined
   let stopRequested = false
   const stop = () => {
     stopRequested = true
@@ -53,12 +45,7 @@ async function main(): Promise<void> {
   process.on("SIGQUIT", stop)
 
   try {
-    app = await ClaudeTreeApp.create(
-      renderer,
-      process.cwd(),
-      claudeExecutable,
-      compatibilityWarning,
-    )
+    app = await AgentTreeApp.create(renderer, process.cwd(), provider)
     if (stopRequested) {
       await app.stop()
       return
@@ -72,22 +59,6 @@ async function main(): Promise<void> {
     if (app) await app.stop()
     else renderer.destroy()
   }
-}
-
-async function readClaudeVersion(executable: string): Promise<string> {
-  const process = Bun.spawn([executable, "--version"], {
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    process.exited,
-    new Response(process.stdout).text(),
-    new Response(process.stderr).text(),
-  ])
-  if (exitCode !== 0) {
-    throw new Error(`Unable to run Claude Code: ${stderr.trim() || `exit ${exitCode}`}`)
-  }
-  return stdout.trim()
 }
 
 void main().catch((error) => {

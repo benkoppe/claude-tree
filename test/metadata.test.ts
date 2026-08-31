@@ -18,13 +18,14 @@ describe("BranchMetadataStore", () => {
     const state = join(root, "state")
     await mkdir(project)
 
-    const store = await BranchMetadataStore.open(project, state)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
     const relation = await store.saveRelation({
       childSessionId: "22222222-2222-4222-8222-222222222222",
       parentSessionId: "11111111-1111-4111-8111-111111111111",
       sourceMessageId: "33333333-3333-4333-8333-333333333333",
-      copiedPrefixLength: 2,
-      childPrefixEndMessageId: "44444444-4444-4444-8444-444444444444",
+      sharedMessages: [
+        { parentMessageId: "parent-message", childMessageId: "child-message" },
+      ],
       createdAt: "2026-08-30T12:00:00.000Z",
     })
 
@@ -37,12 +38,12 @@ describe("BranchMetadataStore", () => {
     const project = join(root, "project")
     const state = join(root, "state")
     await mkdir(project)
-    const store = await BranchMetadataStore.open(project, state)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
 
     const manifestFiles = await filesRecursively(join(state, "claude-tree", "projects"))
     const manifestPath = manifestFiles.find((path) => path.endsWith("project.json"))
     expect(manifestPath).toBeDefined()
-    const branchPath = join(dirname(manifestPath!), "branches", "broken.json")
+    const branchPath = join(dirname(manifestPath!), "providers", "claude", "branches", "broken.json")
     await writeFile(branchPath, "{}\n")
 
     expect(store.loadRelations()).rejects.toThrow()
@@ -53,16 +54,17 @@ describe("BranchMetadataStore", () => {
     const project = join(root, "project")
     const state = join(root, "state")
     await mkdir(project)
-    const store = await BranchMetadataStore.open(project, state)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
     const childSessionId = "22222222-2222-4222-8222-222222222222"
     await store.saveRelation({
       childSessionId,
       parentSessionId: "11111111-1111-4111-8111-111111111111",
       sourceMessageId: "33333333-3333-4333-8333-333333333333",
+      sharedMessages: [],
     })
 
     const files = await filesRecursively(join(state, "claude-tree", "projects"))
-    const relationPath = files.find((path) => path.endsWith(`${childSessionId}.json`))
+    const relationPath = files.find((path) => path.endsWith(".json") && !path.endsWith("project.json"))
     expect(relationPath).toBeDefined()
     const contents = await readFile(relationPath!, "utf8")
     expect(() => JSON.parse(contents)).not.toThrow()
@@ -80,65 +82,90 @@ describe("validateRelations", () => {
     ).toThrow("cycle")
   })
 
-  test("requires a child boundary for positive copied prefixes", async () => {
+  test("does not persist a relation that creates a cycle", async () => {
     const root = await temporaryDirectory()
     const project = join(root, "project")
     const state = join(root, "state")
     await mkdir(project)
-    const store = await BranchMetadataStore.open(project, state)
+    const store = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+
+    await store.saveRelation({
+      childSessionId: "child",
+      parentSessionId: "parent",
+      sourceMessageId: "parent-message",
+      sharedMessages: [],
+    })
+    await expect(
+      store.saveRelation({
+        childSessionId: "parent",
+        parentSessionId: "child",
+        sourceMessageId: "child-message",
+        sharedMessages: [],
+      }),
+    ).rejects.toThrow("cycle")
+    expect(await store.loadRelations()).toHaveLength(1)
+  })
+
+  test("requires unique shared-message mappings", async () => {
+    const root = await temporaryDirectory()
+    const project = join(root, "project")
+    const state = join(root, "state")
+    await mkdir(project)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
 
     expect(
       store.saveRelation({
         childSessionId: "22222222-2222-4222-8222-222222222222",
         parentSessionId: "11111111-1111-4111-8111-111111111111",
         sourceMessageId: "33333333-3333-4333-8333-333333333333",
-        copiedPrefixLength: 2,
+        sharedMessages: [
+          { parentMessageId: "same-parent", childMessageId: "child-one" },
+          { parentMessageId: "same-parent", childMessageId: "child-two" },
+        ],
       }),
-    ).rejects.toThrow("positive copied prefixes require")
+    ).rejects.toThrow("shared message mappings must be unique")
   })
 
-  test("accepts a zero prefix without a child boundary", async () => {
+  test("accepts a relationship with no shared history", async () => {
     const root = await temporaryDirectory()
     const project = join(root, "project")
     const state = join(root, "state")
     await mkdir(project)
-    const store = await BranchMetadataStore.open(project, state)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
 
     const saved = await store.saveRelation({
       childSessionId: "22222222-2222-4222-8222-222222222222",
       parentSessionId: "11111111-1111-4111-8111-111111111111",
       sourceMessageId: "33333333-3333-4333-8333-333333333333",
-      copiedPrefixLength: 0,
+      sharedMessages: [],
     })
-    expect(saved.copiedPrefixLength).toBe(0)
-    expect(saved.childPrefixEndMessageId).toBeUndefined()
+    expect(saved.sharedMessages).toEqual([])
   })
 
-  test("rejects a child boundary for a zero prefix", async () => {
+  test("accepts opaque provider identifiers", async () => {
     const root = await temporaryDirectory()
     const project = join(root, "project")
     const state = join(root, "state")
     await mkdir(project)
-    const store = await BranchMetadataStore.open(project, state)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
 
-    expect(
-      store.saveRelation({
-        childSessionId: "22222222-2222-4222-8222-222222222222",
-        parentSessionId: "11111111-1111-4111-8111-111111111111",
-        sourceMessageId: "33333333-3333-4333-8333-333333333333",
-        copiedPrefixLength: 0,
-        childPrefixEndMessageId: "44444444-4444-4444-8444-444444444444",
-      }),
-    ).rejects.toThrow("positive copied prefixes require")
+    const saved = await store.saveRelation({
+      childSessionId: "session/child:opaque",
+      parentSessionId: "session/parent:opaque",
+      sourceMessageId: "turn:42",
+      sharedMessages: [],
+    })
+    expect(saved.childSessionId).toBe("session/child:opaque")
   })
 })
 
 function relation(childSessionId: string, parentSessionId: string): BranchRelation {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     childSessionId,
     parentSessionId,
     sourceMessageId: "33333333-3333-4333-8333-333333333333",
+    sharedMessages: [],
     createdAt: "2026-08-30T12:00:00.000Z",
   }
 }

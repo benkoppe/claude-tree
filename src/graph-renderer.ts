@@ -5,6 +5,7 @@ import {
   type TextChunk,
 } from "@opentui/core"
 
+import type { DraftPreview } from "./agent-provider"
 import { displayWidth, graphemes, truncateToWidth } from "./display-text"
 import type { ConversationGraph } from "./message-graph"
 import {
@@ -13,7 +14,6 @@ import {
   type PositionedGraphNode,
   layoutConversationGraph,
 } from "./graph-layout"
-import type { DraftPreview } from "./terminal-manager"
 import { theme } from "./theme"
 
 export interface RenderedText {
@@ -86,7 +86,7 @@ export function renderConversationGraph(
   viewportHeight: number,
   runningSessionIds: Set<string>,
   draftPreviews: Map<string, DraftPreview> = new Map(),
-  generatingSessionIds: Set<string> = new Set(),
+  workingSessionIds: Set<string> = new Set(),
   spinnerFrame = 0,
   viewportOffset?: ViewportOffset,
 ): RenderedGraph {
@@ -106,7 +106,7 @@ export function renderConversationGraph(
       nodeWidth,
       positionedNode.node.id === selectedNodeId,
       draftPreviews,
-      generatingSessionIds,
+      workingSessionIds,
       spinnerFrame,
     )
   }
@@ -242,7 +242,7 @@ function drawNode(
   width: number,
   selected: boolean,
   draftPreviews: Map<string, DraftPreview>,
-  generatingSessionIds: Set<string>,
+  workingSessionIds: Set<string>,
   spinnerFrame: number,
 ): void {
   const { node, x, y } = positioned
@@ -276,8 +276,8 @@ function drawNode(
     return
   }
 
-  const sessionId = node.session.sessionId
-  if (generatingSessionIds.has(sessionId)) {
+  const sessionId = node.session.id
+  if (workingSessionIds.has(sessionId)) {
     drawHeading(canvas, x + 2, y, ICONS.assistant, "Assistant", contentWidth, {
       ...headerStyle,
       fg: selected ? theme.selectedText : theme.primary,
@@ -294,7 +294,7 @@ function drawNode(
     ...headerStyle,
     fg: selected ? theme.selectedText : theme.info,
   }, headerStyle)
-  const draft = draftPreviews.get(node.session.sessionId)
+  const draft = draftPreviews.get(node.session.id)
   const description = draft ? normalizePreview(draft.text) : ""
   canvas.write(x + 2, y + 1, truncateToWidth(description, contentWidth), {
     ...baseStyle,

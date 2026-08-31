@@ -6,10 +6,11 @@ import { join } from "node:path"
 import { createTestRenderer, MouseButtons } from "@opentui/core/testing"
 import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-sdk"
 
-import { ClaudeTreeApp } from "../src/app"
+import { NullTerminalObserver, type AgentProvider, type AgentSession } from "../src/agent-provider"
+import { AgentTreeApp } from "../src/app"
 import { displayWidth } from "../src/display-text"
 import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
-import { SessionService } from "../src/sessions"
+import { ClaudeProvider } from "../src/providers/claude"
 import { theme } from "../src/theme"
 
 const temporaryDirectories: string[] = []
@@ -26,23 +27,11 @@ test("renders navigator chrome against the terminal edges in both views", async 
 
   const sessionId = "11111111-1111-4111-8111-111111111111"
   const transcript = [
-    sessionMessage(
-      sessionId,
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
-      "user",
-      "question",
-    ),
+    sessionMessage(sessionId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
   ]
-  const sessionService = new SessionService(project, {
+  const provider = new ClaudeProvider(project, join(root, "unused-claude"), undefined, {
     async list(): Promise<SDKSessionInfo[]> {
-      return [
-        {
-          sessionId,
-          summary: "Layout conversation",
-          firstPrompt: "question",
-          lastModified: Date.now(),
-        },
-      ]
+      return [{ sessionId, summary: "Layout conversation", firstPrompt: "question", lastModified: Date.now() }]
     },
     async messages(): Promise<SessionMessage[]> {
       return transcript
@@ -52,14 +41,7 @@ test("renders navigator chrome against the terminal edges in both views", async 
     },
   })
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await ClaudeTreeApp.create(
-    setup.renderer,
-    project,
-    join(root, "unused-claude"),
-    undefined,
-    state,
-    sessionService,
-  )
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
   try {
@@ -92,7 +74,38 @@ test("returns to the navigator when the visible Claude process exits", async () 
   await chmod(fakeClaude, 0o755)
 
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await ClaudeTreeApp.create(setup.renderer, project, fakeClaude, undefined, state)
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    compatibilityWarning: undefined,
+    async listSessions() {
+      return []
+    },
+    async readTranscript() {
+      return []
+    },
+    async prepareNewSession() {
+      const id = "new-session"
+      return {
+        session: { id, title: "New conversation", lastModified: Date.now(), transient: true },
+        launch: {
+          sessionId: id,
+          command: [fakeClaude],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [fakeClaude],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
   try {
@@ -109,11 +122,11 @@ test("returns to the navigator when the visible Claude process exits", async () 
       if (frame.includes("CHILD_TERMINAL_ACTIVE") && !frame.includes("claude-tree")) {
         showedTerminal = true
       }
-      if (frame.includes("Claude session exited")) break
+      if (frame.includes("Test Agent session exited")) break
     }
     expect(showedTerminal).toBeTrue()
     expect(frame).toContain("claude-tree")
-    expect(frame).toContain("Claude session exited")
+    expect(frame).toContain("Test Agent session exited")
 
     setup.mockInput.pressKey("q")
     await running
@@ -128,9 +141,9 @@ test("quit closes the UI immediately while live sessions finish shutting down", 
   const state = join(root, "state")
   const processMarker = join(root, "processes")
   await mkdir(project)
-  const fakeClaude = join(root, "claude")
+  const executable = join(root, "agent")
   await writeFile(
-    fakeClaude,
+    executable,
     `#!/bin/sh
 trap '' HUP TERM
 sleep 30 &
@@ -139,34 +152,19 @@ printf '%s %s\n' "$$" "$child" > ${JSON.stringify(processMarker)}
 wait "$child"
 `,
   )
-  await chmod(fakeClaude, 0o755)
+  await chmod(executable, 0o755)
 
   let listCalls = 0
-  let finishRefresh!: (sessions: SDKSessionInfo[]) => void
-  const blockedRefresh = new Promise<SDKSessionInfo[]>((resolve) => {
+  let finishRefresh!: (sessions: AgentSession[]) => void
+  const blockedRefresh = new Promise<AgentSession[]>((resolve) => {
     finishRefresh = resolve
   })
-  const sessionService = new SessionService(project, {
-    async list(): Promise<SDKSessionInfo[]> {
-      listCalls += 1
-      return listCalls === 1 ? [] : blockedRefresh
-    },
-    async messages(): Promise<SessionMessage[]> {
-      return []
-    },
-    async fork(): Promise<{ sessionId: string }> {
-      throw new Error("not used")
-    },
+  const provider = testProvider(project, executable, () => {
+    listCalls += 1
+    return listCalls === 1 ? Promise.resolve([]) : blockedRefresh
   })
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await ClaudeTreeApp.create(
-    setup.renderer,
-    project,
-    fakeClaude,
-    undefined,
-    state,
-    sessionService,
-  )
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
   try {
@@ -199,30 +197,13 @@ test("shutdown does not wait for an initial session refresh", async () => {
   const state = join(root, "state")
   await mkdir(project)
 
-  let finishRefresh!: (sessions: SDKSessionInfo[]) => void
-  const blockedRefresh = new Promise<SDKSessionInfo[]>((resolve) => {
+  let finishRefresh!: (sessions: AgentSession[]) => void
+  const blockedRefresh = new Promise<AgentSession[]>((resolve) => {
     finishRefresh = resolve
   })
-  const sessionService = new SessionService(project, {
-    async list(): Promise<SDKSessionInfo[]> {
-      return blockedRefresh
-    },
-    async messages(): Promise<SessionMessage[]> {
-      return []
-    },
-    async fork(): Promise<{ sessionId: string }> {
-      throw new Error("not used")
-    },
-  })
+  const provider = testProvider(project, process.execPath, () => blockedRefresh)
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await ClaudeTreeApp.create(
-    setup.renderer,
-    project,
-    process.execPath,
-    undefined,
-    state,
-    sessionService,
-  )
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
   try {
@@ -277,7 +258,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
     }),
   )
   let listCalls = 0
-  const sessionService = new SessionService(project, {
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
     async list(): Promise<SDKSessionInfo[]> {
       listCalls += 1
       return sessions
@@ -290,14 +271,7 @@ test("supports mouse selection, scrolling, activation, and footer actions", asyn
     },
   })
   const setup = await createTestRenderer({ width: 100, height: 15 })
-  const app = await ClaudeTreeApp.create(
-    setup.renderer,
-    project,
-    fakeClaude,
-    undefined,
-    state,
-    sessionService,
-  )
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
   const running = app.run()
 
   try {
@@ -406,7 +380,7 @@ sleep 30
     "completed answer",
   )
   let transcript = [userMessage]
-  const sessionService = new SessionService(project, {
+  const provider = new ClaudeProvider(project, fakeClaude, undefined, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
         {
@@ -425,13 +399,11 @@ sleep 30
     },
   })
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await ClaudeTreeApp.create(
+  const app = await AgentTreeApp.create(
     setup.renderer,
     project,
-    fakeClaude,
-    undefined,
+    provider,
     state,
-    sessionService,
   )
   const running = app.run()
 
@@ -538,6 +510,42 @@ async function waitForFrame(
     if (predicate(frame)) return frame
   }
   throw new Error(`Timed out waiting for frame:\n${frame}`)
+}
+
+function testProvider(
+  project: string,
+  executable: string,
+  listSessions: () => Promise<AgentSession[]>,
+): AgentProvider {
+  return {
+    id: "test-agent",
+    displayName: "Test Agent",
+    compatibilityWarning: undefined,
+    listSessions,
+    async readTranscript() {
+      return []
+    },
+    async prepareNewSession() {
+      const id = "new-session"
+      return {
+        session: { id, title: "New conversation", lastModified: Date.now(), transient: true },
+        launch: {
+          sessionId: id,
+          command: [executable],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
 }
 
 async function readProcessIds(path: string): Promise<number[]> {

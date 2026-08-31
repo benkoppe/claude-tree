@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { TextRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 
+import type { AgentMessage, AgentSession } from "../src/agent-provider"
 import { displayWidth, truncateToWidth } from "../src/display-text"
 import {
   directionalMove,
@@ -17,7 +18,6 @@ import {
 } from "../src/graph-renderer"
 import { buildConversationForest } from "../src/message-graph"
 import type { BranchRelation } from "../src/metadata"
-import type { ConversationMessage, SessionSummary } from "../src/sessions"
 import { theme } from "../src/theme"
 
 const ROOT = "11111111-1111-4111-8111-111111111111"
@@ -391,12 +391,14 @@ function branchGraph() {
     message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "fork answer", 1),
   ]
   const relation: BranchRelation = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     childSessionId: CHILD,
     parentSessionId: ROOT,
     sourceMessageId: parentMessages[0]!.id,
-    copiedPrefixLength: 1,
-    childPrefixEndMessageId: childMessages[0]!.id,
+    sharedMessages: [{
+      parentMessageId: parentMessages[0]!.id,
+      childMessageId: childMessages[0]!.id,
+    }],
     createdAt: "2026-08-30T12:00:00.000Z",
   }
   return buildConversationForest(
@@ -417,11 +419,11 @@ function rootReplayGraph() {
     0,
   )
   const relation: BranchRelation = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     childSessionId: CHILD,
     parentSessionId: ROOT,
     sourceMessageId: rootMessage.id,
-    copiedPrefixLength: 0,
+    sharedMessages: [],
     createdAt: "2026-08-30T12:00:00.000Z",
   }
   return buildConversationForest(
@@ -446,12 +448,14 @@ function unevenBranchGraph() {
     message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "short", 1),
   ]
   const relation: BranchRelation = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     childSessionId: CHILD,
     parentSessionId: ROOT,
     sourceMessageId: parentMessages[0]!.id,
-    copiedPrefixLength: 1,
-    childPrefixEndMessageId: childMessages[0]!.id,
+    sharedMessages: [{
+      parentMessageId: parentMessages[0]!.id,
+      childMessageId: childMessages[0]!.id,
+    }],
     createdAt: "2026-08-30T12:00:00.000Z",
   }
   return buildConversationForest(
@@ -472,15 +476,15 @@ function nodeIdByPreview(graph: ReturnType<typeof branchGraph>, preview: string)
   return node.id
 }
 
-function session(sessionId: string, title: string, lastModified: number): SessionSummary {
-  return { sessionId, title, lastModified }
+function session(id: string, title: string, lastModified: number): AgentSession {
+  return { id, title, lastModified }
 }
 
 function message(
   id: string,
-  role: ConversationMessage["role"],
+  role: AgentMessage["role"],
   preview: string,
-  rawIndex: number,
-): ConversationMessage {
-  return { id, role, preview, rawIndex, visible: true }
+  ordinal: number,
+): AgentMessage {
+  return { id, role, preview, ordinal, visible: true }
 }

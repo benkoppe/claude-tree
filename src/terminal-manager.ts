@@ -2,12 +2,11 @@ import {
   CliRenderEvents,
   EmbeddedTerminalRenderable,
   type CliRenderer,
-  type EmbeddedTerminalScreen,
   type Selection,
 } from "@opentui/core"
 
+import type { AgentActivity, DraftPreview, TerminalLaunch, TerminalObserver } from "./agent-provider"
 import { Osc52Forwarder } from "./clipboard"
-import { OscSequenceParser } from "./osc"
 
 const SHUTDOWN_GRACE_PERIOD_MS = 200
 const FORCED_SHUTDOWN_PERIOD_MS = 200
@@ -17,19 +16,11 @@ interface ManagedTerminal {
   process: Bun.Subprocess
   pty: Bun.Terminal
   terminal: EmbeddedTerminalRenderable
+  observer: TerminalObserver
   exitCode: number | null
   draftPreview?: DraftPreview
   inputObserved: boolean
-  generating: boolean
-}
-
-export type TerminalLaunch =
-  | { kind: "new"; sessionId: string; prefillText?: string }
-  | { kind: "resume"; sessionId: string; prefillText?: string }
-
-export interface DraftPreview {
-  text: string
-  exact: boolean
+  activity: AgentActivity
 }
 
 export interface TerminalExitEvent {
@@ -40,7 +31,7 @@ export interface TerminalExitEvent {
 
 export interface TerminalActivityEvent {
   sessionId: string
-  generating: boolean
+  activity: AgentActivity
 }
 
 export class TerminalManager {
@@ -51,8 +42,6 @@ export class TerminalManager {
 
   constructor(
     private readonly renderer: CliRenderer,
-    private readonly projectPath: string,
-    private readonly claudeExecutable: string,
     private readonly onProcessExited: (event: TerminalExitEvent) => void,
     private readonly onActivityChanged: (event: TerminalActivityEvent) => void = () => undefined,
   ) {
@@ -61,7 +50,7 @@ export class TerminalManager {
 
   async show(launch: TerminalLaunch): Promise<void> {
     if (this.shuttingDown) {
-      throw new Error("Cannot open a Claude session while claude-tree is shutting down")
+      throw new Error("Cannot open an agent session while claude-tree is shutting down")
     }
     let managed = this.terminals.get(launch.sessionId)
     if (managed && managed.exitCode !== null) {
@@ -118,10 +107,10 @@ export class TerminalManager {
     )
   }
 
-  generatingSessionIds(): Set<string> {
+  workingSessionIds(): Set<string> {
     return new Set(
       [...this.terminals.values()]
-        .filter((managed) => managed.exitCode === null && managed.generating)
+        .filter((managed) => managed.exitCode === null && managed.activity === "working")
         .map((managed) => managed.sessionId),
     )
   }
@@ -157,20 +146,17 @@ export class TerminalManager {
       }
     }
 
-    if (errors.length > 0) throw new AggregateError(errors, "Unable to stop every Claude process")
+    if (errors.length > 0) throw new AggregateError(errors, "Unable to stop every agent process")
   }
 
   private spawn(launch: TerminalLaunch): ManagedTerminal {
-    if (launch.prefillText?.includes("\0")) {
-      throw new Error("Claude prompt prefill cannot contain a null byte")
-    }
     const cols = Math.max(1, this.renderer.terminalWidth)
     const rows = Math.max(1, this.renderer.terminalHeight)
     let pty: Bun.Terminal | undefined
     const osc52 = new Osc52Forwarder()
-    const activityObserver = new ClaudeActivityObserver()
     const renderer = this.renderer
     const manager = this
+    let observedActivity: AgentActivity = "idle"
     let resolvePtyClosed!: () => void
     const ptyClosed = new Promise<void>((resolve) => {
       resolvePtyClosed = resolve
@@ -178,7 +164,7 @@ export class TerminalManager {
 
     let managed: ManagedTerminal | undefined
     const terminal = new EmbeddedTerminalRenderable(this.renderer, {
-      id: `claude-session-${launch.sessionId}`,
+      id: `agent-session-${encodeURIComponent(launch.sessionId)}`,
       position: "absolute",
       top: 0,
       left: 0,
@@ -198,25 +184,23 @@ export class TerminalManager {
       },
       onScreenChange() {
         if (!managed) return
-        const generating = observeClaudeGenerating(terminal.screen())
-        if (generating !== undefined) manager.setGenerating(managed, generating)
+        const activity = launch.observer.observeScreen(terminal.screen())
+        if (activity !== undefined) {
+          observedActivity = activity
+          manager.setActivity(managed, activity)
+        }
       },
     })
     this.renderer.root.add(terminal)
 
-    const args =
-      launch.kind === "new"
-        ? [this.claudeExecutable, "--session-id", launch.sessionId]
-        : [this.claudeExecutable, "--resume", launch.sessionId]
-    if (launch.prefillText !== undefined) args.push(`--prefill=${launch.prefillText}`)
-
     let process: Bun.Subprocess
     try {
-      process = Bun.spawn(args, {
-        cwd: this.projectPath,
+      process = Bun.spawn(launch.command, {
+        cwd: launch.cwd,
         detached: true,
         env: {
           ...globalThis.process.env,
+          ...launch.env,
           TERM: "xterm-256color",
           COLORTERM: "truecolor",
         },
@@ -227,8 +211,11 @@ export class TerminalManager {
             if (manager.shuttingDown) return
             pty = childPty
             const clipboardWrites = osc52.observe(data)
-            const generating = activityObserver.observe(data)
-            if (managed && generating !== undefined) manager.setGenerating(managed, generating)
+            const activity = launch.observer.observeOutput(data)
+            if (activity !== undefined) {
+              observedActivity = activity
+              if (managed) manager.setActivity(managed, activity)
+            }
             if (manager.activeSessionId === launch.sessionId) {
               for (const text of clipboardWrites) renderer.copyToClipboardOSC52(text)
             }
@@ -250,7 +237,7 @@ export class TerminalManager {
       process.kill()
       this.renderer.root.remove(terminal)
       terminal.destroy()
-      throw new Error("Bun did not create a pseudo-terminal for Claude")
+      throw new Error("Bun did not create a pseudo-terminal for the agent")
     }
 
     managed = {
@@ -258,12 +245,11 @@ export class TerminalManager {
       process,
       pty,
       terminal,
+      observer: launch.observer,
       exitCode: null,
-      ...(launch.prefillText === undefined
-        ? {}
-        : { draftPreview: { text: launch.prefillText.trim(), exact: true } }),
+      ...(launch.initialDraft === undefined ? {} : { draftPreview: launch.initialDraft }),
       inputObserved: false,
-      generating: activityObserver.generating ?? false,
+      activity: observedActivity,
     }
     void process.exited.then(async (exitCode) => {
       managed.exitCode = exitCode
@@ -284,7 +270,7 @@ export class TerminalManager {
   private captureDraft(managed: ManagedTerminal): void {
     const screen = managed.terminal.screen()
     if (!managed.inputObserved && managed.draftPreview?.exact) return
-    const observed = observeClaudeDraft(screen)
+    const observed = managed.observer.observeDraft(screen)
     if (observed !== undefined) {
       managed.draftPreview = { text: observed, exact: false }
     } else if (managed.inputObserved) {
@@ -293,10 +279,10 @@ export class TerminalManager {
     managed.inputObserved = false
   }
 
-  private setGenerating(managed: ManagedTerminal, generating: boolean): void {
-    if (managed.generating === generating) return
-    managed.generating = generating
-    this.onActivityChanged({ sessionId: managed.sessionId, generating })
+  private setActivity(managed: ManagedTerminal, activity: AgentActivity): void {
+    if (managed.activity === activity) return
+    managed.activity = activity
+    this.onActivityChanged({ sessionId: managed.sessionId, activity })
   }
 
   private pruneExited(): void {
@@ -325,92 +311,6 @@ export class TerminalManager {
     const selectedText = selection.getSelectedText()
     if (selectedText.length > 0) this.renderer.copyToClipboardOSC52(selectedText)
   }
-}
-
-export function observeClaudeDraft(screen: EmbeddedTerminalScreen): string | undefined {
-  const composer = observeClaudeComposer(screen)
-  return composer && composer.length > 0 ? composer : undefined
-}
-
-export function observeClaudeGenerating(screen: EmbeddedTerminalScreen): boolean | undefined {
-  const recentLines = screen.lines.filter((line) => line.trim().length > 0).slice(-12)
-  if (
-    recentLines.some(
-      (line) =>
-        /^\s*[⏸⏵].*esc to interrupt(?:\s|·|$)/u.test(line) ||
-        /^\s*[*·✢✶✻✽]\s+\S.*…(?:\s+\(\d+[smh](?:\s|·)|\s*$)/u.test(line),
-    )
-  ) {
-    return true
-  }
-  return observeClaudeComposer(screen) !== undefined ? false : undefined
-}
-
-export function claudeGeneratingFromTitle(title: string): boolean | undefined {
-  if (/^[\u2800-\u28ff\u25d0-\u25d3] /u.test(title)) return true
-  if (/^✳ /u.test(title)) return false
-  return undefined
-}
-
-class ClaudeActivityObserver {
-  private readonly parser = new OscSequenceParser()
-  generating: boolean | undefined
-
-  observe(bytes: Uint8Array): boolean | undefined {
-    let observed: boolean | undefined
-    for (const body of this.parser.observe(bytes)) {
-      const title = decodeOscTitle(body)
-      if (title === undefined) continue
-      const generating = claudeGeneratingFromTitle(title)
-      if (generating === undefined) continue
-      this.generating = generating
-      observed = generating
-    }
-    return observed
-  }
-}
-
-function decodeOscTitle(body: readonly number[]): string | undefined {
-  const separator = body.indexOf(0x3b)
-  if (separator < 0) return undefined
-  const command = Buffer.from(body.slice(0, separator)).toString("ascii")
-  if (command !== "0" && command !== "2") return undefined
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(
-      Uint8Array.from(body.slice(separator + 1)),
-    )
-  } catch {
-    return undefined
-  }
-}
-
-function observeClaudeComposer(screen: EmbeddedTerminalScreen): string | undefined {
-  if (!screen.cursor.visible) return undefined
-  const cursorRow = screen.cursor.y
-  if (cursorRow < 0 || cursorRow >= screen.lines.length) return undefined
-
-  for (let promptRow = cursorRow; promptRow >= Math.max(0, cursorRow - 20); promptRow -= 1) {
-    const match = screen.lines[promptRow]?.match(/^\s*[❯>]\s?(.*)$/u)
-    if (!match) continue
-
-    let borderRow = -1
-    for (let row = Math.max(promptRow + 1, cursorRow + 1); row < screen.lines.length; row += 1) {
-      if (isHorizontalRule(screen.lines[row] ?? "")) {
-        borderRow = row
-        break
-      }
-    }
-    if (borderRow < 0 || cursorRow >= borderRow) continue
-
-    const lines = [match[1] ?? "", ...screen.lines.slice(promptRow + 1, borderRow)]
-    const text = lines.join("\n").trim()
-    return text
-  }
-  return undefined
-}
-
-function isHorizontalRule(line: string): boolean {
-  return /^\s*[─━═-]{8,}\s*$/u.test(line)
 }
 
 async function waitForPtyDrain(ptyClosed: Promise<void>, timeoutMs = 250): Promise<void> {

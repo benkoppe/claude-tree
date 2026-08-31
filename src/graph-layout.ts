@@ -64,7 +64,7 @@ export function visibleGraphNodeId(
 ): string | undefined {
   const node = nodeId ? graph.nodes.get(nodeId) : undefined
   if (!node || node.kind === "origin") return undefined
-  if (node.kind === "message" || visibleEndpointSessionIds.has(node.session.sessionId)) {
+  if (node.kind === "message" || visibleEndpointSessionIds.has(node.session.id)) {
     return node.id
   }
   return visibleGraphNodeId(graph, node.parentId ?? undefined, visibleEndpointSessionIds)
@@ -145,7 +145,7 @@ function isPositionedNode(
 ): boolean {
   return (
     node.kind === "message" ||
-    (node.kind === "endpoint" && visibleEndpointSessionIds.has(node.session.sessionId))
+    (node.kind === "endpoint" && visibleEndpointSessionIds.has(node.session.id))
   )
 }
 

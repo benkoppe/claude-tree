@@ -5,10 +5,9 @@ import { join } from "node:path"
 
 import { createTestRenderer } from "@opentui/core/testing"
 
+import type { TerminalLaunch } from "../src/agent-provider"
+import { ClaudeTerminalObserver } from "../src/providers/claude-terminal-observer"
 import {
-  claudeGeneratingFromTitle,
-  observeClaudeDraft,
-  observeClaudeGenerating,
   TerminalManager,
 } from "../src/terminal-manager"
 
@@ -20,22 +19,14 @@ afterEach(async () => {
 
 test("terminal ownership closes permanently when shutdown starts", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    process.execPath,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
     const startedAt = performance.now()
     await manager.shutdown()
     expect(performance.now() - startedAt).toBeLessThan(250)
     await expect(
-      manager.show({
-        kind: "new",
-        sessionId: "11111111-1111-4111-8111-111111111111",
-      }),
+      manager.show(launch(process.execPath, "11111111-1111-4111-8111-111111111111")),
     ).rejects.toThrow("shutting down")
   } finally {
     setup.renderer.destroy()
@@ -47,25 +38,17 @@ test("shutdown releases emulators immediately and terminates the owned process g
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-shutdown-test-"))
   temporaryDirectories.push(directory)
   const processMarker = join(directory, "processes")
-  const fakeClaude = await createFakeClaude(
+  const executable = await createFakeClaude(
     `trap 'exit 0' HUP TERM
     (trap '' HUP TERM; sleep 30) &
     child=$!
     printf '%s %s\n' "$$" "$child" > ${JSON.stringify(processMarker)}
     wait "$child"`,
   )
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    fakeClaude,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
+    await manager.show(launch(executable, "11111111-1111-4111-8111-111111111111"))
     const processIds = await readProcessIds(processMarker)
 
     const startedAt = performance.now()
@@ -88,24 +71,16 @@ test("shutdown keeps the PTY open for graceful process cleanup", async () => {
   temporaryDirectories.push(directory)
   const readyMarker = join(directory, "ready")
   const resultMarker = join(directory, "result")
-  const fakeClaude = await createFakeClaude(
+  const executable = await createFakeClaude(
     `trap 'sleep 0.05; printf term > ${JSON.stringify(resultMarker)}; exit 0' TERM
     trap 'printf hup > ${JSON.stringify(resultMarker)}; exit 1' HUP
     printf '%s\n' "$$" > ${JSON.stringify(readyMarker)}
     while :; do sleep 30 & wait "$!"; done`,
   )
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    fakeClaude,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
+    await manager.show(launch(executable, "11111111-1111-4111-8111-111111111111"))
     await readProcessIds(readyMarker)
 
     await manager.shutdown(200)
@@ -116,7 +91,7 @@ test("shutdown keeps the PTY open for graceful process cleanup", async () => {
   }
 })
 
-test("passes a prefill only when spawning a Claude process", async () => {
+test("uses launch arguments and initial draft only when spawning a process", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-prefill-test-"))
   temporaryDirectories.push(directory)
@@ -127,11 +102,11 @@ test("passes a prefill only when spawning a Claude process", async () => {
     `#!/bin/sh\nprintf '%s\\n' "$@" > "${argumentsPath}"\nsleep 30\n`,
   )
   await chmod(executable, 0o755)
-  const manager = new TerminalManager(setup.renderer, process.cwd(), executable, () => undefined)
+  const manager = new TerminalManager(setup.renderer, () => undefined)
   const sessionId = "11111111-1111-4111-8111-111111111111"
 
   try {
-    await manager.show({ kind: "resume", sessionId, prefillText: "draft prompt" })
+    await manager.show(launch(executable, sessionId, ["--resume", sessionId, "--prefill=draft prompt"], "draft prompt"))
     await Bun.sleep(30)
     expect((await readFile(argumentsPath, "utf8")).trim().split("\n")).toEqual([
       "--resume",
@@ -145,79 +120,12 @@ test("passes a prefill only when spawning a Claude process", async () => {
 
     manager.hideActive()
     expect(manager.draftPreviews().get(sessionId)?.exact).toBeTrue()
-    await manager.show({ kind: "resume", sessionId, prefillText: "replacement" })
+    await manager.show(launch(executable, sessionId, ["--resume", sessionId, "--prefill=replacement"], "replacement"))
     expect((await readFile(argumentsPath, "utf8")).trim()).not.toContain("replacement")
   } finally {
     await manager.shutdown(50)
     setup.renderer.destroy()
   }
-})
-
-test("observes only a cursor-local Claude composer bounded by its rule", () => {
-  expect(
-    observeClaudeDraft({
-      text: "",
-      lines: ["old output", "────────────────", "❯ first line", "  second line", "────────────────", "status"],
-      columns: 40,
-      rows: 6,
-      cursor: { x: 8, y: 3, visible: true },
-    }),
-  ).toBe("first line\n  second line")
-  expect(
-    observeClaudeDraft({
-      text: "",
-      lines: ["❯ transcript text", "not a composer"],
-      columns: 40,
-      rows: 2,
-      cursor: { x: 5, y: 0, visible: true },
-    }),
-  ).toBeUndefined()
-  expect(
-    observeClaudeDraft({
-      text: "",
-      lines: ["❯ hidden cursor", "────────────────"],
-      columns: 40,
-      rows: 2,
-      cursor: { x: 5, y: 0, visible: false },
-    }),
-  ).toBeUndefined()
-})
-
-test("recognizes Claude's working and idle terminal titles", () => {
-  expect(claudeGeneratingFromTitle("⠋ Claude Code")).toBeTrue()
-  expect(claudeGeneratingFromTitle("◐ Claude Code")).toBeTrue()
-  expect(claudeGeneratingFromTitle("✳ Claude Code")).toBeFalse()
-  expect(claudeGeneratingFromTitle("project shell")).toBeUndefined()
-})
-
-test("uses the visible Claude footer and composer as activity fallbacks", () => {
-  expect(
-    observeClaudeGenerating({
-      text: "",
-      lines: ["✻ Cogitating… (12s · esc to interrupt)"],
-      columns: 40,
-      rows: 1,
-      cursor: { x: 0, y: 0, visible: false },
-    }),
-  ).toBeTrue()
-  expect(
-    observeClaudeGenerating({
-      text: "",
-      lines: ["❯ ", "────────────────"],
-      columns: 40,
-      rows: 2,
-      cursor: { x: 2, y: 0, visible: true },
-    }),
-  ).toBeFalse()
-  expect(
-    observeClaudeGenerating({
-      text: "",
-      lines: ["historical output"],
-      columns: 40,
-      rows: 1,
-      cursor: { x: 0, y: 0, visible: false },
-    }),
-  ).toBeUndefined()
 })
 
 test("tracks OSC activity transitions from a hidden process", async () => {
@@ -229,24 +137,22 @@ test("tracks OSC activity transitions from a hidden process", async () => {
     printf '\033]0;\342\234\263 Claude Code\007'
     sleep 30`,
   )
-  const activityChanges: Array<{ sessionId: string; generating: boolean }> = []
+  const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
   const manager = new TerminalManager(
     setup.renderer,
-    process.cwd(),
-    fakeClaude,
     () => undefined,
     (event) => activityChanges.push(event),
   )
   const sessionId = "11111111-1111-4111-8111-111111111111"
 
   try {
-    await manager.show({ kind: "new", sessionId })
+    await manager.show(launch(fakeClaude, sessionId))
     manager.hideActive()
-    await waitUntil(() => manager.generatingSessionIds().has(sessionId))
-    await waitUntil(() => !manager.generatingSessionIds().has(sessionId))
+    await waitUntil(() => manager.workingSessionIds().has(sessionId))
+    await waitUntil(() => !manager.workingSessionIds().has(sessionId))
     expect(activityChanges).toEqual([
-      { sessionId, generating: true },
-      { sessionId, generating: false },
+      { sessionId, activity: "working" },
+      { sessionId, activity: "idle" },
     ])
   } finally {
     await manager.shutdown(50)
@@ -256,18 +162,10 @@ test("tracks OSC activity transitions from a hidden process", async () => {
 
 test("an exited hidden process releases its emulator", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    process.execPath,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
+    await manager.show(launch(process.execPath, "11111111-1111-4111-8111-111111111111"))
     manager.hideActive()
 
     const deadline = performance.now() + 2_000
@@ -287,16 +185,11 @@ test("reports that the visible process exited", async () => {
   const exited = new Promise<{ sessionId: string; exitCode: number; wasActive: boolean }>((resolve) => {
     resolveExit = resolve
   })
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    process.execPath,
-    resolveExit,
-  )
+  const manager = new TerminalManager(setup.renderer, resolveExit)
 
   try {
     const sessionId = "11111111-1111-4111-8111-111111111111"
-    await manager.show({ kind: "new", sessionId })
+    await manager.show(launch(process.execPath, sessionId))
     expect(await exited).toEqual({ sessionId, exitCode: 1, wasActive: true })
     expect(setup.renderer.root.getChildrenCount()).toBe(0)
   } finally {
@@ -313,18 +206,10 @@ test("copies embedded-terminal selections through renderer OSC52", async () => {
     copiedText = text
     return true
   }
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    fakeClaude,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
+    await manager.show(launch(fakeClaude, "11111111-1111-4111-8111-111111111111"))
     await Bun.sleep(30)
     await setup.renderOnce()
     await setup.mockMouse.drag(0, 0, 13, 0)
@@ -345,18 +230,10 @@ test("forwards OSC52 writes emitted by the child process", async () => {
     copiedText = text
     return true
   }
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    fakeClaude,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
+    await manager.show(launch(fakeClaude, "11111111-1111-4111-8111-111111111111"))
     const deadline = performance.now() + 2_000
     while (copiedText === undefined && performance.now() < deadline) await Bun.sleep(10)
     expect(copiedText).toBe("https://example.com/login")
@@ -382,22 +259,11 @@ test("does not forward OSC52 writes from hidden child processes", async () => {
     copiedTexts.push(text)
     return true
   }
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    fakeClaude,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
-    await manager.show({
-      kind: "new",
-      sessionId: "22222222-2222-4222-8222-222222222222",
-    })
+    await manager.show(launch(fakeClaude, "11111111-1111-4111-8111-111111111111"))
+    await manager.show(launch(fakeClaude, "22222222-2222-4222-8222-222222222222"))
     await Bun.sleep(150)
     expect(copiedTexts).toEqual(["active"])
   } finally {
@@ -415,22 +281,11 @@ test("a hidden process exit preserves the active terminal selection", async () =
     esac`,
   )
   setup.renderer.copyToClipboardOSC52 = () => true
-  const manager = new TerminalManager(
-    setup.renderer,
-    process.cwd(),
-    fakeClaude,
-    () => undefined,
-  )
+  const manager = new TerminalManager(setup.renderer, () => undefined)
 
   try {
-    await manager.show({
-      kind: "new",
-      sessionId: "11111111-1111-4111-8111-111111111111",
-    })
-    await manager.show({
-      kind: "new",
-      sessionId: "22222222-2222-4222-8222-222222222222",
-    })
+    await manager.show(launch(fakeClaude, "11111111-1111-4111-8111-111111111111"))
+    await manager.show(launch(fakeClaude, "22222222-2222-4222-8222-222222222222"))
     await Bun.sleep(30)
     await setup.renderOnce()
     await setup.mockMouse.drag(0, 0, 17, 0)
@@ -451,6 +306,23 @@ async function createFakeClaude(body: string): Promise<string> {
   await writeFile(executable, `#!/bin/sh\n${body}\n`)
   await chmod(executable, 0o755)
   return executable
+}
+
+function launch(
+  executable: string,
+  sessionId: string,
+  args: string[] = ["--session-id", sessionId],
+  initialDraft?: string,
+): TerminalLaunch {
+  return {
+    sessionId,
+    command: [executable, ...args],
+    cwd: process.cwd(),
+    observer: new ClaudeTerminalObserver(),
+    ...(initialDraft === undefined
+      ? {}
+      : { initialDraft: { text: initialDraft, exact: true } }),
+  }
 }
 
 async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<void> {

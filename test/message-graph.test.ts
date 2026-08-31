@@ -2,12 +2,11 @@ import { describe, expect, test } from "bun:test"
 
 import {
   buildConversationForest,
-  resolveForkPlan,
   resolveForkTarget,
   type MessageGraphNode,
 } from "../src/message-graph"
+import type { AgentMessage, AgentSession, SharedMessage } from "../src/agent-provider"
 import type { BranchRelation } from "../src/metadata"
-import type { ConversationMessage, SessionSummary } from "../src/sessions"
 
 const ROOT = "11111111-1111-4111-8111-111111111111"
 const CHILD = "22222222-2222-4222-8222-222222222222"
@@ -31,7 +30,7 @@ describe("buildConversationForest", () => {
         [ROOT, parentMessages],
         [CHILD, childMessages],
       ]),
-      [relation(CHILD, ROOT, parentMessages[1]!.id, 2, childMessages[1]!.id)],
+      [relation(CHILD, ROOT, parentMessages[1]!.id, shared(parentMessages, childMessages, 2))],
     )
 
     expect(forest.graphs).toHaveLength(1)
@@ -82,8 +81,8 @@ describe("buildConversationForest", () => {
         [GRANDCHILD, grandchildMessages],
       ]),
       [
-        relation(CHILD, ROOT, parentMessages[1]!.id, 2, childMessages[1]!.id, 1),
-        relation(GRANDCHILD, CHILD, childMessages[0]!.id, 1, grandchildMessages[0]!.id, 2),
+        relation(CHILD, ROOT, parentMessages[1]!.id, shared(parentMessages, childMessages, 2), 1),
+        relation(GRANDCHILD, CHILD, childMessages[0]!.id, shared(childMessages, grandchildMessages, 1), 2),
       ],
     )
 
@@ -116,15 +115,14 @@ describe("buildConversationForest", () => {
           CHILD,
           ROOT,
           source.id,
-          1,
-          "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          [{ parentMessageId: source.id, childMessageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }],
         ),
       ],
     )
 
     expect(forest.graphs).toHaveLength(2)
     expect(forest.graphBySessionId.get(CHILD)?.rootSessionId).toBe(CHILD)
-    expect(forest.warnings[0]).toContain("copied prefix boundary does not match")
+    expect(forest.warnings[0]).toContain("shared history does not match")
   })
 })
 
@@ -149,53 +147,7 @@ describe("message ordering", () => {
   })
 })
 
-describe("fork planning", () => {
-  test("forks a user message at its nearest assistant and prefills only the selected prompt", () => {
-    const messages = [
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "root prompt", 0, true, "root prompt"),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer", 1),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "user", "first follow-up", 2, true, "first follow-up"),
-      message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "user", "second follow-up", 3, true, "second\nfollow-up"),
-    ]
-    const graph = buildConversationForest(
-      [session(ROOT, "Root", 10)],
-      new Map([[ROOT, messages]]),
-      [],
-    ).graphs[0]!
-
-    expect(resolveForkPlan(graph, `message:${ROOT}:${messages[3]!.id}`)).toEqual({
-      kind: "prefilled",
-      prefillText: "second\nfollow-up",
-      target: { sessionId: ROOT, messageId: messages[1]!.id },
-    })
-    expect(resolveForkPlan(graph, `message:${ROOT}:${messages[1]!.id}`)).toEqual({
-      kind: "historical",
-      target: { sessionId: ROOT, messageId: messages[1]!.id },
-    })
-  })
-
-  test("turns a user message without an assistant ancestor into a new root", () => {
-    const rootMessage = message(
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
-      "user",
-      "root prompt",
-      0,
-      true,
-      "root prompt",
-    )
-    const graph = buildConversationForest(
-      [session(ROOT, "Root", 10)],
-      new Map([[ROOT, [rootMessage]]]),
-      [],
-    ).graphs[0]!
-
-    expect(resolveForkPlan(graph, graph.rootNodeId)).toEqual({
-      kind: "root-replay",
-      prefillText: "root prompt",
-      source: { sessionId: ROOT, messageId: rootMessage.id },
-    })
-  })
-
+describe("fork targets", () => {
   test("uses an endpoint's exact final message even when that message is hidden", () => {
     const messages = [
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "visible", 0),
@@ -224,14 +176,13 @@ describe("zero-prefix root replay", () => {
       "root prompt",
       0,
       true,
-      "root prompt",
     )
     const relation: BranchRelation = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       childSessionId: CHILD,
       parentSessionId: ROOT,
       sourceMessageId: rootMessage.id,
-      copiedPrefixLength: 0,
+      sharedMessages: [],
       createdAt: "2026-08-30T12:00:00.000Z",
     }
     const forest = buildConversationForest(
@@ -258,11 +209,11 @@ describe("zero-prefix root replay", () => {
     const rootMessage = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "original", 0)
     const replayMessage = message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "edited", 0)
     const relation: BranchRelation = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       childSessionId: CHILD,
       parentSessionId: ROOT,
       sourceMessageId: rootMessage.id,
-      copiedPrefixLength: 0,
+      sharedMessages: [],
       createdAt: "2026-08-30T12:00:00.000Z",
     }
     const graph = buildConversationForest(
@@ -283,25 +234,23 @@ describe("zero-prefix root replay", () => {
   })
 })
 
-function session(sessionId: string, title: string, lastModified: number): SessionSummary {
-  return { sessionId, title, lastModified }
+function session(id: string, title: string, lastModified: number): AgentSession {
+  return { id, title, lastModified }
 }
 
 function message(
   id: string,
-  role: ConversationMessage["role"],
+  role: AgentMessage["role"],
   preview: string,
-  rawIndex: number,
+  ordinal: number,
   visible = true,
-  prefillText?: string,
-): ConversationMessage {
+): AgentMessage {
   return {
     id,
     role,
     preview,
-    rawIndex,
+    ordinal,
     visible,
-    ...(prefillText === undefined ? {} : { prefillText }),
   }
 }
 
@@ -309,17 +258,22 @@ function relation(
   childSessionId: string,
   parentSessionId: string,
   sourceMessageId: string,
-  copiedPrefixLength: number,
-  childPrefixEndMessageId: string,
+  sharedMessages: SharedMessage[],
   seconds = 0,
 ): BranchRelation {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     childSessionId,
     parentSessionId,
     sourceMessageId,
-    copiedPrefixLength,
-    childPrefixEndMessageId,
+    sharedMessages,
     createdAt: `2026-08-30T12:00:${String(seconds).padStart(2, "0")}.000Z`,
   }
+}
+
+function shared(parent: AgentMessage[], child: AgentMessage[], length: number): SharedMessage[] {
+  return parent.slice(0, length).map((message, index) => ({
+    parentMessageId: message.id,
+    childMessageId: child[index]!.id,
+  }))
 }

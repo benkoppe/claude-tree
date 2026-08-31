@@ -95,12 +95,12 @@ Dragging across text in an embedded Claude terminal copies the selection through
 Claude transcripts remain Claude's source of truth. `claude-tree` stores only branch relationships under:
 
 ```text
-$XDG_STATE_HOME/claude-tree/projects/<project-hash>/
+$XDG_STATE_HOME/claude-tree/projects/<project-hash>/providers/claude/
 ```
 
 When `XDG_STATE_HOME` is unset, the base directory is `~/.local/state`.
 
-The canonical project path is recorded and checked before state is used. Relationship files are validated strictly and replaced atomically. Sessions without recorded ancestry appear as independent roots.
+The canonical project path is recorded and checked before state is used. Relationship files are provider-scoped, validated strictly, and replaced atomically. Sessions without recorded ancestry appear as independent roots. Incompatible earlier state schemas fail closed rather than being silently reused.
 
 Observed unsent drafts are process-local UI state. They are kept only in memory while `claude-tree` is running and are never written to application state.
 
@@ -116,6 +116,8 @@ nix flake check --no-update-lock-file
 ```
 
 Tests use temporary state, Anthropic's in-memory session store, fixture PTYs, and OpenTUI's in-memory renderer. They do not call a model or modify real Claude transcripts.
+
+The application core depends on an agent-provider contract for session discovery, transcript reads, launch preparation, branching, and terminal observation. Claude-specific SDK types, CLI flags, replay rules, and screen heuristics live in the Claude provider adapter. Claude remains the only shipped provider; future providers are selected one per application invocation.
 
 ## MVP Limits
 

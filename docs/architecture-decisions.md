@@ -2,19 +2,27 @@
 
 This document records decisions that shape the project and the reasons behind them. Specific libraries and versions are an initial baseline and can be upgraded or replaced when a better implementation preserves these constraints.
 
-## Stock Claude Code Runs In Owned PTYs
+## Providers Are Explicit Application Dependencies
 
-Each live branch is a normal interactive `claude` process attached to its own pseudo-terminal and terminal emulator state. The application forwards input to the selected process and continues consuming output from every hidden process.
+One provider is selected when the application starts and is injected into the application controller. The provider owns session discovery, transcript normalization, new and resumed session launch preparation, historical branch semantics, compatibility checks, and interpretation of provider-specific terminal output. The application core owns graph construction, navigation, rendering, process lifecycle, and relationship persistence.
+
+Session and message identifiers are opaque provider strings. The core must not assume UUIDs, provider CLI flags, transcript payload formats, or a particular branching implementation. Historical branch results expose validated parent-to-child message correspondence so the graph can merge shared history without understanding how the provider created it.
+
+Branching is an explicit capability. A provider that cannot branch through a supported interface must report that limitation rather than editing transcripts or simulating fragile terminal input. The initial provider is Claude Code, and only one provider's sessions appear in a given application invocation.
+
+## Stock Agent TUIs Run In Owned PTYs
+
+Each live branch is a normal interactive provider process attached to its own pseudo-terminal and terminal emulator state. The application forwards input to the selected process and continues consuming output from every hidden process.
 
 Only the selected emulator is rendered. Switching views must not suspend or recreate unrelated Claude processes.
 
-This preserves the complete Claude Code experience and avoids maintaining a partial clone of its UI. It also rules out tmux and Herdr-style visible panes as the primary architecture.
+This preserves the complete stock-agent experience and avoids maintaining a partial clone of its UI. It also rules out tmux and Herdr-style visible panes as the primary architecture.
 
-The initial implementation direction is Bun's native PTY API with OpenTUI's `EmbeddedTerminalRenderable`, which uses Ghostty's VT parser. This combination has been validated in the development environment, but the ownership model is more important than those particular dependencies.
+The generic terminal manager executes provider-prepared commands and delegates activity and draft observation to a provider-created terminal observer. The initial implementation uses Bun's native PTY API with OpenTUI's `EmbeddedTerminalRenderable`, which uses Ghostty's VT parser. This combination has been validated in the development environment, but the ownership model is more important than those particular dependencies.
 
-## The Agent SDK Is A Session Tool, Not The Chat Runtime
+## Provider APIs Are Session Tools, Not The Chat Runtime
 
-Use supported SDK functions for session discovery, message reads, and historical forks. In particular, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation.
+Use supported provider APIs for session discovery, message reads, and historical forks. For the Claude adapter, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation.
 
 The initial SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.239 with Claude Code 2.1.239. Upgrade them deliberately and verify session compatibility together.
 
@@ -24,7 +32,7 @@ Forked sessions do not include the source session's file-history snapshots. A hi
 
 Claude sessions are persisted independently. Historical forking remaps message UUIDs and does not retain enough source-branch information for this application to reconstruct a reliable cross-session tree later.
 
-Store only the missing relationship data, such as the child session, parent session, source message, and copied-prefix boundary. Keep it outside the repository under the user's XDG state directory, scoped by project. Write it defensively so a failed or partial update cannot damage Claude's transcripts.
+Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Keep it outside the repository under the user's XDG state directory, scoped by project and provider. Write it defensively so a failed or partial update cannot damage provider transcripts.
 
 Sessions and forks not created or recorded by `claude-tree` should still be usable. When their ancestry cannot be established reliably, show them as independent roots rather than guessing from message content.
 
@@ -50,7 +58,7 @@ Navigation retains a preferred world-space column for vertical movement and dept
 
 Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child Claude processes and restores the host terminal. Persisted sessions can be resumed on the next launch.
 
-Shutdown releases the navigator and terminal emulators immediately, then remains in the foreground for a short, bounded cleanup of each owned Claude process group. Keep PTYs open during the graceful termination window so Claude can finish its signal handling; escalate surviving process groups and close their PTYs before the application exits.
+Shutdown releases the navigator and terminal emulators immediately, then remains in the foreground for a short, bounded cleanup of each owned agent process group. Keep PTYs open during the graceful termination window so the agent can finish its signal handling; escalate surviving process groups and close their PTYs before the application exits.
 
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 
@@ -58,12 +66,12 @@ Do not run two live processes against the same Claude session ID, because concur
 
 ## Input And View Ownership
 
-The application has two modes: navigator and embedded terminal. In terminal mode, input belongs to Claude except for one configurable host escape chord. The initial default is `Ctrl+Space`, selected explicitly for returning to the navigator.
+The application has two modes: navigator and embedded terminal. In terminal mode, input belongs to the selected agent except for one configurable host escape chord. The initial default is `Ctrl+Space`, selected explicitly for returning to the navigator.
 
-Avoid intercepting ordinary Claude keys. Host shortcuts should be mode-specific, visible to the user, and configurable when practical.
+Avoid intercepting ordinary agent keys. Host shortcuts should be mode-specific, visible to the user, and configurable when practical.
 
 ## Shared Working Tree Is Deliberate
 
-Every Claude process starts in the same project directory. This allows branches to observe and build on the same filesystem state, but it also permits simultaneous edits and conflicts. The application should communicate status accurately and must not claim branch-level file isolation or silently create worktrees.
+Every agent process starts in the same project directory. This allows branches to observe and build on the same filesystem state, but it also permits simultaneous edits and conflicts. The application should communicate status accurately and must not claim branch-level file isolation or silently create worktrees.
 
 Future agents have latitude in UI composition, state modeling, testing strategy, and dependency choices. Changes should be judged against the goals in `project-goals.md` and the behavioral constraints above.
