@@ -77,7 +77,7 @@ Message nodes are filled cards labeled with Nerd Font icons and readable roles s
 
 Graph edges use connected Unicode box-drawing lines with proper corners, branches, and intersections. Vertical movement follows graph edges, so reaching the bottom of a branch never jumps into a taller neighboring branch. Horizontal movement crosses branches and root chains by visual position, including when the target is outside the viewport. Navigation preserves the desired column or depth like a text-editor cursor, so reversing an ambiguous move returns to the exact node it came from.
 
-Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A Claude session card appears after the latest message only while that session has a running Claude process. Live cards show their observed unsent draft: `Draft` is an exact prompt initially prefilled by `claude-tree`, while `Observed draft` is a best-effort preview read from Claude's visible composer when returning to the graph. Claude exposes no composer-state API, so long, scrolled, or unrecognized drafts may appear as `No draft observed`. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
+Saved sessions end at their latest message; selecting that message and pressing `Enter` resumes the session. A specially colored card appears after the latest message only while that session has a running Claude process. While Claude is generating, the card is labeled `Assistant` and shows an animated braille spinner. When the response completes, `claude-tree` refreshes Claude's transcript and atomically replaces that spinner with the completed assistant message followed by a new `Draft` leaf. The draft's second line is blank or contains only the observed unsent text. Draft text is either an exact prompt initially prefilled by `claude-tree` or a best-effort preview read from Claude's visible composer when returning to the graph. The conversation-root list uses `● Live` and `○ Saved` to summarize each family.
 
 ## Fork Behavior
 
@@ -98,6 +98,8 @@ When `XDG_STATE_HOME` is unset, the base directory is `~/.local/state`.
 The canonical project path is recorded and checked before state is used. Relationship files are validated strictly and replaced atomically. Sessions without recorded ancestry appear as independent roots.
 
 Observed unsent drafts are process-local UI state. They are kept only in memory while `claude-tree` is running and are never written to application state.
+
+Generation status is also process-local UI state. It is detected passively from Claude's OSC terminal-title activity indicator, with the last visible Claude screen as a fallback; no Claude plugin or hook is installed.
 
 ## Development
 
@@ -120,3 +122,4 @@ Tests use temporary state, Anthropic's in-memory session store, fixture PTYs, an
 - OpenTUI's embedded terminal renders character cells, not Kitty graphics or Sixel images.
 - Clipboard forwarding depends on OSC52 support in the outer terminal and any intervening SSH or multiplexer configuration.
 - Draft observation is a conservative parse of Claude's visible input box, not a semantic composer API. It may be unavailable when the prompt is scrolled, visually abbreviated, or displayed by an incompatible Claude Code version.
+- Generation detection follows Claude's terminal title and visible activity UI rather than a semantic API. Disabling Claude's terminal title or changing these UI signals can make a hidden session's status unavailable or stale.

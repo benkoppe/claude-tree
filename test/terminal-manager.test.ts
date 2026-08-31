@@ -5,7 +5,12 @@ import { join } from "node:path"
 
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { observeClaudeDraft, TerminalManager } from "../src/terminal-manager"
+import {
+  claudeGeneratingFromTitle,
+  observeClaudeDraft,
+  observeClaudeGenerating,
+  TerminalManager,
+} from "../src/terminal-manager"
 
 const temporaryDirectories: string[] = []
 
@@ -102,6 +107,77 @@ test("observes only a cursor-local Claude composer bounded by its rule", () => {
       cursor: { x: 5, y: 0, visible: false },
     }),
   ).toBeUndefined()
+})
+
+test("recognizes Claude's working and idle terminal titles", () => {
+  expect(claudeGeneratingFromTitle("⠋ Claude Code")).toBeTrue()
+  expect(claudeGeneratingFromTitle("◐ Claude Code")).toBeTrue()
+  expect(claudeGeneratingFromTitle("✳ Claude Code")).toBeFalse()
+  expect(claudeGeneratingFromTitle("project shell")).toBeUndefined()
+})
+
+test("uses the visible Claude footer and composer as activity fallbacks", () => {
+  expect(
+    observeClaudeGenerating({
+      text: "",
+      lines: ["✻ Cogitating… (12s · esc to interrupt)"],
+      columns: 40,
+      rows: 1,
+      cursor: { x: 0, y: 0, visible: false },
+    }),
+  ).toBeTrue()
+  expect(
+    observeClaudeGenerating({
+      text: "",
+      lines: ["❯ ", "────────────────"],
+      columns: 40,
+      rows: 2,
+      cursor: { x: 2, y: 0, visible: true },
+    }),
+  ).toBeFalse()
+  expect(
+    observeClaudeGenerating({
+      text: "",
+      lines: ["historical output"],
+      columns: 40,
+      rows: 1,
+      cursor: { x: 0, y: 0, visible: false },
+    }),
+  ).toBeUndefined()
+})
+
+test("tracks OSC activity transitions from a hidden process", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const fakeClaude = await createFakeClaude(
+    String.raw`sleep 0.05
+    printf '\033]0;\342\240\213 Claude Code\007'
+    sleep 0.15
+    printf '\033]0;\342\234\263 Claude Code\007'
+    sleep 30`,
+  )
+  const activityChanges: Array<{ sessionId: string; generating: boolean }> = []
+  const manager = new TerminalManager(
+    setup.renderer,
+    process.cwd(),
+    fakeClaude,
+    () => undefined,
+    (event) => activityChanges.push(event),
+  )
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+
+  try {
+    await manager.show({ kind: "new", sessionId })
+    manager.hideActive()
+    await waitUntil(() => manager.generatingSessionIds().has(sessionId))
+    await waitUntil(() => !manager.generatingSessionIds().has(sessionId))
+    expect(activityChanges).toEqual([
+      { sessionId, generating: true },
+      { sessionId, generating: false },
+    ])
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
 })
 
 test("an exited hidden process releases its emulator", async () => {
@@ -301,4 +377,10 @@ async function createFakeClaude(body: string): Promise<string> {
   await writeFile(executable, `#!/bin/sh\n${body}\n`)
   await chmod(executable, 0o755)
   return executable
+}
+
+async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (!condition() && performance.now() < deadline) await Bun.sleep(10)
+  expect(condition()).toBeTrue()
 }

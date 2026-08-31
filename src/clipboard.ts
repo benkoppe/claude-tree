@@ -1,61 +1,13 @@
-const ESCAPE = 0x1b
-const BELL = 0x07
-const OSC_MARKER = 0x5d
-const STRING_TERMINATOR = 0x5c
-const MAX_OSC52_BODY_BYTES = 256 * 1024
-
-type ParserState = "ground" | "escape" | "osc" | "osc-escape"
+import { OscSequenceParser } from "./osc"
 
 export class Osc52Forwarder {
-  private state: ParserState = "ground"
-  private body: number[] = []
+  private readonly parser = new OscSequenceParser()
 
   observe(bytes: Uint8Array): string[] {
-    const clipboardWrites: string[] = []
-
-    for (const byte of bytes) {
-      if (this.state === "ground") {
-        if (byte === ESCAPE) this.state = "escape"
-      } else if (this.state === "escape") {
-        if (byte === OSC_MARKER) {
-          this.body = []
-          this.state = "osc"
-        } else if (byte !== ESCAPE) {
-          this.state = "ground"
-        }
-      } else if (this.state === "osc") {
-        if (byte === BELL) {
-          this.finish(clipboardWrites)
-          this.state = "ground"
-        } else if (byte === ESCAPE) {
-          this.state = "osc-escape"
-        } else {
-          this.body.push(byte)
-        }
-      } else if (byte === STRING_TERMINATOR) {
-        this.finish(clipboardWrites)
-        this.state = "ground"
-      } else if (byte === ESCAPE) {
-        // tmux passthrough doubles the inner escape, including the one in ST.
-        this.state = "osc-escape"
-      } else {
-        this.body.push(ESCAPE, byte)
-        this.state = "osc"
-      }
-
-      if (this.body.length > MAX_OSC52_BODY_BYTES) {
-        this.body = []
-        this.state = "ground"
-      }
-    }
-
-    return clipboardWrites
-  }
-
-  private finish(clipboardWrites: string[]): void {
-    const text = decodeOsc52Write(this.body)
-    if (text !== null) clipboardWrites.push(text)
-    this.body = []
+    return this.parser
+      .observe(bytes)
+      .map(decodeOsc52Write)
+      .filter((text): text is string => text !== null)
   }
 }
 

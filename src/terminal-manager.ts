@@ -7,6 +7,7 @@ import {
 } from "@opentui/core"
 
 import { Osc52Forwarder } from "./clipboard"
+import { OscSequenceParser } from "./osc"
 
 interface ManagedTerminal {
   sessionId: string
@@ -16,6 +17,7 @@ interface ManagedTerminal {
   exitCode: number | null
   draftPreview?: DraftPreview
   inputObserved: boolean
+  generating: boolean
 }
 
 export type TerminalLaunch =
@@ -33,6 +35,11 @@ export interface TerminalExitEvent {
   wasActive: boolean
 }
 
+export interface TerminalActivityEvent {
+  sessionId: string
+  generating: boolean
+}
+
 export class TerminalManager {
   private readonly terminals = new Map<string, ManagedTerminal>()
   private activeSessionId: string | null = null
@@ -43,6 +50,7 @@ export class TerminalManager {
     private readonly projectPath: string,
     private readonly claudeExecutable: string,
     private readonly onProcessExited: (event: TerminalExitEvent) => void,
+    private readonly onActivityChanged: (event: TerminalActivityEvent) => void = () => undefined,
   ) {
     renderer.on(CliRenderEvents.SELECTION, this.onSelection)
   }
@@ -106,6 +114,14 @@ export class TerminalManager {
     )
   }
 
+  generatingSessionIds(): Set<string> {
+    return new Set(
+      [...this.terminals.values()]
+        .filter((managed) => managed.exitCode === null && managed.generating)
+        .map((managed) => managed.sessionId),
+    )
+  }
+
   async shutdown(gracePeriodMs = 1_500): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
@@ -143,6 +159,7 @@ export class TerminalManager {
     const rows = Math.max(1, this.renderer.terminalHeight)
     let pty: Bun.Terminal | undefined
     const osc52 = new Osc52Forwarder()
+    const activityObserver = new ClaudeActivityObserver()
     const renderer = this.renderer
     const manager = this
     let resolvePtyClosed!: () => void
@@ -170,6 +187,11 @@ export class TerminalManager {
       onTerminalResize(nextCols, nextRows) {
         if (pty && !pty.closed) pty.resize(nextCols, nextRows)
       },
+      onScreenChange() {
+        if (!managed) return
+        const generating = observeClaudeGenerating(terminal.screen())
+        if (generating !== undefined) manager.setGenerating(managed, generating)
+      },
     })
     this.renderer.root.add(terminal)
 
@@ -194,6 +216,8 @@ export class TerminalManager {
           data(childPty, data) {
             pty = childPty
             const clipboardWrites = osc52.observe(data)
+            const generating = activityObserver.observe(data)
+            if (managed && generating !== undefined) manager.setGenerating(managed, generating)
             if (manager.activeSessionId === launch.sessionId) {
               for (const text of clipboardWrites) renderer.copyToClipboardOSC52(text)
             }
@@ -228,6 +252,7 @@ export class TerminalManager {
         ? {}
         : { draftPreview: { text: launch.prefillText.trim(), exact: true } }),
       inputObserved: false,
+      generating: activityObserver.generating ?? false,
     }
     void process.exited.then(async (exitCode) => {
       managed.exitCode = exitCode
@@ -246,14 +271,21 @@ export class TerminalManager {
   }
 
   private captureDraft(managed: ManagedTerminal): void {
+    const screen = managed.terminal.screen()
     if (!managed.inputObserved && managed.draftPreview?.exact) return
-    const observed = observeClaudeDraft(managed.terminal.screen())
+    const observed = observeClaudeDraft(screen)
     if (observed !== undefined) {
       managed.draftPreview = { text: observed, exact: false }
     } else if (managed.inputObserved) {
       delete managed.draftPreview
     }
     managed.inputObserved = false
+  }
+
+  private setGenerating(managed: ManagedTerminal, generating: boolean): void {
+    if (managed.generating === generating) return
+    managed.generating = generating
+    this.onActivityChanged({ sessionId: managed.sessionId, generating })
   }
 
   private pruneExited(): void {
@@ -281,6 +313,63 @@ export class TerminalManager {
 }
 
 export function observeClaudeDraft(screen: EmbeddedTerminalScreen): string | undefined {
+  const composer = observeClaudeComposer(screen)
+  return composer && composer.length > 0 ? composer : undefined
+}
+
+export function observeClaudeGenerating(screen: EmbeddedTerminalScreen): boolean | undefined {
+  const recentLines = screen.lines.filter((line) => line.trim().length > 0).slice(-12)
+  if (
+    recentLines.some(
+      (line) =>
+        /^\s*[⏸⏵].*esc to interrupt(?:\s|·|$)/u.test(line) ||
+        /^\s*[*·✢✶✻✽]\s+\S.*…(?:\s+\(\d+[smh](?:\s|·)|\s*$)/u.test(line),
+    )
+  ) {
+    return true
+  }
+  return observeClaudeComposer(screen) !== undefined ? false : undefined
+}
+
+export function claudeGeneratingFromTitle(title: string): boolean | undefined {
+  if (/^[\u2800-\u28ff\u25d0-\u25d3] /u.test(title)) return true
+  if (/^✳ /u.test(title)) return false
+  return undefined
+}
+
+class ClaudeActivityObserver {
+  private readonly parser = new OscSequenceParser()
+  generating: boolean | undefined
+
+  observe(bytes: Uint8Array): boolean | undefined {
+    let observed: boolean | undefined
+    for (const body of this.parser.observe(bytes)) {
+      const title = decodeOscTitle(body)
+      if (title === undefined) continue
+      const generating = claudeGeneratingFromTitle(title)
+      if (generating === undefined) continue
+      this.generating = generating
+      observed = generating
+    }
+    return observed
+  }
+}
+
+function decodeOscTitle(body: readonly number[]): string | undefined {
+  const separator = body.indexOf(0x3b)
+  if (separator < 0) return undefined
+  const command = Buffer.from(body.slice(0, separator)).toString("ascii")
+  if (command !== "0" && command !== "2") return undefined
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(body.slice(separator + 1)),
+    )
+  } catch {
+    return undefined
+  }
+}
+
+function observeClaudeComposer(screen: EmbeddedTerminalScreen): string | undefined {
   if (!screen.cursor.visible) return undefined
   const cursorRow = screen.cursor.y
   if (cursorRow < 0 || cursorRow >= screen.lines.length) return undefined
@@ -300,7 +389,7 @@ export function observeClaudeDraft(screen: EmbeddedTerminalScreen): string | und
 
     const lines = [match[1] ?? "", ...screen.lines.slice(promptRow + 1, borderRow)]
     const text = lines.join("\n").trim()
-    return text.length > 0 ? text : undefined
+    return text
   }
   return undefined
 }

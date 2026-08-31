@@ -59,6 +59,8 @@ const EAST = 2
 const SOUTH = 4
 const WEST = 8
 
+export const BRAILLE_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const
+
 const ICONS = {
   user: "󰭹",
   assistant: "󰚩",
@@ -74,6 +76,8 @@ export function renderConversationGraph(
   viewportHeight: number,
   runningSessionIds: Set<string>,
   draftPreviews: Map<string, DraftPreview> = new Map(),
+  generatingSessionIds: Set<string> = new Set(),
+  spinnerFrame = 0,
 ): RenderedGraph {
   const safeWidth = Math.max(1, viewportWidth)
   const safeHeight = Math.max(1, viewportHeight)
@@ -91,6 +95,8 @@ export function renderConversationGraph(
       nodeWidth,
       positionedNode.node.id === selectedNodeId,
       draftPreviews,
+      generatingSessionIds,
+      spinnerFrame,
     )
   }
 
@@ -214,6 +220,8 @@ function drawNode(
   width: number,
   selected: boolean,
   draftPreviews: Map<string, DraftPreview>,
+  generatingSessionIds: Set<string>,
+  spinnerFrame: number,
 ): void {
   const { node, x, y } = positioned
   const background = selected
@@ -246,26 +254,29 @@ function drawNode(
     return
   }
 
-  const status = "● Live"
-  const statusStyle = {
-    ...headerStyle,
-    fg: selected ? theme.selectedText : theme.success,
+  const sessionId = node.session.sessionId
+  if (generatingSessionIds.has(sessionId)) {
+    drawHeading(canvas, x + 2, y, ICONS.assistant, "Assistant", contentWidth, {
+      ...headerStyle,
+      fg: selected ? theme.selectedText : theme.primary,
+    }, headerStyle)
+    const frame = BRAILLE_SPINNER_FRAMES[spinnerFrame % BRAILLE_SPINNER_FRAMES.length]!
+    canvas.write(x + 2, y + 1, frame, {
+      ...baseStyle,
+      fg: selected ? theme.selectedText : theme.primary,
+    })
+    return
   }
-  const heading = `${ICONS.session} Claude session`
-  const statusX = x + width - 2 - displayWidth(status)
-  canvas.write(x + 2, y, truncateToWidth(heading, Math.max(0, statusX - x - 3)), {
+
+  drawHeading(canvas, x + 2, y, ICONS.session, "Draft", contentWidth, {
     ...headerStyle,
     fg: selected ? theme.selectedText : theme.info,
-  })
-  canvas.write(statusX, y, status, statusStyle)
-
+  }, headerStyle)
   const draft = draftPreviews.get(node.session.sessionId)
-  const description = draft
-    ? `${draft.exact ? "Draft" : "Observed draft"}: ${normalizePreview(draft.text)}`
-    : "No draft observed"
+  const description = draft ? normalizePreview(draft.text) : ""
   canvas.write(x + 2, y + 1, truncateToWidth(description, contentWidth), {
     ...baseStyle,
-    fg: selected ? theme.selectedText : draft && !draft.exact ? theme.warning : theme.text,
+    fg: selected ? theme.selectedText : theme.text,
   })
 }
 

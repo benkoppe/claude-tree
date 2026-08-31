@@ -13,7 +13,11 @@ import {
 } from "@opentui/core"
 
 import { truncateToWidth } from "./display-text"
-import { renderConversationGraph, renderRootPicker } from "./graph-renderer"
+import {
+  BRAILLE_SPINNER_FRAMES,
+  renderConversationGraph,
+  renderRootPicker,
+} from "./graph-renderer"
 import {
   directionalMove,
   initialVisibleGraphNodeId,
@@ -39,6 +43,7 @@ import {
 } from "./sessions"
 import {
   TerminalManager,
+  type TerminalActivityEvent,
   type TerminalExitEvent,
   type TerminalLaunch,
 } from "./terminal-manager"
@@ -46,6 +51,8 @@ import { theme } from "./theme"
 
 const MINIMUM_WIDTH = 50
 const MINIMUM_HEIGHT = 12
+const SPINNER_INTERVAL_MS = 80
+const COMPLETION_REFRESH_DELAY_MS = 75
 
 export class ClaudeTreeApp {
   private readonly navigator: BoxRenderable
@@ -72,6 +79,12 @@ export class ClaudeTreeApp {
   private busy = false
   private stopping = false
   private refreshGeneration = 0
+  private spinnerFrame = 0
+  private spinnerTimer: ReturnType<typeof setInterval> | undefined
+  private completionRefreshTimer: ReturnType<typeof setTimeout> | undefined
+  private completionRefreshRunning = false
+  private completionRefreshVersion = 0
+  private readonly pendingCompletionRefreshes = new Map<string, number>()
   private readonly compatibilityWarning: string | undefined
 
   private constructor(
@@ -80,16 +93,18 @@ export class ClaudeTreeApp {
     relations: BranchRelation[],
     claudeExecutable: string,
     compatibilityWarning?: string,
+    sessionService?: SessionService,
   ) {
     this.relations = relations
     this.compatibilityWarning = compatibilityWarning
     this.status = "Ready"
-    this.sessionService = new SessionService(metadata.projectPath)
+    this.sessionService = sessionService ?? new SessionService(metadata.projectPath)
     this.terminalManager = new TerminalManager(
       renderer,
       metadata.projectPath,
       claudeExecutable,
       (event) => this.onTerminalExited(event),
+      (event) => this.onTerminalActivityChanged(event),
     )
     this.stopped = new Promise((resolve) => {
       this.resolveStopped = resolve
@@ -146,6 +161,7 @@ export class ClaudeTreeApp {
     claudeExecutable: string,
     compatibilityWarning?: string,
     stateHome?: string,
+    sessionService?: SessionService,
   ): Promise<ClaudeTreeApp> {
     const metadata = await BranchMetadataStore.open(projectDirectory, stateHome)
     const relations = await metadata.loadRelations()
@@ -155,6 +171,7 @@ export class ClaudeTreeApp {
       relations,
       claudeExecutable,
       compatibilityWarning,
+      sessionService,
     )
   }
 
@@ -174,6 +191,10 @@ export class ClaudeTreeApp {
     this.renderer.keyInput.off("keypress", this.onKeyPress)
     this.renderer.keyInput.off("keyrelease", this.onKeyRelease)
     this.renderer.off(CliRenderEvents.RESIZE, this.onResize)
+    this.stopSpinnerAnimation()
+    if (this.completionRefreshTimer) clearTimeout(this.completionRefreshTimer)
+    this.completionRefreshTimer = undefined
+    this.pendingCompletionRefreshes.clear()
     await this.terminalManager.shutdown()
     this.renderer.destroy()
     this.resolveStopped()
@@ -186,6 +207,7 @@ export class ClaudeTreeApp {
 
   private onTerminalExited(event: TerminalExitEvent): void {
     if (this.stopping) return
+    this.pendingCompletionRefreshes.delete(event.sessionId)
     const exitStatus =
       event.exitCode === 0
         ? "Claude session exited"
@@ -203,6 +225,18 @@ export class ClaudeTreeApp {
         this.status = `${exitStatus}; refresh failed: ${error instanceof Error ? error.message : String(error)}`
         this.render()
       })
+  }
+
+  private onTerminalActivityChanged(event: TerminalActivityEvent): void {
+    if (this.stopping) return
+    if (event.generating) {
+      this.pendingCompletionRefreshes.delete(event.sessionId)
+      if (this.view !== "terminal") this.render()
+      return
+    }
+    this.pendingCompletionRefreshes.set(event.sessionId, ++this.completionRefreshVersion)
+    this.scheduleCompletionRefresh()
+    if (this.view !== "terminal") this.render()
   }
 
   private readonly onKeyRelease = (key: KeyEvent) => {
@@ -285,7 +319,7 @@ export class ClaudeTreeApp {
     }
   }
 
-  private async runAction(action: () => Promise<void>): Promise<void> {
+  private async runAction(action: () => Promise<unknown>): Promise<void> {
     this.busy = true
     this.render()
     try {
@@ -294,6 +328,7 @@ export class ClaudeTreeApp {
       this.status = error instanceof Error ? error.message : String(error)
     } finally {
       this.busy = false
+      this.scheduleCompletionRefresh()
       this.render()
     }
   }
@@ -343,13 +378,11 @@ export class ClaudeTreeApp {
     this.render()
   }
 
-  private async refreshData(focusSessionId?: string): Promise<void> {
+  private async refreshData(focusSessionId?: string, updateStatus = true): Promise<boolean> {
     const generation = ++this.refreshGeneration
-    const previousRootSessionId = this.currentRootSessionId
-    const previousNodeId = this.selectedGraphNodeId
-    const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
+    const pendingCompletions = new Map(this.pendingCompletionRefreshes)
     const discovered = await this.sessionService.list()
-    if (generation !== this.refreshGeneration || this.stopping) return
+    if (generation !== this.refreshGeneration || this.stopping) return false
 
     const discoveredIds = new Set(discovered.map((session) => session.sessionId))
     for (const sessionId of discoveredIds) this.temporarySessions.delete(sessionId)
@@ -365,7 +398,10 @@ export class ClaudeTreeApp {
         return [session.sessionId, await this.sessionService.messages(session.sessionId)] as const
       }),
     )
-    if (generation !== this.refreshGeneration || this.stopping) return
+    if (generation !== this.refreshGeneration || this.stopping) return false
+    const previousRootSessionId = this.currentRootSessionId
+    const previousNodeId = this.selectedGraphNodeId
+    const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
     this.transcripts = new Map(transcriptEntries)
     this.forest = buildConversationForest(this.sessions, this.transcripts, this.relations)
     this.graphNavigationIntent = null
@@ -402,11 +438,15 @@ export class ClaudeTreeApp {
       this.selectedRootIndex = preservedRootIndex >= 0 ? preservedRootIndex : 0
     }
 
-    this.status =
-      this.forest.warnings[0] ??
-      (this.forest.graphs.length === 0
-        ? "No Claude conversations found. Press n to start one."
-        : "Refreshed")
+    if (updateStatus) {
+      this.status =
+        this.forest.warnings[0] ??
+        (this.forest.graphs.length === 0
+          ? "No Claude conversations found. Press n to start one."
+          : "Refreshed")
+    }
+    this.clearPendingCompletions(pendingCompletions)
+    return true
   }
 
   private async newSession(
@@ -533,6 +573,7 @@ export class ClaudeTreeApp {
     await this.terminalManager.show(launch)
     this.view = "terminal"
     this.navigator.visible = false
+    this.stopSpinnerAnimation()
   }
 
   private async returnToGraph(): Promise<void> {
@@ -556,7 +597,9 @@ export class ClaudeTreeApp {
   }
 
   private render(): void {
-    if (this.renderer.isDestroyed || this.view === "terminal") return
+    if (this.renderer.isDestroyed) return
+    this.updateSpinnerAnimation()
+    if (this.view === "terminal") return
     const tooSmall =
       this.renderer.terminalWidth < MINIMUM_WIDTH || this.renderer.terminalHeight < MINIMUM_HEIGHT
     this.header.content = tooSmall
@@ -601,6 +644,8 @@ export class ClaudeTreeApp {
         contentHeight,
         this.terminalManager.runningSessionIds(),
         this.terminalManager.draftPreviews(),
+        this.displayedGeneratingSessionIds(),
+        this.spinnerFrame,
       )
       this.graphLayout = rendered.layout
       this.content.content = rendered.content
@@ -676,15 +721,16 @@ export class ClaudeTreeApp {
     const selected = this.selectedGraphNode()
     if (!selected) return "No node selected"
     if (selected.kind === "endpoint") {
+      if (this.displayedGeneratingSessionIds().has(selected.session.sessionId)) {
+        return `Selected assistant · generating · ${selected.session.sessionId.slice(0, 8)}`
+      }
       const draft = this.terminalManager.draftPreviews().get(selected.session.sessionId)
-      const draftDescription = draft
-        ? `${draft.exact ? "Draft" : "Observed draft"}: ${draft.text.replace(/\s+/g, " ").trim()}`
-        : "No draft observed"
+      const draftDescription = draft ? draft.text.replace(/\s+/g, " ").trim() : "blank"
       const description = truncateToWidth(
         draftDescription,
         Math.max(20, this.renderer.terminalWidth - 32),
       )
-      return `Selected session · ${description} · ${selected.session.sessionId.slice(0, 8)}`
+      return `Selected draft · ${description} · ${selected.session.sessionId.slice(0, 8)}`
     }
     const role = selected.internal
       ? "internal"
@@ -694,6 +740,84 @@ export class ClaudeTreeApp {
           ? "user"
           : "system"
     return `Selected ${role} · ${truncateToWidth(selected.preview, Math.max(20, this.renderer.terminalWidth - 24))}`
+  }
+
+  private updateSpinnerAnimation(): void {
+    const graph = this.currentGraph()
+    const generatingSessionIds = this.displayedGeneratingSessionIds()
+    const shouldAnimate =
+      this.view === "graph" &&
+      this.renderer.terminalWidth >= MINIMUM_WIDTH &&
+      this.renderer.terminalHeight >= MINIMUM_HEIGHT &&
+      graph !== undefined &&
+      [...graph.sessionIds].some((sessionId) => generatingSessionIds.has(sessionId))
+    if (!shouldAnimate) {
+      this.stopSpinnerAnimation()
+      return
+    }
+    if (this.spinnerTimer) return
+    this.spinnerTimer = setInterval(() => {
+      this.spinnerFrame = (this.spinnerFrame + 1) % BRAILLE_SPINNER_FRAMES.length
+      this.render()
+    }, SPINNER_INTERVAL_MS)
+  }
+
+  private stopSpinnerAnimation(): void {
+    if (this.spinnerTimer) clearInterval(this.spinnerTimer)
+    this.spinnerTimer = undefined
+    this.spinnerFrame = 0
+  }
+
+  private displayedGeneratingSessionIds(): Set<string> {
+    const runningSessionIds = this.terminalManager.runningSessionIds()
+    const generatingSessionIds = this.terminalManager.generatingSessionIds()
+    for (const sessionId of this.pendingCompletionRefreshes.keys()) {
+      if (runningSessionIds.has(sessionId)) generatingSessionIds.add(sessionId)
+    }
+    return generatingSessionIds
+  }
+
+  private scheduleCompletionRefresh(): void {
+    if (
+      this.stopping ||
+      this.busy ||
+      this.completionRefreshRunning ||
+      this.completionRefreshTimer ||
+      this.pendingCompletionRefreshes.size === 0
+    ) {
+      return
+    }
+    this.completionRefreshTimer = setTimeout(() => {
+      this.completionRefreshTimer = undefined
+      void this.refreshCompletedSessions()
+    }, COMPLETION_REFRESH_DELAY_MS)
+  }
+
+  private async refreshCompletedSessions(): Promise<void> {
+    if (this.stopping || this.completionRefreshRunning) return
+    const refreshes = new Map(this.pendingCompletionRefreshes)
+    if (refreshes.size === 0) return
+    this.completionRefreshRunning = true
+    let failed = false
+    try {
+      await this.refreshData(undefined, false)
+    } catch (error) {
+      failed = true
+      this.status = `Refresh failed: ${error instanceof Error ? error.message : String(error)}`
+    } finally {
+      if (failed) this.clearPendingCompletions(refreshes)
+      this.completionRefreshRunning = false
+      this.render()
+      this.scheduleCompletionRefresh()
+    }
+  }
+
+  private clearPendingCompletions(completions: Map<string, number>): void {
+    for (const [sessionId, version] of completions) {
+      if (this.pendingCompletionRefreshes.get(sessionId) === version) {
+        this.pendingCompletionRefreshes.delete(sessionId)
+      }
+    }
   }
 }
 

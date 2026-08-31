@@ -9,7 +9,11 @@ import {
   layoutConversationGraph,
   visibleGraphNodeId,
 } from "../src/graph-layout"
-import { renderConversationGraph, renderRootPicker } from "../src/graph-renderer"
+import {
+  BRAILLE_SPINNER_FRAMES,
+  renderConversationGraph,
+  renderRootPicker,
+} from "../src/graph-renderer"
 import { buildConversationForest } from "../src/message-graph"
 import type { BranchRelation } from "../src/metadata"
 import type { ConversationMessage, SessionSummary } from "../src/sessions"
@@ -36,11 +40,12 @@ describe("renderConversationGraph", () => {
     expect(rendered.text).toContain("󰚩 Assistant")
     expect(rendered.text).toContain("main answer")
     expect(rendered.text).toContain("fork answer")
-    expect(rendered.text).toContain("󰆍 Claude session")
-    expect(rendered.text.match(/Claude session/g)).toHaveLength(1)
-    expect(rendered.text).toContain("● Live")
+    expect(rendered.text).toContain("󰆍 Draft")
+    expect(rendered.text.match(/󰆍 Draft/g)).toHaveLength(1)
+    expect(rendered.text).not.toContain("Claude session")
+    expect(rendered.text).not.toContain("● Live")
     expect(rendered.text).not.toContain("○ Saved")
-    expect(rendered.text).toContain("Draft: fix the tests")
+    expect(rendered.text).toContain("fix the tests")
     expect(rendered.text).not.toContain("Fork")
     expect(rendered.text).not.toContain(">")
     expect(rendered.text).not.toContain("+")
@@ -50,7 +55,7 @@ describe("renderConversationGraph", () => {
     expect(rendered.text).toContain("┐")
     expect(rendered.text).toContain("│")
     const selectedHeader = rendered.content.chunks.find(
-      (chunk) => chunk.text.includes("Claude session") && chunk.bg?.equals(theme.selected),
+      (chunk) => chunk.text.includes("Draft") && chunk.bg?.equals(theme.selected),
     )
     expect(selectedHeader?.fg?.equals(theme.selectedText)).toBeTrue()
     const unselectedPreview = rendered.content.chunks.find((chunk) =>
@@ -80,7 +85,7 @@ describe("renderConversationGraph", () => {
       const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
       expect(
         spans.some(
-          (span) => span.text.includes("Claude session") && span.bg.equals(theme.selected),
+          (span) => span.text.includes("Draft") && span.bg.equals(theme.selected),
         ),
       ).toBeTrue()
       expect(
@@ -99,7 +104,7 @@ describe("renderConversationGraph", () => {
     expect(rendered.offsetX).toBeGreaterThan(0)
     expect(rendered.offsetY).toBeGreaterThan(0)
     expect(rendered.text).toContain("fork answer")
-    expect(rendered.text).not.toContain("Claude session")
+    expect(rendered.text).not.toContain("Draft")
     expect(rendered.layout.nodes.has(graph.endpointBySessionId.get(ROOT)!)).toBeFalse()
     expect(rendered.layout.nodes.has(graph.endpointBySessionId.get(CHILD)!)).toBeFalse()
     expect(visibleGraphNodeId(graph, graph.endpointBySessionId.get(CHILD), new Set())).toBe(
@@ -113,7 +118,7 @@ describe("renderConversationGraph", () => {
     expect(rendered.text.split("\n")).toHaveLength(4)
   })
 
-  test("marks screen-derived drafts as approximate", () => {
+  test("shows screen-derived draft text without an observation prefix", () => {
     const graph = branchGraph()
     const selected = graph.endpointBySessionId.get(CHILD)!
     const rendered = renderConversationGraph(
@@ -125,12 +130,63 @@ describe("renderConversationGraph", () => {
       new Map([[CHILD, { text: "line one\nline two", exact: false }]]),
     )
 
-    expect(rendered.text).toContain("Observed draft: line one li…")
-    const warningDraft = rendered.content.chunks.find((chunk) =>
-      chunk.text.includes("Observed draft"),
+    expect(rendered.text).toContain("line one line two")
+    expect(rendered.text).not.toContain("Observed draft")
+  })
+
+  test("replaces a live draft with an animated assistant card while generating", () => {
+    const graph = branchGraph()
+    const selected = graph.endpointBySessionId.get(CHILD)!
+    const first = renderConversationGraph(
+      graph,
+      selected,
+      100,
+      30,
+      new Set([CHILD]),
+      new Map([[CHILD, { text: "queued text", exact: true }]]),
+      new Set([CHILD]),
+      0,
     )
-    expect(warningDraft?.bg?.equals(theme.selected)).toBeTrue()
-    expect(warningDraft?.fg?.equals(theme.selectedText)).toBeTrue()
+    const second = renderConversationGraph(
+      graph,
+      selected,
+      100,
+      30,
+      new Set([CHILD]),
+      new Map(),
+      new Set([CHILD]),
+      1,
+    )
+
+    expect(first.text).toContain("󰚩 Assistant")
+    expect(first.text).toContain(BRAILLE_SPINNER_FRAMES[0])
+    expect(first.text).not.toContain("Draft")
+    expect(first.text).not.toContain("queued text")
+    expect(second.text).toContain(BRAILLE_SPINNER_FRAMES[1])
+    expect(second.text).not.toContain(BRAILLE_SPINNER_FRAMES[0])
+  })
+
+  test("keeps the special live-card background in both activity states", () => {
+    const graph = branchGraph()
+    const selected = graph.endpointBySessionId.get(CHILD)!
+    const rendered = renderConversationGraph(
+      graph,
+      selected,
+      100,
+      30,
+      new Set([ROOT, CHILD]),
+      new Map(),
+      new Set([ROOT]),
+    )
+
+    const assistant = rendered.content.chunks.find(
+      (chunk) => chunk.text.includes("Assistant") && chunk.bg?.equals(theme.sessionElement),
+    )
+    const draft = rendered.content.chunks.find(
+      (chunk) => chunk.text.includes("Draft") && chunk.bg?.equals(theme.selected),
+    )
+    expect(assistant).toBeDefined()
+    expect(draft).toBeDefined()
   })
 })
 
@@ -206,10 +262,10 @@ describe("spatial graph navigation", () => {
     const live = renderConversationGraph(graph, endpointId, 40, 8, new Set([ROOT]))
 
     expect(saved.layout.nodes.size).toBe(0)
-    expect(saved.text).not.toContain("Claude session")
+    expect(saved.text).not.toContain("Draft")
     expect(initialVisibleGraphNodeId(graph, new Set())).toBeUndefined()
     expect(live.layout.nodes.has(endpointId)).toBeTrue()
-    expect(live.text).toContain("Claude session")
+    expect(live.text).toContain("Draft")
     expect(initialVisibleGraphNodeId(graph, new Set([ROOT]))).toBe(endpointId)
   })
 
