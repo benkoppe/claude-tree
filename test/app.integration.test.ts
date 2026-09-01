@@ -287,6 +287,91 @@ test("refreshes a created fork with unvalidated ancestry as an independent root"
   }
 })
 
+test("persists and opens a provenance-validated fork with sparse active history", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const parentId = "11111111-1111-4111-8111-111111111111"
+  const childId = "22222222-2222-4222-8222-222222222222"
+  const parent = [
+    sessionMessage(parentId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+    sessionMessage(parentId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "preserved"),
+    sessionMessage(parentId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "user", "follow-up"),
+    sessionMessage(parentId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "assistant", "source"),
+  ]
+  const copied = parent.map((entry, index) =>
+    sessionMessage(
+      childId,
+      `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`,
+      entry.type,
+      sessionMessageText(entry),
+    )
+  )
+  const child = [copied[0]!, copied[2]!, copied[3]!]
+  let forked = false
+  const provider = new ClaudeProvider(project, join(root, "unused-claude"), {
+    async list(): Promise<SDKSessionInfo[]> {
+      const parentSession = {
+        sessionId: parentId,
+        summary: "Long conversation",
+        firstPrompt: "question",
+        lastModified: 1,
+      }
+      return forked
+        ? [{ ...parentSession, sessionId: childId, summary: "Long conversation (fork)", lastModified: 2 }, parentSession]
+        : [parentSession]
+    },
+    async messages(sessionId): Promise<SessionMessage[]> {
+      return sessionId === parentId ? parent : child
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      forked = true
+      return { sessionId: childId }
+    },
+    async forkRecords() {
+      return parent.map((entry, index) => ({
+        childMessageId: copied[index]!.uuid,
+        parentSessionId: parentId,
+        parentMessageId: entry.uuid,
+        parentOrdinal: index,
+        parentType: entry.type === "assistant" ? "assistant" as const : "user" as const,
+        parentMessage: entry.message,
+        type: entry.type === "assistant" ? "assistant" as const : "user" as const,
+        message: copied[index]!.message,
+      }))
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const showTerminal = spyOn(TerminalManager.prototype, "show").mockResolvedValue()
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Long conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("preserved") && frame.includes("source"))
+    setup.mockInput.pressKey("g", { shift: true })
+    await waitForFrame(setup, () => isSelected(setup, "source"))
+    setup.mockInput.pressKey("f")
+    await waitUntil(() => showTerminal.mock.calls.length === 1)
+
+    const metadata = await BranchMetadataStore.openForProvider(project, provider.id, state)
+    const relations = await metadata.loadRelations()
+    expect(relations).toHaveLength(1)
+    expect(relations[0]?.sharedMessages).toEqual(
+      parent.map((entry, index) => ({
+        parentMessageId: entry.uuid,
+        childMessageId: copied[index]!.uuid,
+      })),
+    )
+  } finally {
+    showTerminal.mockRestore()
+    await app.stop()
+    await running
+  }
+})
+
 test("returns to the navigator when the visible Claude process exits", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -3896,6 +3981,11 @@ function sessionMessage(
     parent_tool_use_id: null,
     parent_agent_id: null,
   }
+}
+
+function sessionMessageText(message: SessionMessage): string {
+  const payload = message.message as { content: Array<{ text?: string }> }
+  return payload.content[0]?.text ?? ""
 }
 
 function testUuid(value: number): string {

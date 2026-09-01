@@ -4,8 +4,11 @@ import { isDeepStrictEqual } from "node:util"
 import {
   forkSession,
   getSessionMessages,
+  importSessionToStore,
   listSessions,
   type SDKSessionInfo,
+  type SessionStore,
+  type SessionStoreEntry,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk"
 
@@ -33,6 +36,21 @@ export interface ClaudeSdk {
     sessionId: string,
     options: { dir: string; upToMessageId: string },
   ): Promise<{ sessionId: string }>
+  forkRecords?(
+    sessionId: string,
+    options: { dir: string; parentSessionId: string },
+  ): Promise<ClaudeForkRecord[]>
+}
+
+export interface ClaudeForkRecord {
+  childMessageId: string
+  parentSessionId: string
+  parentMessageId: string
+  parentOrdinal: number
+  parentType: "user" | "assistant"
+  parentMessage: unknown
+  type: "user" | "assistant"
+  message: unknown
 }
 
 export interface ClaudeProviderOptions {
@@ -48,6 +66,7 @@ const defaultSdk: ClaudeSdk = {
   list: listSessions,
   messages: getSessionMessages,
   fork: forkSession,
+  forkRecords: readClaudeForkRecords,
 }
 
 const LOCAL_COMMAND_INVOCATION_PATTERN =
@@ -60,6 +79,10 @@ const FORK_VALIDATION_RETRY_DELAYS_MS = [25, 50, 100, 200]
 interface ClaudeMessage extends AgentMessage {
   replayText?: string
   rawMessage: unknown
+}
+
+interface ValidatedFork {
+  sharedMessages: Array<{ parentMessageId: string; childMessageId: string }>
 }
 
 export class ClaudeProvider implements AgentProvider {
@@ -149,6 +172,10 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     this.validateDraft(replayText)
+    const readForkRecords = this.sdk.forkRecords
+    if (!readForkRecords) {
+      throw new Error("Claude SDK fork provenance is unavailable")
+    }
 
     const forkMessage = parentTranscript[forkIndex]!
     const parentSession = (await this.listSessions()).find((session) => session.id === target.sessionId)
@@ -161,24 +188,13 @@ export class ClaudeProvider implements AgentProvider {
       title: `${parentSession?.title ?? "Conversation"} (fork)`,
       lastModified: Date.now(),
     }
-    const copiedPrefixLength = forkIndex + 1
-    const childTranscript = await this.readForkedTranscript(session, copiedPrefixLength)
-    for (let index = 0; index < copiedPrefixLength; index += 1) {
-      const parentMessage = parentTranscript[index]!
-      const childMessage = childTranscript[index]!
-      if (
-        parentMessage.role !== childMessage.role ||
-        !isDeepStrictEqual(parentMessage.rawMessage, childMessage.rawMessage) ||
-        parentMessage.visible !== childMessage.visible
-      ) {
-        throw new BranchCreatedError(
-          session,
-          childTranscript,
-          true,
-          `Fork ${result.sessionId} was created, but its copied prefix does not match the source`,
-        )
-      }
-    }
+    const parentPrefix = parentTranscript.slice(0, forkIndex + 1)
+    const validatedFork = await this.readForkedTranscript(
+      session,
+      target.sessionId,
+      parentPrefix,
+      (sessionId, options) => readForkRecords.call(this.sdk, sessionId, options),
+    )
 
     return {
       session,
@@ -187,10 +203,7 @@ export class ClaudeProvider implements AgentProvider {
         childSessionId: result.sessionId,
         parentSessionId: target.sessionId,
         sourceMessageId: forkMessage.id,
-        sharedMessages: parentTranscript.slice(0, copiedPrefixLength).map((message, index) => ({
-          parentMessageId: message.id,
-          childMessageId: childTranscript[index]!.id,
-        })),
+        sharedMessages: validatedFork.sharedMessages,
       },
       providerSessionCreated: true,
     }
@@ -260,11 +273,14 @@ export class ClaudeProvider implements AgentProvider {
 
   private async readForkedTranscript(
     session: AgentSession,
-    copiedPrefixLength: number,
-  ): Promise<ClaudeMessage[]> {
+    parentSessionId: string,
+    parentPrefix: ClaudeMessage[],
+    readForkRecords: NonNullable<ClaudeSdk["forkRecords"]>,
+  ): Promise<ValidatedFork> {
     let observedTranscript: ClaudeMessage[] = []
+    let observedCopiedMessages = 0
     let transcriptAvailable = false
-    let lastReadError: unknown
+    let lastReadError: { kind: "transcript" | "provenance"; error: unknown } | undefined
     const delays = [0, ...this.forkValidationRetryDelaysMs]
 
     for (const delayMs of delays) {
@@ -274,28 +290,226 @@ export class ClaudeProvider implements AgentProvider {
         observedTranscript = transcript
         transcriptAvailable = true
         lastReadError = undefined
-        if (transcript.length >= copiedPrefixLength) return transcript
       } catch (error) {
-        lastReadError = error
+        lastReadError = { kind: "transcript", error }
+        continue
       }
+
+      let forkRecords: ClaudeForkRecord[]
+      try {
+        forkRecords = await readForkRecords(session.id, {
+          dir: this.projectPath,
+          parentSessionId,
+        })
+        lastReadError = undefined
+      } catch (error) {
+        lastReadError = { kind: "provenance", error }
+        continue
+      }
+
+      const validation = validateForkProvenance(
+        parentSessionId,
+        parentPrefix,
+        observedTranscript,
+        forkRecords,
+      )
+      observedCopiedMessages = validation.copiedMessages
+      if (validation.kind === "short") continue
+      if (validation.kind === "invalid") {
+        throw new BranchCreatedError(
+          session,
+          observedTranscript,
+          true,
+          `Fork ${session.id} was created, but its copied prefix does not match the source`,
+        )
+      }
+      return { sharedMessages: validation.sharedMessages }
     }
 
     if (lastReadError !== undefined) {
+      const subject = lastReadError.kind === "transcript" ? "transcript" : "copied-prefix provenance"
       throw new BranchCreatedError(
         session,
         observedTranscript,
         transcriptAvailable,
-        `Fork ${session.id} was created, but its transcript could not be read after ${delays.length} attempts: ${lastReadError instanceof Error ? lastReadError.message : String(lastReadError)}`,
-        { cause: lastReadError },
+        `Fork ${session.id} was created, but its ${subject} could not be read after ${delays.length} attempts: ${lastReadError.error instanceof Error ? lastReadError.error.message : String(lastReadError.error)}`,
+        { cause: lastReadError.error },
       )
     }
     throw new BranchCreatedError(
       session,
       observedTranscript,
       true,
-      `Fork ${session.id} was created, but its copied prefix could not be validated (expected ${copiedPrefixLength} messages; found ${observedTranscript.length})`,
+      `Fork ${session.id} was created, but its copied prefix could not be validated (expected ${parentPrefix.length} messages; found ${observedCopiedMessages})`,
     )
   }
+}
+
+type ForkProvenanceValidation =
+  | {
+      kind: "valid"
+      copiedMessages: number
+      sharedMessages: Array<{ parentMessageId: string; childMessageId: string }>
+    }
+  | { kind: "short"; copiedMessages: number }
+  | { kind: "invalid"; copiedMessages: number }
+
+function validateForkProvenance(
+  parentSessionId: string,
+  parentPrefix: ClaudeMessage[],
+  childTranscript: ClaudeMessage[],
+  forkRecords: ClaudeForkRecord[],
+): ForkProvenanceValidation {
+  const parentIndexById = new Map(parentPrefix.map((message, index) => [message.id, index]))
+  const observedExpectedIds = new Set(
+    forkRecords
+      .filter((record) => parentIndexById.has(record.parentMessageId))
+      .map((record) => record.parentMessageId),
+  )
+  const recordByParentId = new Map<string, ClaudeForkRecord>()
+  const parentIdByChildId = new Map<string, string>()
+  const seenParentIds = new Set<string>()
+  const seenChildIds = new Set<string>()
+  let previousParentOrdinal = -1
+  let previousExpectedIndex = -1
+
+  for (const record of forkRecords) {
+    if (
+      record.parentSessionId !== parentSessionId ||
+      seenParentIds.has(record.parentMessageId) ||
+      seenChildIds.has(record.childMessageId) ||
+      record.parentType !== record.type ||
+      !isDeepStrictEqual(record.parentMessage, record.message)
+    ) {
+      return { kind: "invalid", copiedMessages: recordByParentId.size }
+    }
+    if (record.parentOrdinal !== previousParentOrdinal + 1) {
+      return observedExpectedIds.size < parentPrefix.length
+        ? { kind: "short", copiedMessages: observedExpectedIds.size }
+        : { kind: "invalid", copiedMessages: recordByParentId.size }
+    }
+    previousParentOrdinal = record.parentOrdinal
+    seenParentIds.add(record.parentMessageId)
+    seenChildIds.add(record.childMessageId)
+    const expectedIndex = parentIndexById.get(record.parentMessageId)
+    if (expectedIndex === undefined) continue
+    if (expectedIndex <= previousExpectedIndex) {
+      return { kind: "invalid", copiedMessages: recordByParentId.size }
+    }
+    previousExpectedIndex = expectedIndex
+    recordByParentId.set(record.parentMessageId, record)
+    parentIdByChildId.set(record.childMessageId, record.parentMessageId)
+  }
+
+  const copiedMessages = recordByParentId.size
+  if (copiedMessages < parentPrefix.length) return { kind: "short", copiedMessages }
+  if (forkRecords.at(-1)?.parentMessageId !== parentPrefix.at(-1)?.id) {
+    return { kind: "invalid", copiedMessages }
+  }
+
+  const sharedMessages: Array<{ parentMessageId: string; childMessageId: string }> = []
+  for (const parentMessage of parentPrefix) {
+    const record = recordByParentId.get(parentMessage.id)
+    if (!record) return { kind: "short", copiedMessages }
+    const role = record.type === "assistant" ? "agent" : "user"
+    const visible = !isLocalCommandArtifact(record) && isVisibleMessage(record)
+    if (
+      parentMessage.role !== role ||
+      parentMessage.visible !== visible ||
+      !isDeepStrictEqual(parentMessage.rawMessage, record.message)
+    ) {
+      return { kind: "invalid", copiedMessages }
+    }
+    sharedMessages.push({
+      parentMessageId: parentMessage.id,
+      childMessageId: record.childMessageId,
+    })
+  }
+
+  let previousParentIndex = -1
+  for (const childMessage of childTranscript) {
+    const parentMessageId = parentIdByChildId.get(childMessage.id)
+    const parentIndex = parentMessageId === undefined ? undefined : parentIndexById.get(parentMessageId)
+    const parentMessage = parentIndex === undefined ? undefined : parentPrefix[parentIndex]
+    if (
+      parentIndex === undefined ||
+      parentIndex <= previousParentIndex ||
+      parentMessage === undefined ||
+      parentMessage.role !== childMessage.role ||
+      parentMessage.visible !== childMessage.visible ||
+      !isDeepStrictEqual(parentMessage.rawMessage, childMessage.rawMessage)
+    ) {
+      return { kind: "invalid", copiedMessages }
+    }
+    previousParentIndex = parentIndex
+  }
+  if (previousParentIndex !== parentPrefix.length - 1) {
+    return { kind: "short", copiedMessages }
+  }
+
+  return { kind: "valid", copiedMessages, sharedMessages }
+}
+
+async function readClaudeForkRecords(
+  sessionId: string,
+  options: { dir: string; parentSessionId: string },
+): Promise<ClaudeForkRecord[]> {
+  const [parentEntries, childEntries] = await Promise.all([
+    readClaudeConversationEntries(options.parentSessionId, options.dir),
+    readClaudeConversationEntries(sessionId, options.dir),
+  ])
+  const parentById = new Map<string, { ordinal: number; entry: SessionStoreEntry }>()
+  for (const [ordinal, entry] of parentEntries.entries()) {
+    if (typeof entry.uuid !== "string" || parentById.has(entry.uuid)) {
+      throw new Error("Source conversation records do not have unique message IDs")
+    }
+    parentById.set(entry.uuid, { ordinal, entry })
+  }
+
+  return childEntries.map((entry): ClaudeForkRecord => {
+    if (typeof entry.uuid !== "string" || !isRecord(entry.forkedFrom)) {
+      throw new Error("Forked conversation record has no valid provenance")
+    }
+    const parentSessionId = entry.forkedFrom.sessionId
+    const parentMessageId = entry.forkedFrom.messageUuid
+    if (typeof parentSessionId !== "string" || typeof parentMessageId !== "string") {
+      throw new Error("Forked conversation record has no valid provenance")
+    }
+    const parent = parentById.get(parentMessageId)
+    if (!parent || (parent.entry.type !== "user" && parent.entry.type !== "assistant")) {
+      throw new Error("Forked conversation record refers to an unavailable source message")
+    }
+    return {
+      childMessageId: entry.uuid,
+      parentSessionId,
+      parentMessageId,
+      parentOrdinal: parent.ordinal,
+      parentType: parent.entry.type,
+      parentMessage: parent.entry.message,
+      type: entry.type as "user" | "assistant",
+      message: entry.message,
+    }
+  })
+}
+
+async function readClaudeConversationEntries(
+  sessionId: string,
+  dir: string,
+): Promise<SessionStoreEntry[]> {
+  const entries: SessionStoreEntry[] = []
+  const store: SessionStore = {
+    async append(key, batch) {
+      if (key.sessionId === sessionId && key.subpath === undefined) entries.push(...batch)
+    },
+    async load() {
+      return null
+    },
+  }
+  await importSessionToStore(sessionId, store, {
+    dir,
+    includeSubagents: false,
+  })
+  return entries.filter((entry) => entry.type === "user" || entry.type === "assistant")
 }
 
 export async function createClaudeProvider(

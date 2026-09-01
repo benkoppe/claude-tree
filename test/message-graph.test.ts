@@ -204,8 +204,8 @@ describe("buildConversationForest", () => {
       ],
     )
 
-    expect(forest.graphs).toHaveLength(1)
     expect(forest.warnings).toEqual([])
+    expect(forest.graphs).toHaveLength(1)
     const graph = forest.graphs[0]!
     expect(messagePreviews(graph)).toEqual([
       "shared root",
@@ -508,6 +508,503 @@ describe("buildConversationForest", () => {
     expect(forest.graphs).toHaveLength(1)
     expect(forest.graphBySessionId.get(CHILD)?.rootSessionId).toBe(ROOT)
     expect(forest.warnings).toEqual([])
+  })
+
+  test("accepts an ordered active-child subsequence of validated shared history", () => {
+    const parentMessages = [
+      message("parent-a", "user", "A", 0),
+      message("parent-preserved", "agent", "preserved", 1),
+      message("parent-c", "user", "C", 2),
+      message("parent-source", "agent", "source", 3),
+    ]
+    const copiedChildMessages = [
+      message("child-a", "user", "A", 0),
+      message("child-preserved", "agent", "preserved", 1),
+      message("child-c", "user", "C", 2),
+      message("child-source", "agent", "source", 3),
+    ]
+    const activeChildMessages = [
+      copiedChildMessages[0]!,
+      { ...copiedChildMessages[2]!, ordinal: 1 },
+      { ...copiedChildMessages[3]!, ordinal: 2 },
+      message("child-tail", "user", "continued fork", 3),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, activeChildMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[3]!.id,
+          shared(parentMessages, copiedChildMessages, 4),
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const graph = forest.graphs[0]!
+    const preserved = messageNodes(graph).find((node) => node.preview === "preserved")!
+    expect(preserved.aliases).toContainEqual({
+      sessionId: CHILD,
+      messageId: copiedChildMessages[1]!.id,
+    })
+    const tail = messageNodes(graph).find((node) => node.preview === "continued fork")!
+    const source = messageNodes(graph).find((node) => node.preview === "source")!
+    expect(tail.parentId).toBe(source.id)
+    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(tail.id)
+  })
+
+  test("fails closed when validated shared child IDs are out of order", () => {
+    const parentMessages = [
+      message("parent-a", "user", "A", 0),
+      message("parent-b", "agent", "B", 1),
+      message("parent-c", "user", "C", 2),
+    ]
+    const copiedChildMessages = [
+      message("child-a", "user", "A", 0),
+      message("child-b", "agent", "B", 1),
+      message("child-c", "user", "C", 2),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, [copiedChildMessages[0]!, copiedChildMessages[2]!, copiedChildMessages[1]!]],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[2]!.id,
+          shared(parentMessages, copiedChildMessages, 3),
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(2)
+    expect(forest.warnings[0]).toContain("recorded order")
+  })
+
+  test("attaches descendants through a parent with sparse active shared history", () => {
+    const parentMessages = [
+      message("parent-a", "user", "A", 0),
+      message("parent-preserved", "agent", "preserved", 1),
+      message("parent-c", "user", "C", 2),
+      message("parent-source", "agent", "source", 3),
+    ]
+    const copiedChildMessages = [
+      message("child-a", "user", "A", 0),
+      message("child-preserved", "agent", "preserved", 1),
+      message("child-c", "user", "C", 2),
+      message("child-source", "agent", "source", 3),
+    ]
+    const activeChildMessages = [
+      copiedChildMessages[0]!,
+      { ...copiedChildMessages[2]!, ordinal: 1 },
+      { ...copiedChildMessages[3]!, ordinal: 2 },
+      message("child-tail", "user", "child tail", 3),
+    ]
+    const grandchildMessages = activeChildMessages.map((entry, index) => ({
+      ...entry,
+      id: `grandchild-${index}`,
+    }))
+    grandchildMessages.push(message("grandchild-tail", "agent", "grandchild tail", 4))
+    const forest = buildConversationForest(
+      [
+        session(ROOT, "Root", 30),
+        session(CHILD, "Fork", 20),
+        session(GRANDCHILD, "Nested fork", 10),
+      ],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, activeChildMessages],
+        [GRANDCHILD, grandchildMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[3]!.id,
+          shared(parentMessages, copiedChildMessages, 4),
+          1,
+        ),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          activeChildMessages[3]!.id,
+          shared(activeChildMessages, grandchildMessages, 4),
+          2,
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.graphs[0]!.sessionIds).toEqual(new Set([ROOT, CHILD, GRANDCHILD]))
+    expect(messagePreviews(forest.graphs[0]!)).toContain("grandchild tail")
+  })
+
+  test("retains an existing descendant after its parent active history becomes sparse", () => {
+    const parentMessages = [
+      message("parent-a", "user", "A", 0),
+      message("parent-preserved", "agent", "preserved", 1),
+      message("parent-c", "user", "C", 2),
+      message("parent-source", "agent", "source", 3),
+    ]
+    const copiedChildMessages = parentMessages.map((entry, index) => ({
+      ...entry,
+      id: `child-${index}`,
+    }))
+    const fullChildMessages = [
+      ...copiedChildMessages,
+      message("child-tail", "user", "child tail", 4),
+    ]
+    const activeChildMessages = [
+      copiedChildMessages[0]!,
+      { ...copiedChildMessages[2]!, ordinal: 1 },
+      { ...copiedChildMessages[3]!, ordinal: 2 },
+      { ...fullChildMessages[4]!, ordinal: 3 },
+    ]
+    const grandchildMessages = fullChildMessages.map((entry, index) => ({
+      ...entry,
+      id: `grandchild-${index}`,
+    }))
+    grandchildMessages.push(message("grandchild-tail", "agent", "grandchild tail", 5))
+    const forest = buildConversationForest(
+      [
+        session(ROOT, "Root", 30),
+        session(CHILD, "Fork", 20),
+        session(GRANDCHILD, "Nested fork", 10),
+      ],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, activeChildMessages],
+        [GRANDCHILD, grandchildMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[3]!.id,
+          shared(parentMessages, copiedChildMessages, 4),
+          1,
+        ),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          fullChildMessages[4]!.id,
+          shared(fullChildMessages, grandchildMessages, 5),
+          2,
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.graphs[0]!.sessionIds).toEqual(new Set([ROOT, CHILD, GRANDCHILD]))
+  })
+
+  test("restores an interior parent message retained only by its child", () => {
+    const parentHistory = [
+      message("parent-a", "user", "A", 0),
+      message("parent-b", "agent", "B", 1),
+      message("parent-c", "user", "C", 2),
+    ]
+    const activeParent = [parentHistory[0]!, { ...parentHistory[2]!, ordinal: 1 }]
+    const childMessages = parentHistory.map((entry, index) => ({
+      ...entry,
+      id: `child-${index}`,
+    }))
+    childMessages.push(message("child-tail", "agent", "tail", 3))
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, activeParent],
+        [CHILD, childMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentHistory[2]!.id,
+          shared(parentHistory, childMessages, 3),
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    expect(forest.graphs).toHaveLength(1)
+    const nodesByPreview = new Map(
+      messageNodes(forest.graphs[0]!).map((node) => [node.preview, node]),
+    )
+    expect(nodesByPreview.get("B")?.parentId).toBe(nodesByPreview.get("A")?.id)
+    expect(nodesByPreview.get("C")?.parentId).toBe(nodesByPreview.get("B")?.id)
+    expect(nodesByPreview.get("B")?.aliases.map((alias) => alias.sessionId)).toEqual([
+      CHILD,
+      ROOT,
+    ])
+  })
+
+  test("propagates retained sparse history across multiple generations", () => {
+    const rootMessages = [
+      message("root-a", "user", "A", 0),
+      message("root-b", "agent", "B", 1),
+      message("root-c", "user", "C", 2),
+    ]
+    const fullChildMessages = rootMessages.map((entry, index) => ({
+      ...entry,
+      id: `child-${index}`,
+    }))
+    const activeChildMessages = [
+      fullChildMessages[0]!,
+      { ...fullChildMessages[2]!, ordinal: 1 },
+    ]
+    const fullGrandchildMessages = fullChildMessages.map((entry, index) => ({
+      ...entry,
+      id: `grandchild-${index}`,
+    }))
+    const activeGrandchildMessages = [
+      fullGrandchildMessages[0]!,
+      { ...fullGrandchildMessages[2]!, ordinal: 1 },
+      message("grandchild-tail", "agent", "tail", 2),
+    ]
+    const forest = buildConversationForest(
+      [
+        session(ROOT, "Root", 30),
+        session(CHILD, "Fork", 20),
+        session(GRANDCHILD, "Nested fork", 10),
+      ],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, activeChildMessages],
+        [GRANDCHILD, activeGrandchildMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          rootMessages[2]!.id,
+          shared(rootMessages, fullChildMessages, 3),
+          1,
+        ),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          fullChildMessages[2]!.id,
+          shared(fullChildMessages, fullGrandchildMessages, 3),
+          2,
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    expect(forest.graphs).toHaveLength(1)
+    const retainedNode = messageNodes(forest.graphs[0]!).find((node) => node.preview === "B")
+    expect(retainedNode?.aliases.map((alias) => alias.sessionId)).toEqual([
+      ROOT,
+      CHILD,
+      GRANDCHILD,
+    ])
+  })
+
+  test("restores an omitted record inside a provider display group", () => {
+    const parentMessages = [
+      message("parent-user", "user", "question", 0),
+      message("parent-first", "agent", "first", 1, true, "parent-user"),
+      message("parent-second", "agent", "second", 2, true, "parent-user"),
+    ]
+    const activeParent = [parentMessages[0]!, { ...parentMessages[2]!, ordinal: 1 }]
+    const childMessages = [
+      message("child-user", "user", "question", 0),
+      message("child-first", "agent", "first", 1, true, "child-user"),
+      message("child-second", "agent", "second", 2, true, "child-user"),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, activeParent],
+        [CHILD, childMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[2]!.id,
+          shared(parentMessages, childMessages, 3),
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    const agentNodes = messageNodes(forest.graphs[0]!).filter((node) => node.role === "agent")
+    expect(agentNodes).toHaveLength(1)
+    expect(agentNodes[0]!.preview).toBe("first second")
+    expect(agentNodes[0]!.aliases.map((alias) => alias.messageId)).toEqual([
+      "parent-second",
+      "child-first",
+      "parent-first",
+      "child-second",
+    ])
+  })
+
+  test("splits a display group merged across an omitted user message", () => {
+    const parentHistory = [
+      message("parent-user-one", "user", "first question", 0),
+      message("parent-answer-one", "agent", "first answer", 1, true, "parent-user-one"),
+      message("parent-user-two", "user", "second question", 2),
+      message("parent-answer-two", "agent", "second answer", 3, true, "parent-user-two"),
+    ]
+    const activeParent = [
+      parentHistory[0]!,
+      parentHistory[1]!,
+      {
+        ...parentHistory[3]!,
+        ordinal: 2,
+        displayGroupId: "parent-user-one",
+      },
+    ]
+    const childMessages = [
+      message("child-user-one", "user", "first question", 0),
+      message("child-answer-one", "agent", "first answer", 1, true, "child-user-one"),
+      message("child-user-two", "user", "second question", 2),
+      message("child-answer-two", "agent", "second answer", 3, true, "child-user-two"),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, activeParent],
+        [CHILD, childMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentHistory[3]!.id,
+          shared(parentHistory, childMessages, 4),
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    const visibleNodes = messageNodes(forest.graphs[0]!).filter((node) => !node.internal)
+    expect(visibleNodes.map((node) => node.preview)).toEqual([
+      "first question",
+      "first answer",
+      "second question",
+      "second answer",
+    ])
+    expect(visibleNodes[2]!.parentId).toBe(visibleNodes[1]!.id)
+    expect(visibleNodes[3]!.parentId).toBe(visibleNodes[2]!.id)
+  })
+
+  test("uses the fuller parent history when child compaction changes display grouping", () => {
+    const parentMessages = [
+      message("parent-user-one", "user", "first question", 0),
+      message("parent-answer-one", "agent", "first answer", 1, true, "parent-user-one"),
+      message("parent-user-two", "user", "second question", 2),
+      message("parent-answer-two", "agent", "second answer", 3, true, "parent-user-two"),
+    ]
+    const fullChildMessages = [
+      message("child-user-one", "user", "first question", 0),
+      message("child-answer-one", "agent", "first answer", 1, true, "child-user-one"),
+      message("child-user-two", "user", "second question", 2),
+      message("child-answer-two", "agent", "second answer", 3, true, "child-user-two"),
+    ]
+    const activeChild = [
+      fullChildMessages[0]!,
+      fullChildMessages[1]!,
+      {
+        ...fullChildMessages[3]!,
+        ordinal: 2,
+        displayGroupId: "child-user-one",
+      },
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, activeChild],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[3]!.id,
+          shared(parentMessages, fullChildMessages, 4),
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    expect(messageNodes(forest.graphs[0]!).map((node) => node.preview)).toEqual([
+      "first question",
+      "first answer",
+      "second question",
+      "second answer",
+    ])
+  })
+
+  test("uses the nearest retained user when sparse grouping metadata disagrees", () => {
+    const parentHistory = [
+      message("parent-u0", "user", "zero", 0),
+      message("parent-a0", "agent", "zero answer", 1, true, "parent-u0"),
+      message("parent-u1", "user", "one", 2),
+      message("parent-a1", "agent", "one answer", 3, true, "parent-u1"),
+      message("parent-u2", "user", "two", 4),
+      message("parent-a2", "agent", "two first", 5, true, "parent-u2"),
+      message("parent-a3", "agent", "two second", 6, true, "parent-u2"),
+    ]
+    const activeParent = [
+      ...parentHistory.slice(0, 4),
+      {
+        ...parentHistory[6]!,
+        ordinal: 4,
+        displayGroupId: "parent-u1",
+      },
+    ]
+    const childHistory = parentHistory.map((entry) => ({
+      ...entry,
+      id: entry.id.replace("parent-", "child-"),
+      ...(entry.displayGroupId === undefined
+        ? {}
+        : { displayGroupId: entry.displayGroupId.replace("parent-", "child-") }),
+    }))
+    const activeChild = [
+      childHistory[0]!,
+      { ...childHistory[4]!, ordinal: 1 },
+      { ...childHistory[5]!, ordinal: 2 },
+      { ...childHistory[6]!, ordinal: 3 },
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, activeParent],
+        [CHILD, activeChild],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentHistory[6]!.id,
+          shared(parentHistory, childHistory, 7),
+        ),
+      ],
+    )
+
+    expect(forest.warnings).toEqual([])
+    expect(messageNodes(forest.graphs[0]!).map((node) => node.preview)).toEqual([
+      "zero",
+      "zero answer",
+      "one",
+      "one answer",
+      "two",
+      "two first two second",
+    ])
   })
 
   test("renders a fully rewritten Claude child chain from the family origin", () => {
