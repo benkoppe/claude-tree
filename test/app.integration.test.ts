@@ -326,11 +326,19 @@ test("returns to the navigator when the visible Claude process exits", async () 
       }
     },
   }
-  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const processTitles: string[] = []
+  const app = await AgentTreeApp.create(
+    setup.renderer,
+    project,
+    provider,
+    state,
+    (title) => processTitles.push(title),
+  )
   const running = app.run()
 
   try {
     await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    expect(processTitles.at(-1)).toBe("c/t")
     setup.mockInput.pressKey("n")
 
     const deadline = performance.now() + 2_000
@@ -346,6 +354,8 @@ test("returns to the navigator when the visible Claude process exits", async () 
       if (showedTerminal && frame.includes("Conversation roots")) break
     }
     expect(showedTerminal).toBeTrue()
+    expect(processTitles).toContain("c/t: New conversation")
+    expect(processTitles.at(-1)).toBe("c/t")
     expect(frame).toContain("claude-tree")
     expect(frame).not.toContain("session exited")
 
@@ -366,9 +376,12 @@ test("replaces a temporary new-session id after the provider reports the real se
   await chmod(fakeAgent, 0o755)
   let resolveStarted!: (session: AgentSession) => void
   const startedSession = new Promise<AgentSession>((resolve) => { resolveStarted = resolve })
+  let resolveSecondStarted!: (session: AgentSession) => void
+  const secondStartedSession = new Promise<AgentSession>((resolve) => { resolveSecondStarted = resolve })
   let resolveDiscovery!: (sessions: AgentSession[]) => void
   const discovery = new Promise<AgentSession[]>((resolve) => { resolveDiscovery = resolve })
   let listCalls = 0
+  let newSessionCalls = 0
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
@@ -389,6 +402,19 @@ test("replaces a temporary new-session id after the provider reports the real se
       ]]))
     },
     async prepareNewSession() {
+      newSessionCalls += 1
+      if (newSessionCalls === 2) {
+        return {
+          session: { id: "second-pending", title: "Second pending", lastModified: 3, transient: true },
+          launch: {
+            sessionId: "second-pending",
+            command: [fakeAgent],
+            cwd: project,
+            observer: new NullTerminalObserver(),
+          },
+          startedSession: secondStartedSession,
+        }
+      }
       return {
         session: { id: "pending-session", title: "Pending conversation", lastModified: 1, transient: true },
         launch: {
@@ -403,15 +429,24 @@ test("replaces a temporary new-session id after the provider reports the real se
     async prepareResume() { throw new Error("not used") },
   }
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const processTitles: string[] = []
+  const app = await AgentTreeApp.create(
+    setup.renderer,
+    project,
+    provider,
+    state,
+    (title) => processTitles.push(title),
+  )
   const running = app.run()
 
   try {
     await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    expect(processTitles.at(-1)).toBe("c/t")
     setup.mockInput.pressKey("n")
     await waitForFrame(setup, (frame) => frame.includes("NEW_SESSION_ACTIVE"))
     const recorder = new TestRecorder(setup.renderer)
     recorder.rec()
+    expect(processTitles.at(-1)).toBe("c/t: Pending conversation")
     setup.mockInput.pressKey(" ", { ctrl: true })
     await waitUntil(() => listCalls === 2)
     const pendingGraph = await waitForFrame(
@@ -422,24 +457,48 @@ test("replaces a temporary new-session id after the provider reports the real se
     expect(pendingGraph).not.toContain("No conversations")
     recorder.stop()
     expect(recorder.recordedFrames.some(({ frame }) => frame.includes("Conversation roots"))).toBeFalse()
+    expect(processTitles.at(-1)).toBe("c/t: Pending conversation")
     resolveDiscovery([{ id: "real-session", title: "Real conversation", lastModified: 2 }])
     await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    expect(processTitles.at(-1)).toBe("c/t: Pending conversation")
     setup.mockInput.pressKey("q")
     await waitForFrame(
       setup,
       (frame) => frame.includes("Conversation roots") && frame.includes("Pending conversation"),
     )
+    expect(processTitles.at(-1)).toBe("c/t")
     resolveStarted({ id: "real-session", title: "Real conversation", lastModified: 2, transient: true })
     const roots = await waitForFrame(
       setup,
       (frame) => frame.includes("Conversation roots") && frame.includes("Real conversation"),
     )
     expect(roots).not.toContain("Pending conversation")
+    expect(processTitles.at(-1)).toBe("c/t")
     setup.mockInput.pressEnter()
     await waitForFrame(
       setup,
       (frame) => frame.includes("Message graph") && frame.includes("persisted history"),
     )
+    expect(processTitles.at(-1)).toBe("c/t: Real conversation")
+    setup.mockInput.pressKey("q")
+    const settledRoots = await waitForFrame(setup, (frame) => frame.includes("Real conversation"))
+    expect(settledRoots).not.toContain("Pending conversation")
+    expect(processTitles.at(-1)).toBe("c/t")
+
+    setup.mockInput.pressKey("n")
+    await waitUntil(() => processTitles.at(-1) === "c/t: Second pending")
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    expect(processTitles.at(-1)).toBe("c/t: Second pending")
+    const titlesBeforeGraphAdoption = processTitles.length
+    resolveSecondStarted({
+      id: "second-real",
+      title: "Second real conversation",
+      lastModified: 4,
+      transient: true,
+    })
+    await waitUntil(() => processTitles.at(-1) === "c/t: Second real conversation")
+    expect(processTitles.slice(titlesBeforeGraphAdoption)).not.toContain("c/t")
   } finally {
     resolveDiscovery([])
     await app.stop()
@@ -2080,19 +2139,40 @@ test("uses Ctrl+N and Ctrl+P to move through conversation roots", async () => {
     },
   })
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const processTitles: string[] = []
+  const app = await AgentTreeApp.create(
+    setup.renderer,
+    project,
+    provider,
+    state,
+    (title) => processTitles.push(title),
+  )
   const running = app.run()
 
   try {
     await waitForFrame(setup, (frame) => frame.includes("Root 1"))
     expect(isSelected(setup, "Root 1")).toBeTrue()
+    expect(processTitles.at(-1)).toBe("c/t")
 
     setup.mockInput.pressKey("n", { ctrl: true })
     await waitForFrame(setup, () => isSelected(setup, "Root 2"))
+    expect(processTitles.at(-1)).toBe("c/t")
 
     setup.mockInput.pressKey("p", { ctrl: true })
-    const frame = await waitForFrame(setup, () => isSelected(setup, "Root 1"))
+    let frame = await waitForFrame(setup, () => isSelected(setup, "Root 1"))
     expect(frame).toContain("Conversation roots")
+    expect(processTitles.at(-1)).toBe("c/t")
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Message graph") && candidate.includes("question 1"),
+    )
+    expect(processTitles.at(-1)).toBe("c/t: Root 1")
+
+    setup.mockInput.pressKey("q")
+    frame = await waitForFrame(setup, (candidate) => candidate.includes("Conversation roots"))
+    expect(processTitles.at(-1)).toBe("c/t")
   } finally {
     await app.stop()
     await running
@@ -2234,16 +2314,40 @@ sleep 30
     },
   })
   const setup = await createTestRenderer({ width: 80, height: 24 })
-  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const processTitles: string[] = []
+  const terminalTitles: string[] = []
+  let rendererStarted = false
+  let terminalTitleSetBeforeStart = false
+  const startRenderer = setup.renderer.start.bind(setup.renderer)
+  setup.renderer.start = () => {
+    rendererStarted = true
+    startRenderer()
+  }
+  setup.renderer.setTerminalTitle = (title) => {
+    if (!rendererStarted) terminalTitleSetBeforeStart = true
+    terminalTitles.push(title)
+  }
+  const app = await AgentTreeApp.create(
+    setup.renderer,
+    project,
+    provider,
+    state,
+    (title) => processTitles.push(title),
+  )
   const running = app.run()
 
   try {
     await waitForFrame(setup, (frame) => frame.includes("Root leaf"))
+    expect(processTitles.at(-1)).toBe("c/t")
+    expect(terminalTitles.at(-1)).toBe("c/t")
+    expect(terminalTitleSetBeforeStart).toBeFalse()
     setup.mockInput.pressEnter()
     await waitForFrame(
       setup,
       (frame) => frame.includes("Message graph") && frame.includes("branch source"),
     )
+    expect(processTitles.at(-1)).toBe("c/t: Root leaf")
+    expect(terminalTitles.at(-1)).toBe("c/t: Root leaf")
     setup.mockInput.pressKey("g", { shift: true })
     let frame = await waitForFrame(
       setup,
@@ -2288,12 +2392,16 @@ sleep 30
     setup.mockInput.pressEnter()
     await waitForFrame(setup, (candidate) => !candidate.includes("claude-tree"))
     expect(await readMarker(launchMarker)).toEqual(["--resume", childSessionId])
+    expect(processTitles.at(-1)).toBe("c/t: Child leaf")
+    expect(terminalTitles.at(-1)).toBe("c/t: Child leaf")
 
     setup.mockInput.pressKey(" ", { ctrl: true })
     await waitForFrame(
       setup,
       (candidate) => candidate.includes("Message graph") && candidate.includes("branch answer"),
     )
+    expect(processTitles.at(-1)).toBe("c/t: Root leaf")
+    expect(terminalTitles.at(-1)).toBe("c/t: Root leaf")
     setup.mockInput.pressArrow("up")
     await waitForFrame(setup, () => isSelected(setup, "branch answer"))
     setup.mockInput.pressArrow("up")

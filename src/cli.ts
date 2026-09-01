@@ -4,6 +4,7 @@ import { createCliRenderer } from "@opentui/core"
 
 import { AgentTreeApp } from "./app"
 import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
+import { setProcessTitle } from "./process-title"
 import { parseCliArguments, resolveProjectDirectory } from "./cli-options"
 import { createClaudeProvider } from "./providers/claude"
 import { createCodexProvider } from "./providers/codex"
@@ -49,7 +50,13 @@ async function main(): Promise<void> {
   process.on("SIGQUIT", stop)
 
   try {
-    app = await AgentTreeApp.create(renderer, projectPath, provider)
+    app = await AgentTreeApp.create(
+      renderer,
+      projectPath,
+      provider,
+      undefined,
+      setProcessTitle,
+    )
     if (stopRequested) {
       await app.stop()
       return

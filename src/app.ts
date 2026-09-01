@@ -61,7 +61,7 @@ import {
   type NewConversationRemoval,
 } from "./metadata"
 import { OpenLeafPicker } from "./open-leaf-picker"
-import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
+import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import {
   TerminalManager,
   type TerminalActivityEvent,
@@ -205,6 +205,9 @@ export class AgentTreeApp {
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
   private stopPromise: Promise<void> | undefined
+  private currentProcessTitle: string | undefined
+  private currentTerminalTitle: string | undefined
+  private rendererStarted = false
 
   private relations: BranchRelation[]
   private removals: ConversationRemoval[]
@@ -251,6 +254,7 @@ export class AgentTreeApp {
     private readonly provider: AgentProvider,
     relations: BranchRelation[],
     removals: ConversationRemoval[],
+    private readonly setProcessTitle: (title: string) => void,
   ) {
     this.relations = relations
     this.removals = removals
@@ -601,13 +605,14 @@ export class AgentTreeApp {
     projectDirectory: string,
     provider: AgentProvider,
     stateHome?: string,
+    setProcessTitle: (title: string) => void = () => undefined,
   ): Promise<AgentTreeApp> {
     const metadata = await BranchMetadataStore.openForProvider(projectDirectory, provider.id, stateHome)
     const [relations, removals] = await Promise.all([
       metadata.loadRelations(),
       metadata.loadRemovals(),
     ])
-    return new AgentTreeApp(renderer, metadata, provider, relations, removals)
+    return new AgentTreeApp(renderer, metadata, provider, relations, removals, setProcessTitle)
   }
 
   async run(): Promise<void> {
@@ -617,6 +622,7 @@ export class AgentTreeApp {
     await Promise.race([this.refreshData(), this.stopped])
     if (this.stopping) return
     this.renderer.start()
+    this.rendererStarted = true
     this.render()
     await this.stopped
   }
@@ -1613,7 +1619,11 @@ export class AgentTreeApp {
         : this.forest.graphByRootSessionId.get(selectedRootSessionId ?? "")
       if (selectedGraph) this.selectedRootIndex = this.forest.graphs.indexOf(selectedGraph)
     }
-    if (this.activeSurface === "navigator") this.render()
+    if (this.activeSurface === "navigator") {
+      this.render()
+    } else {
+      this.updateProcessTitle()
+    }
     this.scheduleCompletionRefresh()
   }
 
@@ -1971,6 +1981,7 @@ export class AgentTreeApp {
     this.activeSurface = "terminal"
     this.navigator.visible = false
     this.stopSpinnerAnimation()
+    this.updateProcessTitle()
   }
 
   private async returnToGraph(): Promise<void> {
@@ -2021,6 +2032,7 @@ export class AgentTreeApp {
 
   private render(): void {
     if (this.renderer.isDestroyed) return
+    this.updateProcessTitle()
     this.updateSpinnerAnimation()
     if (this.activeSurface === "terminal") {
       this.confirmationOverlay.visible = false
@@ -2358,6 +2370,28 @@ export class AgentTreeApp {
       if (runningSessionIds.has(sessionId)) workingSessionIds.add(sessionId)
     }
     return workingSessionIds
+  }
+
+  private updateProcessTitle(): void {
+    const activeSessionId = this.terminalManager.activeTerminalSessionId()
+    let context: string | undefined
+    if (activeSessionId) {
+      context =
+        this.sessions.find((session) => session.id === activeSessionId)?.title ??
+        this.temporarySessions.get(activeSessionId)?.title
+    } else if (this.navigatorView === "graph") {
+      context = this.currentGraph()?.rootSession.title
+    }
+    const title = context === undefined
+      ? PROCESS_TITLE_PREFIX
+      : `${PROCESS_TITLE_PREFIX}: ${context}`
+    if (this.rendererStarted && title !== this.currentTerminalTitle) {
+      this.currentTerminalTitle = title
+      this.renderer.setTerminalTitle(title)
+    }
+    if (title === this.currentProcessTitle) return
+    this.currentProcessTitle = title
+    this.setProcessTitle(title)
   }
 
   private scheduleCompletionRefresh(): void {
