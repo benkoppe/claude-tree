@@ -325,6 +325,57 @@ describe("renderConversationGraph", () => {
     expect(second.text).not.toContain(BRAILLE_SPINNER_FRAMES[0])
   })
 
+  test("renders a blocked live endpoint as an Agent that needs user input", () => {
+    const graph = branchGraph()
+    const rootEndpoint = graph.endpointBySessionId.get(ROOT)!
+    const childEndpoint = graph.endpointBySessionId.get(CHILD)!
+    const unselected = renderConversationGraph(
+      graph,
+      rootEndpoint,
+      100,
+      30,
+      new Set([ROOT, CHILD]),
+      new Map([[CHILD, { text: "hidden draft", exact: true }]]),
+      new Set(),
+      4,
+      undefined,
+      new Set([ROOT, CHILD]),
+      new Set(),
+      new Set(),
+      new Set([CHILD]),
+    )
+
+    expect(unselected.text).toContain("󰚩 Agent")
+    expect(unselected.text).toContain("Needs user")
+    expect(unselected.text).not.toContain("hidden draft")
+    expect(BRAILLE_SPINNER_FRAMES.every((spinner) => !unselected.text.includes(spinner))).toBeTrue()
+    expect(unselected.layout.nodes.get(childEndpoint)).toMatchObject({ width: 32, height: 2 })
+    const needsUser = unselected.content.chunks.find((chunk) => chunk.text.includes("Needs user"))
+    expect(needsUser?.fg?.equals(theme.danger)).toBeTrue()
+    expect(needsUser?.bg?.equals(theme.sessionElement)).toBeTrue()
+
+    const selected = renderConversationGraph(
+      graph,
+      childEndpoint,
+      100,
+      30,
+      new Set([CHILD]),
+      new Map(),
+      new Set(),
+      0,
+      undefined,
+      new Set([CHILD]),
+      new Set(),
+      new Set(),
+      new Set([CHILD]),
+    )
+    const selectedNeedsUser = selected.content.chunks.find((chunk) =>
+      chunk.text.includes("Needs user"),
+    )
+    expect(selectedNeedsUser?.fg?.equals(theme.selectedText)).toBeTrue()
+    expect(selectedNeedsUser?.bg?.equals(theme.selected)).toBeTrue()
+  })
+
   test("keeps the special live-card background in both activity states", () => {
     const graph = branchGraph()
     const selected = graph.endpointBySessionId.get(CHILD)!
@@ -457,6 +508,26 @@ describe("renderRootPicker", () => {
     )
     expect(narrow.text).toContain("Root")
     expect(narrow.text).not.toContain("New updates")
+  })
+
+  test("gives needs-user roots precedence over updates and other live statuses", () => {
+    const graph = branchGraph()
+    const rendered = renderRootPicker(
+      [graph],
+      0,
+      5,
+      80,
+      new Set([ROOT, CHILD]),
+      0,
+      new Set([CHILD]),
+      new Set([ROOT]),
+    )
+
+    expect(rendered.text.split("\n")[0]).toContain(" ●  Root")
+    const needsUserStatus = rendered.content.chunks.find(
+      (chunk) => chunk.text === "●" && chunk.bg?.equals(theme.selected),
+    )
+    expect(needsUserStatus?.fg?.equals(theme.danger)).toBeTrue()
   })
 
   test("keeps a stable viewport and scrolls only to reveal the selection", () => {

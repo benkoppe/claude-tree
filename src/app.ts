@@ -103,7 +103,7 @@ type FooterAction =
 interface KillConfirmation {
   kind: "kill"
   sessionId: string
-  sessionKind: "draft" | "working"
+  sessionKind: "draft" | "needs-user" | "working"
   choice: "confirm" | "cancel"
 }
 
@@ -1300,10 +1300,15 @@ export class AgentTreeApp {
     }
 
     const sessionId = selected.session.id
+    const needsUserSessionIds = this.needsUserSessionIds()
     this.confirmation = {
       kind: "kill",
       sessionId,
-      sessionKind: this.displayedWorkingSessionIds().has(sessionId) ? "working" : "draft",
+      sessionKind: needsUserSessionIds.has(sessionId)
+        ? "needs-user"
+        : this.displayedWorkingSessionIds().has(sessionId)
+          ? "working"
+          : "draft",
       choice: "confirm",
     }
     this.pendingMouseAction = null
@@ -1512,6 +1517,7 @@ export class AgentTreeApp {
       options: choices.map(({ option }) => option),
       activeSessionIds: this.terminalManager.runningSessionIds(),
       newUpdateSessionIds: this.unviewedUpdateSessionIds,
+      needsUserSessionIds: this.needsUserSessionIds(),
       onSelect: ({ endpoint }) => {
         const nodeId = nodeIdBySessionId.get(endpoint.session.id)
         if (nodeId) this.selectGraphNode(nodeId)
@@ -1633,7 +1639,7 @@ export class AgentTreeApp {
       const retainedTemporarySessionIds = new Set(
         retainedTemporarySessions.map((session) => session.id),
       )
-      const workingSessionIds = this.terminalManager.workingSessionIds()
+      const nonIdleSessionIds = this.terminalManager.nonIdleSessionIds()
       const refreshedTranscriptIds = new Set(incremental ? missingTranscriptIds : persistedSessionIds)
       const availableSessions: AgentSession[] = []
       const transcriptEntries: Array<readonly [string, AgentMessage[]]> = []
@@ -1664,7 +1670,7 @@ export class AgentTreeApp {
         const previousTranscript = this.transcripts.get(session.id) ?? []
         const rewindAnchor = this.liveRewindAnchors.get(session.id)
         let acceptedTranscript =
-          workingSessionIds.has(session.id) && refreshedTranscriptIds.has(session.id)
+          nonIdleSessionIds.has(session.id) && refreshedTranscriptIds.has(session.id)
             ? stableTranscriptWhileWorking(previousTranscript, transcript)
             : transcript
         if (acceptedTranscript.length < previousTranscript.length && !rewindAnchor) {
@@ -1956,6 +1962,7 @@ export class AgentTreeApp {
         ...(preferredSessionId === undefined ? {} : { selectedSessionId: preferredSessionId }),
         activeSessionIds: this.terminalManager.runningSessionIds(),
         newUpdateSessionIds: this.unviewedUpdateSessionIds,
+        needsUserSessionIds: this.needsUserSessionIds(),
         onSelect: ({ endpoint }) => {
           void this.runAction(() => this.openEndpoint(endpoint))
         },
@@ -2636,6 +2643,7 @@ export class AgentTreeApp {
           this.terminalManager.runningSessionIds(),
           this.rootViewportStart,
           this.unviewedUpdateSessionIds,
+          this.needsUserSessionIds(),
         )
         this.rootViewportStart = rendered.startIndex
         this.content.content = rendered.content
@@ -2664,6 +2672,7 @@ export class AgentTreeApp {
         this.visibleEndpointSessionIds(),
         this.unavailableTranscriptSessionIds,
         this.unviewedUpdateSessionIds,
+        this.needsUserSessionIds(),
       )
       this.graphLayout = rendered.layout
       this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
@@ -2791,7 +2800,16 @@ export class AgentTreeApp {
     const hasNewUpdates = selected
       ? [...selected.sessionIds].some((sessionId) => this.unviewedUpdateSessionIds.has(sessionId))
       : false
-    const status = hasNewUpdates ? "● New updates" : live ? "● Live" : undefined
+    const needsUser = selected
+      ? [...selected.sessionIds].some((sessionId) => this.needsUserSessionIds().has(sessionId))
+      : false
+    const status = needsUser
+      ? "● Needs user"
+      : hasNewUpdates
+        ? "● New updates"
+        : live
+          ? "● Live"
+          : undefined
     const prefixWidth = status ? displayWidth(`${status} · `) : 0
     const title = truncateToWidth(
       selected ? graphTitle(selected) : "",
@@ -2803,7 +2821,11 @@ export class AgentTreeApp {
         chunk("\n", theme.text),
         ...(status
           ? [
-              chunk(status, hasNewUpdates ? theme.warning : theme.success, TextAttributes.BOLD),
+              chunk(
+                status,
+                needsUser ? theme.danger : hasNewUpdates ? theme.warning : theme.success,
+                TextAttributes.BOLD,
+              ),
               chunk(" · ", theme.textMuted),
             ]
           : []),
@@ -2835,6 +2857,9 @@ export class AgentTreeApp {
     const selected = this.selectedGraphNode()
     if (!selected) return "No node selected"
     if (selected.kind === "endpoint") {
+      if (this.needsUserSessionIds().has(selected.session.id)) {
+        return `Selected agent · needs user · ${selected.session.id.slice(0, 8)}`
+      }
       if (this.displayedWorkingSessionIds().has(selected.session.id)) {
         return `Selected agent · generating · ${selected.session.id.slice(0, 8)}`
       }
@@ -2909,11 +2934,15 @@ export class AgentTreeApp {
 
   private displayedWorkingSessionIds(): Set<string> {
     const runningSessionIds = this.terminalManager.runningSessionIds()
-    const workingSessionIds = this.terminalManager.workingSessionIds()
+    const workingSessionIds = this.terminalManager.activitySessionIds("working")
     for (const sessionId of this.pendingCompletionRefreshes.keys()) {
       if (runningSessionIds.has(sessionId)) workingSessionIds.add(sessionId)
     }
     return workingSessionIds
+  }
+
+  private needsUserSessionIds(): Set<string> {
+    return this.terminalManager.activitySessionIds("blocked")
   }
 
   private updateProcessTitle(): void {
@@ -3170,6 +3199,8 @@ function confirmationContent(confirmation: Confirmation): {
       message:
         confirmation.sessionKind === "working"
           ? "Interrupt this working Agent?\nPersisted response text remains resumable."
+          : confirmation.sessionKind === "needs-user"
+            ? "Kill this Agent that needs user input?\nPersisted response text remains resumable."
           : "Kill this Draft?\nIts unsent text will be discarded.",
       confirmLabel: "Kill",
     }

@@ -92,6 +92,7 @@ export function renderConversationGraph(
   visibleEndpointSessionIds: Set<string> = runningSessionIds,
   unavailableTranscriptSessionIds: ReadonlySet<string> = new Set(),
   unviewedUpdateSessionIds: ReadonlySet<string> = new Set(),
+  needsUserSessionIds: ReadonlySet<string> = new Set(),
 ): RenderedGraph {
   const safeWidth = Math.max(1, viewportWidth)
   const safeHeight = Math.max(1, viewportHeight)
@@ -114,6 +115,7 @@ export function renderConversationGraph(
       spinnerFrame,
       unavailableTranscriptSessionIds,
       unviewedUpdateSessionIds,
+      needsUserSessionIds,
     )
   }
 
@@ -156,6 +158,7 @@ export function renderRootPicker(
   runningSessionIds: Set<string>,
   viewportStart = 0,
   unviewedUpdateSessionIds: ReadonlySet<string> = new Set(),
+  needsUserSessionIds: ReadonlySet<string> = new Set(),
 ): RenderedRootPicker {
   const safeWidth = Math.max(1, width)
   if (graphs.length === 0) {
@@ -186,18 +189,23 @@ export function renderRootPicker(
     const hasNewUpdates = [...graph.sessionIds].some((sessionId) =>
       unviewedUpdateSessionIds.has(sessionId),
     )
-    const status = live || hasNewUpdates ? "●" : "○"
+    const needsUser = [...graph.sessionIds].some((sessionId) =>
+      needsUserSessionIds.has(sessionId),
+    )
+    const status = needsUser || live || hasNewUpdates ? "●" : "○"
     const counts = `${messageCount} messages · ${sessionCount} ${sessionCount === 1 ? "session" : "sessions"}`
     const rowStyle = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     const statusStyle = {
       ...rowStyle,
-      fg: hasNewUpdates
-        ? theme.warning
-        : selected
-          ? theme.selectedText
-          : live
-            ? theme.success
-            : theme.textMuted,
+      fg: needsUser
+        ? theme.danger
+        : hasNewUpdates
+          ? theme.warning
+          : selected
+            ? theme.selectedText
+            : live
+              ? theme.success
+              : theme.textMuted,
       attributes: TextAttributes.BOLD,
     }
 
@@ -263,6 +271,7 @@ function drawNode(
   spinnerFrame: number,
   unavailableTranscriptSessionIds: ReadonlySet<string>,
   unviewedUpdateSessionIds: ReadonlySet<string>,
+  needsUserSessionIds: ReadonlySet<string>,
 ): void {
   const { node, x, y } = positioned
   const background = selected
@@ -296,6 +305,18 @@ function drawNode(
   }
 
   const sessionId = node.session.id
+  if (needsUserSessionIds.has(sessionId)) {
+    drawHeading(canvas, x + 2, y, ICONS.agent, "Agent", contentWidth, {
+      ...headerStyle,
+      fg: selected ? theme.selectedText : theme.primary,
+    }, headerStyle)
+    canvas.write(x + 2, y + 1, truncateToWidth("Needs user", contentWidth), {
+      ...baseStyle,
+      fg: selected ? theme.selectedText : theme.danger,
+    })
+    return
+  }
+
   if (workingSessionIds.has(sessionId)) {
     drawHeading(canvas, x + 2, y, ICONS.agent, "Agent", contentWidth, {
       ...headerStyle,

@@ -19,12 +19,17 @@ test("supports arrow, vim, and control-key selection", async () => {
     options[0]!.endpoint.session.id,
     options[1]!.endpoint.session.id,
   ])
-  const newUpdateSessionIds = new Set([options[1]!.endpoint.session.id])
+  const newUpdateSessionIds = new Set([
+    options[1]!.endpoint.session.id,
+    options[2]!.endpoint.session.id,
+  ])
+  const needsUserSessionIds = new Set([options[2]!.endpoint.session.id])
   picker.open({
     title: "Open leaf",
     options,
     activeSessionIds,
     newUpdateSessionIds,
+    needsUserSessionIds,
     onSelect: (option) => {
       selected = option
     },
@@ -38,6 +43,7 @@ test("supports arrow, vim, and control-key selection", async () => {
     expect(initialFrame).not.toContain("┌")
     expect(initialFrame).toContain("• Leaf 1")
     expect(initialFrame).toContain("● Leaf 2")
+    expect(initialFrame).toContain("● Leaf 3")
     expect(coordinateOf(initialFrame, "Leaf 1").x).toBe(
       coordinateOf(initialFrame, "Leaf 2").x,
     )
@@ -47,6 +53,11 @@ test("supports arrow, vim, and control-key selection", async () => {
       .find((span) => span.text.includes("●"))
     expect(updateMarker?.fg.equals(theme.warning)).toBeTrue()
     expect(updateMarker?.bg.equals(theme.element)).toBeTrue()
+    const needsUserMarker = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("●") && span.fg.equals(theme.danger))
+    expect(needsUserMarker?.bg.equals(theme.element)).toBeTrue()
     const selectedLiveMarker = setup
       .captureSpans()
       .lines.flatMap((line) => line.spans)
@@ -91,6 +102,7 @@ test("supports arrow, vim, and control-key selection", async () => {
       selectedSessionId: options[2]!.endpoint.session.id,
       activeSessionIds,
       newUpdateSessionIds,
+      needsUserSessionIds,
       onSelect: (option) => {
         selected = option
       },

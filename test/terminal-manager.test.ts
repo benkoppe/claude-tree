@@ -371,7 +371,9 @@ test("tracks ordered OSC activity transitions from one hidden-process output chu
     await manager.show(launch(fakeClaude, sessionId))
     manager.hideActive()
     await waitUntil(() => activityChanges.length === 2)
-    expect(manager.workingSessionIds().has(sessionId)).toBeFalse()
+    expect(manager.nonIdleSessionIds().has(sessionId)).toBeFalse()
+    expect(manager.activitySessionIds("working").has(sessionId)).toBeFalse()
+    expect(manager.activitySessionIds("blocked").has(sessionId)).toBeFalse()
     expect(activityChanges).toEqual([
       { sessionId, activity: "working", wasActive: false },
       { sessionId, activity: "idle", wasActive: false },
@@ -476,6 +478,48 @@ test("reports visible Claude work and blockers when its title remains idle", asy
     await waitUntil(() => reports.includes("working"))
     await waitUntil(() => reports.includes("blocked"))
     expect(reports).toEqual(["idle", "working", "blocked"])
+    expect(manager.nonIdleSessionIds()).toEqual(new Set(["static-title-session"]))
+    expect(manager.activitySessionIds("working")).toEqual(new Set())
+    expect(manager.activitySessionIds("blocked")).toEqual(new Set(["static-title-session"]))
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("reports a Claude blocker that appears while the terminal is hidden", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8 })
+  const directory = await mkdtemp(join(tmpdir(), "claude-tree-hidden-blocker-test-"))
+  temporaryDirectories.push(directory)
+  const blockerMarker = join(directory, "block")
+  const fakeClaude = await createFakeClaude(
+    String.raw`sleep 0.05
+    printf '\033]0;\342\240\213 Claude Code\007'
+    while [ ! -f ${JSON.stringify(blockerMarker)} ]; do sleep 0.01; done
+    printf '\033]0;\342\234\263 Claude Code\007\033[2J\033[HWould you like to proceed?\r\n\342\235\257 1. Allow once\r\n  2. Deny\r\nEsc to cancel'
+    sleep 30`,
+  )
+  const activityChanges: Array<{ activity: AgentActivity; wasActive: boolean }> = []
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    ({ activity, wasActive }) => activityChanges.push({ activity, wasActive }),
+  )
+  const sessionId = "hidden-blocker-session"
+
+  try {
+    await manager.show(launch(fakeClaude, sessionId))
+    await waitUntil(() => activityChanges.some(({ activity }) => activity === "working"))
+    manager.hideActive()
+    await writeFile(blockerMarker, "")
+    await waitUntil(() => activityChanges.some(({ activity }) => activity === "blocked"))
+
+    expect(activityChanges).toEqual([
+      { activity: "working", wasActive: true },
+      { activity: "idle", wasActive: false },
+      { activity: "blocked", wasActive: false },
+    ])
+    expect(manager.activitySessionIds("blocked")).toEqual(new Set([sessionId]))
   } finally {
     await manager.shutdown(50)
     setup.renderer.destroy()
