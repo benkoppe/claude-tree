@@ -240,8 +240,12 @@ export class ClaudeProvider implements AgentProvider {
 
   private async readClaudeTranscript(sessionId: string): Promise<ClaudeMessage[]> {
     const messages = await this.sdk.messages(sessionId, { dir: this.projectPath })
+    let assistantDisplayGroupId: string | undefined
     return messages.map((message, ordinal) => {
       const localCommandArtifact = isLocalCommandArtifact(message)
+      const visible = !localCommandArtifact && isVisibleMessage(message)
+      if (message.type === "user" && visible) assistantDisplayGroupId = message.uuid
+      const turnComplete = assistantTurnComplete(message)
       const replayText =
         message.type === "user" && !localCommandArtifact
           ? extractUserPromptText(message.message)
@@ -251,8 +255,12 @@ export class ClaudeProvider implements AgentProvider {
         role: message.type === "assistant" ? "agent" : message.type,
         preview: formatMessage(message.message),
         ordinal,
-        visible: !localCommandArtifact && isVisibleMessage(message),
+        visible,
         rawMessage: message.message,
+        ...(message.type === "assistant" && assistantDisplayGroupId !== undefined
+          ? { displayGroupId: assistantDisplayGroupId }
+          : {}),
+        ...(turnComplete === undefined ? {} : { turnComplete }),
         ...(replayText === undefined ? {} : { replayText }),
       }
     })
@@ -402,6 +410,16 @@ function isLocalCommandArtifact(message: Pick<SessionMessage, "type" | "message"
     message.type === "user" &&
     (LOCAL_COMMAND_INVOCATION_PATTERN.test(text) || LOCAL_COMMAND_OUTPUT_PATTERN.test(text))
   )
+}
+
+function assistantTurnComplete(
+  message: Pick<SessionMessage, "type" | "message">,
+): boolean | undefined {
+  if (message.type !== "assistant" || !isRecord(message.message)) return undefined
+  const stopReason = message.message.stop_reason
+  if (stopReason === null) return false
+  if (typeof stopReason !== "string") return undefined
+  return stopReason !== "tool_use" && stopReason !== "pause_turn"
 }
 
 function toSessionSummary(session: SDKSessionInfo): AgentSession {

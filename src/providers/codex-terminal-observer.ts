@@ -19,8 +19,8 @@ export class CodexTerminalObserver implements TerminalObserver {
   private titleActivity: AgentActivity | undefined
   private sawActiveTitle = false
 
-  observeOutput(bytes: Uint8Array): AgentActivity | undefined {
-    let observed: AgentActivity | undefined
+  observeOutput(bytes: Uint8Array): readonly AgentActivity[] {
+    const observed: AgentActivity[] = []
     for (const body of this.parser.observe(bytes)) {
       const title = decodeOscTitle(body)
       if (title === undefined) continue
@@ -28,16 +28,16 @@ export class CodexTerminalObserver implements TerminalObserver {
       const explicitActivity = codexActivityFromTitle(title)
       if (explicitActivity === "working") {
         this.sawActiveTitle = true
-        observed = "working"
+        observed.push("working")
       } else if (explicitActivity === "idle") {
         this.sawActiveTitle = false
-        observed = "idle"
+        observed.push("idle")
       } else if (this.sawActiveTitle) {
         this.sawActiveTitle = false
-        observed = "idle"
+        observed.push("idle")
       }
     }
-    if (observed !== undefined) this.titleActivity = observed
+    if (observed.length > 0) this.titleActivity = observed.at(-1)
     return observed
   }
 

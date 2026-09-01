@@ -78,6 +78,7 @@ const SEPARATOR_HEIGHT = 1
 const NAVIGATOR_CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const COMPLETION_REFRESH_DELAY_MS = 75
+const COMPLETION_REFRESH_RETRY_DELAYS_MS = [75, 150, 300, 600, 1_200, 2_400, 4_800] as const
 const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
 
 type FooterAction =
@@ -123,6 +124,7 @@ interface ActiveRefresh {
   generation: number
   controller: AbortController
   focusSessionId?: string
+  transcriptSessionIds?: Set<string>
 }
 
 interface FooterControl {
@@ -232,9 +234,12 @@ export class AgentTreeApp {
   private spinnerFrame = 0
   private spinnerTimer: ReturnType<typeof setInterval> | undefined
   private completionRefreshTimer: ReturnType<typeof setTimeout> | undefined
+  private completionRefreshTimerDueAt: number | undefined
   private completionRefreshRunning = false
   private completionRefreshVersion = 0
   private readonly pendingCompletionRefreshes = new Map<string, number>()
+  private readonly completionRefreshAttempts = new Map<string, number>()
+  private readonly completionRefreshDueAt = new Map<string, number>()
   private constructor(
     private readonly renderer: CliRenderer,
     private readonly metadata: BranchMetadataStore,
@@ -627,7 +632,10 @@ export class AgentTreeApp {
       this.stopSpinnerAnimation()
       if (this.completionRefreshTimer) clearTimeout(this.completionRefreshTimer)
       this.completionRefreshTimer = undefined
+      this.completionRefreshTimerDueAt = undefined
       this.pendingCompletionRefreshes.clear()
+      this.completionRefreshAttempts.clear()
+      this.completionRefreshDueAt.clear()
 
       const terminalShutdown = this.terminalManager.shutdown()
       this.renderer.destroy()
@@ -651,15 +659,21 @@ export class AgentTreeApp {
       this.confirmation = null
     }
     this.pendingCompletionRefreshes.delete(event.sessionId)
+    this.completionRefreshAttempts.delete(event.sessionId)
+    this.completionRefreshDueAt.delete(event.sessionId)
     if (event.wasActive) {
-      this.view = "roots"
+      if (!this.focusCachedGraph(event.sessionId)) this.view = "roots"
       this.navigator.visible = true
     }
     const exitError =
       event.exitCode === 0
         ? undefined
         : `${this.provider.displayName} session exited with code ${event.exitCode}`
-    void this.refreshData(event.wasActive ? event.sessionId : undefined)
+    void this.refreshData(
+      event.wasActive ? event.sessionId : undefined,
+      true,
+      new Set([event.sessionId]),
+    )
       .then(() => {
         if (exitError) this.showError(exitError)
       })
@@ -673,10 +687,14 @@ export class AgentTreeApp {
     if (this.stopping) return
     if (event.activity === "working") {
       this.pendingCompletionRefreshes.delete(event.sessionId)
+      this.completionRefreshAttempts.delete(event.sessionId)
+      this.completionRefreshDueAt.delete(event.sessionId)
       if (this.view !== "terminal") this.render()
       return
     }
     this.pendingCompletionRefreshes.set(event.sessionId, ++this.completionRefreshVersion)
+    this.completionRefreshAttempts.set(event.sessionId, 0)
+    this.completionRefreshDueAt.set(event.sessionId, Date.now() + COMPLETION_REFRESH_DELAY_MS)
     this.scheduleCompletionRefresh()
     if (this.view !== "terminal") this.render()
   }
@@ -1265,16 +1283,24 @@ export class AgentTreeApp {
     this.render()
   }
 
-  private async requestRefresh(focusSessionId?: string, showWarnings = true): Promise<boolean> {
+  private async requestRefresh(
+    focusSessionId?: string,
+    showWarnings = true,
+    transcriptSessionIds?: ReadonlySet<string>,
+  ): Promise<boolean> {
     try {
-      return await this.refreshData(focusSessionId, showWarnings)
+      return await this.refreshData(focusSessionId, showWarnings, transcriptSessionIds)
     } catch (error) {
       this.showError(error)
       return false
     }
   }
 
-  private async refreshData(focusSessionId?: string, showWarnings = true): Promise<boolean> {
+  private async refreshData(
+    focusSessionId?: string,
+    showWarnings = true,
+    transcriptSessionIds?: ReadonlySet<string>,
+  ): Promise<boolean> {
     this.openLeafPicker.close()
     const effectiveFocusSessionId = focusSessionId ?? this.activeRefresh?.focusSessionId
     this.cancelActiveRefresh()
@@ -1286,13 +1312,17 @@ export class AgentTreeApp {
       ...(effectiveFocusSessionId === undefined
         ? {}
         : { focusSessionId: effectiveFocusSessionId }),
+      ...(transcriptSessionIds === undefined
+        ? {}
+        : { transcriptSessionIds: new Set(transcriptSessionIds) }),
     }
     this.activeRefresh = refresh
     const pendingCompletions = new Map(this.pendingCompletionRefreshes)
     this.render()
 
     try {
-      const snapshot = this.provider.loadSessionSnapshot
+      const incremental = refresh.transcriptSessionIds !== undefined && !this.initialLoadPending
+      const snapshot = !incremental && this.provider.loadSessionSnapshot
         ? await abortable(this.provider.loadSessionSnapshot(), controller.signal)
         : undefined
       const discovered = snapshot?.sessions ?? await abortable(
@@ -1312,9 +1342,14 @@ export class AgentTreeApp {
       const persistedSessionIds = sessions
         .filter((session) => !session.transient)
         .map((session) => session.id)
-      const persistedTranscripts = new Map(snapshot?.transcripts)
-      const missingTranscriptIds = persistedSessionIds.filter(
-        (sessionId) => !persistedTranscripts.has(sessionId),
+      const persistedTranscripts = incremental
+        ? new Map<string, AgentMessage[] | null>(this.transcripts)
+        : new Map(snapshot?.transcripts)
+      const previousSessionIds = new Set(this.sessions.map((session) => session.id))
+      const missingTranscriptIds = persistedSessionIds.filter((sessionId) =>
+        incremental
+          ? refresh.transcriptSessionIds!.has(sessionId) || !previousSessionIds.has(sessionId)
+          : !persistedTranscripts.has(sessionId),
       )
       if (missingTranscriptIds.length > 0) {
         const missingTranscripts = await abortable(
@@ -1328,6 +1363,8 @@ export class AgentTreeApp {
       const retainedTemporarySessionIds = new Set(
         retainedTemporarySessions.map((session) => session.id),
       )
+      const workingSessionIds = this.terminalManager.workingSessionIds()
+      const refreshedTranscriptIds = new Set(incremental ? missingTranscriptIds : persistedSessionIds)
       const availableSessions: AgentSession[] = []
       const transcriptEntries: Array<readonly [string, AgentMessage[]]> = []
       for (const session of sessions) {
@@ -1349,16 +1386,45 @@ export class AgentTreeApp {
           transcriptEntries.push([session.id, retainedTranscript])
           continue
         }
-        this.unavailableTranscriptSessionIds.delete(session.id)
+        if (refreshedTranscriptIds.has(session.id)) {
+          this.unavailableTranscriptSessionIds.delete(session.id)
+        }
         availableSessions.push(session)
-        transcriptEntries.push([session.id, transcript])
+        const previousTranscript = this.transcripts.get(session.id) ?? []
+        let acceptedTranscript =
+          workingSessionIds.has(session.id) && refreshedTranscriptIds.has(session.id)
+            ? stableTranscriptWhileWorking(previousTranscript, transcript)
+            : transcript
+        const pendingVersion = this.pendingCompletionRefreshes.get(session.id)
+        if (
+          pendingVersion !== undefined &&
+          refreshedTranscriptIds.has(session.id) &&
+          (
+            pendingCompletions.get(session.id) !== pendingVersion ||
+            !completionTranscriptReady(previousTranscript, acceptedTranscript)
+          )
+        ) {
+          acceptedTranscript = previousTranscript
+        }
+        transcriptEntries.push([session.id, acceptedTranscript])
       }
       if (!this.refreshCurrent(refresh)) return false
       const previousRootSessionId = this.currentRootSessionId
       const previousNodeId = this.selectedGraphNodeId
       const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
+      const nextTranscripts = new Map(transcriptEntries)
+      const advancedCompletions = new Map<string, number>()
+      for (const [sessionId, version] of pendingCompletions) {
+        if (
+          this.pendingCompletionRefreshes.get(sessionId) === version &&
+          refreshedTranscriptIds.has(sessionId) &&
+          transcriptAdvanced(this.transcripts.get(sessionId) ?? [], nextTranscripts.get(sessionId))
+        ) {
+          advancedCompletions.set(sessionId, version)
+        }
+      }
       this.sessions = availableSessions
-      this.transcripts = new Map(transcriptEntries)
+      this.transcripts = nextTranscripts
       for (const sessionId of this.visibleEmptySessionIds) {
         if (this.transcripts.get(sessionId)?.some((message) => message.visible)) {
           this.visibleEmptySessionIds.delete(sessionId)
@@ -1379,8 +1445,9 @@ export class AgentTreeApp {
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
 
-      const focusedGraph = effectiveFocusSessionId
-        ? this.forest.graphBySessionId.get(effectiveFocusSessionId)
+      const refreshedFocusSessionId = refresh.focusSessionId
+      const focusedGraph = refreshedFocusSessionId
+        ? this.forest.graphBySessionId.get(refreshedFocusSessionId)
         : undefined
       const preservedGraph = previousRootSessionId
         ? this.forest.graphByRootSessionId.get(previousRootSessionId)
@@ -1389,8 +1456,8 @@ export class AgentTreeApp {
       if (graph) {
         this.selectedRootIndex = this.forest.graphs.indexOf(graph)
         const requestedNodeId =
-          (effectiveFocusSessionId
-            ? graph.endpointBySessionId.get(effectiveFocusSessionId)
+          (refreshedFocusSessionId
+            ? graph.endpointBySessionId.get(refreshedFocusSessionId)
             : undefined) ??
           (previousNodeId && graph.nodes.has(previousNodeId) ? previousNodeId : graph.rootNodeId)
         const selectedNodeId =
@@ -1399,7 +1466,7 @@ export class AgentTreeApp {
         if (selectedNodeId) {
           this.currentRootSessionId = graph.rootSessionId
           this.selectedGraphNodeId = selectedNodeId
-          if (effectiveFocusSessionId) this.view = "graph"
+          if (refreshedFocusSessionId) this.view = "graph"
         } else {
           this.currentRootSessionId = null
           this.selectedGraphNodeId = null
@@ -1417,7 +1484,7 @@ export class AgentTreeApp {
         this.selectedRootIndex = preservedRootIndex >= 0 ? preservedRootIndex : 0
       }
 
-      this.clearPendingCompletions(pendingCompletions)
+      this.clearPendingCompletions(advancedCompletions)
       if (showWarnings && this.forest.warnings[0]) this.showError(this.forest.warnings[0])
       return true
     } catch (error) {
@@ -1465,8 +1532,44 @@ export class AgentTreeApp {
   ): Promise<void> {
     const startedSession = await startedSessionPromise
     if (!this.terminalManager.replaceSessionId(temporarySession.id, startedSession.id)) return
+    if (this.activeRefresh?.focusSessionId === temporarySession.id) {
+      this.activeRefresh.focusSessionId = startedSession.id
+    }
+    if (this.activeRefresh?.transcriptSessionIds?.delete(temporarySession.id)) {
+      this.activeRefresh.transcriptSessionIds.add(startedSession.id)
+    }
+    const completionVersion = this.pendingCompletionRefreshes.get(temporarySession.id)
+    const completionAttempt = this.completionRefreshAttempts.get(temporarySession.id)
+    const completionDueAt = this.completionRefreshDueAt.get(temporarySession.id)
+    this.pendingCompletionRefreshes.delete(temporarySession.id)
+    this.completionRefreshAttempts.delete(temporarySession.id)
+    this.completionRefreshDueAt.delete(temporarySession.id)
+    if (completionVersion !== undefined) {
+      this.pendingCompletionRefreshes.set(startedSession.id, completionVersion)
+      this.completionRefreshAttempts.set(startedSession.id, completionAttempt ?? 0)
+      this.completionRefreshDueAt.set(startedSession.id, completionDueAt ?? Date.now())
+    }
+    const temporaryGraph = this.forest.graphBySessionId.get(temporarySession.id)
+    const focusedTemporaryGraph = temporaryGraph?.rootSessionId === this.currentRootSessionId
+    const temporaryTranscript = this.transcripts.get(temporarySession.id)
+    const discoveredSession = this.sessions.find((session) => session.id === startedSession.id)
+    this.sessions = this.sessions.flatMap((session) =>
+      session.id === temporarySession.id
+        ? (discoveredSession ? [] : [startedSession])
+        : [session],
+    )
+    this.transcripts.delete(temporarySession.id)
+    if (temporaryTranscript && !this.transcripts.has(startedSession.id)) {
+      this.transcripts.set(startedSession.id, temporaryTranscript)
+    }
     this.temporarySessions.delete(temporarySession.id)
-    this.temporarySessions.set(startedSession.id, startedSession)
+    this.temporarySessions.set(startedSession.id, discoveredSession ?? startedSession)
+    this.rebuildForest()
+    if (focusedTemporaryGraph && this.view === "graph") {
+      this.focusCachedGraph(startedSession.id)
+      this.render()
+    }
+    this.scheduleCompletionRefresh()
   }
 
   private async openSelectedLeaf(): Promise<void> {
@@ -1513,9 +1616,12 @@ export class AgentTreeApp {
 
     this.cancelActiveRefresh()
     this.pendingCompletionRefreshes.delete(sessionId)
+    this.completionRefreshAttempts.delete(sessionId)
+    this.completionRefreshDueAt.delete(sessionId)
     if (this.pendingCompletionRefreshes.size === 0 && this.completionRefreshTimer) {
       clearTimeout(this.completionRefreshTimer)
       this.completionRefreshTimer = undefined
+      this.completionRefreshTimerDueAt = undefined
     }
     if (graph && endpointId && this.selectedGraphNodeId === endpointId) {
       const fallbackNodeId = visibleGraphNodeId(
@@ -1633,9 +1739,14 @@ export class AgentTreeApp {
   }
 
   private clearCompletionRefreshes(sessionIds: string[]): void {
-    for (const sessionId of sessionIds) this.pendingCompletionRefreshes.delete(sessionId)
+    for (const sessionId of sessionIds) {
+      this.pendingCompletionRefreshes.delete(sessionId)
+      this.completionRefreshAttempts.delete(sessionId)
+      this.completionRefreshDueAt.delete(sessionId)
+    }
     if (this.completionRefreshTimer) clearTimeout(this.completionRefreshTimer)
     this.completionRefreshTimer = undefined
+    this.completionRefreshTimerDueAt = undefined
   }
 
   private repairSelectionAfterRemoval(confirmation: RemovalConfirmation): void {
@@ -1759,9 +1870,34 @@ export class AgentTreeApp {
 
   private async returnToGraph(): Promise<void> {
     const sessionId = this.terminalManager.hideActive()
-    this.view = "roots"
+    if (!sessionId || !this.focusCachedGraph(sessionId)) this.view = "roots"
     this.navigator.visible = true
-    await this.requestRefresh(sessionId ?? undefined)
+    await this.requestRefresh(
+      sessionId ?? undefined,
+      true,
+      sessionId ? new Set([sessionId]) : undefined,
+    )
+  }
+
+  private focusCachedGraph(sessionId: string): boolean {
+    const graph = this.forest.graphBySessionId.get(sessionId)
+    const endpointId = graph?.endpointBySessionId.get(sessionId)
+    if (!graph || !endpointId) return false
+    const selectedNodeId = visibleGraphNodeId(
+      graph,
+      endpointId,
+      this.terminalManager.runningSessionIds(),
+    )
+    if (!selectedNodeId) return false
+
+    this.currentRootSessionId = graph.rootSessionId
+    this.selectedRootIndex = this.forest.graphs.indexOf(graph)
+    this.selectedGraphNodeId = selectedNodeId
+    this.preferredOpenSession = null
+    this.graphViewportOffset = null
+    this.graphNavigationIntent = null
+    this.view = "graph"
+    return true
   }
 
   private currentGraph(): ConversationGraph | undefined {
@@ -2091,14 +2227,20 @@ export class AgentTreeApp {
       return
     }
     if (this.spinnerTimer) return
-    this.spinnerTimer = setInterval(() => {
-      this.spinnerFrame += 1
-      this.render()
-    }, SPINNER_INTERVAL_MS)
+    const scheduleFrame = () => {
+      const timer = setTimeout(() => {
+        if (this.spinnerTimer !== timer) return
+        this.spinnerFrame += 1
+        this.render()
+        if (this.spinnerTimer === timer) scheduleFrame()
+      }, SPINNER_INTERVAL_MS)
+      this.spinnerTimer = timer
+    }
+    scheduleFrame()
   }
 
   private stopSpinnerAnimation(): void {
-    if (this.spinnerTimer) clearInterval(this.spinnerTimer)
+    if (this.spinnerTimer) clearTimeout(this.spinnerTimer)
     this.spinnerTimer = undefined
     this.spinnerFrame = 0
   }
@@ -2118,37 +2260,80 @@ export class AgentTreeApp {
       this.busy ||
       this.activeRefresh !== null ||
       this.completionRefreshRunning ||
-      this.completionRefreshTimer ||
       this.pendingCompletionRefreshes.size === 0
     ) {
       return
     }
+    const now = Date.now()
+    const dueAt = Math.min(...[...this.pendingCompletionRefreshes.keys()].map((sessionId) => {
+      const sessionDueAt = this.completionRefreshDueAt.get(sessionId) ?? now
+      this.completionRefreshDueAt.set(sessionId, sessionDueAt)
+      return sessionDueAt
+    }))
+    if (
+      this.completionRefreshTimer !== undefined &&
+      this.completionRefreshTimerDueAt !== undefined &&
+      this.completionRefreshTimerDueAt <= dueAt
+    ) {
+      return
+    }
+    if (this.completionRefreshTimer) clearTimeout(this.completionRefreshTimer)
+    this.completionRefreshTimerDueAt = dueAt
     this.completionRefreshTimer = setTimeout(() => {
       this.completionRefreshTimer = undefined
+      this.completionRefreshTimerDueAt = undefined
       if (this.busy || this.activeRefresh) {
         this.scheduleCompletionRefresh()
         return
       }
       void this.refreshCompletedSessions()
-    }, COMPLETION_REFRESH_DELAY_MS)
+    }, Math.max(0, dueAt - now))
   }
 
   private async refreshCompletedSessions(): Promise<void> {
     if (this.stopping || this.completionRefreshRunning) return
-    const refreshes = new Map(this.pendingCompletionRefreshes)
-    if (refreshes.size === 0) return
+    const now = Date.now()
+    const refreshes = new Map(
+      [...this.pendingCompletionRefreshes].filter(
+        ([sessionId]) => (this.completionRefreshDueAt.get(sessionId) ?? now) <= now,
+      ),
+    )
+    if (refreshes.size === 0) {
+      this.scheduleCompletionRefresh()
+      return
+    }
     this.completionRefreshRunning = true
-    let failed = false
+    let refreshError: unknown
+    let refreshed = false
     try {
-      await this.refreshData(undefined, false)
+      refreshed = await this.refreshData(undefined, false, new Set(refreshes.keys()))
     } catch (error) {
-      failed = true
-      this.showError(`Refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+      refreshError = error
     } finally {
-      if (failed) this.clearPendingCompletions(refreshes)
+      const exhausted: string[] = []
+      if (refreshed || refreshError !== undefined) {
+        for (const [sessionId, version] of refreshes) {
+          if (this.pendingCompletionRefreshes.get(sessionId) !== version) continue
+          const attempt = (this.completionRefreshAttempts.get(sessionId) ?? 0) + 1
+          if (attempt >= COMPLETION_REFRESH_RETRY_DELAYS_MS.length) {
+            this.pendingCompletionRefreshes.delete(sessionId)
+            this.completionRefreshAttempts.delete(sessionId)
+            this.completionRefreshDueAt.delete(sessionId)
+            exhausted.push(sessionId)
+          } else {
+            this.completionRefreshAttempts.set(sessionId, attempt)
+            const delay = COMPLETION_REFRESH_RETRY_DELAYS_MS[attempt] ?? COMPLETION_REFRESH_DELAY_MS
+            this.completionRefreshDueAt.set(sessionId, Date.now() + delay)
+          }
+        }
+      }
       this.completionRefreshRunning = false
       this.render()
       this.scheduleCompletionRefresh()
+      if (exhausted.length > 0) {
+        const detail = refreshError instanceof Error ? `: ${refreshError.message}` : ""
+        this.showError(`Completed response did not become available${detail}`)
+      }
     }
   }
 
@@ -2156,6 +2341,8 @@ export class AgentTreeApp {
     for (const [sessionId, version] of completions) {
       if (this.pendingCompletionRefreshes.get(sessionId) === version) {
         this.pendingCompletionRefreshes.delete(sessionId)
+        this.completionRefreshAttempts.delete(sessionId)
+        this.completionRefreshDueAt.delete(sessionId)
       }
     }
   }
@@ -2289,6 +2476,80 @@ function abortError(): Error {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError"
+}
+
+function stableTranscriptWhileWorking(
+  previous: AgentMessage[],
+  refreshed: AgentMessage[],
+): AgentMessage[] {
+  if (!isTranscriptPrefix(previous, refreshed)) return previous
+
+  let lastNewVisibleUserIndex = -1
+  for (let index = previous.length; index < refreshed.length; index += 1) {
+    const message = refreshed[index]
+    if (message?.role === "user" && message.visible) lastNewVisibleUserIndex = index
+  }
+  return lastNewVisibleUserIndex < 0
+    ? previous
+    : refreshed.slice(0, lastNewVisibleUserIndex + 1)
+}
+
+function transcriptAdvanced(
+  previous: AgentMessage[],
+  refreshed: AgentMessage[] | undefined,
+): boolean {
+  return refreshed !== undefined && !sameTranscript(previous, refreshed)
+}
+
+function isTranscriptPrefix(prefix: AgentMessage[], transcript: AgentMessage[]): boolean {
+  return (
+    prefix.length <= transcript.length &&
+    prefix.every((message, index) => sameAgentMessage(message, transcript[index]))
+  )
+}
+
+function sameTranscript(left: AgentMessage[], right: AgentMessage[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((message, index) => sameAgentMessage(message, right[index]))
+  )
+}
+
+function sameAgentMessage(
+  left: AgentMessage,
+  right: AgentMessage | undefined,
+): boolean {
+  return (
+    right !== undefined &&
+    left.id === right.id &&
+    left.role === right.role &&
+    left.preview === right.preview &&
+    left.ordinal === right.ordinal &&
+    left.visible === right.visible &&
+    left.displayGroupId === right.displayGroupId &&
+    left.turnComplete === right.turnComplete
+  )
+}
+
+function completionTranscriptReady(
+  previous: AgentMessage[],
+  refreshed: AgentMessage[],
+): boolean {
+  if (!transcriptAdvanced(previous, refreshed)) return false
+
+  const lastVisibleUserIndex = refreshed.findLastIndex(
+    (message) => message.role === "user" && message.visible,
+  )
+  const messagesAfterUser = refreshed.slice(lastVisibleUserIndex + 1)
+  const completionSignals = refreshed
+    .slice(Math.max(0, lastVisibleUserIndex))
+    .filter(
+      (message): message is AgentMessage & { turnComplete: boolean } =>
+        message.turnComplete !== undefined,
+    )
+  return completionSignals.at(-1)?.turnComplete ?? messagesAfterUser.some(
+    (message) => message.role === "agent",
+  )
 }
 
 function sameMouseAction(left: PendingMouseAction, right: PendingMouseAction): boolean {

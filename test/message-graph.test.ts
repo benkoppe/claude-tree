@@ -517,9 +517,130 @@ describe("persisted removals", () => {
     expect(messagePreviews(rebuilt)).toEqual(["kept"])
     expect(rebuilt.endpointBySessionId.size).toBe(0)
   })
+
+  test("keeps grouped history before a removed endpoint boundary", () => {
+    const displayGroupId = "removed-endpoint-turn"
+    const messages = [
+      message("removal-user", "user", "question", 0),
+      message("removal-anchor", "agent", "kept answer", 1, true, displayGroupId),
+      message("removal-late", "agent", "late continuation", 2, true, displayGroupId),
+    ]
+    const rebuilt = buildConversationForest(
+      [session(ROOT, "Root", 20)],
+      new Map([[ROOT, messages]]),
+      [],
+      [endpointRemoval(ROOT, "removal-anchor")],
+    ).graphs[0]!
+
+    expect(messagePreviews(rebuilt)).toEqual(["question", "kept answer"])
+    expect(rebuilt.endpointBySessionId.size).toBe(0)
+  })
+
+  test("keeps grouped history before an invisible removed endpoint boundary", () => {
+    const displayGroupId = "hidden-removal-turn"
+    const messages = [
+      message("hidden-removal-user", "user", "question", 0),
+      message("hidden-removal-answer", "agent", "kept answer", 1, true, displayGroupId),
+      message("hidden-removal-anchor", "user", "tool result", 2, false),
+      message("hidden-removal-late", "agent", "late continuation", 3, true, displayGroupId),
+    ]
+    const rebuilt = buildConversationForest(
+      [session(ROOT, "Root", 20)],
+      new Map([[ROOT, messages]]),
+      [],
+      [endpointRemoval(ROOT, "hidden-removal-anchor")],
+    ).graphs[0]!
+
+    expect(messagePreviews(rebuilt)).toEqual(["question", "kept answer"])
+    expect(rebuilt.endpointBySessionId.size).toBe(0)
+  })
 })
 
 describe("message ordering", () => {
+  test("folds only provider-grouped messages and keeps the first node ID stable", () => {
+    const displayGroupId = "claude-user-turn"
+    const firstMessages = [
+      message("group-user", "user", "question", 0),
+      message("group-first", "agent", "first blurb", 1, true, displayGroupId),
+    ]
+    const completedMessages = [
+      ...firstMessages,
+      message("group-tool-result", "user", "tool result", 2, false),
+      message("group-second", "agent", "second blurb", 3, true, displayGroupId),
+    ]
+    const build = (messages: AgentMessage[]) =>
+      buildConversationForest(
+        [session(ROOT, "Root", 10)],
+        new Map([[ROOT, messages]]),
+        [],
+      ).graphs[0]!
+
+    const initialGraph = build(firstMessages)
+    const completedGraph = build(completedMessages)
+    const groupedNodeId = `message:${ROOT}:group-first`
+    const initialGroupedNode = initialGraph.nodes.get(groupedNodeId)
+    const groupedNode = completedGraph.nodes.get(groupedNodeId)
+
+    expect(initialGroupedNode?.id).toBe(groupedNode?.id)
+    expect(completedGraph.rootNodeId).toBe(initialGraph.rootNodeId)
+    expect(groupedNode?.kind === "message" ? groupedNode.preview : undefined).toBe(
+      "first blurb second blurb",
+    )
+    expect(groupedNode?.kind === "message" ? groupedNode.aliases : []).toEqual([
+      { sessionId: ROOT, messageId: "group-first" },
+      { sessionId: ROOT, messageId: "group-second" },
+    ])
+    expect(resolveForkTarget(completedGraph, groupedNodeId)).toEqual({
+      sessionId: ROOT,
+      messageId: "group-second",
+    })
+  })
+
+  test("closes a display group after an exact branch source and preserves inherited aliases", () => {
+    const parentGroup = "parent-turn"
+    const childGroup = "child-turn"
+    const parentMessages = [
+      message("branch-user", "user", "question", 0),
+      message("branch-first", "agent", "first", 1, true, parentGroup),
+      message("branch-source", "agent", "source", 2, true, parentGroup),
+      message("branch-later", "agent", "later", 3, true, parentGroup),
+    ]
+    const childMessages = [
+      message("child-user", "user", "question", 0),
+      message("child-first", "agent", "first", 1, true, childGroup),
+      message("child-source", "agent", "source", 2, true, childGroup),
+    ]
+    const graph = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, childMessages],
+      ]),
+      [relation(CHILD, ROOT, "branch-source", shared(parentMessages, childMessages, 3))],
+    ).graphs[0]!
+    const sourceNodeId = `message:${ROOT}:branch-first`
+    const sourceNode = graph.nodes.get(sourceNodeId)
+    const laterNodeId = `message:${ROOT}:branch-later`
+
+    expect(messagePreviews(graph)).toEqual(["question", "first source", "later"])
+    expect(sourceNode?.kind === "message" ? sourceNode.aliases : []).toEqual([
+      { sessionId: ROOT, messageId: "branch-first" },
+      { sessionId: ROOT, messageId: "branch-source" },
+      { sessionId: CHILD, messageId: "child-first" },
+      { sessionId: CHILD, messageId: "child-source" },
+    ])
+    expect(resolveForkTarget(graph, sourceNodeId)).toEqual({
+      sessionId: ROOT,
+      messageId: "branch-source",
+    })
+    expect(graph.nodes.get(laterNodeId)?.parentId).toBe(sourceNodeId)
+    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(sourceNodeId)
+    expect(resolveForkTarget(graph, graph.endpointBySessionId.get(CHILD)!)).toEqual({
+      sessionId: CHILD,
+      messageId: "child-source",
+    })
+  })
+
   test("preserves consecutive messages with the same role", () => {
     const messages = [
       message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "first user", 0),
@@ -819,6 +940,7 @@ function message(
   preview: string,
   ordinal: number,
   visible = true,
+  displayGroupId?: string,
 ): AgentMessage {
   return {
     id,
@@ -826,6 +948,7 @@ function message(
     preview,
     ordinal,
     visible,
+    ...(displayGroupId === undefined ? {} : { displayGroupId }),
   }
 }
 

@@ -20,6 +20,7 @@ export interface MessageGraphNode extends GraphNodeBase {
   preview: string
   internal: boolean
   aliases: ForkTarget[]
+  forkTarget?: ForkTarget
 }
 
 export interface SessionEndpointNode extends GraphNodeBase {
@@ -74,6 +75,8 @@ export function buildConversationForest(
 ): ConversationForest {
   const sessionsById = new Map(sessions.map((session) => [session.id, session]))
   const relationsByParent = groupRelationsByParent(relations)
+  const exactBranchPointIdsBySession = collectExactBranchPointIds(relations)
+  const displayGroupEndIdsBySession = collectDisplayGroupEndIds(relations, removals)
   const recordedChildren = new Set(relations.map((relation) => relation.childSessionId))
   const processedSessions = new Set<string>()
   const graphBySessionId = new Map<string, ConversationGraph>()
@@ -112,7 +115,15 @@ export function buildConversationForest(
       for (const relation of relationsByParent.get(parentSessionId) ?? []) {
         const child = sessionsById.get(relation.childSessionId)
         if (!child || processedSessions.has(child.id)) continue
-        const error = attachChildSession(graph, child, relation, parentContext, transcripts, relationsByParent)
+        const error = attachChildSession(
+          graph,
+          child,
+          relation,
+          parentContext,
+          transcripts,
+          exactBranchPointIdsBySession,
+          displayGroupEndIdsBySession,
+        )
         if (error) {
           graph.warnings.push(error)
           warnings.push(error)
@@ -132,7 +143,8 @@ export function buildConversationForest(
       graph,
       rootSession,
       transcripts.get(rootSession.id) ?? [],
-      relationsByParent,
+      exactBranchPointIdsBySession,
+      displayGroupEndIdsBySession,
     )
     contexts.set(rootSession.id, rootContext)
     processedSessions.add(rootSession.id)
@@ -350,7 +362,8 @@ function appendRootSession(
   graph: ConversationGraph,
   session: AgentSession,
   transcript: AgentMessage[],
-  relationsByParent: Map<string, BranchRelation[]>,
+  exactBranchPointIdsBySession: Map<string, Set<string>>,
+  displayGroupEndIdsBySession: Map<string, Set<string>>,
 ): SessionGraphContext {
   const context = createContext(transcript)
   appendSessionMessages(
@@ -359,7 +372,8 @@ function appendRootSession(
     transcript,
     0,
     graph.originNodeId,
-    sourceMessageIds(relationsByParent.get(session.id)),
+    exactBranchPointIdsBySession.get(session.id) ?? new Set(),
+    displayGroupEndIdsBySession.get(session.id) ?? new Set(),
     context,
   )
   const finalMessageNodeId = lastDefined(context.rawLogicalNodeIds)
@@ -380,7 +394,8 @@ function attachChildSession(
   relation: BranchRelation,
   parentContext: SessionGraphContext,
   transcripts: Map<string, AgentMessage[]>,
-  relationsByParent: Map<string, BranchRelation[]>,
+  exactBranchPointIdsBySession: Map<string, Set<string>>,
+  displayGroupEndIdsBySession: Map<string, Set<string>>,
 ): string | null {
   const sourceIndex = parentContext.transcript.findIndex(
     (message) => message.id === relation.sourceMessageId,
@@ -400,7 +415,8 @@ function attachChildSession(
       transcript,
       0,
       graph.originNodeId,
-      sourceMessageIds(relationsByParent.get(child.id)),
+      exactBranchPointIdsBySession.get(child.id) ?? new Set(),
+      displayGroupEndIdsBySession.get(child.id) ?? new Set(),
       context,
     )
     const finalMessageNodeId = lastDefined(context.rawLogicalNodeIds)
@@ -451,7 +467,8 @@ function attachChildSession(
     transcript,
     sharedPrefixLength,
     sourceNodeId,
-    sourceMessageIds(relationsByParent.get(child.id)),
+    exactBranchPointIdsBySession.get(child.id) ?? new Set(),
+    displayGroupEndIdsBySession.get(child.id) ?? new Set(),
     context,
   )
   const appendedMessageNodeId = lastDefined(context.rawLogicalNodeIds, sharedPrefixLength)
@@ -474,12 +491,35 @@ function appendSessionMessages(
   startIndex: number,
   initialParentId: string | null,
   exactBranchPoints: Set<string>,
+  displayGroupEndPoints: Set<string>,
   context: SessionGraphContext,
 ): void {
   let parentId = initialParentId
+  let openDisplayGroup: { id: string; nodeId: string } | undefined
   for (let index = startIndex; index < transcript.length; index += 1) {
     const message = transcript[index]
-    if (!message || (!message.visible && !exactBranchPoints.has(message.id))) continue
+    if (!message) continue
+    if (!message.visible && !exactBranchPoints.has(message.id)) {
+      if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+      continue
+    }
+
+    const alias = { sessionId, messageId: message.id }
+    const preview = message.visible ? message.preview : "[internal branch point]"
+    const groupedNode =
+      message.displayGroupId !== undefined && openDisplayGroup?.id === message.displayGroupId
+        ? graph.nodes.get(openDisplayGroup.nodeId)
+        : undefined
+    if (groupedNode?.kind === "message") {
+      groupedNode.preview = `${groupedNode.preview} ${preview}`
+      groupedNode.internal = groupedNode.internal && !message.visible
+      addAlias(groupedNode, alias)
+      groupedNode.forkTarget = alias
+      context.rawLogicalNodeIds[index] = groupedNode.id
+      context.nodeIdByMessageId.set(message.id, groupedNode.id)
+      if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+      continue
+    }
 
     const nodeId = `message:${encodeURIComponent(sessionId)}:${encodeURIComponent(message.id)}`
     const node: MessageGraphNode = {
@@ -488,15 +528,20 @@ function appendSessionMessages(
       parentId,
       childIds: [],
       role: message.role,
-      preview: message.visible ? message.preview : "[internal branch point]",
+      preview,
       internal: !message.visible,
-      aliases: [{ sessionId, messageId: message.id }],
+      aliases: [alias],
+      forkTarget: alias,
     }
     graph.nodes.set(nodeId, node)
     if (parentId) graph.nodes.get(parentId)?.childIds.push(nodeId)
     context.rawLogicalNodeIds[index] = nodeId
     context.nodeIdByMessageId.set(message.id, nodeId)
     parentId = nodeId
+    openDisplayGroup = message.displayGroupId === undefined
+      ? undefined
+      : { id: message.displayGroupId, nodeId }
+    if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
   }
 }
 
@@ -557,7 +602,7 @@ export function resolveForkTarget(
   const node = graph.nodes.get(nodeId)
   if (!node) return undefined
   if (node.kind === "origin") return undefined
-  if (node.kind === "message") return node.aliases[0]
+  if (node.kind === "message") return node.forkTarget
   return node.forkTarget
 }
 
@@ -595,8 +640,55 @@ function compareRelations(left: BranchRelation, right: BranchRelation): number {
   )
 }
 
-function sourceMessageIds(relations: BranchRelation[] | undefined): Set<string> {
-  return new Set((relations ?? []).map((relation) => relation.sourceMessageId))
+function collectExactBranchPointIds(relations: BranchRelation[]): Map<string, Set<string>> {
+  const idsBySession = new Map<string, Set<string>>()
+  for (const relation of relations) {
+    const ids = idsBySession.get(relation.parentSessionId) ?? new Set()
+    ids.add(relation.sourceMessageId)
+    idsBySession.set(relation.parentSessionId, ids)
+  }
+
+  propagateSharedMessageIds(idsBySession, relations)
+  return idsBySession
+}
+
+function collectDisplayGroupEndIds(
+  relations: BranchRelation[],
+  removals: ConversationRemoval[],
+): Map<string, Set<string>> {
+  const idsBySession = collectExactBranchPointIds(relations)
+  for (const removal of removals) {
+    if (removal.kind !== "subtree" || removal.target.kind !== "endpoint") continue
+    if (removal.target.afterMessageId === null) continue
+    const ids = idsBySession.get(removal.target.sessionId) ?? new Set()
+    ids.add(removal.target.afterMessageId)
+    idsBySession.set(removal.target.sessionId, ids)
+  }
+  propagateSharedMessageIds(idsBySession, relations)
+  return idsBySession
+}
+
+function propagateSharedMessageIds(
+  idsBySession: Map<string, Set<string>>,
+  relations: BranchRelation[],
+): void {
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const relation of relations) {
+      const childIds = idsBySession.get(relation.childSessionId)
+      if (!childIds) continue
+      const parentIds = idsBySession.get(relation.parentSessionId) ?? new Set()
+      for (const sharedMessage of relation.sharedMessages) {
+        if (!childIds.has(sharedMessage.childMessageId) || parentIds.has(sharedMessage.parentMessageId)) {
+          continue
+        }
+        parentIds.add(sharedMessage.parentMessageId)
+        changed = true
+      }
+      if (parentIds.size > 0) idsBySession.set(relation.parentSessionId, parentIds)
+    }
+  }
 }
 
 function addAlias(node: MessageGraphNode, alias: ForkTarget): void {

@@ -56,6 +56,10 @@ Claude Code also does not expose semantic generation state to its terminal host.
 
 After Claude reports that a historical fork was created, retry bounded reads of a missing or short child transcript before validating correspondence. Create the provider fork only once and keep payload validation strict. If correspondence still cannot be validated, save no ancestry and refresh the created child as an independent root rather than guessing its relationship or deleting its provider transcript.
 
+Automatic terminal-return and completion refreshes reread the affected sessions and merge them with cached unrelated transcripts; initial loads and explicit manual refreshes remain complete snapshots. Preserve every ordered activity transition reported in one PTY chunk. Because provider persistence can lag an idle title, retain the pending endpoint and retry with bounded backoff until the transcript advances to a provider-confirmed completed turn. If the session resumes working, reject the stale completion and keep newly persisted assistant-tail records behind the single working endpoint.
+
+Claude may persist one user turn as multiple assistant records, including streamed content blocks and continuations around tool calls. Normalize those raw records into one visible Agent node per user turn while retaining every UUID for prefix validation, removals, and provider operations. A newly selected grouped Agent forks from its latest represented raw boundary. An existing recorded fork closes the display group at its exact source so later parent content never appears before the branch.
+
 ## Codex Forks Only At Completed Turn Boundaries
 
 Codex app-server forks whole turns rather than arbitrary transcript items. A valid Codex fork target is therefore the final agent item in a completed turn. User-message replay, system-item targets, intra-turn targets, and incomplete turns fail before creating a child. After a fork, compare the copied child prefix against the source payloads and fail closed if Codex did not preserve it exactly.

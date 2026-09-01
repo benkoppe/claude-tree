@@ -366,12 +366,28 @@ test("replaces a temporary new-session id after the provider reports the real se
   await chmod(fakeAgent, 0o755)
   let resolveStarted!: (session: AgentSession) => void
   const startedSession = new Promise<AgentSession>((resolve) => { resolveStarted = resolve })
+  let resolveDiscovery!: (sessions: AgentSession[]) => void
+  const discovery = new Promise<AgentSession[]>((resolve) => { resolveDiscovery = resolve })
+  let listCalls = 0
   const provider: AgentProvider = {
     id: "test-agent",
     displayName: "Test Agent",
     navigatorIdentity: { label: "Agent", color: theme.secondary },
-    async listSessions() { return [] },
-    async readTranscripts() { return new Map() },
+    async listSessions() {
+      listCalls += 1
+      return listCalls === 1 ? [] : discovery
+    },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [
+        {
+          id: "real-history",
+          role: "user" as const,
+          preview: "persisted history",
+          ordinal: 0,
+          visible: true,
+        },
+      ]]))
+    },
     async prepareNewSession() {
       return {
         session: { id: "pending-session", title: "Pending conversation", lastModified: 1, transient: true },
@@ -394,15 +410,20 @@ test("replaces a temporary new-session id after the provider reports the real se
     await waitForFrame(setup, (frame) => frame.includes("No conversations"))
     setup.mockInput.pressKey("n")
     await waitForFrame(setup, (frame) => frame.includes("NEW_SESSION_ACTIVE"))
-    resolveStarted({ id: "real-session", title: "Real conversation", lastModified: 2, transient: true })
-    await Bun.sleep(10)
-
     setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitUntil(() => listCalls === 2)
+    resolveDiscovery([{ id: "real-session", title: "Real conversation", lastModified: 2 }])
     await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    resolveStarted({ id: "real-session", title: "Real conversation", lastModified: 2, transient: true })
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("persisted history"),
+    )
     setup.mockInput.pressKey("q")
     const roots = await waitForFrame(setup, (frame) => frame.includes("Real conversation"))
     expect(roots).not.toContain("Pending conversation")
   } finally {
+    resolveDiscovery([])
     await app.stop()
     await running
   }
@@ -2023,13 +2044,31 @@ sleep 30
     "user",
     "question",
   )
-  const agentMessage = sessionMessage(
+  const partialAgentMessage = sessionMessage(
     sessionId,
     "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
     "assistant",
-    "completed answer",
+    "first blurb",
+    undefined,
+    null,
   )
-  let transcript = [userMessage]
+  const agentMessage = sessionMessage(
+    sessionId,
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+    "assistant",
+    "completed answer",
+    undefined,
+    "end_turn",
+  )
+  const unrelatedSessionId = "22222222-2222-4222-8222-222222222222"
+  const unrelatedTranscript = [sessionMessage(
+    unrelatedSessionId,
+    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
+    "user",
+    "unrelated question",
+  )]
+  let transcript: SessionMessage[] = [userMessage]
+  const transcriptReadSessionIds: string[] = []
   const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
       return [
@@ -2037,12 +2076,19 @@ sleep 30
           sessionId,
           summary: "Live conversation",
           firstPrompt: "question",
-          lastModified: Date.now(),
+          lastModified: 2,
+        },
+        {
+          sessionId: unrelatedSessionId,
+          summary: "Unrelated conversation",
+          firstPrompt: "unrelated question",
+          lastModified: 1,
         },
       ]
     },
-    async messages(): Promise<SessionMessage[]> {
-      return transcript
+    async messages(readSessionId): Promise<SessionMessage[]> {
+      transcriptReadSessionIds.push(readSessionId)
+      return readSessionId === sessionId ? transcript : unrelatedTranscript
     },
     async fork(): Promise<{ sessionId: string }> {
       throw new Error("not used")
@@ -2059,10 +2105,12 @@ sleep 30
 
   try {
     await waitForFrame(setup, (frame) => frame.includes("Live conversation"))
+    transcriptReadSessionIds.length = 0
     setup.mockInput.pressEnter()
     await waitForFrame(setup, (frame) => frame.includes("question") && frame.includes("Message graph"))
     setup.mockInput.pressEnter()
     await Bun.sleep(50)
+    transcript = [userMessage, partialAgentMessage]
     setup.mockInput.pressKey(" ", { ctrl: true })
 
     const generating = await waitForFrame(
@@ -2070,11 +2118,13 @@ sleep 30
       (frame) =>
         frame.includes("Agent") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
     )
+    expect(generating).not.toContain("first blurb")
     expect(generating).not.toContain("completed answer")
     expect(generating).not.toContain("Draft")
 
-    transcript = [userMessage, agentMessage]
     await writeFile(finishMarker, "")
+    await waitUntil(() => transcriptReadSessionIds.length >= 2)
+    transcript = [userMessage, partialAgentMessage, agentMessage]
     const completed = await waitForFrame(
       setup,
       (frame) => {
@@ -2088,7 +2138,10 @@ sleep 30
         )
       },
     )
+    expect(completed.match(/󰚩 Agent/g)).toHaveLength(1)
+    expect(completed).toContain("first blurb completed answer")
     expect(completed.indexOf("completed answer")).toBeLessThan(completed.indexOf("Draft"))
+    expect(transcriptReadSessionIds.every((readSessionId) => readSessionId === sessionId)).toBeTrue()
     const selectedDraft = setup
       .captureSpans()
       .lines.flatMap((line) => line.spans)
@@ -2101,6 +2154,96 @@ sleep 30
       (frame) => frame.includes("Conversation roots") && frame.includes("● Live · Live conversation"),
     )
     expect(roots).not.toContain("Saved")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("keeps completion pending when persistence has only reached the user message", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const finishMarker = join(root, "finish")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+${String.raw`printf '\033]0;\342\240\213 Claude Code\007'`}
+while [ ! -f ${JSON.stringify(finishMarker)} ]; do sleep 0.01; done
+${String.raw`printf '\033]0;\342\234\263 Claude Code\007'`}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "33333333-3333-4333-8333-333333333333"
+  const oldUser = sessionMessage(sessionId, "cccccccc-cccc-4ccc-8ccc-ccccccccccc1", "user", "old question")
+  const oldAgent = sessionMessage(
+    sessionId,
+    "cccccccc-cccc-4ccc-8ccc-ccccccccccc2",
+    "assistant",
+    "old answer",
+    undefined,
+    "end_turn",
+  )
+  const newUser = sessionMessage(sessionId, "cccccccc-cccc-4ccc-8ccc-ccccccccccc3", "user", "new question")
+  const newAgent = sessionMessage(
+    sessionId,
+    "cccccccc-cccc-4ccc-8ccc-ccccccccccc4",
+    "assistant",
+    "new answer",
+    undefined,
+    "end_turn",
+  )
+  let transcript: SessionMessage[] = [oldUser, oldAgent]
+  let transcriptReads = 0
+  const provider = new ClaudeProvider(project, fakeClaude, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [{ sessionId, summary: "Persistence lag", firstPrompt: "old question", lastModified: 1 }]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      transcriptReads += 1
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Persistence lag"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("old answer"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(50)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("Agent") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
+    )
+
+    const readsBeforeIdle = transcriptReads
+    transcript = [oldUser, oldAgent, newUser]
+    await writeFile(finishMarker, "")
+    await waitUntil(() => transcriptReads > readsBeforeIdle)
+    const pending = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Agent") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
+    )
+    expect(pending).not.toContain("new question")
+    expect(pending).not.toContain("Draft")
+
+    transcript = [oldUser, oldAgent, newUser, newAgent]
+    const completed = await waitForFrame(
+      setup,
+      (frame) => frame.includes("new question") && frame.includes("new answer") && frame.includes("Draft"),
+    )
+    expect(completed.indexOf("new question")).toBeLessThan(completed.indexOf("new answer"))
   } finally {
     await app.stop()
     await running
@@ -2343,7 +2486,12 @@ test("preserves return-to-graph focus when that refresh is restarted", async () 
     setup.mockInput.pressEnter()
     await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
     setup.mockInput.pressKey(" ", { ctrl: true })
-    await waitForFrame(setup, refreshSpinnerVisible)
+    const returning = await waitForFrame(
+      setup,
+      (frame) =>
+        listCalls === 2 && frame.includes("Message graph") && frame.includes("focus question"),
+    )
+    expect(returning).not.toContain("Conversation roots")
 
     setup.mockInput.pressKey("r")
     const graph = await waitForFrame(
@@ -2370,6 +2518,7 @@ function sessionMessage(
   type: SessionMessage["type"],
   text: string,
   model?: string,
+  stopReason?: string | null,
 ): SessionMessage {
   return {
     type,
@@ -2377,6 +2526,7 @@ function sessionMessage(
     session_id: sessionId,
     message: {
       ...(model === undefined ? {} : { model }),
+      ...(stopReason === undefined ? {} : { stop_reason: stopReason }),
       content: [{ type: "text", text }],
     },
     parent_tool_use_id: null,

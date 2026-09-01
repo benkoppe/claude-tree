@@ -14,6 +14,8 @@ export interface AgentMessage {
   preview: string
   ordinal: number
   visible: boolean
+  displayGroupId?: string
+  turnComplete?: boolean
 }
 
 export interface MessageRef {
@@ -29,7 +31,7 @@ export interface DraftPreview {
 export type AgentActivity = "working" | "idle"
 
 export interface TerminalObserver {
-  observeOutput(data: Uint8Array): AgentActivity | undefined
+  observeOutput(data: Uint8Array): readonly AgentActivity[]
   observeScreen(screen: EmbeddedTerminalScreen): AgentActivity | undefined
   observeDraft(screen: EmbeddedTerminalScreen): string | undefined
 }
@@ -105,8 +107,8 @@ export interface AgentProvider {
 }
 
 export class NullTerminalObserver implements TerminalObserver {
-  observeOutput(): undefined {
-    return undefined
+  observeOutput(): readonly AgentActivity[] {
+    return []
   }
 
   observeScreen(): undefined {

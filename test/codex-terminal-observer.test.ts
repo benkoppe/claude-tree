@@ -11,19 +11,28 @@ test("parses split Codex OSC title sequences incrementally", () => {
   const observer = new CodexTerminalObserver()
   const sequence = new TextEncoder().encode("noise\u001b]0;⠋ | claude-tree-codex\u001b\\")
 
-  expect(observer.observeOutput(sequence.slice(0, 10))).toBeUndefined()
-  expect(observer.observeOutput(sequence.slice(10, 16))).toBeUndefined()
-  expect(observer.observeOutput(sequence.slice(16))).toBe("working")
+  expect(observer.observeOutput(sequence.slice(0, 10))).toEqual([])
+  expect(observer.observeOutput(sequence.slice(10, 16))).toEqual([])
+  expect(observer.observeOutput(sequence.slice(16))).toEqual(["working"])
 })
 
 test("observes a non-active title as idle only after known activity", () => {
   const observer = new CodexTerminalObserver()
   const encode = (value: string) => new TextEncoder().encode(value)
 
-  expect(observer.observeOutput(encode("\u001b]2;claude-tree-codex\u0007"))).toBeUndefined()
-  expect(observer.observeOutput(encode("\u001b]2;⠹ | claude-tree-codex\u0007"))).toBe("working")
-  expect(observer.observeOutput(encode("\u001b]2;claude-tree-codex\u0007"))).toBe("idle")
-  expect(observer.observeOutput(encode("\u001b]2;another-project\u0007"))).toBeUndefined()
+  expect(observer.observeOutput(encode("\u001b]2;claude-tree-codex\u0007"))).toEqual([])
+  expect(observer.observeOutput(encode("\u001b]2;⠹ | claude-tree-codex\u0007"))).toEqual(["working"])
+  expect(observer.observeOutput(encode("\u001b]2;claude-tree-codex\u0007"))).toEqual(["idle"])
+  expect(observer.observeOutput(encode("\u001b]2;another-project\u0007"))).toEqual([])
+})
+
+test("preserves ordered Codex activity transitions in one output chunk", () => {
+  const observer = new CodexTerminalObserver()
+  const output = new TextEncoder().encode(
+    "\u001b]2;⠹ | claude-tree-codex\u0007\u001b]2;claude-tree-codex\u0007",
+  )
+
+  expect(observer.observeOutput(output)).toEqual(["working", "idle"])
 })
 
 test("recognizes action-required and explicit Codex title statuses conservatively", () => {
@@ -43,7 +52,7 @@ test("keeps action-required title activity authoritative over a stale status row
     observer.observeOutput(
       new TextEncoder().encode("\u001b]0;[ ! ] Action Required | claude-tree-codex\u0007"),
     ),
-  ).toBe("working")
+  ).toEqual(["working"])
   expect(
     observer.observeScreen({
       text: "",
@@ -141,7 +150,7 @@ test("keeps visible Codex confirmation and trust prompts active", () => {
   const observer = new CodexTerminalObserver()
   expect(
     observer.observeOutput(new TextEncoder().encode("\u001b]0;project | Ready\u0007")),
-  ).toBe("idle")
+  ).toEqual(["idle"])
   expect(observer.observeScreen(confirmation)).toBe("working")
 
   expect(
