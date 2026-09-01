@@ -5,6 +5,7 @@ import { createCliRenderer } from "@opentui/core"
 import { AgentTreeApp } from "./app"
 import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import { parseCliArguments, resolveProjectDirectory } from "./cli-options"
+import { createHerdrReporter } from "./herdr-reporter"
 import { createClaudeProvider } from "./providers/claude"
 import { createCodexProvider } from "./providers/codex"
 import { theme } from "./theme"
@@ -49,7 +50,9 @@ async function main(): Promise<void> {
   process.on("SIGQUIT", stop)
 
   try {
-    app = await AgentTreeApp.create(renderer, projectPath, provider)
+    app = await AgentTreeApp.create(renderer, projectPath, provider, undefined, {
+      herdrReporter: createHerdrReporter(),
+    })
     if (stopRequested) {
       await app.stop()
       return

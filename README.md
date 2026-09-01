@@ -50,6 +50,12 @@ nix run github:benkoppe/claude-tree#unwrapped
 
 `claude-tree` remembers the current roots selection, graph message, or open agent terminal for each project and provider. The next invocation restores that semantic location when it still exists. An open terminal is resumed through the provider; terminal scrollback, transient dialogs, and unsent drafts are not persisted.
 
+## Herdr
+
+When launched inside a [Herdr](https://github.com/herdrdev/herdr) pane, `claude-tree` registers under its own name and automatically reports `working`, `blocked`, and `idle` status through Herdr's CLI. The navigator reports idle, and only the visible provider terminal controls the row; hidden sessions keep running without overriding it.
+
+Herdr integration is optional and is detected through `HERDR_ENV`, `HERDR_BIN_PATH`, and `HERDR_PANE_ID`. Herdr does not take ownership of claude-tree's child terminals, and claude-tree remains usable without Herdr installed.
+
 ## Development
 
 The development shell includes Bun and the validated provider CLIs available for the platform:

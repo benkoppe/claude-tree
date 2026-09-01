@@ -21,6 +21,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
 
   observeScreen(screen: EmbeddedTerminalScreen): AgentActivity | undefined {
     const activity = observeClaudeActivity(screen)
+    if (activity === "blocked" || activity === "working") return activity
     if (activity !== undefined && this.titleActivity !== undefined && activity !== this.titleActivity) {
       return undefined
     }
@@ -33,22 +34,56 @@ export class ClaudeTerminalObserver implements TerminalObserver {
 }
 
 export function observeClaudeDraft(screen: EmbeddedTerminalScreen): string | undefined {
-  const composer = observeClaudeComposer(screen)
+  const composer = observeClaudeComposer(screen)?.text
   return composer && composer.length > 0 ? composer : undefined
 }
 
 export function observeClaudeActivity(screen: EmbeddedTerminalScreen): AgentActivity | undefined {
-  const recentLines = screen.lines.filter((line) => line.trim().length > 0).slice(-12)
+  const recentRows = screen.lines
+    .map((line, row) => ({ line, row }))
+    .filter(({ line }) => line.trim().length > 0)
+    .slice(-12)
+  if (isClaudeBlocker(recentRows.map(({ line }) => line))) return "blocked"
+
+  const composer = observeClaudeComposer(screen)
+  const working = recentRows.findLast(({ line }) => isClaudeWorkingLine(line))
+  if (working && (!composer || working.row > composer.promptRow)) return "working"
+  return composer ? "idle" : undefined
+}
+
+function isClaudeWorkingLine(line: string): boolean {
+  return (
+    /^\s*[⏸⏵].*esc to interrupt(?:\s|·|$)/u.test(line) ||
+    /^\s*[*·✢✶✻✽]\s+\S.*…(?:\s+\(\d+[smh](?:\s|·)|\s*$)/u.test(line)
+  )
+}
+
+function isClaudeBlocker(lines: readonly string[]): boolean {
+  const text = lines.join("\n")
+  const lower = text.toLowerCase()
   if (
-    recentLines.some(
-      (line) =>
-        /^\s*[⏸⏵].*esc to interrupt(?:\s|·|$)/u.test(line) ||
-        /^\s*[*·✢✶✻✽]\s+\S.*…(?:\s+\(\d+[smh](?:\s|·)|\s*$)/u.test(line),
+    lower.includes("esc to cancel") &&
+    (
+      lower.includes("enter to confirm") ||
+      lower.includes("enter to select") ||
+      lower.includes("run a dynamic workflow?")
     )
   ) {
-    return "working"
+    return true
   }
-  return observeClaudeComposer(screen) !== undefined ? "idle" : undefined
+  if (
+    (lower.includes("do you want to proceed?") || lower.includes("would you like to proceed?")) &&
+    lower.includes("esc to cancel") &&
+    /(?:^|\n)\s*❯?\s*(?:\d+\.\s*)?(?:yes|allow|deny|no)\b/iu.test(text)
+  ) {
+    return true
+  }
+  return (
+    lower.includes("mcp server") &&
+    lower.includes("requests your input") &&
+    lower.includes("esc to cancel") &&
+    /(?:^|\n)\s*❯?\s*(?:accept|decline)\b/iu.test(text)
+  )
 }
 
 export function claudeActivityFromTitle(title: string): AgentActivity | undefined {
@@ -71,7 +106,9 @@ function decodeOscTitle(body: readonly number[]): string | undefined {
   }
 }
 
-function observeClaudeComposer(screen: EmbeddedTerminalScreen): string | undefined {
+function observeClaudeComposer(
+  screen: EmbeddedTerminalScreen,
+): { text: string; promptRow: number } | undefined {
   if (!screen.cursor.visible) return undefined
   const cursorRow = screen.cursor.y
   if (cursorRow < 0 || cursorRow >= screen.lines.length) return undefined
@@ -89,7 +126,10 @@ function observeClaudeComposer(screen: EmbeddedTerminalScreen): string | undefin
     }
     if (borderRow < 0 || cursorRow >= borderRow) continue
 
-    return [match[1] ?? "", ...screen.lines.slice(promptRow + 1, borderRow)].join("\n").trim()
+    return {
+      text: [match[1] ?? "", ...screen.lines.slice(promptRow + 1, borderRow)].join("\n").trim(),
+      promptRow,
+    }
   }
   return undefined
 }

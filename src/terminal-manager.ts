@@ -7,9 +7,18 @@ import {
 
 import type { AgentActivity, DraftPreview, TerminalLaunch, TerminalObserver } from "./agent-provider"
 import { Osc52Forwarder } from "./clipboard"
+import { NULL_HERDR_REPORTER, type HerdrReporter } from "./herdr-reporter"
 
 const SHUTDOWN_GRACE_PERIOD_MS = 200
 const FORCED_SHUTDOWN_PERIOD_MS = 200
+const NESTED_HERDR_ENVIRONMENT_KEYS = [
+  "HERDR_ENV",
+  "HERDR_BIN_PATH",
+  "HERDR_SOCKET_PATH",
+  "HERDR_PANE_ID",
+  "HERDR_TAB_ID",
+  "HERDR_WORKSPACE_ID",
+] as const
 
 interface ManagedTerminal {
   sessionId: string
@@ -54,8 +63,10 @@ export class TerminalManager {
     private readonly renderer: CliRenderer,
     private readonly onProcessExited: (event: TerminalExitEvent) => void,
     private readonly onActivityChanged: (event: TerminalActivityEvent) => void = () => undefined,
+    private readonly herdrReporter: HerdrReporter = NULL_HERDR_REPORTER,
   ) {
     renderer.on(CliRenderEvents.SELECTION, this.onSelection)
+    this.herdrReporter.report("idle")
   }
 
   async show(launch: TerminalLaunch): Promise<void> {
@@ -102,9 +113,11 @@ export class TerminalManager {
     managed.terminal.visible = true
     try {
       managed.terminal.focus()
+      this.herdrReporter.report(managed.activity)
     } catch (error) {
       this.activeSessionId = null
       managed.terminal.visible = false
+      this.herdrReporter.report("idle")
       throw error
     }
   }
@@ -120,11 +133,16 @@ export class TerminalManager {
       if (managed) managed.terminal.visible = false
     }
     this.pruneExited()
+    this.herdrReporter.report("idle")
     return previous
   }
 
   ownsInput(): boolean {
     return this.activeSessionId !== null
+  }
+
+  activeSession(): string | null {
+    return this.activeSessionId
   }
 
   runningSessionIds(): Set<string> {
@@ -171,7 +189,7 @@ export class TerminalManager {
       [...this.terminals.values()]
         .filter(
           (managed) =>
-            managed.state === "running" && managed.exitCode === null && managed.activity === "working",
+            managed.state === "running" && managed.exitCode === null && managed.activity !== "idle",
         )
         .map((managed) => managed.sessionId),
     )
@@ -191,6 +209,7 @@ export class TerminalManager {
     if (wasActive) {
       this.activeSessionId = null
       this.renderer.clearSelection()
+      this.herdrReporter.report("idle")
     }
     this.destroyEmulator(managed)
 
@@ -219,6 +238,7 @@ export class TerminalManager {
       managed.stopRequest ? [managed.stopRequest.completion] : [],
     )
     const errors: unknown[] = []
+    const reporterShutdown = this.herdrReporter.shutdown()
     try {
       signalProcessGroups(owned, "SIGTERM", errors)
       for (const managed of owned) this.destroyEmulator(managed)
@@ -233,6 +253,11 @@ export class TerminalManager {
       const cleanups = await Promise.allSettled(owned.map((managed) => this.cleanupManaged(managed)))
       for (const cleanup of cleanups) {
         if (cleanup.status === "rejected") errors.push(cleanup.reason)
+      }
+      try {
+        await reporterShutdown
+      } catch (error) {
+        errors.push(error)
       }
     } finally {
       for (const managed of owned) {
@@ -329,15 +354,17 @@ export class TerminalManager {
 
     let process: Bun.Subprocess
     try {
+      const environment: NodeJS.ProcessEnv = {
+        ...globalThis.process.env,
+        ...launch.env,
+        TERM: "xterm-256color",
+        COLORTERM: "truecolor",
+      }
+      for (const key of NESTED_HERDR_ENVIRONMENT_KEYS) delete environment[key]
       process = Bun.spawn(launch.command, {
         cwd: launch.cwd,
         detached: true,
-        env: {
-          ...globalThis.process.env,
-          ...launch.env,
-          TERM: "xterm-256color",
-          COLORTERM: "truecolor",
-        },
+        env: environment,
         terminal: {
           cols,
           rows,
@@ -396,6 +423,7 @@ export class TerminalManager {
       if (wasActive) {
         this.activeSessionId = null
         this.renderer.clearSelection()
+        this.herdrReporter.report("idle")
       }
       this.destroyTerminal(managed)
       this.terminals.delete(managed.sessionId)
@@ -421,6 +449,7 @@ export class TerminalManager {
     if (managed.activity === activity) return
     managed.activity = activity
     this.onActivityChanged({ sessionId: managed.sessionId, activity })
+    if (this.activeSessionId === managed.sessionId) this.herdrReporter.report(activity)
   }
 
   private cleanupManaged(managed: ManagedTerminal): Promise<void> {

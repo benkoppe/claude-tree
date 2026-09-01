@@ -5,7 +5,8 @@ import { join } from "node:path"
 
 import { createTestRenderer } from "@opentui/core/testing"
 
-import type { TerminalLaunch } from "../src/agent-provider"
+import type { AgentActivity, TerminalLaunch } from "../src/agent-provider"
+import type { HerdrReporter } from "../src/herdr-reporter"
 import { ClaudeTerminalObserver } from "../src/providers/claude-terminal-observer"
 import {
   TerminalManager,
@@ -33,6 +34,46 @@ test("terminal ownership closes permanently when shutdown starts", async () => {
     ).rejects.toThrow("shutting down")
     expect(cleaned).toBeTrue()
   } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("does not expose the outer Herdr pane identity to nested providers", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const directory = await mkdtemp(join(tmpdir(), "claude-tree-herdr-env-test-"))
+  temporaryDirectories.push(directory)
+  const environmentMarker = join(directory, "environment")
+  const executable = await createFakeClaude(
+    `printf '%s\n' "\${HERDR_ENV-unset}" "\${HERDR_BIN_PATH-unset}" "\${HERDR_SOCKET_PATH-unset}" "\${HERDR_PANE_ID-unset}" "\${HERDR_TAB_ID-unset}" "\${HERDR_WORKSPACE_ID-unset}" "$TERM" "$COLORTERM" "$CUSTOM_PROVIDER_VALUE" > ${JSON.stringify(environmentMarker)}
+    sleep 30`,
+  )
+  const terminalLaunch = launch(executable, "nested-provider-session")
+  terminalLaunch.env = {
+    HERDR_ENV: "1",
+    HERDR_BIN_PATH: "/tmp/herdr",
+    HERDR_SOCKET_PATH: "/tmp/herdr.sock",
+    HERDR_PANE_ID: "pane-7",
+    HERDR_TAB_ID: "tab-3",
+    HERDR_WORKSPACE_ID: "workspace-2",
+    CUSTOM_PROVIDER_VALUE: "kept",
+  }
+  const manager = new TerminalManager(setup.renderer, () => undefined)
+
+  try {
+    await manager.show(terminalLaunch)
+    expect((await readFileEventually(environmentMarker)).trim().split("\n")).toEqual([
+      "unset",
+      "unset",
+      "unset",
+      "unset",
+      "unset",
+      "unset",
+      "xterm-256color",
+      "truecolor",
+      "kept",
+    ])
+  } finally {
+    await manager.shutdown(50)
     setup.renderer.destroy()
   }
 })
@@ -210,7 +251,7 @@ test("tracks ordered OSC activity transitions from one hidden-process output chu
     printf '\033]0;\342\240\213 Claude Code\007\033]0;\342\234\263 Claude Code\007'
     sleep 30`,
   )
-  const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
+  const activityChanges: Array<{ sessionId: string; activity: AgentActivity }> = []
   const manager = new TerminalManager(
     setup.renderer,
     () => undefined,
@@ -227,6 +268,75 @@ test("tracks ordered OSC activity transitions from one hidden-process output chu
       { sessionId, activity: "working" },
       { sessionId, activity: "idle" },
     ])
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("reports only the visible terminal activity to Herdr", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const fakeClaude = await createFakeClaude(
+    String.raw`printf '\033]0;\342\240\213 Claude Code\007'
+    sleep 0.3
+    printf '\033]0;\342\234\263 Claude Code\007'
+    sleep 30`,
+  )
+  const reports: AgentActivity[] = []
+  const reporter: HerdrReporter = {
+    report(activity) {
+      if (reports.at(-1) !== activity) reports.push(activity)
+    },
+    async shutdown() {},
+  }
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    () => undefined,
+    reporter,
+  )
+
+  try {
+    await manager.show(launch(fakeClaude, "visible-session"))
+    await waitUntil(() => reports.includes("working"))
+    manager.hideActive()
+    await Bun.sleep(400)
+    expect(reports).toEqual(["idle", "working", "idle"])
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("reports visible Claude work and blockers when its title remains idle", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8 })
+  const fakeClaude = await createFakeClaude(
+    String.raw`printf '\033]0;\342\234\263 Claude Code\007'
+    sleep 0.05
+    printf '\342\234\273 Cogitating\342\200\246 (12s \302\267 esc to interrupt)\r\n'
+    sleep 0.2
+    printf '\033[2J\033[HWould you like to proceed?\r\n\342\235\257 1. Allow once\r\n  2. Deny\r\nEsc to cancel'
+    sleep 30`,
+  )
+  const reports: AgentActivity[] = []
+  const reporter: HerdrReporter = {
+    report(activity) {
+      if (reports.at(-1) !== activity) reports.push(activity)
+    },
+    async shutdown() {},
+  }
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    () => undefined,
+    reporter,
+  )
+
+  try {
+    await manager.show(launch(fakeClaude, "static-title-session"))
+    await waitUntil(() => reports.includes("working"))
+    await waitUntil(() => reports.includes("blocked"))
+    expect(reports).toEqual(["idle", "working", "blocked"])
   } finally {
     await manager.shutdown(50)
     setup.renderer.destroy()
@@ -329,7 +439,7 @@ test("continues forwarding PTY telemetry after replacing a session id", async ()
     copiedText = text
     return true
   }
-  const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
+  const activityChanges: Array<{ sessionId: string; activity: AgentActivity }> = []
   const manager = new TerminalManager(
     setup.renderer,
     () => undefined,
@@ -450,6 +560,18 @@ async function readProcessIds(path: string): Promise<number[]> {
   }
   expect(contents).not.toBe("")
   return contents.trim().split(/\s+/).map(Number)
+}
+
+async function readFileEventually(path: string): Promise<string> {
+  const deadline = performance.now() + 2_000
+  while (performance.now() < deadline) {
+    try {
+      return await readFile(path, "utf8")
+    } catch {
+      await Bun.sleep(10)
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}`)
 }
 
 function isProcessAlive(processId: number): boolean {

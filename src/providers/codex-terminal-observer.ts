@@ -26,9 +26,9 @@ export class CodexTerminalObserver implements TerminalObserver {
       if (title === undefined) continue
 
       const explicitActivity = codexActivityFromTitle(title)
-      if (explicitActivity === "working") {
+      if (explicitActivity === "working" || explicitActivity === "blocked") {
         this.sawActiveTitle = true
-        observed.push("working")
+        observed.push(explicitActivity)
       } else if (explicitActivity === "idle") {
         this.sawActiveTitle = false
         observed.push("idle")
@@ -44,7 +44,7 @@ export class CodexTerminalObserver implements TerminalObserver {
   observeScreen(screen: EmbeddedTerminalScreen): AgentActivity | undefined {
     const observation = observeCodexScreen(screen)
     if (observation === undefined) return undefined
-    if (observation.signal === "blocker") return "working"
+    if (observation.signal === "blocker") return "blocked"
     if (
       this.titleActivity !== undefined &&
       observation.activity !== this.titleActivity
@@ -70,7 +70,7 @@ export function observeCodexActivity(screen: EmbeddedTerminalScreen): AgentActiv
 
 export function codexActivityFromTitle(title: string): AgentActivity | undefined {
   if (CODEX_SPINNER.test(title)) return "working"
-  if (/\bAction Required\b/u.test(title)) return "working"
+  if (/\bAction Required\b/u.test(title)) return "blocked"
 
   const statusSegments = title.split(/\s(?:[|·—]|-)\s/u).map((segment) => segment.trim())
   if (statusSegments.some((segment) => ACTIVE_TITLE_STATUSES.has(segment))) return "working"
@@ -97,7 +97,7 @@ function observeCodexScreen(screen: EmbeddedTerminalScreen): CodexScreenObservat
 
   const afterLastPrompt = linesAfterLastPrompt(screen.lines)
   if (isCodexTrustPrompt(screen.lines) || isCodexBlocker(afterLastPrompt)) {
-    return { activity: "working", signal: "blocker" }
+    return { activity: "blocked", signal: "blocker" }
   }
 
   if (observeCodexComposer(screen) !== undefined) {

@@ -28,7 +28,7 @@ export interface DraftPreview {
   exact: boolean
 }
 
-export type AgentActivity = "working" | "idle"
+export type AgentActivity = "working" | "blocked" | "idle"
 
 export interface TerminalObserver {
   observeOutput(data: Uint8Array): readonly AgentActivity[]

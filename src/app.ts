@@ -65,6 +65,7 @@ import {
 } from "./metadata"
 import { OpenLeafPicker } from "./open-leaf-picker"
 import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
+import { NULL_HERDR_REPORTER, type HerdrReporter } from "./herdr-reporter"
 import {
   TerminalManager,
   type TerminalActivityEvent,
@@ -254,6 +255,7 @@ export class AgentTreeApp {
     relations: BranchRelation[],
     removals: ConversationRemoval[],
     private readonly initialNavigationState?: NavigationState,
+    herdrReporter: HerdrReporter = NULL_HERDR_REPORTER,
   ) {
     this.relations = relations
     this.removals = removals
@@ -261,6 +263,7 @@ export class AgentTreeApp {
       renderer,
       (event) => this.onTerminalExited(event),
       (event) => this.onTerminalActivityChanged(event),
+      herdrReporter,
     )
     this.stopped = new Promise((resolve) => {
       this.resolveStopped = resolve
@@ -604,6 +607,7 @@ export class AgentTreeApp {
     projectDirectory: string,
     provider: AgentProvider,
     stateHome?: string,
+    dependencies: { herdrReporter?: HerdrReporter } = {},
   ): Promise<AgentTreeApp> {
     const metadata = await BranchMetadataStore.openForProvider(projectDirectory, provider.id, stateHome)
     const [relations, removals, navigation] = await Promise.all([
@@ -618,6 +622,7 @@ export class AgentTreeApp {
       relations,
       removals,
       navigation,
+      dependencies.herdrReporter,
     )
   }
 

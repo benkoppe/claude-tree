@@ -36,8 +36,8 @@ test("preserves ordered Codex activity transitions in one output chunk", () => {
 })
 
 test("recognizes action-required and explicit Codex title statuses conservatively", () => {
-  expect(codexActivityFromTitle("[ ! ] Action Required | claude-tree-codex")).toBe("working")
-  expect(codexActivityFromTitle("[ . ] Action Required | claude-tree-codex")).toBe("working")
+  expect(codexActivityFromTitle("[ ! ] Action Required | claude-tree-codex")).toBe("blocked")
+  expect(codexActivityFromTitle("[ . ] Action Required | claude-tree-codex")).toBe("blocked")
   expect(codexActivityFromTitle("claude-tree-codex | Working")).toBe("working")
   expect(codexActivityFromTitle("claude-tree-codex | Thinking")).toBe("working")
   expect(codexActivityFromTitle("claude-tree-codex | Waiting")).toBe("working")
@@ -52,7 +52,7 @@ test("keeps action-required title activity authoritative over a stale status row
     observer.observeOutput(
       new TextEncoder().encode("\u001b]0;[ ! ] Action Required | claude-tree-codex\u0007"),
     ),
-  ).toEqual(["working"])
+  ).toEqual(["blocked"])
   expect(
     observer.observeScreen({
       text: "",
@@ -61,7 +61,7 @@ test("keeps action-required title activity authoritative over a stale status row
       rows: 1,
       cursor: { x: 0, y: 0, visible: false },
     }),
-  ).toBe("working")
+  ).toBeUndefined()
 })
 
 test("uses stock Codex status rows as visible activity fallbacks", () => {
@@ -136,7 +136,7 @@ test("keeps visible Codex confirmation and trust prompts active", () => {
     rows: 3,
     cursor: { x: 0, y: 2, visible: true },
   }
-  expect(observeCodexActivity(confirmation)).toBe("working")
+  expect(observeCodexActivity(confirmation)).toBe("blocked")
 
   expect(
     observeCodexActivity({
@@ -145,13 +145,13 @@ test("keeps visible Codex confirmation and trust prompts active", () => {
       rows: 4,
       cursor: { x: 0, y: 2, visible: true },
     }),
-  ).toBe("working")
+  ).toBe("blocked")
 
   const observer = new CodexTerminalObserver()
   expect(
     observer.observeOutput(new TextEncoder().encode("\u001b]0;project | Ready\u0007")),
   ).toEqual(["idle"])
-  expect(observer.observeScreen(confirmation)).toBe("working")
+  expect(observer.observeScreen(confirmation)).toBe("blocked")
 
   expect(
     observeCodexActivity({
@@ -165,7 +165,7 @@ test("keeps visible Codex confirmation and trust prompts active", () => {
       rows: 3,
       cursor: { x: 2, y: 2, visible: true },
     }),
-  ).toBe("working")
+  ).toBe("blocked")
 })
 
 test("does not infer activity from stale rows in Codex's transcript viewer", () => {

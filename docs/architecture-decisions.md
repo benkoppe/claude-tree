@@ -52,7 +52,7 @@ User replay initializes the stock Claude composer through `--prefill` rather tha
 
 Claude Code does not expose semantic composer state. The application may show a conservative, in-memory preview parsed from the visible input box when leaving a live terminal, but it must mark that preview as approximate and never persist it as transcript or relationship state.
 
-Claude Code also does not expose semantic generation state to its terminal host. Observe its OSC terminal-title activity indicator directly from PTY output so hidden processes remain observable, with conservative matching against the last visible Claude screen as a fallback. An idle transition triggers a fresh SDK transcript read; keep the live endpoint visually pending until the rebuilt graph is ready so a completed agent message and its following draft leaf appear atomically. Keep activity state ephemeral and informational: process exit remains authoritative, and detection must not control permissions or inject input.
+Claude Code also does not expose semantic generation state to its terminal host. Observe its OSC terminal-title activity indicator directly from PTY output so hidden processes remain observable, with conservative matching against the last visible Claude screen as a fallback. Claude versions that pin an idle title under terminal multiplexers may still be working; a live bottom-screen working footer overrides that stale title, while a visible composer remains idle. Recognized permission and input prompts are blocked rather than working. An idle transition triggers a fresh SDK transcript read; keep the live endpoint visually pending until the rebuilt graph is ready so a completed agent message and its following draft leaf appear atomically. Keep activity state ephemeral and informational: process exit remains authoritative, and detection must not control permissions or inject input.
 
 After Claude reports that a historical fork was created, retry bounded reads of a missing or short child transcript before validating correspondence. Create the provider fork only once and keep payload validation strict. If correspondence still cannot be validated, save no ancestry and refresh the created child as an independent root rather than guessing its relationship or deleting its provider transcript.
 
@@ -64,7 +64,7 @@ Claude may persist one user turn as multiple assistant records, including stream
 
 Codex app-server forks whole turns rather than arbitrary transcript items. A valid Codex fork target is therefore the final agent item in a completed turn. User-message replay, system-item targets, intra-turn targets, and incomplete turns fail before creating a child. After a fork, compare the copied child prefix against the source payloads and fail closed if Codex did not preserve it exactly.
 
-Codex terminal activity and draft previews are observed conservatively from its OSC title and visible composer. An action-required title remains active rather than being mistaken for completion, because the user must return to the stock TUI to resolve it.
+Codex terminal activity and draft previews are observed conservatively from its OSC title and visible composer. An action-required title or recognized confirmation prompt is blocked rather than being mistaken for working or completion, because the user must return to the stock TUI to resolve it.
 
 ## Graph Navigation Preserves Cursor Intent
 
@@ -89,6 +89,14 @@ After an intentional stop, rebuild the graph from a fresh provider transcript re
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 
 Do not run two live processes against the same provider session ID, because concurrent transcript ownership is unsafe. Different branches may run concurrently.
+
+## Herdr Integration Reports One Visible Agent
+
+When Herdr supplies its pane environment, report activity through the Herdr CLI with a dedicated `custom:claude-tree-lifecycle` source. Reporting is optional, serialized, bounded, and non-fatal. Reassert state shortly after each transition, including once after Herdr's release reacquisition window, so rapid restarts, startup process-detection races, and transient command failures recover. Send a low-frequency heartbeat so a Herdr server restart does not permanently lose registration. Release the source during shutdown. Do not add a runtime dependency on Herdr.
+
+Register the pane's agent as `claude-tree`, which is the foreground application Herdr actually hosts. One claude-tree invocation still represents one selected provider: report idle while the navigator is visible and report the visible terminal's working, blocked, or idle state. Activity from hidden sessions remains available to claude-tree's graph logic but must not override the Herdr row. Remove Herdr's pane-specific environment variables from nested provider processes so their own hooks cannot claim the outer pane or persist a provider identity there.
+
+Herdr reporting does not change process ownership. claude-tree continues to own every provider PTY, and Herdr does not receive terminal handles or act as a multipane runtime. Relaunch restores persisted semantic navigation and may resume a provider session, but it cannot restore the prior PTY or emulator state.
 
 ## Input And View Ownership
 
