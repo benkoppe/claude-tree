@@ -26,6 +26,7 @@ interface OpenLeafPickerRequest {
   onSelect: (option: ReachableSessionEndpoint) => void
   selectedSessionId?: string
   activeSessionIds?: ReadonlySet<string>
+  newUpdateSessionIds?: ReadonlySet<string>
 }
 
 export class OpenLeafPicker {
@@ -36,6 +37,7 @@ export class OpenLeafPicker {
   private readonly rows: PickerRow[] = []
   private options: ReachableSessionEndpoint[] = []
   private activeSessionIds: ReadonlySet<string> = new Set()
+  private newUpdateSessionIds: ReadonlySet<string> = new Set()
   private onSelect: ((option: ReachableSessionEndpoint) => void) | undefined
   private selectedIndex = 0
   private pendingMouseIndex: number | null = null
@@ -128,12 +130,14 @@ export class OpenLeafPicker {
       onSelect,
       selectedSessionId,
       activeSessionIds = new Set(),
+      newUpdateSessionIds = new Set(),
     } = request
     this.clearRows()
     this.title.content = title
     this.options = options
     this.onSelect = onSelect
     this.activeSessionIds = new Set(activeSessionIds)
+    this.newUpdateSessionIds = new Set(newUpdateSessionIds)
     const selectedIndex = selectedSessionId
       ? options.findIndex((option) => option.endpoint.session.id === selectedSessionId)
       : -1
@@ -239,6 +243,7 @@ export class OpenLeafPicker {
       if (!option) continue
       const selected = index === this.selectedIndex
       const active = this.activeSessionIds.has(option.endpoint.session.id)
+      const hasNewUpdates = this.newUpdateSessionIds.has(option.endpoint.session.id)
       const background = selected ? theme.selected : theme.element
       const foreground = selected ? theme.selectedText : theme.text
       const distance =
@@ -256,10 +261,10 @@ export class OpenLeafPicker {
         this.rowTextWidth - 2,
       )
       row.container.backgroundColor = background
-      row.marker.bg = background
-      row.marker.fg = selected ? theme.selectedText : theme.success
-      row.marker.attributes = selected ? TextAttributes.BOLD : TextAttributes.NONE
-      row.marker.content = active ? "• " : "  "
+      row.marker.bg = theme.element
+      row.marker.fg = hasNewUpdates ? theme.warning : theme.success
+      row.marker.attributes = selected || hasNewUpdates ? TextAttributes.BOLD : TextAttributes.NONE
+      row.marker.content = hasNewUpdates ? "● " : active ? "• " : "  "
       row.text.bg = background
       row.text.fg = foreground
       row.text.attributes = selected ? TextAttributes.BOLD : TextAttributes.NONE

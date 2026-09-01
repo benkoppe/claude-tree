@@ -45,6 +45,7 @@ export interface TerminalExitEvent {
 export interface TerminalActivityEvent {
   sessionId: string
   activity: AgentActivity
+  wasActive: boolean
 }
 
 export interface TerminalStopRequest {
@@ -142,6 +143,10 @@ export class TerminalManager {
   }
 
   activeSession(): string | null {
+    return this.activeSessionId
+  }
+
+  activeTerminalSessionId(): string | null {
     return this.activeSessionId
   }
 
@@ -448,7 +453,11 @@ export class TerminalManager {
     if (managed.state !== "running") return
     if (managed.activity === activity) return
     managed.activity = activity
-    this.onActivityChanged({ sessionId: managed.sessionId, activity })
+    this.onActivityChanged({
+      sessionId: managed.sessionId,
+      activity,
+      wasActive: this.activeSessionId === managed.sessionId,
+    })
     if (this.activeSessionId === managed.sessionId) this.herdrReporter.report(activity)
   }
 

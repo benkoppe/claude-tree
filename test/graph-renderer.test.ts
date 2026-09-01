@@ -347,6 +347,49 @@ describe("renderConversationGraph", () => {
     expect(agent).toBeDefined()
     expect(draft).toBeDefined()
   })
+
+  test("marks only an unviewed idle Draft without displacing its preview", () => {
+    const graph = branchGraph()
+    const selected = graph.endpointBySessionId.get(ROOT)!
+    const childEndpoint = graph.endpointBySessionId.get(CHILD)!
+    const marked = renderConversationGraph(
+      graph,
+      selected,
+      100,
+      30,
+      new Set([ROOT, CHILD]),
+      new Map([[CHILD, { text: "follow-up draft", exact: true }]]),
+      new Set(),
+      0,
+      undefined,
+      new Set([ROOT, CHILD]),
+      new Set(),
+      new Set([CHILD]),
+    )
+
+    expect(marked.text).toContain("New updates")
+    expect(marked.text).toContain("follow-up draft")
+    expect(marked.layout.nodes.get(childEndpoint)).toMatchObject({ width: 32, height: 2 })
+    const update = marked.content.chunks.find((chunk) => chunk.text.includes("New updates"))
+    expect(update?.fg?.equals(theme.warning)).toBeTrue()
+    expect(update?.bg?.equals(theme.sessionElement)).toBeTrue()
+
+    const working = renderConversationGraph(
+      graph,
+      childEndpoint,
+      100,
+      30,
+      new Set([CHILD]),
+      new Map(),
+      new Set([CHILD]),
+      0,
+      undefined,
+      new Set([CHILD]),
+      new Set(),
+      new Set([CHILD]),
+    )
+    expect(working.text).not.toContain("New updates")
+  })
 })
 
 describe("renderRootPicker", () => {
@@ -382,6 +425,38 @@ describe("renderRootPicker", () => {
 
     expect(rendered.text).toContain("Historical root")
     expect(rendered.text).toContain("0 sessions")
+  })
+
+  test("aggregates unviewed session updates into the conversation root", () => {
+    const graph = branchGraph()
+    const rendered = renderRootPicker(
+      [graph],
+      0,
+      5,
+      80,
+      new Set([CHILD]),
+      0,
+      new Set([CHILD]),
+    )
+
+    expect(rendered.text).toContain("3 messages · 2 sessions")
+    expect(rendered.text).not.toContain("New updates")
+    const updateStatus = rendered.content.chunks.find(
+      (chunk) => chunk.text === "●" && chunk.bg?.equals(theme.selected),
+    )
+    expect(updateStatus?.fg?.equals(theme.warning)).toBeTrue()
+
+    const narrow = renderRootPicker(
+      [graph],
+      0,
+      5,
+      48,
+      new Set([CHILD]),
+      0,
+      new Set([CHILD]),
+    )
+    expect(narrow.text).toContain("Root")
+    expect(narrow.text).not.toContain("New updates")
   })
 
   test("keeps a stable viewport and scrolls only to reveal the selection", () => {
