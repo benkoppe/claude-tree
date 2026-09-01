@@ -127,6 +127,10 @@ export class TerminalManager {
     return this.activeSessionId !== null
   }
 
+  activeTerminalSessionId(): string | null {
+    return this.activeSessionId
+  }
+
   runningSessionIds(): Set<string> {
     return new Set(
       [...this.terminals.values()]
