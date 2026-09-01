@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, expect, spyOn, test } from "bun:test"
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,6 +7,7 @@ import { createTestRenderer, MouseButtons } from "@opentui/core/testing"
 import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-sdk"
 
 import {
+  BranchCreatedError,
   NullTerminalObserver,
   type AgentMessage,
   type AgentProvider,
@@ -19,6 +20,7 @@ import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
 import { BranchMetadataStore } from "../src/metadata"
 import { PROGRAM_VERSION } from "../src/program"
 import { ClaudeProvider } from "../src/providers/claude"
+import { TerminalManager } from "../src/terminal-manager"
 import { theme } from "../src/theme"
 
 const temporaryDirectories: string[] = []
@@ -165,6 +167,116 @@ test("omits provider sessions whose persisted transcript became unavailable", as
     const frame = await waitForFrame(setup, (candidate) => candidate.includes("Available conversation"))
     expect(frame).not.toContain("Stale conversation")
   } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("refreshes a created fork with unvalidated ancestry as an independent root", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const parentId = "parent-session"
+  const childId = "created-child"
+  let childReadAttempts = 0
+  let childDiscovered = false
+  let childTranscript: AgentMessage[] | null = null
+  const sessions: Record<string, AgentSession> = {
+    [parentId]: { id: parentId, title: "Original conversation", lastModified: 1 },
+    [childId]: { id: childId, title: "Unvalidated fork", lastModified: 2 },
+  }
+  const transcripts: Record<string, AgentMessage[]> = {
+    [parentId]: [
+      { id: "parent-message", role: "agent", preview: "source message", ordinal: 0, visible: true },
+    ],
+    [childId]: [
+      { id: "child-message", role: "agent", preview: "orphaned child history", ordinal: 0, visible: true },
+    ],
+  }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      return childDiscovered
+        ? [sessions[childId]!, sessions[parentId]!]
+        : [sessions[parentId]!]
+    },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => {
+        if (sessionId === childId) {
+          childReadAttempts += 1
+          return [sessionId, childTranscript] as const
+        }
+        return [sessionId, transcripts[sessionId] ?? []] as const
+      }))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+    async branchFrom() {
+      throw new BranchCreatedError(
+        sessions[childId]!,
+        [],
+        false,
+        `Fork ${childId} was created, but its copied prefix could not be validated`,
+      )
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const showTerminal = spyOn(TerminalManager.prototype, "show")
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Original conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("source message"))
+
+    setup.mockInput.pressKey("f")
+    const error = await waitForFrame(
+      setup,
+      (frame) => frame.includes("copied prefix") && frame.includes("could not be validated"),
+    )
+    expect(error).toContain(childId)
+    expect(error).toContain("Unvalidated fork")
+    expect(error).toContain("Message graph")
+    expect(error).toContain("Selected session · transcript unavailable")
+    expect(showTerminal).not.toHaveBeenCalled()
+
+    setup.mockInput.pressEscape()
+    await waitForFrame(setup, (frame) => !frame.includes("Error") && frame.includes("Transcript unavailable"))
+    childDiscovered = true
+    const readsBeforeRefresh = childReadAttempts
+    setup.mockInput.pressKey("r")
+    const refreshed = await waitForFrame(
+      setup,
+      (frame) => childReadAttempts > readsBeforeRefresh && !frame.includes("Error"),
+    )
+    expect(refreshed).toContain("Transcript unavailable")
+
+    childTranscript = []
+    setup.mockInput.pressKey("r")
+    const readableEmpty = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Selected session · no visible messages"),
+    )
+    expect(readableEmpty).toContain("No visible messages")
+
+    childTranscript = null
+    const readsBeforeUnavailableRefresh = childReadAttempts
+    setup.mockInput.pressKey("r")
+    const unavailableAgain = await waitForFrame(
+      setup,
+      (frame) => childReadAttempts > readsBeforeUnavailableRefresh && !frame.includes("Error"),
+    )
+    expect(unavailableAgain).toContain("Unvalidated fork")
+    expect(unavailableAgain).toContain("Selected session · no visible messages")
+
+    const metadata = await BranchMetadataStore.openForProvider(project, provider.id, state)
+    expect(await metadata.loadRelations()).toEqual([])
+  } finally {
+    showTerminal.mockRestore()
     await app.stop()
     await running
   }

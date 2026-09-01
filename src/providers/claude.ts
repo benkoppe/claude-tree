@@ -9,14 +9,15 @@ import {
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk"
 
-import type {
-  AgentMessage,
-  AgentProvider,
-  AgentSession,
-  MessageRef,
-  PreparedBranch,
-  PreparedSession,
-  TerminalLaunch,
+import {
+  BranchCreatedError,
+  type AgentMessage,
+  type AgentProvider,
+  type AgentSession,
+  type MessageRef,
+  type PreparedBranch,
+  type PreparedSession,
+  type TerminalLaunch,
 } from "../agent-provider"
 import { theme } from "../theme"
 import { ClaudeTerminalObserver } from "./claude-terminal-observer"
@@ -34,6 +35,17 @@ export interface ClaudeSdk {
   ): Promise<{ sessionId: string }>
 }
 
+export interface ClaudeProviderOptions {
+  compatibilityWarning?: string
+  forkValidationRetryDelaysMs?: readonly number[]
+}
+
+export interface ClaudeProviderDependencies {
+  sdk?: ClaudeSdk
+  which?: (executable: string) => string | null
+  readVersion?: (executable: string) => Promise<string>
+}
+
 const defaultSdk: ClaudeSdk = {
   list: listSessions,
   messages: getSessionMessages,
@@ -45,6 +57,9 @@ const LOCAL_COMMAND_INVOCATION_PATTERN =
 const LOCAL_COMMAND_OUTPUT_PATTERN =
   /^<local-command-(stdout|stderr|caveat)>.*<\/local-command-\1>$/s
 const NO_RESPONSE_REQUESTED = "No response requested."
+const FORK_VALIDATION_RETRY_DELAYS_MS = [25, 50, 100, 200]
+
+export const EXPECTED_CLAUDE_VERSION = "2.1.251"
 
 interface ClaudeMessage extends AgentMessage {
   replayText?: string
@@ -55,12 +70,20 @@ export class ClaudeProvider implements AgentProvider {
   readonly id = "claude"
   readonly displayName = "Claude Code"
   readonly navigatorIdentity = { label: "Claude", color: theme.claude }
+  readonly compatibilityWarning: string | undefined
+
+  private readonly forkValidationRetryDelaysMs: readonly number[]
 
   constructor(
     private readonly projectPath: string,
     private readonly executable: string,
     private readonly sdk: ClaudeSdk = defaultSdk,
-  ) {}
+    options: ClaudeProviderOptions = {},
+  ) {
+    this.compatibilityWarning = options.compatibilityWarning
+    this.forkValidationRetryDelaysMs =
+      options.forkValidationRetryDelaysMs ?? FORK_VALIDATION_RETRY_DELAYS_MS
+  }
 
   async listSessions(): Promise<AgentSession[]> {
     const sessions = await this.sdk.list({
@@ -71,10 +94,18 @@ export class ClaudeProvider implements AgentProvider {
     return sessions.map(toSessionSummary)
   }
 
-  async readTranscripts(sessionIds: readonly string[]): Promise<Map<string, AgentMessage[]>> {
+  async readTranscripts(
+    sessionIds: readonly string[],
+  ): Promise<Map<string, AgentMessage[] | null>> {
     return new Map(
       await Promise.all(
-        sessionIds.map(async (sessionId) => [sessionId, await this.readClaudeTranscript(sessionId)] as const),
+        sessionIds.map(async (sessionId) => {
+          try {
+            return [sessionId, await this.readClaudeTranscript(sessionId)] as const
+          } catch {
+            return [sessionId, null] as const
+          }
+        }),
       ),
     )
   }
@@ -123,24 +154,24 @@ export class ClaudeProvider implements AgentProvider {
       }
     }
 
+    this.validateDraft(replayText)
+    if (this.compatibilityWarning) {
+      throw new Error(`${this.compatibilityWarning}. Historical branching is disabled for this version pair`)
+    }
+
     const forkMessage = parentTranscript[forkIndex]!
     const parentSession = (await this.listSessions()).find((session) => session.id === target.sessionId)
     const result = await this.sdk.fork(target.sessionId, {
       dir: this.projectPath,
       upToMessageId: forkMessage.id,
     })
-    let childTranscript: ClaudeMessage[]
-    try {
-      childTranscript = await this.readClaudeTranscript(result.sessionId)
-    } catch (error) {
-      throw new Error(
-        `Fork ${result.sessionId} was created, but its transcript could not be read: ${error instanceof Error ? error.message : String(error)}`,
-      )
+    const session: AgentSession = {
+      id: result.sessionId,
+      title: `${parentSession?.title ?? "Conversation"} (fork)`,
+      lastModified: Date.now(),
     }
     const copiedPrefixLength = forkIndex + 1
-    if (childTranscript.length < copiedPrefixLength) {
-      throw new Error(`Fork ${result.sessionId} was created, but its copied prefix could not be validated`)
-    }
+    const childTranscript = await this.readForkedTranscript(session, copiedPrefixLength)
     for (let index = 0; index < copiedPrefixLength; index += 1) {
       const parentMessage = parentTranscript[index]!
       const childMessage = childTranscript[index]!
@@ -149,15 +180,15 @@ export class ClaudeProvider implements AgentProvider {
         !isDeepStrictEqual(parentMessage.rawMessage, childMessage.rawMessage) ||
         parentMessage.visible !== childMessage.visible
       ) {
-        throw new Error(`Fork ${result.sessionId} was created, but its copied prefix does not match the source`)
+        throw new BranchCreatedError(
+          session,
+          childTranscript,
+          true,
+          `Fork ${result.sessionId} was created, but its copied prefix does not match the source`,
+        )
       }
     }
 
-    const session: AgentSession = {
-      id: result.sessionId,
-      title: `${parentSession?.title ?? "Conversation"} (fork)`,
-      lastModified: Date.now(),
-    }
     return {
       session,
       launch: this.launch("resume", result.sessionId, replayText),
@@ -188,7 +219,7 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   private launch(kind: "new" | "resume", sessionId: string, draft?: string): TerminalLaunch {
-    if (draft?.includes("\0")) throw new Error("Claude prompt prefill cannot contain a null byte")
+    this.validateDraft(draft)
     const command =
       kind === "new"
         ? [this.executable, "--session-id", sessionId]
@@ -201,6 +232,10 @@ export class ClaudeProvider implements AgentProvider {
       observer: new ClaudeTerminalObserver(),
       ...(draft === undefined ? {} : { initialDraft: { text: draft.trim(), exact: true } }),
     }
+  }
+
+  private validateDraft(draft: string | undefined): void {
+    if (draft?.includes("\0")) throw new Error("Claude prompt prefill cannot contain a null byte")
   }
 
   private async readClaudeTranscript(sessionId: string): Promise<ClaudeMessage[]> {
@@ -222,12 +257,80 @@ export class ClaudeProvider implements AgentProvider {
       }
     })
   }
+
+  private async readForkedTranscript(
+    session: AgentSession,
+    copiedPrefixLength: number,
+  ): Promise<ClaudeMessage[]> {
+    let observedTranscript: ClaudeMessage[] = []
+    let transcriptAvailable = false
+    let lastReadError: unknown
+    const delays = [0, ...this.forkValidationRetryDelaysMs]
+
+    for (const delayMs of delays) {
+      if (delayMs > 0) await Bun.sleep(delayMs)
+      try {
+        const transcript = await this.readClaudeTranscript(session.id)
+        observedTranscript = transcript
+        transcriptAvailable = true
+        lastReadError = undefined
+        if (transcript.length >= copiedPrefixLength) return transcript
+      } catch (error) {
+        lastReadError = error
+      }
+    }
+
+    if (lastReadError !== undefined) {
+      throw new BranchCreatedError(
+        session,
+        observedTranscript,
+        transcriptAvailable,
+        `Fork ${session.id} was created, but its transcript could not be read after ${delays.length} attempts: ${lastReadError instanceof Error ? lastReadError.message : String(lastReadError)}`,
+        { cause: lastReadError },
+      )
+    }
+    throw new BranchCreatedError(
+      session,
+      observedTranscript,
+      true,
+      `Fork ${session.id} was created, but its copied prefix could not be validated (expected ${copiedPrefixLength} messages; found ${observedTranscript.length})`,
+    )
+  }
 }
 
-export async function createClaudeProvider(projectPath: string): Promise<ClaudeProvider> {
-  const executable = Bun.which("claude")
+export async function createClaudeProvider(
+  projectPath: string,
+  dependencies: ClaudeProviderDependencies = {},
+): Promise<ClaudeProvider> {
+  const executable = (dependencies.which ?? Bun.which)("claude")
   if (!executable) throw new Error("Claude Code was not found on PATH")
-  return new ClaudeProvider(projectPath, executable)
+  const installedVersion = await (dependencies.readVersion ?? readClaudeVersion)(executable)
+  const compatibilityWarning = claudeCompatibilityWarning(installedVersion)
+  return new ClaudeProvider(
+    projectPath,
+    executable,
+    dependencies.sdk ?? defaultSdk,
+    compatibilityWarning === undefined ? {} : { compatibilityWarning },
+  )
+}
+
+export function claudeCompatibilityWarning(installedVersion: string): string | undefined {
+  const escaped = EXPECTED_CLAUDE_VERSION.replace(/\./g, "\\.")
+  if (new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(installedVersion.trim())) return undefined
+  return `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found ${installedVersion.trim()}`
+}
+
+export async function readClaudeVersion(executable: string): Promise<string> {
+  const child = Bun.spawn([executable, "--version"], { stdout: "pipe", stderr: "pipe" })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ])
+  if (exitCode !== 0) {
+    throw new Error(`Unable to run Claude Code: ${stderr.trim() || `exit ${exitCode}`}`)
+  }
+  return stdout.trim()
 }
 
 export function formatMessage(message: unknown): string {

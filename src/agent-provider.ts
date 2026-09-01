@@ -67,6 +67,19 @@ export interface PreparedBranch extends PreparedSession {
   providerSessionCreated: boolean
 }
 
+export class BranchCreatedError extends Error {
+  constructor(
+    readonly session: AgentSession,
+    readonly transcript: AgentMessage[],
+    readonly transcriptAvailable: boolean,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = "BranchCreatedError"
+  }
+}
+
 export interface AgentNavigatorIdentity {
   label: string
   color: RGBA

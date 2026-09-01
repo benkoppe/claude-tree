@@ -11,11 +11,13 @@ import {
   type TextChunk,
 } from "@opentui/core"
 
-import type {
-  AgentMessage,
-  AgentProvider,
-  AgentSession,
-  TerminalLaunch,
+import {
+  BranchCreatedError,
+  type AgentMessage,
+  type AgentProvider,
+  type AgentSession,
+  type PreparedBranch,
+  type TerminalLaunch,
 } from "./agent-provider"
 import { displayWidth, truncateToWidth } from "./display-text"
 import {
@@ -192,6 +194,8 @@ export class AgentTreeApp {
   private readonly terminalManager: TerminalManager
   private readonly openLeafPicker: OpenLeafPicker
   private readonly temporarySessions = new Map<string, AgentSession>()
+  private readonly visibleEmptySessionIds = new Set<string>()
+  private readonly unavailableTranscriptSessionIds = new Set<string>()
   private readonly consumedKeyReleases = new Set<string>()
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
@@ -1153,8 +1157,7 @@ export class AgentTreeApp {
   private enterSelectedRoot(): void {
     const graph = this.forest.graphs[this.selectedRootIndex]
     if (!graph) return
-    const runningSessionIds = this.terminalManager.runningSessionIds()
-    const selectedNodeId = initialVisibleGraphNodeId(graph, runningSessionIds)
+    const selectedNodeId = initialVisibleGraphNodeId(graph, this.visibleEndpointSessionIds())
     if (!selectedNodeId) {
       const endpointId = graph.endpointBySessionId.get(graph.rootSessionId)
       const endpoint = endpointId ? graph.nodes.get(endpointId) : undefined
@@ -1200,13 +1203,13 @@ export class AgentTreeApp {
     const graph = this.currentGraph()
     if (!graph || !this.graphLayout || !this.selectedGraphNodeId) return
 
-    const runningSessionIds = this.terminalManager.runningSessionIds()
+    const visibleEndpointSessionIds = this.visibleEndpointSessionIds()
     const destinations = new Map<
       string,
       { option: ReachableSessionEndpoint; nodeId: string }
     >()
     for (const reachable of reachableSessionEndpoints(graph, this.selectedGraphNodeId)) {
-      const nodeId = visibleGraphNodeId(graph, reachable.endpoint.id, runningSessionIds)
+      const nodeId = visibleGraphNodeId(graph, reachable.endpoint.id, visibleEndpointSessionIds)
       if (!nodeId || destinations.has(nodeId)) continue
       destinations.set(nodeId, {
         option: {
@@ -1234,7 +1237,7 @@ export class AgentTreeApp {
     this.openLeafPicker.open({
       title: "Jump to Leaf",
       options: choices.map(({ option }) => option),
-      activeSessionIds: runningSessionIds,
+      activeSessionIds: this.terminalManager.runningSessionIds(),
       onSelect: ({ endpoint }) => {
         const nodeId = nodeIdBySessionId.get(endpoint.session.id)
         if (nodeId) this.selectGraphNode(nodeId)
@@ -1322,6 +1325,9 @@ export class AgentTreeApp {
           persistedTranscripts.set(sessionId, transcript)
         }
       }
+      const retainedTemporarySessionIds = new Set(
+        retainedTemporarySessions.map((session) => session.id),
+      )
       const availableSessions: AgentSession[] = []
       const transcriptEntries: Array<readonly [string, AgentMessage[]]> = []
       for (const session of sessions) {
@@ -1334,7 +1340,16 @@ export class AgentTreeApp {
         if (transcript === undefined) {
           throw new Error(`${this.provider.displayName} did not return transcript ${session.id}`)
         }
-        if (transcript === null) continue
+        if (transcript === null) {
+          const retainedTranscript = this.temporarySessions.has(session.id)
+            ? this.transcripts.get(session.id)
+            : undefined
+          if (retainedTranscript === undefined) continue
+          availableSessions.push(session)
+          transcriptEntries.push([session.id, retainedTranscript])
+          continue
+        }
+        this.unavailableTranscriptSessionIds.delete(session.id)
         availableSessions.push(session)
         transcriptEntries.push([session.id, transcript])
       }
@@ -1342,16 +1357,23 @@ export class AgentTreeApp {
       const previousRootSessionId = this.currentRootSessionId
       const previousNodeId = this.selectedGraphNodeId
       const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
-      const retainedTemporarySessionIds = new Set(
-        retainedTemporarySessions.map((session) => session.id),
-      )
+      this.sessions = availableSessions
+      this.transcripts = new Map(transcriptEntries)
+      for (const sessionId of this.visibleEmptySessionIds) {
+        if (this.transcripts.get(sessionId)?.some((message) => message.visible)) {
+          this.visibleEmptySessionIds.delete(sessionId)
+          this.unavailableTranscriptSessionIds.delete(sessionId)
+        }
+      }
       for (const sessionId of this.temporarySessions.keys()) {
-        if (!retainedTemporarySessionIds.has(sessionId)) {
+        if (
+          !retainedTemporarySessionIds.has(sessionId) &&
+          persistedTranscripts.get(sessionId) !== null &&
+          !this.visibleEmptySessionIds.has(sessionId)
+        ) {
           this.temporarySessions.delete(sessionId)
         }
       }
-      this.sessions = availableSessions
-      this.transcripts = new Map(transcriptEntries)
       this.rebuildForest(runningIds)
       this.initialLoadPending = false
       this.graphViewportOffset = null
@@ -1372,8 +1394,8 @@ export class AgentTreeApp {
             : undefined) ??
           (previousNodeId && graph.nodes.has(previousNodeId) ? previousNodeId : graph.rootNodeId)
         const selectedNodeId =
-          visibleGraphNodeId(graph, requestedNodeId, runningIds) ??
-          initialVisibleGraphNodeId(graph, runningIds)
+          visibleGraphNodeId(graph, requestedNodeId, this.visibleEndpointSessionIds(runningIds)) ??
+          initialVisibleGraphNodeId(graph, this.visibleEndpointSessionIds(runningIds))
         if (selectedNodeId) {
           this.currentRootSessionId = graph.rootSessionId
           this.selectedGraphNodeId = selectedNodeId
@@ -1499,7 +1521,7 @@ export class AgentTreeApp {
       const fallbackNodeId = visibleGraphNodeId(
         graph,
         endpointId,
-        this.terminalManager.runningSessionIds(),
+        this.visibleEndpointSessionIds(),
       )
       if (fallbackNodeId) {
         this.selectedGraphNodeId = fallbackNodeId
@@ -1600,8 +1622,14 @@ export class AgentTreeApp {
         this.relations,
         this.removals,
       ),
-      runningSessionIds,
+      this.visibleEndpointSessionIds(runningSessionIds),
     )
+  }
+
+  private visibleEndpointSessionIds(
+    runningSessionIds = this.terminalManager.runningSessionIds(),
+  ): Set<string> {
+    return new Set([...runningSessionIds, ...this.visibleEmptySessionIds])
   }
 
   private clearCompletionRefreshes(sessionIds: string[]): void {
@@ -1626,10 +1654,10 @@ export class AgentTreeApp {
     }
 
     const graph = this.forest.graphByRootSessionId.get(confirmation.rootSessionId)
-    const runningSessionIds = this.terminalManager.runningSessionIds()
+    const visibleEndpointSessionIds = this.visibleEndpointSessionIds()
     const selectedNodeId = graph
-      ? (visibleGraphNodeId(graph, confirmation.parentNodeId, runningSessionIds) ??
-        initialVisibleGraphNodeId(graph, runningSessionIds))
+      ? (visibleGraphNodeId(graph, confirmation.parentNodeId, visibleEndpointSessionIds) ??
+        initialVisibleGraphNodeId(graph, visibleEndpointSessionIds))
       : undefined
     if (graph && selectedNodeId) {
       this.currentRootSessionId = graph.rootSessionId
@@ -1658,7 +1686,28 @@ export class AgentTreeApp {
       return
     }
 
-    const prepared = await this.provider.branchFrom(target)
+    let prepared: PreparedBranch
+    try {
+      prepared = await this.provider.branchFrom(target)
+    } catch (error) {
+      if (!(error instanceof BranchCreatedError)) throw error
+      this.temporarySessions.set(error.session.id, error.session)
+      this.transcripts.set(error.session.id, error.transcript)
+      if (!error.transcript.some((message) => message.visible)) {
+        this.visibleEmptySessionIds.add(error.session.id)
+      }
+      if (!error.transcriptAvailable) {
+        this.unavailableTranscriptSessionIds.add(error.session.id)
+      }
+      let refreshed = false
+      try {
+        refreshed = await this.refreshData(error.session.id, false)
+      } catch {}
+      if (!refreshed || !this.forest.graphBySessionId.has(error.session.id)) {
+        this.showIndependentCreatedBranch(error)
+      }
+      throw error
+    }
 
     let relation: BranchRelation
     try {
@@ -1674,6 +1723,26 @@ export class AgentTreeApp {
     this.temporarySessions.set(prepared.session.id, prepared.session)
     if (!prepared.session.transient) await this.refreshData(prepared.session.id)
     await this.openTerminal(prepared.launch)
+  }
+
+  private showIndependentCreatedBranch(error: BranchCreatedError): void {
+    this.sessions = [error.session, ...this.sessions.filter((session) => session.id !== error.session.id)]
+    this.transcripts.set(error.session.id, error.transcript)
+    this.rebuildForest()
+
+    const graph = this.forest.graphBySessionId.get(error.session.id)
+    if (!graph) return
+    const requestedNodeId = graph.endpointBySessionId.get(error.session.id) ?? graph.rootNodeId
+    const selectedNodeId = visibleGraphNodeId(
+      graph,
+      requestedNodeId,
+      this.visibleEndpointSessionIds(),
+    )
+    if (!selectedNodeId) return
+    this.selectedRootIndex = this.forest.graphs.indexOf(graph)
+    this.currentRootSessionId = graph.rootSessionId
+    this.selectedGraphNodeId = selectedNodeId
+    this.view = "graph"
   }
 
   private async openTerminal(launch: TerminalLaunch): Promise<void> {
@@ -1799,6 +1868,8 @@ export class AgentTreeApp {
         this.displayedWorkingSessionIds(),
         this.spinnerFrame,
         this.graphViewportOffset ?? undefined,
+        this.visibleEndpointSessionIds(),
+        this.unavailableTranscriptSessionIds,
       )
       this.graphLayout = rendered.layout
       this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
@@ -1968,6 +2039,15 @@ export class AgentTreeApp {
     if (selected.kind === "endpoint") {
       if (this.displayedWorkingSessionIds().has(selected.session.id)) {
         return `Selected agent · generating · ${selected.session.id.slice(0, 8)}`
+      }
+      if (
+        !this.terminalManager.runningSessionIds().has(selected.session.id) &&
+        this.visibleEmptySessionIds.has(selected.session.id)
+      ) {
+        const state = this.unavailableTranscriptSessionIds.has(selected.session.id)
+          ? "transcript unavailable"
+          : "no visible messages"
+        return `Selected session · ${state} · ${selected.session.id.slice(0, 8)}`
       }
       if (
         !this.terminalManager.runningSessionIds().has(selected.session.id) &&

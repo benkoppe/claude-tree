@@ -2,8 +2,12 @@ import { describe, expect, test } from "bun:test"
 
 import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-sdk"
 
+import { BranchCreatedError } from "../src/agent-provider"
 import {
   ClaudeProvider,
+  claudeCompatibilityWarning,
+  createClaudeProvider,
+  EXPECTED_CLAUDE_VERSION,
   extractUserPromptText,
   formatMessage,
   type ClaudeSdk,
@@ -52,6 +56,18 @@ describe("Claude message normalization", () => {
     }))
 
     expect((await provider.readTranscripts([ROOT])).get(ROOT)?.[0]?.role).toBe("agent")
+  })
+
+  test("isolates an unreadable transcript from other session reads", async () => {
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({
+      parent: [message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "assistant", "answer")],
+      childReads: [new Error("unreadable")],
+    }))
+
+    const transcripts = await provider.readTranscripts([ROOT, CHILD])
+
+    expect(transcripts.get(ROOT)?.[0]?.preview).toBe("answer")
+    expect(transcripts.get(CHILD)).toBeNull()
   })
 
   test("retains local command records internally but hides them from the graph", async () => {
@@ -187,11 +203,152 @@ describe("Claude branching", () => {
       message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "question "),
       message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "answer"),
     ]
-    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({ parent, child }))
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({ parent, child }),
+      { forkValidationRetryDelaysMs: [] },
+    )
+
+    const error = await provider
+      .branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+      .catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(BranchCreatedError)
+    expect(error).toHaveProperty("session.id", CHILD)
+    expect(error).toHaveProperty(
+      "message",
+      `Fork ${CHILD} was created, but its copied prefix does not match the source`,
+    )
+  })
+
+  test("retries a short child transcript without creating a second fork", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    let forkCalls = 0
+    let childReads = 0
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        childReads: [[], child.slice(0, 1), child],
+        onChildRead() { childReads += 1 },
+        onFork() { forkCalls += 1 },
+      }),
+      { forkValidationRetryDelaysMs: [0, 0] },
+    )
+
+    const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+
+    expect(forkCalls).toBe(1)
+    expect(childReads).toBe(3)
+    expect(prepared.derivation.sharedMessages).toEqual([
+      { parentMessageId: parent[0]!.uuid, childMessageId: child[0]!.uuid },
+      { parentMessageId: parent[1]!.uuid, childMessageId: child[1]!.uuid },
+    ])
+  })
+
+  test("retries a temporarily unreadable child transcript", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({ parent, childReads: [new Error("not visible yet"), child] }),
+      { forkValidationRetryDelaysMs: [0] },
+    )
+
+    const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+
+    expect(prepared.session.id).toBe(CHILD)
+  })
+
+  test("reports a permanently short child as a created branch failure", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = [
+      message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "question"),
+    ]
+    let childReads = 0
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({ parent, child, onChildRead() { childReads += 1 } }),
+      { forkValidationRetryDelaysMs: [0, 0] },
+    )
+
+    const error = await provider
+      .branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+      .catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(BranchCreatedError)
+    expect(error).toHaveProperty("session.id", CHILD)
+    expect(error).toHaveProperty(
+      "message",
+      `Fork ${CHILD} was created, but its copied prefix could not be validated (expected 2 messages; found 1)`,
+    )
+    expect(childReads).toBe(3)
+  })
+
+  test("reports a permanently unreadable child with its created session", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    let childReads = 0
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        childReads: [new Error("not visible")],
+        onChildRead() { childReads += 1 },
+      }),
+      { forkValidationRetryDelaysMs: [0, 0] },
+    )
+
+    const error = await provider
+      .branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+      .catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(BranchCreatedError)
+    expect(error).toHaveProperty("session.id", CHILD)
+    expect(error).toHaveProperty("transcript", [])
+    expect(error).toHaveProperty(
+      "message",
+      `Fork ${CHILD} was created, but its transcript could not be read after 3 attempts: not visible`,
+    )
+    expect(childReads).toBe(3)
+  })
+
+  test("rejects an invalid replay draft before creating its historical fork", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "assistant", "answer"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "user", "invalid\0draft"),
+    ]
+    let forkCalls = 0
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({
+      parent,
+      onFork() { forkCalls += 1 },
+    }))
 
     await expect(
       provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
-    ).rejects.toThrow(`Fork ${CHILD} was created, but its copied prefix does not match the source`)
+    ).rejects.toThrow("Claude prompt prefill cannot contain a null byte")
+    expect(forkCalls).toBe(0)
   })
 
   test("preserves hidden local command records in fork correspondence", async () => {
@@ -240,17 +397,74 @@ describe("Claude branching", () => {
   })
 })
 
+describe("Claude compatibility", () => {
+  test("warns unless the installed CLI exactly matches the validated baseline", () => {
+    expect(claudeCompatibilityWarning(`${EXPECTED_CLAUDE_VERSION} (Claude Code)`)).toBeUndefined()
+    expect(claudeCompatibilityWarning("2.1.250 (Claude Code)")).toBe(
+      `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found 2.1.250 (Claude Code)`,
+    )
+    expect(claudeCompatibilityWarning("12.1.2510 (Claude Code)")).toContain("Warning")
+  })
+
+  test("checks the CLI version and blocks historical forks before creation on mismatch", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    let forked = false
+    const fakeSdk = sdk({
+      parent,
+      onFork() { forked = true },
+    })
+    const calls: string[] = []
+    const provider = await createClaudeProvider("/project", {
+      sdk: fakeSdk,
+      which(name) {
+        calls.push(`which:${name}`)
+        return "/usr/local/bin/claude"
+      },
+      async readVersion(executable) {
+        calls.push(`version:${executable}`)
+        return "2.1.250 (Claude Code)"
+      },
+    })
+
+    expect(calls).toEqual(["which:claude", "version:/usr/local/bin/claude"])
+    expect(provider.compatibilityWarning).toContain("2.1.250")
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow("Historical branching is disabled for this version pair")
+    expect(forked).toBeFalse()
+  })
+
+  test("fails when Claude Code is not on PATH", async () => {
+    await expect(createClaudeProvider("/project", { which: () => null })).rejects.toThrow(
+      "Claude Code was not found on PATH",
+    )
+  })
+})
+
 function sdk(options: {
   parent: SessionMessage[]
   child?: SessionMessage[]
+  childReads?: Array<SessionMessage[] | Error>
+  onChildRead?: () => void
   onFork?: (messageId: string) => void
 }): ClaudeSdk {
+  let childReadIndex = 0
   return {
     async list(): Promise<SDKSessionInfo[]> {
       return [{ sessionId: ROOT, summary: "Root", firstPrompt: "root prompt", lastModified: 1 }]
     },
     async messages(sessionId): Promise<SessionMessage[]> {
-      return sessionId === ROOT ? options.parent : options.child ?? []
+      if (sessionId === ROOT) return options.parent
+      options.onChildRead?.()
+      const result = options.childReads?.[
+        Math.min(childReadIndex, Math.max(0, options.childReads.length - 1))
+      ]
+      childReadIndex += 1
+      if (result instanceof Error) throw result
+      return result ?? options.child ?? []
     },
     async fork(_sessionId, forkOptions): Promise<{ sessionId: string }> {
       options.onFork?.(forkOptions.upToMessageId)

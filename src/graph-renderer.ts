@@ -89,10 +89,12 @@ export function renderConversationGraph(
   workingSessionIds: Set<string> = new Set(),
   spinnerFrame = 0,
   viewportOffset?: ViewportOffset,
+  visibleEndpointSessionIds: Set<string> = runningSessionIds,
+  unavailableTranscriptSessionIds: ReadonlySet<string> = new Set(),
 ): RenderedGraph {
   const safeWidth = Math.max(1, viewportWidth)
   const safeHeight = Math.max(1, viewportHeight)
-  const layout = layoutConversationGraph(graph, safeWidth, runningSessionIds)
+  const layout = layoutConversationGraph(graph, safeWidth, visibleEndpointSessionIds)
   const { nodes: positioned, nodeWidth } = layout
   const canvas = new SparseCanvas()
 
@@ -109,6 +111,7 @@ export function renderConversationGraph(
       draftPreviews,
       workingSessionIds,
       spinnerFrame,
+      unavailableTranscriptSessionIds,
     )
   }
 
@@ -246,6 +249,7 @@ function drawNode(
   draftPreviews: Map<string, DraftPreview>,
   workingSessionIds: Set<string>,
   spinnerFrame: number,
+  unavailableTranscriptSessionIds: ReadonlySet<string>,
 ): void {
   const { node, x, y } = positioned
   const background = selected
@@ -298,6 +302,21 @@ function drawNode(
       ...headerStyle,
       fg: selected ? theme.selectedText : theme.accent,
     }, headerStyle)
+    return
+  }
+
+  if (!runningSessionIds.has(sessionId)) {
+    drawHeading(canvas, x + 2, y, ICONS.session, "Session", contentWidth, {
+      ...headerStyle,
+      fg: selected ? theme.selectedText : theme.textMuted,
+    }, headerStyle)
+    const state = unavailableTranscriptSessionIds.has(sessionId)
+      ? "Transcript unavailable"
+      : "No visible messages"
+    canvas.write(x + 2, y + 1, truncateToWidth(state, contentWidth), {
+      ...baseStyle,
+      fg: selected ? theme.selectedText : theme.textMuted,
+    })
     return
   }
 

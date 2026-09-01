@@ -24,7 +24,7 @@ The generic terminal manager executes provider-prepared commands and delegates a
 
 Use supported provider APIs for session discovery, message reads, and historical forks. For the Claude adapter, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation. For Codex, short-lived `codex app-server --stdio` processes perform thread listing, reading, and forking; interactive work remains in the stock `codex resume <thread-id>` TUI.
 
-The initial SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.239 with Claude Code 2.1.239. Upgrade them deliberately and verify session compatibility together.
+The SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.251 with Claude Code 2.1.251. Upgrade them deliberately and verify session compatibility together. A different installed Claude Code version is shown as a compatibility warning, and historical branching is disabled before creating a child because transcript parsing and fork semantics are version-sensitive.
 
 The validated Codex baseline is 0.150.1. The app-server protocol and terminal telemetry are version-sensitive, so a different installed version is shown as a compatibility warning. One refresh batches all transcript reads through one app-server process, and every metadata operation closes its process after a bounded wait.
 
@@ -53,6 +53,8 @@ User replay initializes the stock Claude composer through `--prefill` rather tha
 Claude Code does not expose semantic composer state. The application may show a conservative, in-memory preview parsed from the visible input box when leaving a live terminal, but it must mark that preview as approximate and never persist it as transcript or relationship state.
 
 Claude Code also does not expose semantic generation state to its terminal host. Observe its OSC terminal-title activity indicator directly from PTY output so hidden processes remain observable, with conservative matching against the last visible Claude screen as a fallback. An idle transition triggers a fresh SDK transcript read; keep the live endpoint visually pending until the rebuilt graph is ready so a completed agent message and its following draft leaf appear atomically. Keep activity state ephemeral and informational: process exit remains authoritative, and detection must not control permissions or inject input.
+
+After Claude reports that a historical fork was created, retry bounded reads of a missing or short child transcript before validating correspondence. Create the provider fork only once and keep payload validation strict. If correspondence still cannot be validated, save no ancestry and refresh the created child as an independent root rather than guessing its relationship or deleting its provider transcript.
 
 ## Codex Forks Only At Completed Turn Boundaries
 
