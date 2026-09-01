@@ -373,7 +373,9 @@ test("continues forwarding PTY telemetry after replacing a session id", async ()
 
   try {
     await manager.show(launch(fakeClaude, "pending-session"))
+    expect(manager.activeTerminalSessionId()).toBe("pending-session")
     expect(manager.replaceSessionId("pending-session", "real-session")).toBeTrue()
+    expect(manager.activeTerminalSessionId()).toBe("real-session")
     expect(manager.runningSessionIds()).toEqual(new Set(["real-session"]))
     await waitUntil(() => copiedText !== undefined && activityChanges.length > 0)
     expect(copiedText).toBe("renamed")

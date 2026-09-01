@@ -33,6 +33,25 @@ describe("BranchMetadataStore", () => {
     expect(store.projectPath).toBe(await realpath(project))
   })
 
+  test("removes an exact branch relationship during local launch rollback", async () => {
+    const root = await temporaryDirectory()
+    const project = join(root, "project")
+    const state = join(root, "state")
+    await mkdir(project)
+
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
+    const relation = await store.saveRelation({
+      childSessionId: "child",
+      parentSessionId: "parent",
+      sourceMessageId: "source",
+      sharedMessages: [],
+    })
+
+    await store.removeRelation(relation)
+
+    expect(await store.loadRelations()).toEqual([])
+  })
+
   test("rejects malformed metadata rather than silently dropping it", async () => {
     const root = await temporaryDirectory()
     const project = join(root, "project")

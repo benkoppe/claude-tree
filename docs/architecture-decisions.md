@@ -30,6 +30,8 @@ The validated Codex baseline is 0.150.1. The app-server protocol and terminal te
 
 Codex does not allocate or persist a new thread until its first user turn, so a fresh thread cannot be handed to `codex resume`. New Codex sessions instead launch the stock TUI against a dedicated authenticated loopback app-server and let the TUI call `thread/start` when the user submits that turn. The application initially owns that terminal under a temporary ID, then replaces it with the real ID reported by the sidecar's loaded-thread API. The terminal manager cleans up the sidecar with the TUI. Once the first turn is persisted, normal discovery and later resume use short-lived metadata operations and the ordinary local TUI path.
 
+Locally prepared sessions are an immediate overlay on the last provider snapshot. Project them into the conversation forest and establish their navigator destination before activating their terminal, including when the provider has not persisted or discovered them yet. Returning from a terminal must reveal that local graph synchronously; provider refresh reconciles metadata and transcripts afterward rather than deciding which navigator view appears. Temporary-to-provider ID adoption updates terminal ownership and the local graph projection as one transition.
+
 Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
 
 ## Relationships And Navigator Removals Need Application Metadata

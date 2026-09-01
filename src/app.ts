@@ -61,7 +61,7 @@ import {
   type NewConversationRemoval,
 } from "./metadata"
 import { OpenLeafPicker } from "./open-leaf-picker"
-import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
+import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import {
   TerminalManager,
   type TerminalActivityEvent,
@@ -126,6 +126,9 @@ interface ActiveRefresh {
   focusSessionId?: string
   transcriptSessionIds?: Set<string>
 }
+
+type NavigatorView = "roots" | "graph"
+type ActiveSurface = "navigator" | "terminal"
 
 interface FooterControl {
   key: string
@@ -202,6 +205,9 @@ export class AgentTreeApp {
   private readonly stopped: Promise<void>
   private resolveStopped!: () => void
   private stopPromise: Promise<void> | undefined
+  private currentProcessTitle: string | undefined
+  private currentTerminalTitle: string | undefined
+  private rendererStarted = false
 
   private relations: BranchRelation[]
   private removals: ConversationRemoval[]
@@ -213,7 +219,8 @@ export class AgentTreeApp {
     graphByRootSessionId: new Map(),
     warnings: [],
   }
-  private view: "roots" | "graph" | "terminal" = "roots"
+  private navigatorView: NavigatorView = "roots"
+  private activeSurface: ActiveSurface = "navigator"
   private selectedRootIndex = 0
   private currentRootSessionId: string | null = null
   private selectedGraphNodeId: string | null = null
@@ -224,6 +231,7 @@ export class AgentTreeApp {
   private footerHitRegions: FooterHitRegion[] = []
   private pendingMouseAction: PendingMouseAction | null = null
   private confirmation: Confirmation | null = null
+  private activeConfirmedAction: Confirmation | null = null
   private infoModal: InfoModal | null = null
   private preferredOpenSession: PreferredOpenSession | null = null
   private busy = false
@@ -248,6 +256,7 @@ export class AgentTreeApp {
     private readonly provider: AgentProvider,
     relations: BranchRelation[],
     removals: ConversationRemoval[],
+    private readonly setProcessTitle: (title: string) => void,
   ) {
     this.relations = relations
     this.removals = removals
@@ -598,13 +607,14 @@ export class AgentTreeApp {
     projectDirectory: string,
     provider: AgentProvider,
     stateHome?: string,
+    setProcessTitle: (title: string) => void = () => undefined,
   ): Promise<AgentTreeApp> {
     const metadata = await BranchMetadataStore.openForProvider(projectDirectory, provider.id, stateHome)
     const [relations, removals] = await Promise.all([
       metadata.loadRelations(),
       metadata.loadRemovals(),
     ])
-    return new AgentTreeApp(renderer, metadata, provider, relations, removals)
+    return new AgentTreeApp(renderer, metadata, provider, relations, removals, setProcessTitle)
   }
 
   async run(): Promise<void> {
@@ -614,6 +624,7 @@ export class AgentTreeApp {
     await Promise.race([this.refreshData(), this.stopped])
     if (this.stopping) return
     this.renderer.start()
+    this.rendererStarted = true
     this.render()
     await this.stopped
   }
@@ -668,7 +679,8 @@ export class AgentTreeApp {
     this.completionRefreshAttempts.delete(event.sessionId)
     this.completionRefreshDueAt.delete(event.sessionId)
     if (event.wasActive) {
-      if (!this.focusCachedGraph(event.sessionId)) this.view = "roots"
+      this.focusCachedGraph(event.sessionId)
+      this.activeSurface = "navigator"
       this.navigator.visible = true
     }
     const exitError =
@@ -696,7 +708,7 @@ export class AgentTreeApp {
       this.pendingUnviewedCompletionVersions.delete(event.sessionId)
       this.completionRefreshAttempts.delete(event.sessionId)
       this.completionRefreshDueAt.delete(event.sessionId)
-      if (this.view !== "terminal") this.render()
+      if (this.activeSurface === "navigator") this.render()
       return
     }
     const completionVersion = ++this.completionRefreshVersion
@@ -709,7 +721,7 @@ export class AgentTreeApp {
     this.completionRefreshAttempts.set(event.sessionId, 0)
     this.completionRefreshDueAt.set(event.sessionId, Date.now() + COMPLETION_REFRESH_DELAY_MS)
     this.scheduleCompletionRefresh()
-    if (this.view !== "terminal") this.render()
+    if (this.activeSurface === "navigator") this.render()
   }
 
   private readonly onKeyRelease = (key: KeyEvent) => {
@@ -726,7 +738,7 @@ export class AgentTreeApp {
       if (!key.repeated) void this.returnToGraph()
       return
     }
-    if (this.view === "terminal") return
+    if (this.activeSurface === "terminal") return
     if (this.infoModal) {
       this.handleInfoModalKey(key)
       return
@@ -752,7 +764,7 @@ export class AgentTreeApp {
       return
     }
 
-    if (this.view === "roots") {
+    if (this.navigatorView === "roots") {
       this.handleRootKey(key)
     } else {
       this.handleGraphKey(key)
@@ -770,7 +782,7 @@ export class AgentTreeApp {
       event.button !== 0 ||
       this.interactionBlocked() ||
       this.hasModal() ||
-      this.view === "terminal"
+      this.activeSurface === "terminal"
     ) {
       return
     }
@@ -788,7 +800,7 @@ export class AgentTreeApp {
       event.button !== 0 ||
       this.interactionBlocked() ||
       this.hasModal() ||
-      this.view === "terminal" ||
+      this.activeSurface === "terminal" ||
       !pending
     ) {
       return
@@ -819,7 +831,7 @@ export class AgentTreeApp {
     const localX = event.x - this.content.screenX
     const localY = event.y - this.content.screenY
     if (localX < 0 || localY < 0) return undefined
-    if (this.view === "roots") {
+    if (this.navigatorView === "roots") {
       const rootIndex = this.rootViewportStart + localY
       return rootIndex >= this.rootViewportStart && rootIndex < this.forest.graphs.length
         ? { kind: "root", rootIndex }
@@ -835,7 +847,7 @@ export class AgentTreeApp {
   }
 
   private readonly onContentMouseScroll = (event: MouseEvent) => {
-    if (this.interactionBlocked() || this.hasModal() || this.view !== "roots") return
+    if (this.interactionBlocked() || this.hasModal() || this.navigatorView !== "roots") return
     const direction = event.scroll?.direction
     if (direction !== "up" && direction !== "down") return
     event.preventDefault()
@@ -846,7 +858,7 @@ export class AgentTreeApp {
 
   private readonly onFooterMouseDown = (event: MouseEvent) => {
     this.pendingMouseAction = null
-    if (event.button !== 0 || this.hasModal() || this.view === "terminal") return
+    if (event.button !== 0 || this.hasModal() || this.activeSurface === "terminal") return
     const action = this.footerMouseActionAt(event)
     if (!action || !this.footerActionAvailable(action.action)) return
     event.preventDefault()
@@ -860,7 +872,7 @@ export class AgentTreeApp {
     if (
       event.button !== 0 ||
       this.hasModal() ||
-      this.view === "terminal" ||
+      this.activeSurface === "terminal" ||
       pending?.kind !== "footer"
     ) {
       return
@@ -1036,18 +1048,25 @@ export class AgentTreeApp {
     if (!confirmation) return
     this.confirmation = null
     if (choice === "confirm") {
-      if (confirmation.kind === "kill") {
-        void this.runAction(() => this.killLiveSession(confirmation.sessionId))
-      } else {
-        void this.runAction(() => this.removeConversation(confirmation))
-      }
+      void this.runAction(async () => {
+        this.activeConfirmedAction = confirmation
+        try {
+          if (confirmation.kind === "kill") {
+            await this.killLiveSession(confirmation)
+          } else {
+            await this.removeConversation(confirmation)
+          }
+        } finally {
+          if (this.activeConfirmedAction === confirmation) this.activeConfirmedAction = null
+        }
+      })
       return
     }
     this.render()
   }
 
   private showKillConfirmation(): void {
-    if (this.interactionBlocked() || this.view !== "graph") return
+    if (this.interactionBlocked() || this.navigatorView !== "graph") return
     const selected = this.selectedGraphNode()
     if (
       selected?.kind !== "endpoint" ||
@@ -1071,7 +1090,7 @@ export class AgentTreeApp {
   private showRemovalConfirmation(): void {
     if (this.interactionBlocked()) return
     const ownedSessionIds = this.terminalManager.ownedSessionIds()
-    if (this.view === "roots") {
+    if (this.navigatorView === "roots") {
       const graph = this.forest.graphs[this.selectedRootIndex]
       if (!graph) return
       const memberSessionIds = representedSessionIds(graph)
@@ -1090,7 +1109,7 @@ export class AgentTreeApp {
         rootIndex: this.selectedRootIndex,
         choice: "cancel",
       }
-    } else if (this.view === "graph") {
+    } else if (this.navigatorView === "graph") {
       const graph = this.currentGraph()
       const selected = this.selectedGraphNode()
       if (!graph || !selected) return
@@ -1202,7 +1221,7 @@ export class AgentTreeApp {
     this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
-    this.view = "graph"
+    this.navigatorView = "graph"
     this.render()
     if (graph.warnings[0]) this.showError(graph.warnings[0])
   }
@@ -1290,7 +1309,7 @@ export class AgentTreeApp {
 
   private showRoots(): void {
     this.openLeafPicker.close()
-    this.view = "roots"
+    this.navigatorView = "roots"
     this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
@@ -1480,16 +1499,16 @@ export class AgentTreeApp {
         if (selectedNodeId) {
           this.currentRootSessionId = graph.rootSessionId
           this.selectedGraphNodeId = selectedNodeId
-          if (refreshedFocusSessionId) this.view = "graph"
+          if (refreshedFocusSessionId) this.navigatorView = "graph"
         } else {
           this.currentRootSessionId = null
           this.selectedGraphNodeId = null
-          this.view = "roots"
+          this.navigatorView = "roots"
         }
       } else {
         this.currentRootSessionId = null
         this.selectedGraphNodeId = null
-        this.view = "roots"
+        this.navigatorView = "roots"
         const preservedRootIndex = previousSelectedRoot
           ? this.forest.graphs.findIndex(
               (candidate) => candidate.rootSessionId === previousSelectedRoot,
@@ -1532,8 +1551,27 @@ export class AgentTreeApp {
   private async newSession(): Promise<void> {
     const prepared = await this.provider.prepareNewSession()
     void prepared.startedSession?.catch(() => undefined)
-    this.temporarySessions.set(prepared.session.id, prepared.session)
-    await this.openTerminal(prepared.launch)
+    const previousNavigatorView = this.navigatorView
+    const previousRootSessionId = this.currentRootSessionId
+    const previousSelectedRootIndex = this.selectedRootIndex
+    const previousNodeId = this.selectedGraphNodeId
+    const previousViewportOffset = this.graphViewportOffset
+    const previousNavigationIntent = this.graphNavigationIntent
+    this.registerTemporarySession(prepared.session)
+    try {
+      await this.openTerminal(prepared.launch)
+    } catch (error) {
+      if (!this.terminalManager.ownedSessionIds().has(prepared.session.id)) {
+        this.removeTemporarySession(prepared.session.id)
+        this.navigatorView = previousNavigatorView
+        this.currentRootSessionId = previousRootSessionId
+        this.selectedRootIndex = previousSelectedRootIndex
+        this.selectedGraphNodeId = previousNodeId
+        this.graphViewportOffset = previousViewportOffset
+        this.graphNavigationIntent = previousNavigationIntent
+      }
+      throw error
+    }
     if (prepared.startedSession) {
       void this.adoptStartedSession(prepared.session, prepared.startedSession).catch((error) => {
         this.showError(error)
@@ -1572,8 +1610,16 @@ export class AgentTreeApp {
       this.pendingUnviewedCompletionVersions.set(startedSession.id, unviewedCompletionVersion)
     }
     if (hasUnviewedUpdates) this.unviewedUpdateSessionIds.add(startedSession.id)
+    if (this.visibleEmptySessionIds.delete(temporarySession.id)) {
+      this.visibleEmptySessionIds.add(startedSession.id)
+    }
+    if (this.unavailableTranscriptSessionIds.delete(temporarySession.id)) {
+      this.unavailableTranscriptSessionIds.add(startedSession.id)
+    }
+    this.replaceConfirmationSessionId(temporarySession.id, startedSession.id)
     const temporaryGraph = this.forest.graphBySessionId.get(temporarySession.id)
     const focusedTemporaryGraph = temporaryGraph?.rootSessionId === this.currentRootSessionId
+    const selectedRootSessionId = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
     const temporaryTranscript = this.transcripts.get(temporarySession.id)
     const discoveredSession = this.sessions.find((session) => session.id === startedSession.id)
     this.sessions = this.sessions.flatMap((session) =>
@@ -1588,11 +1634,29 @@ export class AgentTreeApp {
     this.temporarySessions.delete(temporarySession.id)
     this.temporarySessions.set(startedSession.id, discoveredSession ?? startedSession)
     this.rebuildForest()
-    if (focusedTemporaryGraph && this.view === "graph") {
+    if (focusedTemporaryGraph && this.navigatorView === "graph") {
       this.focusCachedGraph(startedSession.id)
+    } else if (this.navigatorView === "roots") {
+      const selectedGraph = selectedRootSessionId === temporaryGraph?.rootSessionId
+        ? this.forest.graphBySessionId.get(startedSession.id)
+        : this.forest.graphByRootSessionId.get(selectedRootSessionId ?? "")
+      if (selectedGraph) this.selectedRootIndex = this.forest.graphs.indexOf(selectedGraph)
+    }
+    if (this.activeSurface === "navigator") {
       this.render()
+    } else {
+      this.updateProcessTitle()
     }
     this.scheduleCompletionRefresh()
+  }
+
+  private replaceConfirmationSessionId(previousSessionId: string, sessionId: string): void {
+    if (this.confirmation) {
+      replaceConfirmationSessionId(this.confirmation, previousSessionId, sessionId)
+    }
+    if (this.activeConfirmedAction) {
+      replaceConfirmationSessionId(this.activeConfirmedAction, previousSessionId, sessionId)
+    }
   }
 
   private async openSelectedLeaf(): Promise<void> {
@@ -1630,7 +1694,8 @@ export class AgentTreeApp {
     this.preferredOpenSession = null
   }
 
-  private async killLiveSession(sessionId: string): Promise<void> {
+  private async killLiveSession(confirmation: KillConfirmation): Promise<void> {
+    const sessionId = confirmation.sessionId
     const graph = this.currentGraph()
     const endpointId = graph?.endpointBySessionId.get(sessionId)
     const request = this.terminalManager.stopSession(sessionId)
@@ -1662,17 +1727,18 @@ export class AgentTreeApp {
       } else {
         this.currentRootSessionId = null
         this.selectedGraphNodeId = null
-        this.view = "roots"
+        this.navigatorView = "roots"
       }
     }
     this.render()
 
     await request.completion
     if (this.stopping) return
-    const refreshed = await this.refreshData(sessionId, false)
+    const refreshedSessionId = confirmation.sessionId
+    const refreshed = await this.refreshData(refreshedSessionId, false)
     if (!refreshed) return
     this.preferredOpenSession = this.selectedGraphNodeId
-      ? { nodeId: this.selectedGraphNodeId, sessionId }
+      ? { nodeId: this.selectedGraphNodeId, sessionId: refreshedSessionId }
       : null
   }
 
@@ -1747,9 +1813,13 @@ export class AgentTreeApp {
   private rebuildForest(
     runningSessionIds = this.terminalManager.runningSessionIds(),
   ): void {
+    const projectedSessions = new Map(
+      [...this.temporarySessions.values()].map((session) => [session.id, session]),
+    )
+    for (const session of this.sessions) projectedSessions.set(session.id, session)
     this.forest = visibleConversationForest(
       buildConversationForest(
-        this.sessions,
+        [...projectedSessions.values()],
         this.transcripts,
         this.relations,
         this.removals,
@@ -1761,7 +1831,25 @@ export class AgentTreeApp {
   private visibleEndpointSessionIds(
     runningSessionIds = this.terminalManager.runningSessionIds(),
   ): Set<string> {
-    return new Set([...runningSessionIds, ...this.visibleEmptySessionIds])
+    return new Set([
+      ...runningSessionIds,
+      ...this.temporarySessions.keys(),
+      ...this.visibleEmptySessionIds,
+    ])
+  }
+
+  private registerTemporarySession(session: AgentSession): void {
+    this.temporarySessions.set(session.id, session)
+    if (!this.transcripts.has(session.id)) this.transcripts.set(session.id, [])
+    this.rebuildForest()
+  }
+
+  private removeTemporarySession(sessionId: string): void {
+    this.temporarySessions.delete(sessionId)
+    this.visibleEmptySessionIds.delete(sessionId)
+    this.unavailableTranscriptSessionIds.delete(sessionId)
+    if (!this.sessions.some((session) => session.id === sessionId)) this.transcripts.delete(sessionId)
+    this.rebuildForest()
   }
 
   private clearCompletionRefreshes(sessionIds: string[]): void {
@@ -1787,7 +1875,7 @@ export class AgentTreeApp {
     if (confirmation.scope === "tree") {
       this.currentRootSessionId = null
       this.selectedGraphNodeId = null
-      this.view = "roots"
+      this.navigatorView = "roots"
       this.selectedRootIndex = clampRootIndex(confirmation.rootIndex, this.forest.graphs.length)
       return
     }
@@ -1802,13 +1890,13 @@ export class AgentTreeApp {
       this.currentRootSessionId = graph.rootSessionId
       this.selectedGraphNodeId = selectedNodeId
       this.selectedRootIndex = this.forest.graphs.indexOf(graph)
-      this.view = "graph"
+      this.navigatorView = "graph"
       return
     }
 
     this.currentRootSessionId = null
     this.selectedGraphNodeId = null
-    this.view = "roots"
+    this.navigatorView = "roots"
     this.selectedRootIndex = clampRootIndex(confirmation.rootIndex, this.forest.graphs.length)
   }
 
@@ -1830,7 +1918,7 @@ export class AgentTreeApp {
       prepared = await this.provider.branchFrom(target)
     } catch (error) {
       if (!(error instanceof BranchCreatedError)) throw error
-      this.temporarySessions.set(error.session.id, error.session)
+      this.registerTemporarySession(error.session)
       this.transcripts.set(error.session.id, error.transcript)
       if (!error.transcript.some((message) => message.visible)) {
         this.visibleEmptySessionIds.add(error.session.id)
@@ -1838,6 +1926,7 @@ export class AgentTreeApp {
       if (!error.transcriptAvailable) {
         this.unavailableTranscriptSessionIds.add(error.session.id)
       }
+      this.rebuildForest()
       let refreshed = false
       try {
         refreshed = await this.refreshData(error.session.id, false)
@@ -1859,9 +1948,31 @@ export class AgentTreeApp {
     }
 
     this.relations.push(relation)
-    this.temporarySessions.set(prepared.session.id, prepared.session)
+    this.registerTemporarySession(prepared.session)
     if (!prepared.session.transient) await this.refreshData(prepared.session.id)
-    await this.openTerminal(prepared.launch)
+    const previousNodeId = this.selectedGraphNodeId
+    const previousViewportOffset = this.graphViewportOffset
+    const previousNavigationIntent = this.graphNavigationIntent
+    try {
+      await this.openTerminal(prepared.launch)
+    } catch (error) {
+      if (!prepared.providerSessionCreated && !this.terminalManager.ownedSessionIds().has(prepared.session.id)) {
+        try {
+          await this.metadata.removeRelation(relation)
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            `Fork ${prepared.session.id} could not start and its ancestry could not be rolled back`,
+          )
+        }
+        this.relations = this.relations.filter((candidate) => candidate !== relation)
+        this.removeTemporarySession(prepared.session.id)
+        this.selectedGraphNodeId = previousNodeId
+        this.graphViewportOffset = previousViewportOffset
+        this.graphNavigationIntent = previousNavigationIntent
+      }
+      throw error
+    }
   }
 
   private showIndependentCreatedBranch(error: BranchCreatedError): void {
@@ -1881,7 +1992,7 @@ export class AgentTreeApp {
     this.selectedRootIndex = this.forest.graphs.indexOf(graph)
     this.currentRootSessionId = graph.rootSessionId
     this.selectedGraphNodeId = selectedNodeId
-    this.view = "graph"
+    this.navigatorView = "graph"
   }
 
   private async openTerminal(launch: TerminalLaunch): Promise<void> {
@@ -1890,17 +2001,23 @@ export class AgentTreeApp {
       throw new Error("claude-tree is shutting down")
     }
     this.openLeafPicker.close()
+    if (!this.focusCachedGraph(launch.sessionId)) {
+      await launch.cleanup?.()
+      throw new Error(`Conversation graph for ${launch.sessionId} is unavailable`)
+    }
     await this.terminalManager.show(launch)
     this.pendingUnviewedCompletionVersions.delete(launch.sessionId)
     this.unviewedUpdateSessionIds.delete(launch.sessionId)
-    this.view = "terminal"
+    this.activeSurface = "terminal"
     this.navigator.visible = false
     this.stopSpinnerAnimation()
+    this.updateProcessTitle()
   }
 
   private async returnToGraph(): Promise<void> {
     const sessionId = this.terminalManager.hideActive()
-    if (!sessionId || !this.focusCachedGraph(sessionId)) this.view = "roots"
+    if (sessionId) this.focusCachedGraph(sessionId)
+    this.activeSurface = "navigator"
     this.navigator.visible = true
     await this.requestRefresh(
       sessionId ?? undefined,
@@ -1916,7 +2033,7 @@ export class AgentTreeApp {
     const selectedNodeId = visibleGraphNodeId(
       graph,
       endpointId,
-      this.terminalManager.runningSessionIds(),
+      this.visibleEndpointSessionIds(),
     )
     if (!selectedNodeId) return false
 
@@ -1926,7 +2043,7 @@ export class AgentTreeApp {
     this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
-    this.view = "graph"
+    this.navigatorView = "graph"
     return true
   }
 
@@ -1945,8 +2062,9 @@ export class AgentTreeApp {
 
   private render(): void {
     if (this.renderer.isDestroyed) return
+    this.updateProcessTitle()
     this.updateSpinnerAnimation()
-    if (this.view === "terminal") {
+    if (this.activeSurface === "terminal") {
       this.confirmationOverlay.visible = false
       this.infoOverlay.visible = false
       return
@@ -1989,7 +2107,7 @@ export class AgentTreeApp {
     )
     const contentWidth =
       this.renderer.terminalWidth - NAVIGATOR_HORIZONTAL_MARGIN * 2
-    if (this.view === "roots") {
+    if (this.navigatorView === "roots") {
       this.graphLayout = null
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
@@ -2131,7 +2249,7 @@ export class AgentTreeApp {
       chunk(this.metadata.projectPath, theme.textMuted),
       chunk("\n", theme.text),
     ]
-    if (this.view === "roots") {
+    if (this.navigatorView === "roots") {
       return styledText([...identity, chunk("Conversation roots", theme.text, TextAttributes.BOLD)])
     }
     const graph = this.currentGraph()
@@ -2250,11 +2368,11 @@ export class AgentTreeApp {
     const graph = this.currentGraph()
     const workingSessionIds = this.displayedWorkingSessionIds()
     const graphShouldAnimate =
-      this.view === "graph" &&
+      this.navigatorView === "graph" &&
       graph !== undefined &&
       [...graph.sessionIds].some((sessionId) => workingSessionIds.has(sessionId))
     const shouldAnimate =
-      this.view !== "terminal" &&
+      this.activeSurface === "navigator" &&
       this.renderer.terminalWidth >= MINIMUM_WIDTH &&
       this.renderer.terminalHeight >= MINIMUM_HEIGHT &&
       (this.activeRefresh !== null || graphShouldAnimate)
@@ -2288,6 +2406,28 @@ export class AgentTreeApp {
       if (runningSessionIds.has(sessionId)) workingSessionIds.add(sessionId)
     }
     return workingSessionIds
+  }
+
+  private updateProcessTitle(): void {
+    const activeSessionId = this.terminalManager.activeTerminalSessionId()
+    let context: string | undefined
+    if (activeSessionId) {
+      context =
+        this.sessions.find((session) => session.id === activeSessionId)?.title ??
+        this.temporarySessions.get(activeSessionId)?.title
+    } else if (this.navigatorView === "graph") {
+      context = this.currentGraph()?.rootSession.title
+    }
+    const title = context === undefined
+      ? PROCESS_TITLE_PREFIX
+      : `${PROCESS_TITLE_PREFIX}: ${context}`
+    if (this.rendererStarted && title !== this.currentTerminalTitle) {
+      this.currentTerminalTitle = title
+      this.renderer.setTerminalTitle(title)
+    }
+    if (title === this.currentProcessTitle) return
+    this.currentProcessTitle = title
+    this.setProcessTitle(title)
   }
 
   private scheduleCompletionRefresh(): void {
@@ -2448,6 +2588,38 @@ function representedSessionIds(graph: ConversationGraph): string[] {
     for (const alias of node.aliases) sessionIds.add(alias.sessionId)
   }
   return [...sessionIds]
+}
+
+function replaceConfirmationSessionId(
+  confirmation: Confirmation,
+  previousSessionId: string,
+  sessionId: string,
+): void {
+  if (confirmation.kind === "kill") {
+    if (confirmation.sessionId === previousSessionId) confirmation.sessionId = sessionId
+    return
+  }
+
+  confirmation.sessionIdsToStop = confirmation.sessionIdsToStop.map((candidate) =>
+    candidate === previousSessionId ? sessionId : candidate,
+  )
+  if (confirmation.rootSessionId === previousSessionId) confirmation.rootSessionId = sessionId
+  if (confirmation.input.kind === "tree") {
+    if (confirmation.input.rootSessionId === previousSessionId) {
+      confirmation.input.rootSessionId = sessionId
+    }
+    confirmation.input.memberSessionIds = confirmation.input.memberSessionIds.map((candidate) =>
+      candidate === previousSessionId ? sessionId : candidate,
+    )
+  } else if (confirmation.input.target.kind === "endpoint") {
+    if (confirmation.input.target.sessionId === previousSessionId) {
+      confirmation.input.target.sessionId = sessionId
+    }
+  } else {
+    confirmation.input.target.aliases = confirmation.input.target.aliases.map((alias) =>
+      alias.sessionId === previousSessionId ? { ...alias, sessionId } : alias,
+    )
+  }
 }
 
 function confirmationContent(confirmation: Confirmation): {
