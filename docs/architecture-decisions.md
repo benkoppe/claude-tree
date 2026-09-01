@@ -58,6 +58,8 @@ After Claude reports that a historical fork was created, retry bounded reads of 
 
 Automatic terminal-return and completion refreshes reread the affected sessions and merge them with cached unrelated transcripts; initial loads and explicit manual refreshes remain complete snapshots. Preserve every ordered activity transition reported in one PTY chunk. Because provider persistence can lag an idle title, retain the pending endpoint and retry with bounded backoff until the transcript advances to a provider-confirmed completed turn. If the session resumes working, reject the stale completion and keep newly persisted assistant-tail records behind the single working endpoint.
 
+When a hidden live session reaches that provider-confirmed completion boundary, mark its Draft endpoint as having new updates and aggregate that state in the conversation-root picker. This state is ephemeral application UI state rather than provider or relationship metadata. Keep it while the session remains live, clearing it after the exact stock terminal is successfully shown or the live session is stopped or removed; navigator selection alone does not count as viewing the update.
+
 Claude may persist one user turn as multiple assistant records, including streamed content blocks and continuations around tool calls. Normalize those raw records into one visible Agent node per user turn while retaining every UUID for prefix validation, removals, and provider operations. A newly selected grouped Agent forks from its latest represented raw boundary. An existing recorded fork closes the display group at its exact source so later parent content never appears before the branch.
 
 ## Codex Forks Only At Completed Turn Boundaries

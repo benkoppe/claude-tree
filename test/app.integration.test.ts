@@ -1880,12 +1880,16 @@ test("opens a picker for multiple descendant leaves and resumes the chosen sessi
   const project = join(root, "project")
   const state = join(root, "state")
   const launchMarker = join(root, "launch")
+  const finishMarker = join(root, "finish")
   await mkdir(project)
   const fakeClaude = join(root, "claude")
   await writeFile(
     fakeClaude,
     `#!/bin/sh
 printf '%s\n' "$@" > ${JSON.stringify(launchMarker)}
+${String.raw`printf '\033]0;\342\240\213 Claude Code\007'`}
+while [ ! -f ${JSON.stringify(finishMarker)} ]; do sleep 0.01; done
+${String.raw`printf '\033]0;\342\234\263 Claude Code\007'`}
 sleep 30
 `,
   )
@@ -1896,7 +1900,7 @@ sleep 30
   const sourceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
   const copiedSourceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1"
   const rootTranscript = [sessionMessage(rootSessionId, sourceId, "user", "branch source")]
-  const childTranscript = [
+  let childTranscript = [
     sessionMessage(childSessionId, copiedSourceId, "user", "branch source"),
     sessionMessage(
       childSessionId,
@@ -1995,18 +1999,54 @@ sleep 30
     setup.mockInput.pressKey(" ", { ctrl: true })
     await waitForFrame(
       setup,
-      (candidate) => candidate.includes("Message graph") && candidate.includes("branch answer"),
+      (candidate) =>
+        candidate.includes("Message graph") &&
+        candidate.includes("Agent") &&
+        BRAILLE_SPINNER_FRAMES.some((spinner) => candidate.includes(spinner)),
     )
-    setup.mockInput.pressArrow("up")
-    await waitForFrame(setup, () => isSelected(setup, "branch answer"))
-    setup.mockInput.pressArrow("up")
+    childTranscript = [
+      ...childTranscript,
+      sessionMessage(
+        childSessionId,
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3",
+        "user",
+        "follow-up question",
+      ),
+      sessionMessage(
+        childSessionId,
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4",
+        "assistant",
+        "new branch answer",
+        undefined,
+        "end_turn",
+      ),
+    ]
+    await writeFile(finishMarker, "")
+    await waitForFrame(
+      setup,
+      (candidate) =>
+        candidate.includes("new branch answer") &&
+        candidate.includes("Draft") &&
+        candidate.includes("New updates"),
+    )
+    setup.mockInput.pressKey("g")
     await waitForFrame(setup, () => isSelected(setup, "branch source"))
+
+    setup.mockInput.pressKey("g", { shift: true })
+    frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Jump to Leaf") && candidate.includes("● Child leaf"),
+    )
+    expect(frame).not.toContain("• Child leaf")
+    setup.mockInput.pressEscape()
+    await waitForFrame(setup, (candidate) => !candidate.includes("Jump to Leaf"))
+
     setup.mockInput.pressEnter()
     frame = await waitForFrame(
       setup,
-      (candidate) => candidate.includes("Open leaf") && candidate.includes("• Child leaf"),
+      (candidate) => candidate.includes("Open leaf") && candidate.includes("● Child leaf"),
     )
-    expect(frame).not.toContain("●")
+    expect(frame).not.toContain("• Child leaf")
     const optionLines = frame.split("\n").filter((line) => line.includes("node") && line.includes("down"))
     const rootOption = optionLines.find((line) => line.includes("Root leaf"))!
     const childOption = optionLines.find((line) => line.includes("Child leaf"))!
@@ -2134,6 +2174,7 @@ sleep 30
         return (
           frame.includes("completed answer") &&
           frame.includes("Draft") &&
+          frame.includes("New updates") &&
           BRAILLE_SPINNER_FRAMES.every((spinner) => !frame.includes(spinner))
         )
       },
@@ -2151,9 +2192,29 @@ sleep 30
     setup.mockInput.pressKey("q")
     const roots = await waitForFrame(
       setup,
-      (frame) => frame.includes("Conversation roots") && frame.includes("● Live · Live conversation"),
+      (frame) =>
+        frame.includes("Conversation roots") &&
+        frame.includes("New updates") &&
+        frame.includes("● New updates · Live conversation"),
     )
     expect(roots).not.toContain("Saved")
+    expect(roots).not.toContain("● Live · Live conversation")
+
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    setup.mockInput.pressKey("g", { shift: true })
+    await waitForFrame(setup, () => isSelected(setup, "Draft"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const viewed = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("completed answer") &&
+        frame.includes("Draft") &&
+        !frame.includes("New updates"),
+    )
+    expect(viewed).toContain("Live conversation")
   } finally {
     await app.stop()
     await running
@@ -2237,11 +2298,20 @@ sleep 30
     )
     expect(pending).not.toContain("new question")
     expect(pending).not.toContain("Draft")
+    expect(pending).not.toContain("New updates")
 
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
     transcript = [oldUser, oldAgent, newUser, newAgent]
+    await waitUntil(() => transcriptReads > readsBeforeIdle + 1)
+    setup.mockInput.pressKey(" ", { ctrl: true })
     const completed = await waitForFrame(
       setup,
-      (frame) => frame.includes("new question") && frame.includes("new answer") && frame.includes("Draft"),
+      (frame) =>
+        frame.includes("new question") &&
+        frame.includes("new answer") &&
+        frame.includes("Draft") &&
+        !frame.includes("New updates"),
     )
     expect(completed.indexOf("new question")).toBeLessThan(completed.indexOf("new answer"))
   } finally {

@@ -210,7 +210,11 @@ test("tracks ordered OSC activity transitions from one hidden-process output chu
     printf '\033]0;\342\240\213 Claude Code\007\033]0;\342\234\263 Claude Code\007'
     sleep 30`,
   )
-  const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
+  const activityChanges: Array<{
+    sessionId: string
+    activity: "working" | "idle"
+    wasActive: boolean
+  }> = []
   const manager = new TerminalManager(
     setup.renderer,
     () => undefined,
@@ -224,8 +228,35 @@ test("tracks ordered OSC activity transitions from one hidden-process output chu
     await waitUntil(() => activityChanges.length === 2)
     expect(manager.workingSessionIds().has(sessionId)).toBeFalse()
     expect(activityChanges).toEqual([
-      { sessionId, activity: "working" },
-      { sessionId, activity: "idle" },
+      { sessionId, activity: "working", wasActive: false },
+      { sessionId, activity: "idle", wasActive: false },
+    ])
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("reports activity transitions from the visible process as active", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const fakeClaude = await createFakeClaude(
+    String.raw`sleep 0.05
+    printf '\033]0;\342\240\213 Claude Code\007\033]0;\342\234\263 Claude Code\007'
+    sleep 30`,
+  )
+  const activityChanges: Array<{ activity: "working" | "idle"; wasActive: boolean }> = []
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    ({ activity, wasActive }) => activityChanges.push({ activity, wasActive }),
+  )
+
+  try {
+    await manager.show(launch(fakeClaude, "11111111-1111-4111-8111-111111111111"))
+    await waitUntil(() => activityChanges.length === 2)
+    expect(activityChanges).toEqual([
+      { activity: "working", wasActive: true },
+      { activity: "idle", wasActive: true },
     ])
   } finally {
     await manager.shutdown(50)
@@ -329,7 +360,11 @@ test("continues forwarding PTY telemetry after replacing a session id", async ()
     copiedText = text
     return true
   }
-  const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
+  const activityChanges: Array<{
+    sessionId: string
+    activity: "working" | "idle"
+    wasActive: boolean
+  }> = []
   const manager = new TerminalManager(
     setup.renderer,
     () => undefined,
@@ -342,7 +377,9 @@ test("continues forwarding PTY telemetry after replacing a session id", async ()
     expect(manager.runningSessionIds()).toEqual(new Set(["real-session"]))
     await waitUntil(() => copiedText !== undefined && activityChanges.length > 0)
     expect(copiedText).toBe("renamed")
-    expect(activityChanges).toEqual([{ sessionId: "real-session", activity: "working" }])
+    expect(activityChanges).toEqual([
+      { sessionId: "real-session", activity: "working", wasActive: true },
+    ])
   } finally {
     await manager.shutdown(50)
     setup.renderer.destroy()

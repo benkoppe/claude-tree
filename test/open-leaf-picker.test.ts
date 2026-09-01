@@ -15,11 +15,16 @@ test("supports arrow, vim, and control-key selection", async () => {
     picker.handleKeyPress(key)
   })
   const options = [option(1), option(2), option(3)]
-  const activeSessionIds = new Set([options[1]!.endpoint.session.id])
+  const activeSessionIds = new Set([
+    options[0]!.endpoint.session.id,
+    options[1]!.endpoint.session.id,
+  ])
+  const newUpdateSessionIds = new Set([options[1]!.endpoint.session.id])
   picker.open({
     title: "Open leaf",
     options,
     activeSessionIds,
+    newUpdateSessionIds,
     onSelect: (option) => {
       selected = option
     },
@@ -31,17 +36,35 @@ test("supports arrow, vim, and control-key selection", async () => {
     expect(initialFrame).toContain("Open leaf")
     expect(initialFrame).toContain("esc")
     expect(initialFrame).not.toContain("┌")
-    expect(initialFrame).toContain("• Leaf 2")
-    expect(initialFrame).not.toContain("●")
+    expect(initialFrame).toContain("• Leaf 1")
+    expect(initialFrame).toContain("● Leaf 2")
     expect(coordinateOf(initialFrame, "Leaf 1").x).toBe(
       coordinateOf(initialFrame, "Leaf 2").x,
     )
+    const updateMarker = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("●"))
+    expect(updateMarker?.fg.equals(theme.warning)).toBeTrue()
+    expect(updateMarker?.bg.equals(theme.element)).toBeTrue()
+    const selectedLiveMarker = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("•"))
+    expect(selectedLiveMarker?.fg.equals(theme.success)).toBeTrue()
+    expect(selectedLiveMarker?.bg.equals(theme.element)).toBeTrue()
     expect(setup.captureSpans().lines[0]?.spans[0]?.bg.equals(theme.background)).toBeFalse()
     expect(isSelected(setup, "Leaf 1")).toBeTrue()
 
     setup.mockInput.pressArrow("down")
     await setup.renderOnce()
     expect(isSelected(setup, "Leaf 2")).toBeTrue()
+    const selectedUpdateMarker = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("●"))
+    expect(selectedUpdateMarker?.fg.equals(theme.warning)).toBeTrue()
+    expect(selectedUpdateMarker?.bg.equals(theme.element)).toBeTrue()
 
     setup.mockInput.pressKey("k")
     await setup.renderOnce()
@@ -67,6 +90,7 @@ test("supports arrow, vim, and control-key selection", async () => {
       options,
       selectedSessionId: options[2]!.endpoint.session.id,
       activeSessionIds,
+      newUpdateSessionIds,
       onSelect: (option) => {
         selected = option
       },

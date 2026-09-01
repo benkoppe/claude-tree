@@ -36,6 +36,7 @@ export interface TerminalExitEvent {
 export interface TerminalActivityEvent {
   sessionId: string
   activity: AgentActivity
+  wasActive: boolean
 }
 
 export interface TerminalStopRequest {
@@ -420,7 +421,11 @@ export class TerminalManager {
     if (managed.state !== "running") return
     if (managed.activity === activity) return
     managed.activity = activity
-    this.onActivityChanged({ sessionId: managed.sessionId, activity })
+    this.onActivityChanged({
+      sessionId: managed.sessionId,
+      activity,
+      wasActive: this.activeSessionId === managed.sessionId,
+    })
   }
 
   private cleanupManaged(managed: ManagedTerminal): Promise<void> {

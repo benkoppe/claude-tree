@@ -238,6 +238,8 @@ export class AgentTreeApp {
   private completionRefreshRunning = false
   private completionRefreshVersion = 0
   private readonly pendingCompletionRefreshes = new Map<string, number>()
+  private readonly pendingUnviewedCompletionVersions = new Map<string, number>()
+  private readonly unviewedUpdateSessionIds = new Set<string>()
   private readonly completionRefreshAttempts = new Map<string, number>()
   private readonly completionRefreshDueAt = new Map<string, number>()
   private constructor(
@@ -634,6 +636,8 @@ export class AgentTreeApp {
       this.completionRefreshTimer = undefined
       this.completionRefreshTimerDueAt = undefined
       this.pendingCompletionRefreshes.clear()
+      this.pendingUnviewedCompletionVersions.clear()
+      this.unviewedUpdateSessionIds.clear()
       this.completionRefreshAttempts.clear()
       this.completionRefreshDueAt.clear()
 
@@ -659,6 +663,8 @@ export class AgentTreeApp {
       this.confirmation = null
     }
     this.pendingCompletionRefreshes.delete(event.sessionId)
+    this.pendingUnviewedCompletionVersions.delete(event.sessionId)
+    this.unviewedUpdateSessionIds.delete(event.sessionId)
     this.completionRefreshAttempts.delete(event.sessionId)
     this.completionRefreshDueAt.delete(event.sessionId)
     if (event.wasActive) {
@@ -687,12 +693,19 @@ export class AgentTreeApp {
     if (this.stopping) return
     if (event.activity === "working") {
       this.pendingCompletionRefreshes.delete(event.sessionId)
+      this.pendingUnviewedCompletionVersions.delete(event.sessionId)
       this.completionRefreshAttempts.delete(event.sessionId)
       this.completionRefreshDueAt.delete(event.sessionId)
       if (this.view !== "terminal") this.render()
       return
     }
-    this.pendingCompletionRefreshes.set(event.sessionId, ++this.completionRefreshVersion)
+    const completionVersion = ++this.completionRefreshVersion
+    this.pendingCompletionRefreshes.set(event.sessionId, completionVersion)
+    if (event.wasActive) {
+      this.pendingUnviewedCompletionVersions.delete(event.sessionId)
+    } else {
+      this.pendingUnviewedCompletionVersions.set(event.sessionId, completionVersion)
+    }
     this.completionRefreshAttempts.set(event.sessionId, 0)
     this.completionRefreshDueAt.set(event.sessionId, Date.now() + COMPLETION_REFRESH_DELAY_MS)
     this.scheduleCompletionRefresh()
@@ -1256,6 +1269,7 @@ export class AgentTreeApp {
       title: "Jump to Leaf",
       options: choices.map(({ option }) => option),
       activeSessionIds: this.terminalManager.runningSessionIds(),
+      newUpdateSessionIds: this.unviewedUpdateSessionIds,
       onSelect: ({ endpoint }) => {
         const nodeId = nodeIdBySessionId.get(endpoint.session.id)
         if (nodeId) this.selectGraphNode(nodeId)
@@ -1484,6 +1498,7 @@ export class AgentTreeApp {
         this.selectedRootIndex = preservedRootIndex >= 0 ? preservedRootIndex : 0
       }
 
+      this.recordUnviewedCompletions(advancedCompletions)
       this.clearPendingCompletions(advancedCompletions)
       if (showWarnings && this.forest.warnings[0]) this.showError(this.forest.warnings[0])
       return true
@@ -1539,9 +1554,13 @@ export class AgentTreeApp {
       this.activeRefresh.transcriptSessionIds.add(startedSession.id)
     }
     const completionVersion = this.pendingCompletionRefreshes.get(temporarySession.id)
+    const unviewedCompletionVersion = this.pendingUnviewedCompletionVersions.get(temporarySession.id)
+    const hasUnviewedUpdates = this.unviewedUpdateSessionIds.has(temporarySession.id)
     const completionAttempt = this.completionRefreshAttempts.get(temporarySession.id)
     const completionDueAt = this.completionRefreshDueAt.get(temporarySession.id)
     this.pendingCompletionRefreshes.delete(temporarySession.id)
+    this.pendingUnviewedCompletionVersions.delete(temporarySession.id)
+    this.unviewedUpdateSessionIds.delete(temporarySession.id)
     this.completionRefreshAttempts.delete(temporarySession.id)
     this.completionRefreshDueAt.delete(temporarySession.id)
     if (completionVersion !== undefined) {
@@ -1549,6 +1568,10 @@ export class AgentTreeApp {
       this.completionRefreshAttempts.set(startedSession.id, completionAttempt ?? 0)
       this.completionRefreshDueAt.set(startedSession.id, completionDueAt ?? Date.now())
     }
+    if (unviewedCompletionVersion !== undefined) {
+      this.pendingUnviewedCompletionVersions.set(startedSession.id, unviewedCompletionVersion)
+    }
+    if (hasUnviewedUpdates) this.unviewedUpdateSessionIds.add(startedSession.id)
     const temporaryGraph = this.forest.graphBySessionId.get(temporarySession.id)
     const focusedTemporaryGraph = temporaryGraph?.rootSessionId === this.currentRootSessionId
     const temporaryTranscript = this.transcripts.get(temporarySession.id)
@@ -1591,6 +1614,7 @@ export class AgentTreeApp {
         options: endpoints,
         ...(preferredSessionId === undefined ? {} : { selectedSessionId: preferredSessionId }),
         activeSessionIds: this.terminalManager.runningSessionIds(),
+        newUpdateSessionIds: this.unviewedUpdateSessionIds,
         onSelect: ({ endpoint }) => {
           void this.runAction(() => this.openEndpoint(endpoint))
         },
@@ -1616,6 +1640,8 @@ export class AgentTreeApp {
 
     this.cancelActiveRefresh()
     this.pendingCompletionRefreshes.delete(sessionId)
+    this.pendingUnviewedCompletionVersions.delete(sessionId)
+    this.unviewedUpdateSessionIds.delete(sessionId)
     this.completionRefreshAttempts.delete(sessionId)
     this.completionRefreshDueAt.delete(sessionId)
     if (this.pendingCompletionRefreshes.size === 0 && this.completionRefreshTimer) {
@@ -1741,6 +1767,8 @@ export class AgentTreeApp {
   private clearCompletionRefreshes(sessionIds: string[]): void {
     for (const sessionId of sessionIds) {
       this.pendingCompletionRefreshes.delete(sessionId)
+      this.pendingUnviewedCompletionVersions.delete(sessionId)
+      this.unviewedUpdateSessionIds.delete(sessionId)
       this.completionRefreshAttempts.delete(sessionId)
       this.completionRefreshDueAt.delete(sessionId)
     }
@@ -1863,6 +1891,8 @@ export class AgentTreeApp {
     }
     this.openLeafPicker.close()
     await this.terminalManager.show(launch)
+    this.pendingUnviewedCompletionVersions.delete(launch.sessionId)
+    this.unviewedUpdateSessionIds.delete(launch.sessionId)
     this.view = "terminal"
     this.navigator.visible = false
     this.stopSpinnerAnimation()
@@ -1979,6 +2009,7 @@ export class AgentTreeApp {
           contentWidth,
           this.terminalManager.runningSessionIds(),
           this.rootViewportStart,
+          this.unviewedUpdateSessionIds,
         )
         this.rootViewportStart = rendered.startIndex
         this.content.content = rendered.content
@@ -2006,6 +2037,7 @@ export class AgentTreeApp {
         this.graphViewportOffset ?? undefined,
         this.visibleEndpointSessionIds(),
         this.unavailableTranscriptSessionIds,
+        this.unviewedUpdateSessionIds,
       )
       this.graphLayout = rendered.layout
       this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
@@ -2130,7 +2162,11 @@ export class AgentTreeApp {
     const live = selected
       ? [...selected.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
       : false
-    const prefixWidth = live ? displayWidth("● Live · ") : 0
+    const hasNewUpdates = selected
+      ? [...selected.sessionIds].some((sessionId) => this.unviewedUpdateSessionIds.has(sessionId))
+      : false
+    const status = hasNewUpdates ? "● New updates" : live ? "● Live" : undefined
+    const prefixWidth = status ? displayWidth(`${status} · `) : 0
     const title = truncateToWidth(
       selected ? graphTitle(selected) : "",
       Math.max(1, this.renderer.terminalWidth - NAVIGATOR_HORIZONTAL_MARGIN * 2 - prefixWidth),
@@ -2139,9 +2175,9 @@ export class AgentTreeApp {
       content: styledText([
         ...controls.chunks,
         chunk("\n", theme.text),
-        ...(live
+        ...(status
           ? [
-              chunk("● Live", theme.success, TextAttributes.BOLD),
+              chunk(status, hasNewUpdates ? theme.warning : theme.success, TextAttributes.BOLD),
               chunk(" · ", theme.textMuted),
             ]
           : []),
@@ -2317,6 +2353,9 @@ export class AgentTreeApp {
           const attempt = (this.completionRefreshAttempts.get(sessionId) ?? 0) + 1
           if (attempt >= COMPLETION_REFRESH_RETRY_DELAYS_MS.length) {
             this.pendingCompletionRefreshes.delete(sessionId)
+            if (this.pendingUnviewedCompletionVersions.get(sessionId) === version) {
+              this.pendingUnviewedCompletionVersions.delete(sessionId)
+            }
             this.completionRefreshAttempts.delete(sessionId)
             this.completionRefreshDueAt.delete(sessionId)
             exhausted.push(sessionId)
@@ -2341,9 +2380,20 @@ export class AgentTreeApp {
     for (const [sessionId, version] of completions) {
       if (this.pendingCompletionRefreshes.get(sessionId) === version) {
         this.pendingCompletionRefreshes.delete(sessionId)
+        if (this.pendingUnviewedCompletionVersions.get(sessionId) === version) {
+          this.pendingUnviewedCompletionVersions.delete(sessionId)
+        }
         this.completionRefreshAttempts.delete(sessionId)
         this.completionRefreshDueAt.delete(sessionId)
       }
+    }
+  }
+
+  private recordUnviewedCompletions(completions: Map<string, number>): void {
+    for (const [sessionId, version] of completions) {
+      if (this.pendingUnviewedCompletionVersions.get(sessionId) !== version) continue
+      this.pendingUnviewedCompletionVersions.delete(sessionId)
+      this.unviewedUpdateSessionIds.add(sessionId)
     }
   }
 }
