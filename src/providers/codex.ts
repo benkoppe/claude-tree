@@ -38,7 +38,6 @@ import {
   type CodexTuiSwitch,
 } from "./codex-tui-proxy"
 
-export const EXPECTED_CODEX_VERSION = "0.150.1"
 const TRANSCRIPT_READ_CONCURRENCY = 16
 const OVERLOAD_RETRY_DELAYS_MS = [25, 50, 100, 200]
 const SIDECAR_STDERR_LIMIT = 8_192
@@ -54,7 +53,6 @@ export interface CodexProviderDependencies {
   appServerFactory?: CodexAppServerFactory
   observerFactory?: () => TerminalObserver
   which?: (executable: string) => string | null
-  readVersion?: (executable: string) => Promise<string>
   canonicalize?: (path: string) => Promise<string>
   newSessionFactory?: CodexNewSessionFactory
   resumeSessionFactory?: CodexResumeSessionFactory
@@ -100,7 +98,6 @@ export class CodexProvider implements AgentProvider {
   constructor(
     private readonly projectPath: string,
     private readonly executable: string,
-    readonly compatibilityWarning: string | undefined,
     private readonly appServerFactory: CodexAppServerFactory = createCodexAppServerFactory(executable),
     private readonly observerFactory: () => TerminalObserver = () => new CodexTerminalObserver(),
     private readonly newSessionFactory: CodexNewSessionFactory = createCodexNewSession,
@@ -379,13 +376,10 @@ export async function createCodexProvider(
 ): Promise<CodexProvider> {
   const executable = (dependencies.which ?? Bun.which)("codex")
   if (!executable) throw new Error("Codex was not found on PATH")
-  const installedVersion = await (dependencies.readVersion ?? readCodexVersion)(executable)
-  const compatibilityWarning = codexCompatibilityWarning(installedVersion)
   const canonicalPath = await (dependencies.canonicalize ?? realpath)(projectPath)
   return new CodexProvider(
     canonicalPath,
     executable,
-    compatibilityWarning,
     dependencies.appServerFactory ?? createCodexAppServerFactory(executable),
     dependencies.observerFactory,
     dependencies.newSessionFactory,
@@ -618,25 +612,6 @@ export function formatCodexUserInput(content: readonly CodexUserInput[]): string
     }
   })
   return normalizePreview(parts.join(" "))
-}
-
-export function codexCompatibilityWarning(installedVersion: string): string | undefined {
-  const escaped = EXPECTED_CODEX_VERSION.replace(/\./g, "\\.")
-  if (new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(installedVersion.trim())) return undefined
-  return `Warning: validated with Codex ${EXPECTED_CODEX_VERSION}; found ${installedVersion.trim()}`
-}
-
-export async function readCodexVersion(executable: string): Promise<string> {
-  const child = Bun.spawn([executable, "--version"], { stdout: "pipe", stderr: "pipe" })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (exitCode !== 0) {
-    throw new Error(`Unable to run Codex: ${stderr.trim() || `exit ${exitCode}`}`)
-  }
-  return stdout.trim()
 }
 
 function normalizeCodexItem(item: CodexThreadItem): Pick<AgentMessage, "role" | "preview" | "visible"> {

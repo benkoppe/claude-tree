@@ -2745,16 +2745,6 @@ export class AgentTreeApp {
         TextAttributes.NONE,
         background,
       ),
-      ...(this.provider.compatibilityWarning
-        ? [
-            chunk(
-              `\n\n${this.provider.compatibilityWarning}`,
-              theme.warning,
-              TextAttributes.NONE,
-              background,
-            ),
-          ]
-        : []),
     ]
     return styledText(chunks)
   }

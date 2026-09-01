@@ -114,7 +114,6 @@ export interface AgentProvider {
   readonly id: string
   readonly displayName: string
   readonly navigatorIdentity: AgentNavigatorIdentity
-  readonly compatibilityWarning?: string | undefined
 
   loadSessionSnapshot?(): Promise<AgentSessionSnapshot>
   listSessions(): Promise<AgentSession[]>

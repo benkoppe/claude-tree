@@ -803,7 +803,6 @@ test("cleans a prepared terminal launch when shutdown wins the preparation race"
     id: "test-agent",
     displayName: "Test Agent",
     navigatorIdentity: { label: "Agent", color: theme.secondary },
-    compatibilityWarning: undefined,
     async listSessions() { return [] },
     async readTranscripts() { return new Map() },
     async prepareNewSession() {

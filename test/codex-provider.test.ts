@@ -10,11 +10,9 @@ import type {
 } from "../src/providers/codex-app-server"
 import { CodexRpcError } from "../src/providers/codex-app-server"
 import {
-  codexCompatibilityWarning,
   CodexProvider,
   type CodexResumeSessionFactory,
   createCodexProvider,
-  EXPECTED_CODEX_VERSION,
   formatCodexUserInput,
   normalizeCodexThread,
 } from "../src/providers/codex"
@@ -125,7 +123,7 @@ describe("Codex sessions", () => {
         return codexThread(id, [turn(`turn-${id}`, "completed", [user(`user-${id}`, [{ type: "text", text: id }])])])
       },
     })
-    const provider = new CodexProvider("/canonical/project", "/usr/bin/codex", undefined, async () => {
+    const provider = new CodexProvider("/canonical/project", "/usr/bin/codex", async () => {
       factories.push(server)
       return server
     })
@@ -148,7 +146,7 @@ describe("Codex sessions", () => {
       async listThreads() { return { data: [thread], nextCursor: null } },
       async readThread() { return thread },
     })
-    const provider = new CodexProvider("/canonical/project", "/usr/bin/codex", undefined, async () => {
+    const provider = new CodexProvider("/canonical/project", "/usr/bin/codex", async () => {
       factories.push(server)
       return server
     })
@@ -235,7 +233,6 @@ describe("Codex sessions", () => {
     const provider = new CodexProvider(
       "/canonical/project",
       "/usr/bin/codex",
-      undefined,
       async () => fakeServer(),
       () => observer,
       async (executable, cwd) => {
@@ -296,7 +293,6 @@ describe("Codex sessions", () => {
     const provider = new CodexProvider(
       "/canonical/project",
       "/usr/bin/codex",
-      undefined,
       async () => server,
       undefined,
       undefined,
@@ -409,7 +405,6 @@ describe("Codex branching", () => {
     const provider = new CodexProvider(
       "/canonical/project",
       "/usr/bin/codex",
-      undefined,
       async () => server,
       undefined,
       undefined,
@@ -449,7 +444,6 @@ describe("Codex branching", () => {
     const provider = new CodexProvider(
       "/canonical/project",
       "/usr/bin/codex",
-      undefined,
       async () => server,
       undefined,
       undefined,
@@ -529,26 +523,14 @@ describe("Codex branching", () => {
   })
 })
 
-describe("Codex compatibility", () => {
-  test("warns unless the installed CLI exactly matches the validated baseline", () => {
-    expect(codexCompatibilityWarning(`codex-cli ${EXPECTED_CODEX_VERSION}`)).toBeUndefined()
-    expect(codexCompatibilityWarning("codex-cli 0.149.0")).toBe(
-      `Warning: validated with Codex ${EXPECTED_CODEX_VERSION}; found codex-cli 0.149.0`,
-    )
-    expect(codexCompatibilityWarning("codex-cli 10.150.10")).toContain("Warning")
-  })
-
-  test("locates Codex, checks its version, and canonicalizes the project", async () => {
+describe("Codex provider creation", () => {
+  test("locates Codex and canonicalizes the project without checking its version", async () => {
     const calls: string[] = []
     const server = fakeServer()
     const provider = await createCodexProvider("/project-link", {
       which(name) {
         calls.push(`which:${name}`)
         return "/usr/local/bin/codex"
-      },
-      async readVersion(executable) {
-        calls.push(`version:${executable}`)
-        return "codex-cli 0.149.0"
       },
       async canonicalize(path) {
         calls.push(`canonicalize:${path}`)
@@ -560,10 +542,8 @@ describe("Codex compatibility", () => {
 
     expect(calls).toEqual([
       "which:codex",
-      "version:/usr/local/bin/codex",
       "canonicalize:/project-link",
     ])
-    expect(provider.compatibilityWarning).toContain("0.149.0")
     expect(provider.navigatorIdentity.label).toBe("Codex")
     expect((await provider.prepareResume({ id: ROOT, title: "Root", lastModified: 0 })).cwd).toBe(
       "/canonical/project",
@@ -620,7 +600,6 @@ function providerFrom(server: FakeServer, observerFactory?: () => NullTerminalOb
   return new CodexProvider(
     "/canonical/project",
     "/usr/bin/codex",
-    undefined,
     async () => server,
     observerFactory,
     undefined,
