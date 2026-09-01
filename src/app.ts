@@ -1694,7 +1694,7 @@ export class AgentTreeApp {
       const previousTarget = this.navigationTargetForSelection()
       const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
       const nextTranscripts = new Map(transcriptEntries)
-      for (const sessionId of this.terminalManager.workingSessionIds()) {
+      for (const sessionId of this.terminalManager.nonIdleSessionIds()) {
         if (!refreshedTranscriptIds.has(sessionId)) continue
         const nextTranscript = nextTranscripts.get(sessionId)
         if (!nextTranscript) continue
