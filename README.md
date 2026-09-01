@@ -13,15 +13,6 @@ claude-tree --codex /path/to/project
 
 `claude-tree` does not create Git worktrees or restore files to their state at the fork point.
 
-## Navigator States
-
-- **Draft**: the live provider terminal is idle at its composer.
-- **Agent** with a spinner: the provider is working or claude-tree is waiting for its completed response to be persisted.
-- **Agent · Needs user**: the provider needs a permission, confirmation, or answer in its stock terminal.
-- **New updates**: a hidden live session completed since its terminal was last shown.
-
-Conversation roots and leaf pickers prioritize a red needs-user marker over orange new updates and green live activity.
-
 ## Quick Start
 
 `claude-tree` is project-scoped. Run it inside your project folder.
