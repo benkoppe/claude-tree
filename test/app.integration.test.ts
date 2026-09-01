@@ -688,9 +688,10 @@ setInterval(() => undefined, 1_000)
       await waitUntil(async () => (await readFile(inputMarker)).length > previousLength)
       expect(setup.renderer.isDestroyed).toBeFalse()
     }
-    for (const key of ["n", "r", "q", "f", "x", "h", "j", "k", "l"]) {
+    for (const key of ["n", "r", "q", "f", "x", "g", "h", "j", "k", "l"]) {
       await pressAgentKey(() => setup.mockInput.pressKey(key))
     }
+    await pressAgentKey(() => setup.mockInput.pressKey("g", { shift: true }))
     for (const direction of ["up", "down", "left", "right"] as const) {
       await pressAgentKey(() => setup.mockInput.pressArrow(direction))
     }
@@ -1736,7 +1737,22 @@ sleep 30
   try {
     await waitForFrame(setup, (frame) => frame.includes("Linear conversation"))
     setup.mockInput.pressEnter()
-    await waitForFrame(setup, (frame) => frame.includes("Message graph") && frame.includes("first"))
+    let frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Message graph") && candidate.includes("first"),
+    )
+    expect(frame).not.toContain("g top")
+    expect(frame).not.toContain("G bottom")
+
+    setup.mockInput.pressKey("g", { shift: true })
+    await waitForFrame(setup, () => isSelected(setup, "third"))
+    setup.mockInput.pressKey("g", { ctrl: true })
+    await Bun.sleep(20)
+    await setup.renderOnce()
+    expect(isSelected(setup, "third")).toBeTrue()
+    setup.mockInput.pressKey("g")
+    await waitForFrame(setup, () => isSelected(setup, "first"))
+
     setup.mockInput.pressEnter()
     await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
 
@@ -1819,8 +1835,25 @@ sleep 30
       setup,
       (frame) => frame.includes("Message graph") && frame.includes("branch source"),
     )
-    setup.mockInput.pressEnter()
+    setup.mockInput.pressKey("g", { shift: true })
     let frame = await waitForFrame(
+      setup,
+      (candidate) => candidate.includes("Jump to Leaf") && candidate.includes("Child leaf"),
+    )
+    expect(frame).toContain("1 node down")
+    setup.mockInput.pressKey("n", { ctrl: true })
+    await waitForFrame(setup, () => isSelected(setup, "Child leaf"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(
+      setup,
+      (candidate) => !candidate.includes("Jump to Leaf") && isSelected(setup, "branch answer"),
+    )
+    expect(await Bun.file(launchMarker).exists()).toBeFalse()
+    setup.mockInput.pressKey("g")
+    await waitForFrame(setup, () => isSelected(setup, "branch source"))
+
+    setup.mockInput.pressEnter()
+    frame = await waitForFrame(
       setup,
       (candidate) => candidate.includes("Open leaf") && candidate.includes("Child leaf"),
     )

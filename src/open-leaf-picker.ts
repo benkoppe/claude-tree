@@ -20,22 +20,29 @@ interface PickerRow {
   text: TextRenderable
 }
 
+interface OpenLeafPickerRequest {
+  title: string
+  options: ReachableSessionEndpoint[]
+  onSelect: (option: ReachableSessionEndpoint) => void
+  selectedSessionId?: string
+  activeSessionIds?: ReadonlySet<string>
+}
+
 export class OpenLeafPicker {
   private readonly overlay: BoxRenderable
   private readonly panel: BoxRenderable
   private readonly list: ScrollBoxRenderable
+  private readonly title: TextRenderable
   private readonly rows: PickerRow[] = []
   private options: ReachableSessionEndpoint[] = []
   private activeSessionIds: ReadonlySet<string> = new Set()
+  private onSelect: ((option: ReachableSessionEndpoint) => void) | undefined
   private selectedIndex = 0
   private pendingMouseIndex: number | null = null
   private pendingBackdropClick = false
   private rowTextWidth = 1
 
-  constructor(
-    private readonly renderer: CliRenderer,
-    private readonly onSelect: (option: ReachableSessionEndpoint) => void,
-  ) {
+  constructor(private readonly renderer: CliRenderer) {
     this.overlay = new BoxRenderable(renderer, {
       id: "open-leaf-overlay",
       position: "absolute",
@@ -75,12 +82,12 @@ export class OpenLeafPicker {
       justifyContent: "space-between",
       backgroundColor: theme.element,
     })
-    const title = new TextRenderable(renderer, {
+    this.title = new TextRenderable(renderer, {
       id: "open-leaf-title",
       fg: theme.text,
       attributes: TextAttributes.BOLD,
       selectable: false,
-      content: "Open leaf",
+      content: "",
     })
     const escape = new TextRenderable(renderer, {
       id: "open-leaf-escape",
@@ -89,7 +96,7 @@ export class OpenLeafPicker {
       content: "esc",
       onMouseUp: this.onEscapeMouseUp,
     })
-    header.add(title)
+    header.add(this.title)
     header.add(escape)
     this.list = new ScrollBoxRenderable(renderer, {
       id: "open-leaf-list",
@@ -114,13 +121,18 @@ export class OpenLeafPicker {
     return this.overlay.visible
   }
 
-  open(
-    options: ReachableSessionEndpoint[],
-    selectedSessionId?: string,
-    activeSessionIds: ReadonlySet<string> = new Set(),
-  ): void {
+  open(request: OpenLeafPickerRequest): void {
+    const {
+      title,
+      options,
+      onSelect,
+      selectedSessionId,
+      activeSessionIds = new Set(),
+    } = request
     this.clearRows()
+    this.title.content = title
     this.options = options
+    this.onSelect = onSelect
     this.activeSessionIds = new Set(activeSessionIds)
     const selectedIndex = selectedSessionId
       ? options.findIndex((option) => option.endpoint.session.id === selectedSessionId)
@@ -175,6 +187,7 @@ export class OpenLeafPicker {
   close(): void {
     this.pendingMouseIndex = null
     this.pendingBackdropClick = false
+    this.onSelect = undefined
     this.overlay.visible = false
   }
 
@@ -215,8 +228,9 @@ export class OpenLeafPicker {
   private activateSelected(): void {
     const option = this.options[this.selectedIndex]
     if (!option) return
+    const onSelect = this.onSelect
     this.close()
-    this.onSelect(option)
+    onSelect?.(option)
   }
 
   private updateRows(): void {

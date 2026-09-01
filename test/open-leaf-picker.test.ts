@@ -9,16 +9,21 @@ import { theme } from "../src/theme"
 test("supports arrow, vim, and control-key selection", async () => {
   const setup = await createTestRenderer({ width: 80, height: 20 })
   let selected: ReachableSessionEndpoint | undefined
-  const picker = new OpenLeafPicker(setup.renderer, (option) => {
-    selected = option
-  })
+  const picker = new OpenLeafPicker(setup.renderer)
   setup.renderer.keyInput.on("keypress", (key) => {
     key.stopPropagation()
     picker.handleKeyPress(key)
   })
   const options = [option(1), option(2), option(3)]
   const activeSessionIds = new Set([options[1]!.endpoint.session.id])
-  picker.open(options, undefined, activeSessionIds)
+  picker.open({
+    title: "Open leaf",
+    options,
+    activeSessionIds,
+    onSelect: (option) => {
+      selected = option
+    },
+  })
 
   try {
     await setup.renderOnce()
@@ -57,8 +62,17 @@ test("supports arrow, vim, and control-key selection", async () => {
     expect(selected?.endpoint.session.title).toBe("Leaf 2")
     expect(setup.captureCharFrame()).not.toContain("Open leaf")
 
-    picker.open(options, options[2]!.endpoint.session.id, activeSessionIds)
+    picker.open({
+      title: "Jump to Leaf",
+      options,
+      selectedSessionId: options[2]!.endpoint.session.id,
+      activeSessionIds,
+      onSelect: (option) => {
+        selected = option
+      },
+    })
     await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Jump to Leaf")
     expect(isSelected(setup, "Leaf 3")).toBeTrue()
     setup.mockInput.pressEscape()
     await Bun.sleep(20)
@@ -72,10 +86,14 @@ test("supports arrow, vim, and control-key selection", async () => {
 test("scrolls to and opens a mouse-selected option", async () => {
   const setup = await createTestRenderer({ width: 60, height: 12 })
   let selected: ReachableSessionEndpoint | undefined
-  const picker = new OpenLeafPicker(setup.renderer, (option) => {
-    selected = option
+  const picker = new OpenLeafPicker(setup.renderer)
+  picker.open({
+    title: "Open leaf",
+    options: Array.from({ length: 12 }, (_, index) => option(index + 1)),
+    onSelect: (option) => {
+      selected = option
+    },
   })
-  picker.open(Array.from({ length: 12 }, (_, index) => option(index + 1)))
 
   try {
     await setup.renderOnce()

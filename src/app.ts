@@ -28,6 +28,7 @@ import {
   directionalMove,
   graphNodeAt,
   initialVisibleGraphNodeId,
+  topVisibleGraphNodeId,
   type ConversationGraphLayout,
   type GraphDirection,
   type GraphNavigationIntent,
@@ -41,9 +42,15 @@ import {
   type ConversationForest,
   type ConversationGraph,
   type MessageGraphNodeOrEndpoint,
+  type ReachableSessionEndpoint,
   type SessionEndpointNode,
 } from "./message-graph"
-import { isEnterKey, isUnmodifiedKey, listNavigationDelta } from "./list-navigation"
+import {
+  isEnterKey,
+  isShiftedKey,
+  isUnmodifiedKey,
+  listNavigationDelta,
+} from "./list-navigation"
 import {
   BranchMetadataStore,
   type BranchRelation,
@@ -444,9 +451,7 @@ export class AgentTreeApp {
     this.confirmationDialog.add(confirmationContent)
     this.confirmationOverlay.add(this.confirmationDialog)
     renderer.root.add(this.confirmationOverlay)
-    this.openLeafPicker = new OpenLeafPicker(renderer, ({ endpoint }) => {
-      void this.runAction(() => this.openEndpoint(endpoint))
-    })
+    this.openLeafPicker = new OpenLeafPicker(renderer)
 
     this.infoOverlay = new BoxRenderable(renderer, {
       id: "info-overlay",
@@ -917,9 +922,13 @@ export class AgentTreeApp {
   private handleGraphKey(key: KeyEvent): void {
     const exit = isExitKey(key)
     const back = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape")
+    const jumpToTop = isUnmodifiedKey(key, "g")
+    const jumpToBottom = isShiftedKey(key, "g")
     const recognized =
       exit ||
       back ||
+      jumpToTop ||
+      jumpToBottom ||
       ["up", "down", "left", "right", "k", "j", "h", "l"].some((name) =>
         isUnmodifiedKey(key, name),
       ) ||
@@ -940,6 +949,10 @@ export class AgentTreeApp {
       return
     } else if (back) {
       this.showRoots()
+    } else if (jumpToTop && !key.repeated) {
+      this.jumpSelectionToTop()
+    } else if (jumpToBottom && !key.repeated) {
+      this.jumpSelectionToBottom()
     } else if (isUnmodifiedKey(key, "up") || isUnmodifiedKey(key, "k")) {
       this.moveSelection("up")
     } else if (isUnmodifiedKey(key, "down") || isUnmodifiedKey(key, "j")) {
@@ -1191,6 +1204,70 @@ export class AgentTreeApp {
     this.preferredOpenSession = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = move.intent
+    this.render()
+  }
+
+  private jumpSelectionToTop(): void {
+    if (!this.graphLayout || !this.selectedGraphNodeId) return
+    const nodeId = topVisibleGraphNodeId(this.graphLayout, this.selectedGraphNodeId)
+    if (!nodeId || nodeId === this.selectedGraphNodeId) return
+    this.selectGraphNode(nodeId)
+  }
+
+  private jumpSelectionToBottom(): void {
+    const graph = this.currentGraph()
+    if (!graph || !this.graphLayout || !this.selectedGraphNodeId) return
+
+    const runningSessionIds = this.terminalManager.runningSessionIds()
+    const destinations = new Map<
+      string,
+      { option: ReachableSessionEndpoint; nodeId: string }
+    >()
+    for (const reachable of reachableSessionEndpoints(graph, this.selectedGraphNodeId)) {
+      const nodeId = visibleGraphNodeId(graph, reachable.endpoint.id, runningSessionIds)
+      if (!nodeId || destinations.has(nodeId)) continue
+      destinations.set(nodeId, {
+        option: {
+          ...reachable,
+          distance: Math.max(
+            0,
+            reachable.distance - (nodeId === reachable.endpoint.id ? 0 : 1),
+          ),
+        },
+        nodeId,
+      })
+    }
+
+    const choices = [...destinations.values()]
+    if (choices.length === 0) return
+    if (choices.length === 1) {
+      const nodeId = choices[0]!.nodeId
+      if (nodeId !== this.selectedGraphNodeId) this.selectGraphNode(nodeId)
+      return
+    }
+
+    const nodeIdBySessionId = new Map(
+      choices.map(({ option, nodeId }) => [option.endpoint.session.id, nodeId]),
+    )
+    this.openLeafPicker.open({
+      title: "Jump to Leaf",
+      options: choices.map(({ option }) => option),
+      activeSessionIds: runningSessionIds,
+      onSelect: ({ endpoint }) => {
+        const nodeId = nodeIdBySessionId.get(endpoint.session.id)
+        if (nodeId) this.selectGraphNode(nodeId)
+      },
+    })
+  }
+
+  private selectGraphNode(nodeId: string): void {
+    if (!this.graphLayout?.nodes.has(nodeId)) return
+    if (nodeId !== this.selectedGraphNodeId) {
+      this.selectedGraphNodeId = nodeId
+      this.preferredOpenSession = null
+      this.graphViewportOffset = null
+      this.graphNavigationIntent = null
+    }
     this.render()
   }
 
@@ -1485,11 +1562,15 @@ export class AgentTreeApp {
     const preferredSessionId =
       preferred?.nodeId === selected.id ? preferred.sessionId : undefined
     if (endpoints.length > 1) {
-      this.openLeafPicker.open(
-        endpoints,
-        preferredSessionId,
-        this.terminalManager.runningSessionIds(),
-      )
+      this.openLeafPicker.open({
+        title: "Open leaf",
+        options: endpoints,
+        ...(preferredSessionId === undefined ? {} : { selectedSessionId: preferredSessionId }),
+        activeSessionIds: this.terminalManager.runningSessionIds(),
+        onSelect: ({ endpoint }) => {
+          void this.runAction(() => this.openEndpoint(endpoint))
+        },
+      })
       return
     }
 

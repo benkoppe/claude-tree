@@ -12,6 +12,18 @@ export function isUnmodifiedKey(key: KeyEvent, name: string): boolean {
   return key.name === name && !hasModifiers(key)
 }
 
+export function isShiftedKey(key: KeyEvent, name: string): boolean {
+  return (
+    key.name === name &&
+    key.shift &&
+    !key.ctrl &&
+    !key.meta &&
+    !key.option &&
+    !key.super &&
+    !key.hyper
+  )
+}
+
 export function isEnterKey(key: KeyEvent): boolean {
   return (
     (key.name === "return" || key.name === "linefeed" || key.name === "kpenter") &&
