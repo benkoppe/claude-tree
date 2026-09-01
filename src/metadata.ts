@@ -229,6 +229,19 @@ export class BranchMetadataStore {
     return relation
   }
 
+  async removeRelation(relation: BranchRelation): Promise<void> {
+    const targetPath = join(
+      this.projectStateDirectory,
+      "branches",
+      relationFileName(relation.childSessionId),
+    )
+    const existing = relationSchema.parse(JSON.parse(await readFile(targetPath, "utf8")))
+    if (JSON.stringify(existing) !== JSON.stringify(relation)) {
+      throw new Error(`Session ${relation.childSessionId} has different branch metadata`)
+    }
+    await rm(targetPath)
+  }
+
   async loadRemovals(): Promise<ConversationRemoval[]> {
     const removalDirectory = join(this.projectStateDirectory, "removals")
     const entries = await readdir(removalDirectory, { withFileTypes: true })

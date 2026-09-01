@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { createTestRenderer, MouseButtons } from "@opentui/core/testing"
+import { createTestRenderer, MouseButtons, TestRecorder } from "@opentui/core/testing"
 import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-sdk"
 
 import {
@@ -410,20 +410,317 @@ test("replaces a temporary new-session id after the provider reports the real se
     await waitForFrame(setup, (frame) => frame.includes("No conversations"))
     setup.mockInput.pressKey("n")
     await waitForFrame(setup, (frame) => frame.includes("NEW_SESSION_ACTIVE"))
+    const recorder = new TestRecorder(setup.renderer)
+    recorder.rec()
     setup.mockInput.pressKey(" ", { ctrl: true })
     await waitUntil(() => listCalls === 2)
+    const pendingGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("Draft"),
+    )
+    expect(pendingGraph).not.toContain("Conversation roots")
+    expect(pendingGraph).not.toContain("No conversations")
+    recorder.stop()
+    expect(recorder.recordedFrames.some(({ frame }) => frame.includes("Conversation roots"))).toBeFalse()
     resolveDiscovery([{ id: "real-session", title: "Real conversation", lastModified: 2 }])
     await waitForFrame(setup, (frame) => frame.includes("Message graph"))
+    setup.mockInput.pressKey("q")
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("Conversation roots") && frame.includes("Pending conversation"),
+    )
     resolveStarted({ id: "real-session", title: "Real conversation", lastModified: 2, transient: true })
+    const roots = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Conversation roots") && frame.includes("Real conversation"),
+    )
+    expect(roots).not.toContain("Pending conversation")
+    setup.mockInput.pressEnter()
     await waitForFrame(
       setup,
       (frame) => frame.includes("Message graph") && frame.includes("persisted history"),
     )
-    setup.mockInput.pressKey("q")
-    const roots = await waitForFrame(setup, (frame) => frame.includes("Real conversation"))
-    expect(roots).not.toContain("Pending conversation")
   } finally {
     resolveDiscovery([])
+    await app.stop()
+    await running
+  }
+})
+
+test("returns directly to a locally staged transient fork while discovery is pending", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(fakeAgent, '#!/bin/sh\nprintf "BRANCH_ACTIVE\\r\\n"\nsleep 30\n')
+  await chmod(fakeAgent, 0o755)
+
+  const parent: AgentSession = { id: "parent-session", title: "Parent", lastModified: 1 }
+  const child: AgentSession = {
+    id: "transient-child",
+    title: "Transient branch",
+    lastModified: 2,
+    transient: true,
+  }
+  let resolveDiscovery!: (sessions: AgentSession[]) => void
+  const discovery = new Promise<AgentSession[]>((resolve) => { resolveDiscovery = resolve })
+  let listCalls = 0
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      listCalls += 1
+      return listCalls === 1 ? [parent] : discovery
+    },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, sessionId === parent.id
+        ? [{ id: "source-message", role: "agent" as const, preview: "branch source", ordinal: 0, visible: true }]
+        : []]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+    async branchFrom() {
+      return {
+        session: child,
+        launch: {
+          sessionId: child.id,
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+        derivation: {
+          childSessionId: child.id,
+          parentSessionId: parent.id,
+          sourceMessageId: "source-message",
+          sharedMessages: [],
+        },
+        providerSessionCreated: false,
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Parent"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("branch source"))
+    setup.mockInput.pressKey("f")
+    await waitForFrame(setup, (frame) => frame.includes("BRANCH_ACTIVE"))
+
+    const recorder = new TestRecorder(setup.renderer)
+    recorder.rec()
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitUntil(() => listCalls === 2)
+    const pendingGraph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("Draft"),
+    )
+    expect(pendingGraph).toContain("branch source")
+    expect(pendingGraph).not.toContain("Conversation roots")
+    recorder.stop()
+    expect(recorder.recordedFrames.some(({ frame }) => frame.includes("Conversation roots"))).toBeFalse()
+  } finally {
+    resolveDiscovery([parent])
+    await app.stop()
+    await running
+  }
+})
+
+test("rolls back a provider-uncreated fork when its terminal cannot launch", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const parent: AgentSession = { id: "parent-session", title: "Parent", lastModified: 1 }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [parent] },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [
+        { id: "source-message", role: "user" as const, preview: "replayed prompt", ordinal: 0, visible: true },
+      ]]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+    async branchFrom() {
+      return {
+        session: {
+          id: "uncreated-child",
+          title: "Uncreated branch",
+          lastModified: 2,
+          transient: true,
+        },
+        launch: {
+          sessionId: "uncreated-child",
+          command: [process.execPath],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+        derivation: {
+          childSessionId: "uncreated-child",
+          parentSessionId: parent.id,
+          sourceMessageId: "source-message",
+          sharedMessages: [],
+        },
+        providerSessionCreated: false,
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const showTerminal = spyOn(TerminalManager.prototype, "show").mockRejectedValue(
+    new Error("terminal launch failed"),
+  )
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Parent"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("replayed prompt"))
+    setup.mockInput.pressKey("f")
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("Error") && frame.includes("terminal launch failed"),
+    )
+    setup.mockInput.pressEscape()
+    const graph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Message graph") && frame.includes("replayed prompt"),
+    )
+    expect(graph).not.toContain("Draft")
+    const metadata = await BranchMetadataStore.openForProvider(project, provider.id, state)
+    expect(await metadata.loadRelations()).toEqual([])
+  } finally {
+    showTerminal.mockRestore()
+    await app.stop()
+    await running
+  }
+})
+
+test("migrates an in-flight removal when a temporary session gets its real id", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const fakeAgent = join(root, "agent")
+  await writeFile(fakeAgent, "#!/bin/sh\ntrap '' HUP TERM\nwhile :; do sleep 1; done\n")
+  await chmod(fakeAgent, 0o755)
+  let resolveStarted!: (session: AgentSession) => void
+  const startedSession = new Promise<AgentSession>((resolve) => { resolveStarted = resolve })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [] },
+    async readTranscripts() { return new Map() },
+    async prepareNewSession() {
+      return {
+        session: {
+          id: "pending-session",
+          title: "Pending conversation",
+          lastModified: 1,
+          transient: true,
+        },
+        launch: {
+          sessionId: "pending-session",
+          command: [fakeAgent],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+        startedSession,
+      }
+    },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Message graph") && frame.includes("Draft"))
+    setup.mockInput.pressKey("q")
+    await waitForFrame(setup, (frame) => frame.includes("Pending conversation"))
+    setup.mockInput.pressKey("d")
+    await waitForFrame(setup, (frame) => frame.includes("Delete conversation tree"))
+
+    setup.mockInput.pressArrow("right")
+    setup.mockInput.pressEnter()
+    resolveStarted({
+      id: "real-session",
+      title: "Real conversation",
+      lastModified: 2,
+      transient: true,
+    })
+    await waitForFrame(setup, (frame) => frame.includes("No conversations") && !frame.includes("Error"))
+
+    const metadata = await BranchMetadataStore.openForProvider(project, provider.id, state)
+    const removals = await metadata.loadRemovals()
+    expect(removals).toHaveLength(1)
+    expect(removals[0]?.kind === "tree" ? removals[0].rootSessionId : undefined).toBe("real-session")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("rolls back a locally staged new session when its terminal cannot launch", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [] },
+    async readTranscripts() { return new Map() },
+    async prepareNewSession() {
+      return {
+        session: {
+          id: "failed-session",
+          title: "Failed conversation",
+          lastModified: 1,
+          transient: true,
+        },
+        launch: {
+          sessionId: "failed-session",
+          command: [process.execPath],
+          cwd: project,
+          observer: new NullTerminalObserver(),
+        },
+      }
+    },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const showTerminal = spyOn(TerminalManager.prototype, "show").mockRejectedValue(
+    new Error("terminal launch failed"),
+  )
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+    setup.mockInput.pressKey("n")
+    await waitForFrame(setup, (frame) => frame.includes("Error"))
+    setup.mockInput.pressEscape()
+    const roots = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Conversation roots") && frame.includes("No conversations"),
+    )
+    expect(roots).not.toContain("Failed conversation")
+  } finally {
+    showTerminal.mockRestore()
     await app.stop()
     await running
   }
@@ -863,14 +1160,14 @@ wait "$child"
     setup.mockInput.pressKey("n")
     const processIds = await readProcessIds(processMarker)
     setup.mockInput.pressKey(" ", { ctrl: true })
-    const busyFrame = await waitForFrame(
+    await waitForFrame(
       setup,
-      (frame) => refreshSpinnerVisible(frame) && frame.includes("q quit"),
+      (frame) => listCalls === 2 && frame.includes("Message graph") && frame.includes("q quit"),
     )
 
     const startedAt = performance.now()
-    const quitAction = coordinateOf(busyFrame, "q quit")
-    await setup.mockMouse.click(quitAction.x, quitAction.y)
+    setup.mockInput.pressCtrlC()
+    await waitUntil(() => setup.renderer.isDestroyed)
     expect(setup.renderer.isDestroyed).toBeTrue()
 
     await running
