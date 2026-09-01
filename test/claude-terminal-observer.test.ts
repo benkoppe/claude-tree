@@ -313,7 +313,23 @@ test("does not let a stale composer override working title activity", () => {
   ).toBeUndefined()
 })
 
-test("does not let a stale working footer override idle title activity", () => {
+test("does not let a stale working footer above the live composer override idle activity", () => {
+  const observer = new ClaudeTerminalObserver()
+  expect(
+    observer.observeOutput(new TextEncoder().encode("\u001b]0;✳ Claude Code\u0007")),
+  ).toEqual(["idle"])
+  expect(
+    observer.observeScreen({
+      text: "",
+      lines: ["✻ Cogitating… (12s · esc to interrupt)", "❯ ", "────────────────"],
+      columns: 40,
+      rows: 3,
+      cursor: { x: 2, y: 1, visible: true },
+    }),
+  ).toBe("idle")
+})
+
+test("uses a live working footer when Claude pins its title to the idle glyph", () => {
   const observer = new ClaudeTerminalObserver()
   expect(
     observer.observeOutput(new TextEncoder().encode("\u001b]0;✳ Claude Code\u0007")),
@@ -326,7 +342,24 @@ test("does not let a stale working footer override idle title activity", () => {
       rows: 1,
       cursor: { x: 0, y: 0, visible: false },
     }),
-  ).toBeUndefined()
+  ).toBe("working")
+})
+
+test("treats a working footer below the submitted prompt as live", () => {
+  expect(
+    observeClaudeActivity({
+      text: "",
+      lines: [
+        "❯ implement the change",
+        "",
+        "✻ Cogitating… (12s · esc to interrupt)",
+        "────────────────",
+      ],
+      columns: 60,
+      rows: 4,
+      cursor: { x: 0, y: 2, visible: true },
+    }),
+  ).toBe("working")
 })
 
 test("preserves ordered Claude activity transitions in one output chunk", () => {
@@ -366,4 +399,37 @@ test("uses the visible Claude footer and composer as activity fallbacks", () => 
       cursor: { x: 0, y: 0, visible: false },
     }),
   ).toBeUndefined()
+})
+
+test("reports visible Claude permission prompts as blocked", () => {
+  expect(
+    observeClaudeActivity({
+      text: "",
+      lines: [
+        "Bash command",
+        "Do you want to proceed?",
+        "❯ 1. Yes",
+        "  2. No",
+        "Tab to amend · Esc to cancel",
+      ],
+      columns: 60,
+      rows: 5,
+      cursor: { x: 2, y: 2, visible: true },
+    }),
+  ).toBe("blocked")
+
+  expect(
+    observeClaudeActivity({
+      text: "",
+      lines: [
+        "Would you like to proceed?",
+        "❯ 1. Allow once",
+        "  2. Deny",
+        "Esc to cancel",
+      ],
+      columns: 60,
+      rows: 4,
+      cursor: { x: 2, y: 1, visible: true },
+    }),
+  ).toBe("blocked")
 })

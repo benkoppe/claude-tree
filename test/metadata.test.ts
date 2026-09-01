@@ -33,6 +33,25 @@ describe("BranchMetadataStore", () => {
     expect(store.projectPath).toBe(await realpath(project))
   })
 
+  test("removes an exact branch relationship during local launch rollback", async () => {
+    const root = await temporaryDirectory()
+    const project = join(root, "project")
+    const state = join(root, "state")
+    await mkdir(project)
+
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
+    const relation = await store.saveRelation({
+      childSessionId: "child",
+      parentSessionId: "parent",
+      sourceMessageId: "source",
+      sharedMessages: [],
+    })
+
+    await store.removeRelation(relation)
+
+    expect(await store.loadRelations()).toEqual([])
+  })
+
   test("rejects malformed metadata rather than silently dropping it", async () => {
     const root = await temporaryDirectory()
     const project = join(root, "project")
@@ -307,6 +326,48 @@ describe("BranchMetadataStore", () => {
     expect(JSON.parse(await readFile(removalFiles[0]!, "utf8"))).toEqual(removal)
     expect((await stat(removalFiles[0]!)).mode & 0o777).toBe(0o600)
     expect(files.some((path) => path.endsWith(".tmp"))).toBeFalse()
+  })
+
+  test("round-trips semantic navigation state in a private atomic file", async () => {
+    const root = await temporaryDirectory()
+    const project = join(root, "project")
+    const state = join(root, "state")
+    await mkdir(project)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
+    const navigation = await store.saveNavigationState({
+      view: "graph",
+      familySessionId: "root-session",
+      target: {
+        kind: "message",
+        preferred: { sessionId: "child-session", messageId: "copied-message" },
+        aliases: [
+          { sessionId: "root-session", messageId: "source-message" },
+          { sessionId: "child-session", messageId: "copied-message" },
+        ],
+      },
+    })
+
+    expect(await store.loadNavigationState()).toEqual(navigation)
+    const files = await filesRecursively(join(state, "claude-tree", "projects"))
+    const navigationPath = files.find((path) => path.endsWith("/navigation.json"))
+    expect(navigationPath).toBeDefined()
+    expect((await stat(navigationPath!)).mode & 0o777).toBe(0o600)
+    expect(files.some((path) => path.endsWith(".tmp"))).toBeFalse()
+  })
+
+  test("rejects malformed navigation state", async () => {
+    const root = await temporaryDirectory()
+    const project = join(root, "project")
+    const state = join(root, "state")
+    await mkdir(project)
+    const store = await BranchMetadataStore.openForProvider(project, "claude", state)
+    await store.saveNavigationState({ view: "roots", selectedSessionId: null })
+    const files = await filesRecursively(join(state, "claude-tree", "projects"))
+    const navigationPath = files.find((path) => path.endsWith("/navigation.json"))
+    expect(navigationPath).toBeDefined()
+    await writeFile(navigationPath!, '{"schemaVersion":1,"view":"terminal","sessionId":""}\n')
+
+    expect(store.loadNavigationState()).rejects.toThrow()
   })
 })
 

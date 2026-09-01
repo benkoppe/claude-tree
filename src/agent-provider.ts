@@ -32,7 +32,7 @@ export interface DraftPreview {
   submitted?: boolean
 }
 
-export type AgentActivity = "working" | "idle"
+export type AgentActivity = "working" | "blocked" | "idle"
 
 export interface TerminalObserver {
   observeInput?(data: Uint8Array): void

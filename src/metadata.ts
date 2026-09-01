@@ -110,6 +110,58 @@ const subtreeRemovalSchema = z
 
 const removalSchema = z.discriminatedUnion("kind", [treeRemovalSchema, subtreeRemovalSchema])
 
+const navigationTargetSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("message"),
+      preferred: messageRefSchema,
+      aliases: z.array(messageRefSchema).min(1),
+    })
+    .strict()
+    .superRefine((target, context) => {
+      if (
+        !target.aliases.some(
+          (alias) =>
+            alias.sessionId === target.preferred.sessionId &&
+            alias.messageId === target.preferred.messageId,
+        )
+      ) {
+        context.addIssue({ code: "custom", message: "preferred message must be an alias" })
+      }
+    }),
+  z
+    .object({
+      kind: z.literal("endpoint"),
+      sessionId: z.string().min(1),
+    })
+    .strict(),
+])
+
+const navigationStateSchema = z.discriminatedUnion("view", [
+  z
+    .object({
+      schemaVersion: z.literal(SCHEMA_VERSION),
+      view: z.literal("roots"),
+      selectedSessionId: z.string().min(1).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      schemaVersion: z.literal(SCHEMA_VERSION),
+      view: z.literal("graph"),
+      familySessionId: z.string().min(1),
+      target: navigationTargetSchema,
+    })
+    .strict(),
+  z
+    .object({
+      schemaVersion: z.literal(SCHEMA_VERSION),
+      view: z.literal("terminal"),
+      sessionId: z.string().min(1),
+    })
+    .strict(),
+])
+
 export type BranchRelation = z.infer<typeof relationSchema>
 
 export type NewBranchRelation = Omit<BranchRelation, "schemaVersion" | "createdAt"> & {
@@ -123,6 +175,10 @@ export type ConversationRemovalTarget = SubtreeRemovalTarget
 export type TreeConversationRemoval = z.infer<typeof treeRemovalSchema>
 export type SubtreeConversationRemoval = z.infer<typeof subtreeRemovalSchema>
 export type ConversationRemoval = z.infer<typeof removalSchema>
+export type NavigationTarget = z.infer<typeof navigationTargetSchema>
+export type NavigationState = z.infer<typeof navigationStateSchema>
+type WithoutSchemaVersion<T> = T extends unknown ? Omit<T, "schemaVersion"> : never
+export type NewNavigationState = WithoutSchemaVersion<NavigationState>
 
 type NewPersistedRecord<T> = T extends unknown
   ? Omit<T, "schemaVersion" | "createdAt"> & { createdAt?: string }
@@ -229,6 +285,19 @@ export class BranchMetadataStore {
     return relation
   }
 
+  async removeRelation(relation: BranchRelation): Promise<void> {
+    const targetPath = join(
+      this.projectStateDirectory,
+      "branches",
+      relationFileName(relation.childSessionId),
+    )
+    const existing = relationSchema.parse(JSON.parse(await readFile(targetPath, "utf8")))
+    if (JSON.stringify(existing) !== JSON.stringify(relation)) {
+      throw new Error(`Session ${relation.childSessionId} has different branch metadata`)
+    }
+    await rm(targetPath)
+  }
+
   async loadRemovals(): Promise<ConversationRemoval[]> {
     const removalDirectory = join(this.projectStateDirectory, "removals")
     const entries = await readdir(removalDirectory, { withFileTypes: true })
@@ -271,6 +340,21 @@ export class BranchMetadataStore {
 
     await writeJsonAtomically(join(this.projectStateDirectory, "removals", fileName), removal)
     return removal
+  }
+
+  async loadNavigationState(): Promise<NavigationState | undefined> {
+    const path = join(this.projectStateDirectory, "navigation.json")
+    if (!(await Bun.file(path).exists())) return undefined
+    return navigationStateSchema.parse(JSON.parse(await readFile(path, "utf8")))
+  }
+
+  async saveNavigationState(input: NewNavigationState): Promise<NavigationState> {
+    const navigation = navigationStateSchema.parse({
+      ...input,
+      schemaVersion: SCHEMA_VERSION,
+    })
+    await writeJsonAtomically(join(this.projectStateDirectory, "navigation.json"), navigation)
+    return navigation
   }
 }
 

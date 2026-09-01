@@ -30,13 +30,15 @@ The validated Codex baseline is 0.150.1. The app-server protocol and terminal te
 
 Codex does not allocate or persist a new thread until its first user turn, so a fresh thread cannot be handed to `codex resume`. New Codex sessions instead launch the stock TUI against a dedicated authenticated loopback app-server and let the TUI call `thread/start` when the user submits that turn. The application initially owns that terminal under a temporary ID, then replaces it with the real ID reported by the sidecar's loaded-thread API. The terminal manager cleans up the sidecar with the TUI. Once the first turn is persisted, normal discovery and later resume use short-lived metadata operations and the ordinary local TUI path.
 
+Locally prepared sessions are an immediate overlay on the last provider snapshot. Project them into the conversation forest and establish their navigator destination before activating their terminal, including when the provider has not persisted or discovered them yet. Returning from a terminal must reveal that local graph synchronously; provider refresh reconciles metadata and transcripts afterward rather than deciding which navigator view appears. Temporary-to-provider ID adoption updates terminal ownership and the local graph projection as one transition.
+
 Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
 
-## Relationships And Navigator Removals Need Application Metadata
+## Relationships And Navigator State Need Application Metadata
 
 Claude sessions are persisted independently. Historical forking remaps message UUIDs and does not retain enough source-branch information for this application to reconstruct a reliable cross-session tree later.
 
-Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Persist navigator-removal records as application-owned UI state. Keep both outside the repository under the user's XDG state directory, scoped by project and provider, with strict validation and atomic writes.
+Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Persist navigator-removal and current-view records as application-owned UI state. Keep them outside the repository under the user's XDG state directory, scoped by project and provider, with strict validation and atomic writes.
 
 Apply navigator removals after constructing the complete graph so relationship and message-alias resolution still use intact provider history. Prune only the selected tree or the selected node and its visual descendants from the navigator. Never edit or delete provider transcripts to implement removal.
 
@@ -52,11 +54,13 @@ User replay initializes the stock Claude composer through `--prefill` rather tha
 
 Claude Code does not expose semantic composer state. The application may show a conservative, in-memory preview parsed from the visible input box when leaving a live terminal, but it must mark that preview as approximate and never persist it as transcript or relationship state.
 
-Claude Code also does not expose semantic generation state to its terminal host. Observe its OSC terminal-title activity indicator directly from PTY output so hidden processes remain observable, with conservative matching against the last visible Claude screen as a fallback. An idle transition triggers a fresh SDK transcript read; keep the live endpoint visually pending until the rebuilt graph is ready so a completed agent message and its following draft leaf appear atomically. Keep activity state ephemeral and informational: process exit remains authoritative, and detection must not control permissions or inject input.
+Claude Code also does not expose semantic generation state to its terminal host. Observe its OSC terminal-title activity indicator directly from PTY output so hidden processes remain observable, with conservative matching against the last visible Claude screen as a fallback. Claude versions that pin an idle title under terminal multiplexers may still be working; a live bottom-screen working footer overrides that stale title, while a visible composer remains idle. Recognized permission and input prompts are blocked rather than working. An idle transition triggers a fresh SDK transcript read; keep the live endpoint visually pending until the rebuilt graph is ready so a completed agent message and its following draft leaf appear atomically. Keep activity state ephemeral and informational: process exit remains authoritative, and detection must not control permissions or inject input.
 
 After Claude reports that a historical fork was created, retry bounded reads of a missing or short child transcript before validating correspondence. Create the provider fork only once and keep payload validation strict. If correspondence still cannot be validated, save no ancestry and refresh the created child as an independent root rather than guessing its relationship or deleting its provider transcript.
 
 Automatic terminal-return and completion refreshes reread the affected sessions and merge them with cached unrelated transcripts; initial loads and explicit manual refreshes remain complete snapshots. Preserve every ordered activity transition reported in one PTY chunk. Because provider persistence can lag an idle title, retain the pending endpoint and retry with bounded backoff until the transcript advances to a provider-confirmed completed turn. If the session resumes working, reject the stale completion and keep newly persisted assistant-tail records behind the single working endpoint.
+
+When a hidden live session reaches that provider-confirmed completion boundary, mark its Draft endpoint as having new updates and aggregate that state in the conversation-root picker. This state is ephemeral application UI state rather than provider or relationship metadata. Keep it while the session remains live, clearing it after the exact stock terminal is successfully shown or the live session is stopped or removed; navigator selection alone does not count as viewing the update.
 
 Claude may persist one user turn as multiple assistant records, including streamed content blocks and continuations around tool calls. Normalize those raw records into one visible Agent node per user turn while retaining every UUID for prefix validation, removals, and provider operations. A newly selected grouped Agent forks from its latest represented raw boundary. An existing recorded fork closes the display group at its exact source so later parent content never appears before the branch.
 
@@ -64,13 +68,15 @@ Claude may persist one user turn as multiple assistant records, including stream
 
 Codex app-server forks whole turns rather than arbitrary transcript items. A valid Codex fork target is therefore the final agent item in a completed turn. User-message replay, system-item targets, intra-turn targets, and incomplete turns fail before creating a child. After a fork, compare the copied child prefix against the source payloads and fail closed if Codex did not preserve it exactly.
 
-Codex terminal activity and draft previews are observed conservatively from its OSC title and visible composer. An action-required title remains active rather than being mistaken for completion, because the user must return to the stock TUI to resolve it.
+Codex terminal activity and draft previews are observed conservatively from its OSC title and visible composer. An action-required title or recognized confirmation prompt is blocked rather than being mistaken for working or completion, because the user must return to the stock TUI to resolve it.
 
 ## Graph Navigation Preserves Cursor Intent
 
 Vertical navigation follows visible graph edges: up selects the parent and down selects a child. It never falls diagonally into a neighboring branch. Horizontal navigation uses the same world-space node layout as rendering and may cross branches, root chains, and viewport boundaries.
 
 Navigation retains a preferred world-space column for vertical movement and depth for horizontal movement, plus the exact source of the latest transition. This mirrors a text-editor cursor: moving through an ambiguous parent or a shorter neighboring branch and then reversing returns to the node that was left. Blocked movement does not discard that intent. Rebuilding or resizing the graph resets it. The synthetic family origin does not participate in navigation.
+
+Persist navigation using opaque session IDs and message aliases, never list indexes or generated graph node IDs. On startup, restore a surviving roots selection or graph target; if the previous view was a terminal, ask the provider to resume that session and fall back to its graph or the roots list when it is unavailable. Persisted navigation identifies semantic provider state only. PTYs, emulator scrollback, modal state, and approximate drafts remain process-local.
 
 ## One Process For The Initial Product
 
@@ -87,6 +93,14 @@ After an intentional stop, rebuild the graph from a fresh provider transcript re
 A daemon/client split is intentionally deferred. Add one only if surviving application exit becomes a real requirement; do not pay the lifecycle and IPC complexity merely to imitate a terminal multiplexer.
 
 Do not run two live processes against the same provider session ID, because concurrent transcript ownership is unsafe. Different branches may run concurrently.
+
+## Herdr Integration Reports One Visible Agent
+
+When Herdr supplies its pane environment, report activity through the Herdr CLI with a dedicated `custom:claude-tree-lifecycle` source. Reporting is optional, serialized, bounded, and non-fatal. Reassert state shortly after each transition, including once after Herdr's release reacquisition window, so rapid restarts, startup process-detection races, and transient command failures recover. Send a low-frequency heartbeat so a Herdr server restart does not permanently lose registration. Release the source during shutdown. Do not add a runtime dependency on Herdr.
+
+Register the pane's agent as `claude-tree`, which is the foreground application Herdr actually hosts. One claude-tree invocation still represents one selected provider: report idle while the navigator is visible and report the visible terminal's working, blocked, or idle state. Activity from hidden sessions remains available to claude-tree's graph logic but must not override the Herdr row. Remove Herdr's pane-specific environment variables from nested provider processes so their own hooks cannot claim the outer pane or persist a provider identity there.
+
+Herdr reporting does not change process ownership. claude-tree continues to own every provider PTY, and Herdr does not receive terminal handles or act as a multipane runtime. Relaunch restores persisted semantic navigation and may resume a provider session, but it cannot restore the prior PTY or emulator state.
 
 ## Input And View Ownership
 

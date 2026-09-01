@@ -91,6 +91,7 @@ export function renderConversationGraph(
   viewportOffset?: ViewportOffset,
   visibleEndpointSessionIds: Set<string> = runningSessionIds,
   unavailableTranscriptSessionIds: ReadonlySet<string> = new Set(),
+  unviewedUpdateSessionIds: ReadonlySet<string> = new Set(),
 ): RenderedGraph {
   const safeWidth = Math.max(1, viewportWidth)
   const safeHeight = Math.max(1, viewportHeight)
@@ -112,6 +113,7 @@ export function renderConversationGraph(
       workingSessionIds,
       spinnerFrame,
       unavailableTranscriptSessionIds,
+      unviewedUpdateSessionIds,
     )
   }
 
@@ -153,6 +155,7 @@ export function renderRootPicker(
   width: number,
   runningSessionIds: Set<string>,
   viewportStart = 0,
+  unviewedUpdateSessionIds: ReadonlySet<string> = new Set(),
 ): RenderedRootPicker {
   const safeWidth = Math.max(1, width)
   if (graphs.length === 0) {
@@ -180,19 +183,28 @@ export function renderRootPicker(
     const live = [...graph.sessionIds].some((sessionId) => runningSessionIds.has(sessionId))
     const messageCount = [...graph.nodes.values()].filter((node) => node.kind === "message").length
     const sessionCount = graph.endpointBySessionId.size
-    const status = live ? "●" : "○"
-    const metadata = `${messageCount} messages · ${sessionCount} ${sessionCount === 1 ? "session" : "sessions"}`
+    const hasNewUpdates = [...graph.sessionIds].some((sessionId) =>
+      unviewedUpdateSessionIds.has(sessionId),
+    )
+    const status = live || hasNewUpdates ? "●" : "○"
+    const counts = `${messageCount} messages · ${sessionCount} ${sessionCount === 1 ? "session" : "sessions"}`
     const rowStyle = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     const statusStyle = {
       ...rowStyle,
-      fg: selected ? theme.selectedText : live ? theme.success : theme.textMuted,
+      fg: hasNewUpdates
+        ? theme.warning
+        : selected
+          ? theme.selectedText
+          : live
+            ? theme.success
+            : theme.textMuted,
       attributes: TextAttributes.BOLD,
     }
 
     canvas.paint(0, row, safeWidth, 1, rowStyle)
     canvas.write(1, row, status, statusStyle)
     const titleX = 1 + displayWidth(status) + 2
-    const metadataWidth = displayWidth(metadata)
+    const metadataWidth = displayWidth(counts)
     const metadataX = Math.max(titleX, safeWidth - metadataWidth - 1)
     const titleWidth = Math.max(0, metadataX - titleX - 2)
     canvas.write(titleX, row, truncateToWidth(title, titleWidth), {
@@ -200,7 +212,7 @@ export function renderRootPicker(
       attributes: selected ? TextAttributes.BOLD : TextAttributes.NONE,
     })
     if (metadataX > titleX) {
-      canvas.write(metadataX, row, truncateToWidth(metadata, safeWidth - metadataX - 1), {
+      canvas.write(metadataX, row, truncateToWidth(counts, safeWidth - metadataX - 1), {
         ...rowStyle,
         fg: selected ? theme.selectedText : theme.textMuted,
       })
@@ -250,6 +262,7 @@ function drawNode(
   workingSessionIds: Set<string>,
   spinnerFrame: number,
   unavailableTranscriptSessionIds: ReadonlySet<string>,
+  unviewedUpdateSessionIds: ReadonlySet<string>,
 ): void {
   const { node, x, y } = positioned
   const background = selected
@@ -324,6 +337,17 @@ function drawNode(
     ...headerStyle,
     fg: selected ? theme.selectedText : theme.info,
   }, headerStyle)
+  if (unviewedUpdateSessionIds.has(sessionId)) {
+    const updateLabel = "New updates"
+    const headingWidth = displayWidth(ICONS.session) + 1 + displayWidth("Draft")
+    const updateX = x + 2 + contentWidth - displayWidth(updateLabel)
+    if (updateX > x + 2 + headingWidth) {
+      canvas.write(updateX, y, updateLabel, {
+        ...headerStyle,
+        fg: selected ? theme.selectedText : theme.warning,
+      })
+    }
+  }
   const draft = draftPreviews.get(node.session.id)
   const description = draft ? normalizePreview(draft.text) : ""
   canvas.write(x + 2, y + 1, truncateToWidth(description, contentWidth), {
