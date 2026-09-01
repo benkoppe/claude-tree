@@ -32,11 +32,11 @@ Codex does not allocate or persist a new thread until its first user turn, so a 
 
 Forked sessions do not include the source session's file-history snapshots. A historical conversation fork therefore does not provide historical file rewind. Because all branches share the current working tree, it also does not restore files to their state at the selected message.
 
-## Relationships And Navigator Removals Need Application Metadata
+## Relationships And Navigator State Need Application Metadata
 
 Claude sessions are persisted independently. Historical forking remaps message UUIDs and does not retain enough source-branch information for this application to reconstruct a reliable cross-session tree later.
 
-Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Persist navigator-removal records as application-owned UI state. Keep both outside the repository under the user's XDG state directory, scoped by project and provider, with strict validation and atomic writes.
+Store only the missing relationship data: the child session, parent session, source message, and validated correspondence between shared parent and child messages. Persist navigator-removal and current-view records as application-owned UI state. Keep them outside the repository under the user's XDG state directory, scoped by project and provider, with strict validation and atomic writes.
 
 Apply navigator removals after constructing the complete graph so relationship and message-alias resolution still use intact provider history. Prune only the selected tree or the selected node and its visual descendants from the navigator. Never edit or delete provider transcripts to implement removal.
 
@@ -71,6 +71,8 @@ Codex terminal activity and draft previews are observed conservatively from its 
 Vertical navigation follows visible graph edges: up selects the parent and down selects a child. It never falls diagonally into a neighboring branch. Horizontal navigation uses the same world-space node layout as rendering and may cross branches, root chains, and viewport boundaries.
 
 Navigation retains a preferred world-space column for vertical movement and depth for horizontal movement, plus the exact source of the latest transition. This mirrors a text-editor cursor: moving through an ambiguous parent or a shorter neighboring branch and then reversing returns to the node that was left. Blocked movement does not discard that intent. Rebuilding or resizing the graph resets it. The synthetic family origin does not participate in navigation.
+
+Persist navigation using opaque session IDs and message aliases, never list indexes or generated graph node IDs. On startup, restore a surviving roots selection or graph target; if the previous view was a terminal, ask the provider to resume that session and fall back to its graph or the roots list when it is unavailable. Persisted navigation identifies semantic provider state only. PTYs, emulator scrollback, modal state, and approximate drafts remain process-local.
 
 ## One Process For The Initial Product
 

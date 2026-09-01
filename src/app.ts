@@ -58,7 +58,10 @@ import {
   type BranchRelation,
   type ConversationRemoval,
   type ConversationRemovalTarget,
+  type NavigationState,
+  type NavigationTarget,
   type NewConversationRemoval,
+  type NewNavigationState,
 } from "./metadata"
 import { OpenLeafPicker } from "./open-leaf-picker"
 import { PROGRAM_NAME, PROGRAM_VERSION } from "./program"
@@ -240,12 +243,17 @@ export class AgentTreeApp {
   private readonly pendingCompletionRefreshes = new Map<string, number>()
   private readonly completionRefreshAttempts = new Map<string, number>()
   private readonly completionRefreshDueAt = new Map<string, number>()
+  private navigationPersistenceEnabled = false
+  private queuedNavigationState: NewNavigationState | undefined
+  private queuedNavigationStateJson: string | undefined
+  private navigationSavePromise: Promise<void> | undefined
   private constructor(
     private readonly renderer: CliRenderer,
     private readonly metadata: BranchMetadataStore,
     private readonly provider: AgentProvider,
     relations: BranchRelation[],
     removals: ConversationRemoval[],
+    private readonly initialNavigationState?: NavigationState,
   ) {
     this.relations = relations
     this.removals = removals
@@ -598,11 +606,19 @@ export class AgentTreeApp {
     stateHome?: string,
   ): Promise<AgentTreeApp> {
     const metadata = await BranchMetadataStore.openForProvider(projectDirectory, provider.id, stateHome)
-    const [relations, removals] = await Promise.all([
+    const [relations, removals, navigation] = await Promise.all([
       metadata.loadRelations(),
       metadata.loadRemovals(),
+      metadata.loadNavigationState(),
     ])
-    return new AgentTreeApp(renderer, metadata, provider, relations, removals)
+    return new AgentTreeApp(
+      renderer,
+      metadata,
+      provider,
+      relations,
+      removals,
+      navigation,
+    )
   }
 
   async run(): Promise<void> {
@@ -611,8 +627,12 @@ export class AgentTreeApp {
     this.renderer.on(CliRenderEvents.RESIZE, this.onResize)
     await Promise.race([this.refreshData(), this.stopped])
     if (this.stopping) return
+    const terminalSessionId = this.restoreInitialNavigation()
     this.renderer.start()
     this.render()
+    if (terminalSessionId) await this.restoreTerminal(terminalSessionId)
+    this.navigationPersistenceEnabled = true
+    this.queueNavigationSave()
     await this.stopped
   }
 
@@ -637,9 +657,17 @@ export class AgentTreeApp {
       this.completionRefreshAttempts.clear()
       this.completionRefreshDueAt.clear()
 
+      const navigationSave = this.flushNavigationSave()
       const terminalShutdown = this.terminalManager.shutdown()
       this.renderer.destroy()
-      await terminalShutdown
+      const [navigationResult, terminalResult] = await Promise.allSettled([
+        navigationSave,
+        terminalShutdown,
+      ])
+      const errors = [navigationResult, terminalResult].flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      )
+      if (errors.length > 0) throw new AggregateError(errors, "Unable to shut down cleanly")
     } finally {
       if (!this.renderer.isDestroyed) this.renderer.destroy()
       this.resolveStopped()
@@ -685,7 +713,7 @@ export class AgentTreeApp {
 
   private onTerminalActivityChanged(event: TerminalActivityEvent): void {
     if (this.stopping) return
-    if (event.activity === "working") {
+    if (event.activity !== "idle") {
       this.pendingCompletionRefreshes.delete(event.sessionId)
       this.completionRefreshAttempts.delete(event.sessionId)
       this.completionRefreshDueAt.delete(event.sessionId)
@@ -1410,7 +1438,7 @@ export class AgentTreeApp {
       }
       if (!this.refreshCurrent(refresh)) return false
       const previousRootSessionId = this.currentRootSessionId
-      const previousNodeId = this.selectedGraphNodeId
+      const previousTarget = this.navigationTargetForSelection()
       const previousSelectedRoot = this.forest.graphs[this.selectedRootIndex]?.rootSessionId
       const nextTranscripts = new Map(transcriptEntries)
       const advancedCompletions = new Map<string, number>()
@@ -1450,7 +1478,7 @@ export class AgentTreeApp {
         ? this.forest.graphBySessionId.get(refreshedFocusSessionId)
         : undefined
       const preservedGraph = previousRootSessionId
-        ? this.forest.graphByRootSessionId.get(previousRootSessionId)
+        ? graphForSessionIdentity(this.forest, previousRootSessionId)
         : undefined
       const graph = focusedGraph ?? preservedGraph
       if (graph) {
@@ -1459,7 +1487,8 @@ export class AgentTreeApp {
           (refreshedFocusSessionId
             ? graph.endpointBySessionId.get(refreshedFocusSessionId)
             : undefined) ??
-          (previousNodeId && graph.nodes.has(previousNodeId) ? previousNodeId : graph.rootNodeId)
+          (previousTarget ? navigationTargetNodeId(graph, previousTarget) : undefined) ??
+          graph.rootNodeId
         const selectedNodeId =
           visibleGraphNodeId(graph, requestedNodeId, this.visibleEndpointSessionIds(runningIds)) ??
           initialVisibleGraphNodeId(graph, this.visibleEndpointSessionIds(runningIds))
@@ -1478,7 +1507,9 @@ export class AgentTreeApp {
         this.view = "roots"
         const preservedRootIndex = previousSelectedRoot
           ? this.forest.graphs.findIndex(
-              (candidate) => candidate.rootSessionId === previousSelectedRoot,
+              (candidate) =>
+                candidate.rootSessionId === previousSelectedRoot ||
+                candidate.sessionIds.has(previousSelectedRoot),
             )
           : -1
         this.selectedRootIndex = preservedRootIndex >= 0 ? preservedRootIndex : 0
@@ -1569,6 +1600,7 @@ export class AgentTreeApp {
       this.focusCachedGraph(startedSession.id)
       this.render()
     }
+    this.queueNavigationSave()
     this.scheduleCompletionRefresh()
   }
 
@@ -1866,6 +1898,7 @@ export class AgentTreeApp {
     this.view = "terminal"
     this.navigator.visible = false
     this.stopSpinnerAnimation()
+    this.queueNavigationSave()
   }
 
   private async returnToGraph(): Promise<void> {
@@ -1913,8 +1946,132 @@ export class AgentTreeApp {
     return node?.kind === "origin" ? undefined : node
   }
 
+  private restoreInitialNavigation(): string | undefined {
+    const state = this.initialNavigationState
+    if (!state) return undefined
+    if (state.view === "roots") {
+      const graph = state.selectedSessionId
+        ? graphForSessionIdentity(this.forest, state.selectedSessionId)
+        : undefined
+      this.selectedRootIndex = graph ? this.forest.graphs.indexOf(graph) : 0
+      this.currentRootSessionId = null
+      this.selectedGraphNodeId = null
+      this.view = "roots"
+      return undefined
+    }
+
+    const familySessionId = state.view === "terminal" ? state.sessionId : state.familySessionId
+    const graph = graphForSessionIdentity(this.forest, familySessionId)
+    const requestedNodeId = graph
+      ? state.view === "terminal"
+        ? graph.endpointBySessionId.get(state.sessionId)
+        : navigationTargetNodeId(graph, state.target)
+      : undefined
+    const selectedNodeId = graph
+      ? visibleGraphNodeId(
+          graph,
+          requestedNodeId ?? graph.rootNodeId,
+          this.visibleEndpointSessionIds(),
+        ) ?? initialVisibleGraphNodeId(graph, this.visibleEndpointSessionIds())
+      : undefined
+    if (!graph || !selectedNodeId) {
+      this.currentRootSessionId = null
+      this.selectedGraphNodeId = null
+      this.selectedRootIndex = 0
+      this.view = "roots"
+      return undefined
+    }
+
+    this.currentRootSessionId = graph.rootSessionId
+    this.selectedGraphNodeId = selectedNodeId
+    this.selectedRootIndex = this.forest.graphs.indexOf(graph)
+    this.view = "graph"
+    return state.view === "terminal" && graph.endpointBySessionId.has(state.sessionId)
+      ? state.sessionId
+      : undefined
+  }
+
+  private async restoreTerminal(sessionId: string): Promise<void> {
+    const session = this.sessions.find((candidate) => candidate.id === sessionId)
+    if (!session || session.transient) return
+    try {
+      await this.openTerminal(await this.provider.prepareResume(session))
+    } catch (error) {
+      this.showError(
+        `Could not restore ${this.provider.displayName} session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  private navigationTargetForSelection(): NavigationTarget | undefined {
+    const selected = this.selectedGraphNode()
+    if (!selected) return undefined
+    if (selected.kind === "endpoint") {
+      return { kind: "endpoint", sessionId: selected.session.id }
+    }
+    const preferred = selected.forkTarget ?? selected.aliases.at(-1) ?? selected.aliases[0]
+    if (!preferred) return undefined
+    return {
+      kind: "message",
+      preferred: { ...preferred },
+      aliases: selected.aliases.map((alias) => ({ ...alias })),
+    }
+  }
+
+  private currentNavigationState(): NewNavigationState {
+    const activeSessionId = this.terminalManager.activeSession()
+    if (this.view === "terminal" && activeSessionId) {
+      return { view: "terminal", sessionId: activeSessionId }
+    }
+    if (this.view === "graph" && this.currentRootSessionId) {
+      const target = this.navigationTargetForSelection()
+      if (target) {
+        return { view: "graph", familySessionId: this.currentRootSessionId, target }
+      }
+    }
+    return {
+      view: "roots",
+      selectedSessionId: this.forest.graphs[this.selectedRootIndex]?.rootSessionId ?? null,
+    }
+  }
+
+  private queueNavigationSave(): void {
+    if (!this.navigationPersistenceEnabled) return
+    const state = this.currentNavigationState()
+    const json = JSON.stringify(state)
+    if (json === this.queuedNavigationStateJson) return
+    this.queuedNavigationState = state
+    this.queuedNavigationStateJson = json
+    if (this.navigationSavePromise) return
+    this.startNavigationSave()
+  }
+
+  private startNavigationSave(): void {
+    this.navigationSavePromise = this.drainNavigationSaves().finally(() => {
+      this.navigationSavePromise = undefined
+      if (this.queuedNavigationState) this.startNavigationSave()
+    })
+    void this.navigationSavePromise.catch((error) => {
+      if (!this.stopping) this.showError(`Could not save navigation state: ${String(error)}`)
+    })
+  }
+
+  private async drainNavigationSaves(): Promise<void> {
+    while (this.queuedNavigationState) {
+      const state = this.queuedNavigationState
+      this.queuedNavigationState = undefined
+      await this.metadata.saveNavigationState(state)
+    }
+  }
+
+  private async flushNavigationSave(): Promise<void> {
+    this.queueNavigationSave()
+    while (this.navigationSavePromise) await this.navigationSavePromise
+  }
+
   private render(): void {
     if (this.renderer.isDestroyed) return
+    this.queueNavigationSave()
     this.updateSpinnerAnimation()
     if (this.view === "terminal") {
       this.confirmationOverlay.visible = false
@@ -2359,6 +2516,35 @@ function chunk(
 
 function styledText(chunks: TextChunk[]): StyledText {
   return new StyledText(chunks)
+}
+
+function navigationTargetNodeId(
+  graph: ConversationGraph,
+  target: NavigationTarget,
+): string | undefined {
+  if (target.kind === "endpoint") return graph.endpointBySessionId.get(target.sessionId)
+  const references = [target.preferred, ...target.aliases]
+  for (const reference of references) {
+    for (const node of graph.nodes.values()) {
+      if (
+        node.kind === "message" &&
+        node.aliases.some(
+          (alias) =>
+            alias.sessionId === reference.sessionId && alias.messageId === reference.messageId,
+        )
+      ) {
+        return node.id
+      }
+    }
+  }
+  return undefined
+}
+
+function graphForSessionIdentity(
+  forest: ConversationForest,
+  sessionId: string,
+): ConversationGraph | undefined {
+  return forest.graphBySessionId.get(sessionId) ?? forest.graphByRootSessionId.get(sessionId)
 }
 
 function renderControls(controls: FooterControl[], refreshKey?: string): {

@@ -2506,6 +2506,107 @@ test("preserves return-to-graph focus when that refresh is restarted", async () 
   }
 })
 
+test("restores a semantic graph selection across app instances", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const sessionId = "restored-graph-session"
+  const messages: AgentMessage[] = [
+    { id: "first-message", role: "user", preview: "restored first", ordinal: 0, visible: true },
+    { id: "last-message", role: "agent", preview: "restored last", ordinal: 1, visible: true },
+  ]
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      return [{ id: sessionId, title: "Restored graph", lastModified: 1 }]
+    },
+    async readTranscripts() {
+      return new Map([[sessionId, messages]])
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+  }
+
+  const firstSetup = await createTestRenderer({ width: 80, height: 24 })
+  const firstApp = await AgentTreeApp.create(firstSetup.renderer, project, provider, state)
+  const firstRun = firstApp.run()
+  try {
+    await waitForFrame(firstSetup, (frame) => frame.includes("Restored graph"))
+    firstSetup.mockInput.pressEnter()
+    await waitForFrame(firstSetup, (frame) => frame.includes("restored first"))
+    firstSetup.mockInput.pressKey("g", { shift: true })
+    await waitForFrame(firstSetup, () => isSelected(firstSetup, "restored last"))
+  } finally {
+    await firstApp.stop()
+    await firstRun
+  }
+
+  const secondSetup = await createTestRenderer({ width: 80, height: 24 })
+  const secondApp = await AgentTreeApp.create(secondSetup.renderer, project, provider, state)
+  const secondRun = secondApp.run()
+  try {
+    const restored = await waitForFrame(
+      secondSetup,
+      (frame) => frame.includes("Message graph") && isSelected(secondSetup, "restored last"),
+    )
+    expect(restored).not.toContain("Conversation roots")
+  } finally {
+    await secondApp.stop()
+    await secondRun
+  }
+})
+
+test("resumes a persisted terminal view on startup", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, '#!/bin/sh\nprintf "RESTORED_TERMINAL\\r\\n"\nsleep 30\n')
+  await chmod(executable, 0o755)
+  const sessionId = "restored-terminal-session"
+  const metadata = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+  await metadata.saveNavigationState({ view: "terminal", sessionId })
+  const resumed: string[] = []
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      return [{ id: sessionId, title: "Restored terminal", lastModified: 1 }]
+    },
+    async readTranscripts() {
+      return new Map([
+        [sessionId, [{ id: "message", role: "user", preview: "prompt", ordinal: 0, visible: true }]],
+      ])
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume(session) {
+      resumed.push(session.id)
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("RESTORED_TERMINAL"))
+    expect(resumed).toEqual([sessionId])
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 async function temporaryDirectory(): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), "claude-tree-app-test-"))
   temporaryDirectories.push(path)

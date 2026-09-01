@@ -46,6 +46,10 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
+## Restoring Your View
+
+`claude-tree` remembers the current roots selection, graph message, or open agent terminal for each project and provider. The next invocation restores that semantic location when it still exists. An open terminal is resumed through the provider; terminal scrollback, transient dialogs, and unsent drafts are not persisted.
+
 ## Development
 
 The development shell includes Bun and the validated provider CLIs available for the platform:
