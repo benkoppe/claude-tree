@@ -48,7 +48,7 @@ test("does not let a stale composer override working title activity", () => {
   const observer = new ClaudeTerminalObserver()
   expect(
     observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ Claude Code\u0007")),
-  ).toBe("working")
+  ).toEqual(["working"])
   expect(
     observer.observeScreen({
       text: "",
@@ -64,7 +64,7 @@ test("does not let a stale working footer override idle title activity", () => {
   const observer = new ClaudeTerminalObserver()
   expect(
     observer.observeOutput(new TextEncoder().encode("\u001b]0;✳ Claude Code\u0007")),
-  ).toBe("idle")
+  ).toEqual(["idle"])
   expect(
     observer.observeScreen({
       text: "",
@@ -74,6 +74,15 @@ test("does not let a stale working footer override idle title activity", () => {
       cursor: { x: 0, y: 0, visible: false },
     }),
   ).toBeUndefined()
+})
+
+test("preserves ordered Claude activity transitions in one output chunk", () => {
+  const observer = new ClaudeTerminalObserver()
+  const output = new TextEncoder().encode(
+    "\u001b]0;⠋ Claude Code\u0007\u001b]0;✳ Claude Code\u0007",
+  )
+
+  expect(observer.observeOutput(output)).toEqual(["working", "idle"])
 })
 
 test("uses the visible Claude footer and composer as activity fallbacks", () => {

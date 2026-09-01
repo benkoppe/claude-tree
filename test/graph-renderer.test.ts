@@ -16,7 +16,7 @@ import {
   renderConversationGraph,
   renderRootPicker,
 } from "../src/graph-renderer"
-import { buildConversationForest } from "../src/message-graph"
+import { buildConversationForest, type ConversationGraph } from "../src/message-graph"
 import type { BranchRelation } from "../src/metadata"
 import { theme } from "../src/theme"
 
@@ -405,6 +405,44 @@ describe("display text", () => {
 })
 
 describe("spatial graph navigation", () => {
+  test("preserves post-order positions for a branched graph", () => {
+    const graph = branchGraph()
+    const layout = layoutConversationGraph(graph, 100, new Set([ROOT, CHILD]))
+    const rootId = graph.rootNodeId
+    const mainId = nodeIdByPreview(graph, "main answer")
+    const branchId = nodeIdByPreview(graph, "fork answer")
+    const mainEndpointId = graph.endpointBySessionId.get(ROOT)!
+    const branchEndpointId = graph.endpointBySessionId.get(CHILD)!
+
+    expect([...layout.nodes.keys()]).toEqual([
+      mainEndpointId,
+      mainId,
+      branchEndpointId,
+      branchId,
+      rootId,
+    ])
+    expect([...layout.nodes.values()].map(({ node, x, y }) => [node.id, x, y])).toEqual([
+      [mainEndpointId, 0, 8],
+      [mainId, 0, 4],
+      [branchEndpointId, 36, 8],
+      [branchId, 36, 4],
+      [rootId, 18, 0],
+    ])
+  })
+
+  test("lays out a 10,000-node linear graph without overflowing the call stack", () => {
+    const graph = linearGraph(10_000)
+    const layout = layoutConversationGraph(graph, 100)
+
+    expect(layout.nodes.size).toBe(10_000)
+    expect([...layout.nodes.keys()][0]).toBe("linear:9999")
+    expect([...layout.nodes.keys()][9_999]).toBe("linear:0")
+    expect(layout.nodes.get("linear:0")).toMatchObject({ x: 0, y: 0 })
+    expect(layout.nodes.get("linear:9999")).toMatchObject({ x: 0, y: 39_996 })
+    expect(layout.worldWidth).toBe(32)
+    expect(layout.worldHeight).toBe(39_998)
+  })
+
   test("moves in all four directions across different parent chains", () => {
     const graph = branchGraph()
     const layout = layoutConversationGraph(graph, 100, new Set([ROOT, CHILD]))
@@ -717,6 +755,40 @@ function nodeIdByPreview(graph: ReturnType<typeof branchGraph>, preview: string)
   )
   if (!node) throw new Error(`Missing graph node: ${preview}`)
   return node.id
+}
+
+function linearGraph(nodeCount: number): ConversationGraph {
+  const rootSession = session(ROOT, "Linear", 20)
+  const originNodeId = "origin:linear"
+  const nodes: ConversationGraph["nodes"] = new Map()
+  nodes.set(originNodeId, {
+    id: originNodeId,
+    kind: "origin",
+    parentId: null,
+    childIds: nodeCount > 0 ? ["linear:0"] : [],
+  })
+  for (let index = 0; index < nodeCount; index += 1) {
+    nodes.set(`linear:${index}`, {
+      id: `linear:${index}`,
+      kind: "message",
+      parentId: index === 0 ? originNodeId : `linear:${index - 1}`,
+      childIds: index + 1 < nodeCount ? [`linear:${index + 1}`] : [],
+      role: "user",
+      preview: `Message ${index}`,
+      internal: false,
+      aliases: [],
+    })
+  }
+  return {
+    rootSessionId: ROOT,
+    rootSession,
+    originNodeId,
+    rootNodeId: nodeCount > 0 ? "linear:0" : "",
+    nodes,
+    endpointBySessionId: new Map(),
+    sessionIds: new Set([ROOT]),
+    warnings: [],
+  }
 }
 
 function session(id: string, title: string, lastModified: number): AgentSession {

@@ -369,6 +369,7 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): CodexM
         turnId: turn.id,
         turnStatus: turn.status,
         itemIndex,
+        turnComplete: turn.status !== "inProgress",
       })
     }
   }

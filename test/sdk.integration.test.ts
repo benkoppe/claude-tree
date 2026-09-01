@@ -99,6 +99,41 @@ test("the pinned SDK preserves consecutive message roles at an exact fork bounda
   expect(childMessages.map((message) => message.uuid)).not.toContain(agentOneId)
 })
 
+test("the pinned SDK returns streamed assistant blocks as separate transcript records", async () => {
+  const store = new InMemorySessionStore()
+  const sessionId = crypto.randomUUID()
+  const userId = crypto.randomUUID()
+  const firstBlockId = crypto.randomUUID()
+  const secondBlockId = crypto.randomUUID()
+  const apiMessageId = "msg_streamed"
+  const timestamp = "2026-08-30T12:00:00.000Z"
+  const projectKey = process.cwd().replaceAll("/", "-")
+  await store.append({ projectKey, sessionId }, [
+    userEntry(sessionId, userId, null, "question", timestamp),
+    agentEntry(sessionId, firstBlockId, userId, "first block", timestamp, apiMessageId, null),
+    agentEntry(
+      sessionId,
+      secondBlockId,
+      firstBlockId,
+      "second block",
+      timestamp,
+      apiMessageId,
+      "end_turn",
+    ),
+  ])
+
+  const messages = await getSessionMessages(sessionId, {
+    dir: process.cwd(),
+    sessionStore: store,
+  })
+
+  expect(messages.map((message) => message.uuid)).toEqual([userId, firstBlockId, secondBlockId])
+  expect(messages.slice(1).map((message) => (message.message as { id: string }).id)).toEqual([
+    apiMessageId,
+    apiMessageId,
+  ])
+})
+
 function userEntry(
   sessionId: string,
   uuid: string,
@@ -123,6 +158,8 @@ function agentEntry(
   parentUuid: string,
   text: string,
   timestamp: string,
+  apiMessageId = `msg_${uuid}`,
+  stopReason: string | null = "end_turn",
 ): SessionStoreEntry {
   return {
     type: "assistant",
@@ -132,12 +169,12 @@ function agentEntry(
     timestamp,
     cwd: process.cwd(),
     message: {
-      id: `msg_${uuid}`,
+      id: apiMessageId,
       type: "message",
       role: "assistant",
       model: "test",
       content: [{ type: "text", text }],
-      stop_reason: "end_turn",
+      stop_reason: stopReason,
       stop_sequence: null,
       usage: { input_tokens: 1, output_tokens: 1 },
     },

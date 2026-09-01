@@ -57,6 +57,24 @@ describe("Codex message normalization", () => {
     expect(messages[1]?.rawItem).toBe(rawTool)
     expect(messages[1]?.turnId).toBe("turn-1")
     expect(messages.map((message) => message.ordinal)).toEqual([0, 1, 2, 3])
+    expect(messages[2]?.turnComplete).toBeTrue()
+    expect(normalizeCodexThread(codexThread(ROOT, [
+      turn("turn-2", "inProgress", [
+        { type: "agentMessage", id: "agent-working", text: "Working" },
+      ]),
+    ]))[0]?.turnComplete).toBeFalse()
+    for (const status of ["interrupted", "failed"] as const) {
+      expect(normalizeCodexThread(codexThread(ROOT, [
+        turn(`turn-${status}`, status, [
+          { type: "agentMessage", id: `agent-${status}`, text: status },
+        ]),
+      ]))[0]?.turnComplete).toBeTrue()
+    }
+    expect(normalizeCodexThread(codexThread(ROOT, [
+      turn("turn-interrupted-user-only", "interrupted", [
+        user("user-interrupted", [{ type: "text", text: "Interrupted" }]),
+      ]),
+    ]))[0]?.turnComplete).toBeTrue()
   })
 
   test("formats unknown and empty user inputs conservatively", () => {

@@ -54,6 +54,83 @@ describe("Claude message normalization", () => {
     expect((await provider.readTranscripts([ROOT])).get(ROOT)?.[0]?.role).toBe("agent")
   })
 
+  test("groups assistant continuations by visible user turn across hidden records", async () => {
+    const firstUser = message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question")
+    const firstAssistant = apiAssistantMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "api-message-one",
+      "Let me inspect that.",
+      "tool_use",
+    )
+    const toolResult = toolResultMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+    )
+    const command = stringMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+      "user",
+      "<command-name>/status</command-name>",
+    )
+    const commandOutput = stringMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
+      "user",
+      "<local-command-stdout>Ready</local-command-stdout>",
+    )
+    const secondAssistant = apiAssistantMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
+      "api-message-two",
+      "Here is the answer.",
+      "end_turn",
+    )
+    const secondUser = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7",
+      "user",
+      "follow-up",
+    )
+    const thirdAssistant = apiAssistantMessage(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8",
+      "api-message-three",
+      "Follow-up answer.",
+    )
+    const records = [
+      firstUser,
+      firstAssistant,
+      toolResult,
+      command,
+      commandOutput,
+      secondAssistant,
+      secondUser,
+      thirdAssistant,
+    ]
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({ parent: records }))
+
+    const transcript = (await provider.readTranscripts([ROOT])).get(ROOT) ?? []
+
+    expect(transcript.map((entry) => entry.id)).toEqual(records.map((entry) => entry.uuid))
+    expect(transcript.map((entry) => entry.visible)).toEqual([
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+    ])
+    expect(transcript[1]?.displayGroupId).toBe(firstUser.uuid)
+    expect(transcript[5]?.displayGroupId).toBe(firstUser.uuid)
+    expect(transcript[7]?.displayGroupId).toBe(secondUser.uuid)
+    expect(transcript[1]?.displayGroupId).not.toBe(transcript[7]?.displayGroupId)
+    expect(transcript[1]?.turnComplete).toBeFalse()
+    expect(transcript[5]?.turnComplete).toBeTrue()
+  })
+
   test("retains local command records internally but hides them from the graph", async () => {
     const command = stringMessage(
       ROOT,
@@ -290,6 +367,42 @@ function stringMessage(
     uuid,
     session_id: sessionId,
     message: { role: type, content: text },
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+  }
+}
+
+function apiAssistantMessage(
+  sessionId: string,
+  uuid: string,
+  apiMessageId: string,
+  text: string,
+  stopReason?: string | null,
+): SessionMessage {
+  return {
+    type: "assistant",
+    uuid,
+    session_id: sessionId,
+    message: {
+      id: apiMessageId,
+      role: "assistant",
+      content: [{ type: "text", text }],
+      ...(stopReason === undefined ? {} : { stop_reason: stopReason }),
+    },
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+  }
+}
+
+function toolResultMessage(sessionId: string, uuid: string): SessionMessage {
+  return {
+    type: "user",
+    uuid,
+    session_id: sessionId,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "tool-call", content: "result" }],
+    },
     parent_tool_use_id: null,
     parent_agent_id: null,
   }

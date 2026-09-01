@@ -345,8 +345,7 @@ export class TerminalManager {
             pty = childPty
             if (manager.shuttingDown || (managed && managed.state !== "running")) return
             const clipboardWrites = osc52.observe(data)
-            const activity = launch.observer.observeOutput(data)
-            if (activity !== undefined) {
+            for (const activity of launch.observer.observeOutput(data)) {
               observedActivity = activity
               if (managed) manager.setActivity(managed, activity)
             }

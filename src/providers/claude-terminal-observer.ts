@@ -7,15 +7,15 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   private readonly parser = new OscSequenceParser()
   private titleActivity: AgentActivity | undefined
 
-  observeOutput(bytes: Uint8Array): AgentActivity | undefined {
-    let observed: AgentActivity | undefined
+  observeOutput(bytes: Uint8Array): readonly AgentActivity[] {
+    const observed: AgentActivity[] = []
     for (const body of this.parser.observe(bytes)) {
       const title = decodeOscTitle(body)
       if (title === undefined) continue
       const activity = claudeActivityFromTitle(title)
-      if (activity !== undefined) observed = activity
+      if (activity !== undefined) observed.push(activity)
     }
-    if (observed !== undefined) this.titleActivity = observed
+    if (observed.length > 0) this.titleActivity = observed.at(-1)
     return observed
   }
 

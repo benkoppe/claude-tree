@@ -203,13 +203,11 @@ test("uses launch arguments and initial draft only when spawning a process", asy
   }
 })
 
-test("tracks OSC activity transitions from a hidden process", async () => {
+test("tracks ordered OSC activity transitions from one hidden-process output chunk", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
   const fakeClaude = await createFakeClaude(
     String.raw`sleep 0.05
-    printf '\033]0;\342\240\213 Claude Code\007'
-    sleep 0.15
-    printf '\033]0;\342\234\263 Claude Code\007'
+    printf '\033]0;\342\240\213 Claude Code\007\033]0;\342\234\263 Claude Code\007'
     sleep 30`,
   )
   const activityChanges: Array<{ sessionId: string; activity: "working" | "idle" }> = []
@@ -223,8 +221,8 @@ test("tracks OSC activity transitions from a hidden process", async () => {
   try {
     await manager.show(launch(fakeClaude, sessionId))
     manager.hideActive()
-    await waitUntil(() => manager.workingSessionIds().has(sessionId))
-    await waitUntil(() => !manager.workingSessionIds().has(sessionId))
+    await waitUntil(() => activityChanges.length === 2)
+    expect(manager.workingSessionIds().has(sessionId)).toBeFalse()
     expect(activityChanges).toEqual([
       { sessionId, activity: "working" },
       { sessionId, activity: "idle" },

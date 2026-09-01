@@ -39,6 +39,15 @@ export interface ConversationGraphLayout {
   worldHeight: number
 }
 
+interface LayoutTraversalFrame {
+  node: MessageGraphNodeOrEndpoint
+  depth: number
+  visibleChildren: MessageGraphNodeOrEndpoint[]
+  nextChildIndex: number
+  firstChildCenter: number | undefined
+  lastChildCenter: number | undefined
+}
+
 export function graphNodeAt(
   layout: ConversationGraphLayout,
   worldX: number,
@@ -96,40 +105,54 @@ export function layoutConversationGraph(
   const stride = nodeWidth + GRAPH_HORIZONTAL_GAP
   let nextLeaf = 0
 
-  const position = (nodeId: string, depth: number): number => {
-    const node = graph.nodes.get(nodeId)
-    if (!node || node.kind === "origin") return 0
-    if (!isPositionedNode(graph, node, visibleEndpointSessionIds)) {
-      return 0
-    }
-
-    let center: number
-    const visibleChildIds = node.childIds.filter((childId) => {
-      const child = graph.nodes.get(childId)
-      return child ? isPositionedNode(graph, child, visibleEndpointSessionIds) : false
-    })
-    if (visibleChildIds.length === 0) {
-      center = nextLeaf * stride + Math.floor(nodeWidth / 2)
-      nextLeaf += 1
-    } else {
-      const childCenters = visibleChildIds.map((childId) => position(childId, depth + 1))
-      center = Math.round((childCenters[0]! + childCenters[childCenters.length - 1]!) / 2)
-    }
-    positioned.set(nodeId, {
-      node,
-      x: Math.max(0, center - Math.floor(nodeWidth / 2)),
-      y: depth * (GRAPH_NODE_HEIGHT + GRAPH_VERTICAL_GAP),
-      width: nodeWidth,
-      height: GRAPH_NODE_HEIGHT,
-    })
-    return center
-  }
-
   const origin = graph.nodes.get(graph.originNodeId)
   for (const rootId of origin?.childIds ?? []) {
     const root = graph.nodes.get(rootId)
-    if (root && isPositionedNode(graph, root, visibleEndpointSessionIds)) {
-      position(rootId, 0)
+    if (!root || root.kind === "origin" || !isPositionedNode(graph, root, visibleEndpointSessionIds)) {
+      continue
+    }
+
+    const traversal: LayoutTraversalFrame[] = [{
+      node: root,
+      depth: 0,
+      visibleChildren: visibleChildren(graph, root, visibleEndpointSessionIds),
+      nextChildIndex: 0,
+      firstChildCenter: undefined,
+      lastChildCenter: undefined,
+    }]
+    while (traversal.length > 0) {
+      const frame = traversal[traversal.length - 1]!
+      const child = frame.visibleChildren[frame.nextChildIndex]
+      if (child) {
+        frame.nextChildIndex += 1
+        traversal.push({
+          node: child,
+          depth: frame.depth + 1,
+          visibleChildren: visibleChildren(graph, child, visibleEndpointSessionIds),
+          nextChildIndex: 0,
+          firstChildCenter: undefined,
+          lastChildCenter: undefined,
+        })
+        continue
+      }
+
+      const center = frame.visibleChildren.length === 0
+        ? nextLeaf++ * stride + Math.floor(nodeWidth / 2)
+        : Math.round((frame.firstChildCenter! + frame.lastChildCenter!) / 2)
+      positioned.set(frame.node.id, {
+        node: frame.node,
+        x: Math.max(0, center - Math.floor(nodeWidth / 2)),
+        y: frame.depth * (GRAPH_NODE_HEIGHT + GRAPH_VERTICAL_GAP),
+        width: nodeWidth,
+        height: GRAPH_NODE_HEIGHT,
+      })
+      traversal.pop()
+
+      const parent = traversal[traversal.length - 1]
+      if (parent) {
+        parent.firstChildCenter ??= center
+        parent.lastChildCenter = center
+      }
     }
   }
 
@@ -140,6 +163,20 @@ export function layoutConversationGraph(
     worldHeight = Math.max(worldHeight, node.y + node.height)
   }
   return { nodes: positioned, nodeWidth, worldWidth, worldHeight }
+}
+
+function visibleChildren(
+  graph: ConversationGraph,
+  node: MessageGraphNodeOrEndpoint,
+  visibleEndpointSessionIds: ReadonlySet<string>,
+): MessageGraphNodeOrEndpoint[] {
+  return node.childIds
+    .map((childId) => graph.nodes.get(childId))
+    .filter((child): child is MessageGraphNodeOrEndpoint =>
+      child !== undefined &&
+      child.kind !== "origin" &&
+      isPositionedNode(graph, child, visibleEndpointSessionIds)
+    )
 }
 
 function isPositionedNode(
