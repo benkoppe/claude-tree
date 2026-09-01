@@ -5,7 +5,14 @@ import {
   type Selection,
 } from "@opentui/core"
 
-import type { AgentActivity, DraftPreview, TerminalLaunch, TerminalObserver } from "./agent-provider"
+import type {
+  AgentActivity,
+  AgentSession,
+  BranchDerivation,
+  DraftPreview,
+  TerminalLaunch,
+  TerminalObserver,
+} from "./agent-provider"
 import { Osc52Forwarder } from "./clipboard"
 
 const SHUTDOWN_GRACE_PERIOD_MS = 200
@@ -25,17 +32,33 @@ interface ManagedTerminal {
   activity: AgentActivity
   cleanup?: () => Promise<void>
   cleanupPromise?: Promise<void>
+  unsubscribeTransitions?: () => void
 }
 
 export interface TerminalExitEvent {
   sessionId: string
   exitCode: number
   wasActive: boolean
+  draftPreview?: DraftPreview
+  cleanupError?: Error
 }
 
 export interface TerminalActivityEvent {
   sessionId: string
   activity: AgentActivity
+}
+
+export interface TerminalSessionChangedEvent {
+  previousSessionId: string
+  session: AgentSession
+  wasActive: boolean
+  derivation?: Promise<BranchDerivation | undefined>
+}
+
+export interface TerminalSessionTransitionErrorEvent {
+  sessionId: string
+  error: Error
+  wasActive: boolean
 }
 
 export interface TerminalStopRequest {
@@ -54,6 +77,10 @@ export class TerminalManager {
     private readonly renderer: CliRenderer,
     private readonly onProcessExited: (event: TerminalExitEvent) => void,
     private readonly onActivityChanged: (event: TerminalActivityEvent) => void = () => undefined,
+    private readonly onSessionChanged: (event: TerminalSessionChangedEvent) => void = () => undefined,
+    private readonly onSessionTransitionError: (
+      event: TerminalSessionTransitionErrorEvent,
+    ) => void = () => undefined,
   ) {
     renderer.on(CliRenderEvents.SELECTION, this.onSelection)
   }
@@ -229,6 +256,11 @@ export class TerminalManager {
       const survivors = owned.filter((managed) => isProcessGroupAlive(managed.process.pid))
       signalProcessGroups(survivors, "SIGKILL", errors)
       await waitForProcessGroups(survivors, FORCED_SHUTDOWN_PERIOD_MS)
+      for (const managed of survivors) {
+        if (isProcessGroupAlive(managed.process.pid)) {
+          errors.push(new Error(`Agent process group ${managed.process.pid} did not stop`))
+        }
+      }
       await Promise.allSettled(pendingStops)
       const cleanups = await Promise.allSettled(owned.map((managed) => this.cleanupManaged(managed)))
       for (const cleanup of cleanups) {
@@ -309,7 +341,12 @@ export class TerminalManager {
       maxScrollback: 1_000_000,
       onData(data, source) {
         if (managed?.state !== "running") return
-        if (source === "input" && managed) managed.inputObserved = true
+        if (source === "input" && managed) {
+          managed.inputObserved = true
+          managed.observer.observeInput?.(data)
+          const observedDraft = managed.observer.observeDraft(managed.terminal.screen())
+          if (observedDraft?.rewind) managed.draftPreview = observedDraft
+        }
         if (pty && !pty.closed) pty.write(data)
       },
       onTerminalResize(nextCols, nextRows) {
@@ -318,7 +355,8 @@ export class TerminalManager {
       },
       onScreenChange() {
         if (!managed || managed.state !== "running") return
-        const activity = launch.observer.observeScreen(terminal.screen())
+        const screen = terminal.screen()
+        const activity = launch.observer.observeScreen(screen)
         if (activity !== undefined) {
           observedActivity = activity
           manager.setActivity(managed, activity)
@@ -386,11 +424,24 @@ export class TerminalManager {
       activity: observedActivity,
       ...(launch.cleanup === undefined ? {} : { cleanup: launch.cleanup }),
     }
+    if (launch.sessionTransitions) {
+      managed.unsubscribeTransitions = launch.sessionTransitions.subscribe(
+        (transition) => this.applySessionTransition(managed!, transition),
+        (error) => this.failSessionTransition(managed!, error),
+      )
+    }
     void process.exited.then(async (exitCode) => {
       managed.exitCode = exitCode
       await waitForPtyDrain(ptyClosed)
-      await this.cleanupManaged(managed).catch(() => undefined)
-      if (managed.state !== "running") return
+      const reportNaturalExit = managed.state === "running"
+      let cleanupError: Error | undefined
+      try {
+        await this.cleanupManaged(managed)
+      } catch (error) {
+        cleanupError = error instanceof Error ? error : new Error(String(error))
+        if (reportNaturalExit) managed.state = "cleanup-incomplete"
+      }
+      if (!reportNaturalExit) return
       if (this.terminals.get(managed.sessionId) !== managed) return
       const wasActive = this.activeSessionId === managed.sessionId
       if (wasActive) {
@@ -398,8 +449,14 @@ export class TerminalManager {
         this.renderer.clearSelection()
       }
       this.destroyTerminal(managed)
-      this.terminals.delete(managed.sessionId)
-      this.onProcessExited({ sessionId: managed.sessionId, exitCode, wasActive })
+      if (cleanupError === undefined) this.terminals.delete(managed.sessionId)
+      this.onProcessExited({
+        sessionId: managed.sessionId,
+        exitCode,
+        wasActive,
+        ...(managed.draftPreview === undefined ? {} : { draftPreview: managed.draftPreview }),
+        ...(cleanupError === undefined ? {} : { cleanupError }),
+      })
     })
     return managed
   }
@@ -409,8 +466,8 @@ export class TerminalManager {
     if (!managed.inputObserved && managed.draftPreview?.exact) return
     const observed = managed.observer.observeDraft(screen)
     if (observed !== undefined) {
-      managed.draftPreview = { text: observed, exact: false }
-    } else if (managed.inputObserved) {
+      managed.draftPreview = observed
+    } else if (managed.inputObserved && !managed.draftPreview?.rewind) {
       delete managed.draftPreview
     }
     managed.inputObserved = false
@@ -424,8 +481,94 @@ export class TerminalManager {
   }
 
   private cleanupManaged(managed: ManagedTerminal): Promise<void> {
+    managed.unsubscribeTransitions?.()
+    delete managed.unsubscribeTransitions
     managed.cleanupPromise ??= managed.cleanup?.() ?? Promise.resolve()
     return managed.cleanupPromise
+  }
+
+  private applySessionTransition(
+    managed: ManagedTerminal,
+    transition: {
+      session: AgentSession
+      derivation?: Promise<BranchDerivation | undefined>
+    },
+  ): void {
+    const discardDerivation = () => { void transition.derivation?.catch(() => undefined) }
+    if (this.shuttingDown) {
+      this.onSessionChanged({
+        previousSessionId: managed.sessionId,
+        session: transition.session,
+        wasActive: false,
+        ...(transition.derivation === undefined ? {} : { derivation: transition.derivation }),
+      })
+      return
+    }
+    if (managed.state !== "running" || managed.exitCode !== null) {
+      discardDerivation()
+      return
+    }
+    const previousSessionId = managed.sessionId
+    const sessionId = transition.session.id
+    if (sessionId === previousSessionId) {
+      discardDerivation()
+      return
+    }
+    if (this.terminals.get(previousSessionId) !== managed) {
+      discardDerivation()
+      return
+    }
+
+    const existing = this.terminals.get(sessionId)
+    if (existing && existing !== managed) {
+      discardDerivation()
+      const wasActive = this.activeSessionId === previousSessionId
+      const transitionError = new Error(
+        `Agent session ${sessionId} already has an owned terminal; stopped the duplicate process`,
+      )
+      const request = this.stopSession(previousSessionId)
+      this.onSessionTransitionError({
+        sessionId: previousSessionId,
+        wasActive,
+        error: transitionError,
+      })
+      void request?.completion.catch((cleanupError) =>
+        this.onSessionTransitionError({
+          sessionId: previousSessionId,
+          wasActive,
+          error: new AggregateError([transitionError, cleanupError], transitionError.message),
+        }),
+      )
+      return
+    }
+
+    const wasActive = this.activeSessionId === previousSessionId
+    this.terminals.delete(previousSessionId)
+    managed.sessionId = sessionId
+    this.terminals.set(sessionId, managed)
+    if (wasActive) this.activeSessionId = sessionId
+    this.onSessionChanged({
+      previousSessionId,
+      session: transition.session,
+      wasActive,
+      ...(transition.derivation === undefined ? {} : { derivation: transition.derivation }),
+    })
+  }
+
+  private failSessionTransition(managed: ManagedTerminal, error: Error): void {
+    if (managed.state !== "running" || managed.exitCode !== null) return
+    const sessionId = managed.sessionId
+    if (this.terminals.get(sessionId) !== managed) return
+    const wasActive = this.activeSessionId === sessionId
+    const request = this.stopSession(sessionId)
+    this.onSessionTransitionError({ sessionId, error, wasActive })
+    void request?.completion.catch((cleanupError) =>
+      this.onSessionTransitionError({
+        sessionId,
+        wasActive,
+        error: new AggregateError([error, cleanupError], error.message),
+      }),
+    )
   }
 
   private pruneExited(): void {

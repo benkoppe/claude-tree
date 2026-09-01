@@ -12,7 +12,12 @@ import {
   type AgentMessage,
   type AgentProvider,
   type AgentSession,
+  type BranchDerivation,
+  type DraftPreview,
   type PreparedSession,
+  type TerminalObserver,
+  type TerminalSessionTransition,
+  type TerminalSessionTransitionSource,
 } from "../src/agent-provider"
 import { AgentTreeApp } from "../src/app"
 import { displayWidth } from "../src/display-text"
@@ -20,7 +25,7 @@ import { BRAILLE_SPINNER_FRAMES } from "../src/graph-renderer"
 import { BranchMetadataStore } from "../src/metadata"
 import { PROGRAM_VERSION } from "../src/program"
 import { ClaudeProvider } from "../src/providers/claude"
-import { TerminalManager } from "../src/terminal-manager"
+import { TerminalManager, type TerminalSessionChangedEvent } from "../src/terminal-manager"
 import { theme } from "../src/theme"
 
 const temporaryDirectories: string[] = []
@@ -1374,6 +1379,283 @@ test("killing an empty branched draft restores a resumable Fork leaf", async () 
   }
 })
 
+test("moves a live terminal to a provider-created fork and preserves the source endpoint", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, "#!/bin/sh\nsleep 30\n")
+  await chmod(executable, 0o755)
+
+  const parentId = "parent-session"
+  const childId = "native-child-session"
+  const parent: AgentSession = { id: parentId, title: "Parent", lastModified: 1 }
+  const child: AgentSession = { id: childId, title: "Native fork", lastModified: 2 }
+  const parentTranscript: AgentMessage[] = [
+    { id: "parent-user", role: "user", preview: "question", ordinal: 0, visible: true },
+    { id: "parent-agent", role: "agent", preview: "answer", ordinal: 1, visible: true },
+    { id: "parent-later", role: "user", preview: "original continuation", ordinal: 2, visible: true },
+  ]
+  const childTranscript: AgentMessage[] = [
+    { id: "child-user", role: "user", preview: "question", ordinal: 0, visible: true },
+    { id: "child-agent", role: "agent", preview: "answer", ordinal: 1, visible: true },
+  ]
+  const transitions = appTransitionSource()
+  let switched = false
+  const transcriptReads: string[][] = []
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      return switched ? [child, parent] : [parent]
+    },
+    async readTranscripts(sessionIds) {
+      transcriptReads.push([...sessionIds])
+      return new Map(sessionIds.map((sessionId) => [
+        sessionId,
+        sessionId === childId ? childTranscript : parentTranscript,
+      ]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+        sessionTransitions: transitions.source,
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Parent"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("original continuation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+
+    switched = true
+    let resolveDerivation!: (derivation: {
+      childSessionId: string
+      parentSessionId: string
+      sourceMessageId: string
+      sharedMessages: Array<{ parentMessageId: string; childMessageId: string }>
+    }) => void
+    const derivation = new Promise<Parameters<typeof resolveDerivation>[0]>((resolve) => {
+      resolveDerivation = resolve
+    })
+    const completionState = app as unknown as {
+      pendingCompletionRefreshes: Map<string, number>
+      completionRefreshAttempts: Map<string, number>
+    }
+    completionState.pendingCompletionRefreshes.set(parentId, 999)
+    completionState.completionRefreshAttempts.set(parentId, 1)
+    transitions.emit({
+      session: child,
+      derivation,
+    })
+    expect(completionState.pendingCompletionRefreshes.get(parentId)).toBe(999)
+    expect(completionState.pendingCompletionRefreshes.has(childId)).toBeFalse()
+    completionState.pendingCompletionRefreshes.delete(parentId)
+    completionState.completionRefreshAttempts.delete(parentId)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(setup, (frame) => frame.includes("Draft") && isSelected(setup, "Draft"))
+    setup.mockInput.pressKey("d")
+    await Bun.sleep(10)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Delete conversation")
+
+    resolveDerivation({
+      childSessionId: childId,
+      parentSessionId: parentId,
+      sourceMessageId: "parent-agent",
+      sharedMessages: [
+        { parentMessageId: "parent-user", childMessageId: "child-user" },
+        { parentMessageId: "parent-agent", childMessageId: "child-agent" },
+      ],
+    })
+    const metadata = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+    await waitUntil(async () => (await metadata.loadRelations()).length === 1)
+
+    const graph = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("original continuation") &&
+        frame.includes("Draft"),
+    )
+    expect(graph.indexOf("answer")).toBeLessThan(graph.indexOf("original continuation"))
+    expect(isSelected(setup, "Draft")).toBeTrue()
+    expect(transcriptReads.some((ids) => ids.includes(parentId) && ids.includes(childId))).toBeTrue()
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("keeps a live terminal accessible when it switches into a removed session", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, "#!/bin/sh\nsleep 30\n")
+  await chmod(executable, 0o755)
+
+  const visible: AgentSession = { id: "visible-session", title: "Visible", lastModified: 2 }
+  const removed: AgentSession = { id: "removed-session", title: "Removed", lastModified: 1 }
+  const transitions = appTransitionSource()
+  const metadata = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+  await metadata.saveRemoval({
+    kind: "tree",
+    rootSessionId: removed.id,
+    memberSessionIds: [removed.id],
+  })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [visible, removed] },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [{
+        id: `${sessionId}-message`,
+        role: "user" as const,
+        preview: sessionId === removed.id ? "removed secret" : "visible question",
+        ordinal: 0,
+        visible: true,
+      }]]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume(session) {
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: new NullTerminalObserver(),
+        sessionTransitions: transitions.source,
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    const roots = await waitForFrame(setup, (frame) => frame.includes("Visible"))
+    expect(roots).not.toContain("Removed")
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("visible question"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+
+    transitions.emit({ session: removed })
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const fallback = await waitForFrame(
+      setup,
+      (frame) => frame.includes("Draft") && isSelected(setup, "Draft"),
+    )
+    expect(fallback).not.toContain("removed secret")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("waits for in-flight session ancestry persistence during shutdown", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const parent: AgentSession = { id: "shutdown-parent", title: "Parent", lastModified: 1 }
+  const child: AgentSession = { id: "shutdown-child", title: "Child", lastModified: 2 }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [parent, child] },
+    async readTranscripts(sessionIds) {
+      return new Map(sessionIds.map((sessionId) => [sessionId, [{
+        id: `${sessionId}-message`,
+        role: "user" as const,
+        preview: "question",
+        ordinal: 0,
+        visible: true,
+      }]]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+  let resolveDerivation!: (derivation: BranchDerivation) => void
+  const derivation = new Promise<BranchDerivation>((resolve) => { resolveDerivation = resolve })
+
+  await waitForFrame(setup, (frame) => frame.includes("Parent") && frame.includes("Child"))
+  ;(app as unknown as {
+    onTerminalSessionChanged(event: TerminalSessionChangedEvent): void
+  }).onTerminalSessionChanged({
+    previousSessionId: parent.id,
+    session: child,
+    wasActive: false,
+    derivation,
+  })
+  let stopped = false
+  const stopping = app.stop().then(() => { stopped = true })
+  await Bun.sleep(20)
+  expect(stopped).toBeFalse()
+
+  resolveDerivation({
+    childSessionId: child.id,
+    parentSessionId: parent.id,
+    sourceMessageId: `${parent.id}-message`,
+    sharedMessages: [{
+      parentMessageId: `${parent.id}-message`,
+      childMessageId: `${child.id}-message`,
+    }],
+  })
+  await stopping
+  await running
+  const metadata = await BranchMetadataStore.openForProvider(project, "test-agent", state)
+  expect(await metadata.loadRelations()).toHaveLength(1)
+})
+
+test("reports a late session-transition failure during shutdown", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [] },
+    async readTranscripts() { return new Map() },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+  await waitForFrame(setup, (frame) => frame.includes("No conversations"))
+
+  let rejectTransition!: (error: Error) => void
+  const transition = new Promise<void>((_resolve, reject) => { rejectTransition = reject })
+  const stopping = app.stop()
+  ;(app as unknown as {
+    trackSessionTransition(reconciliation: Promise<void>, reportErrors: boolean): void
+  }).trackSessionTransition(transition, false)
+  rejectTransition(new Error("ancestry write failed"))
+
+  await expect(stopping).rejects.toThrow("Unable to finish claude-tree shutdown cleanly")
+  await running
+})
+
 test("removes a live root only after confirmation and keeps it removed after refresh and restart", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -2188,6 +2470,20 @@ sleep 30
     undefined,
     "end_turn",
   )
+  const rewoundUser = sessionMessage(
+    sessionId,
+    "cccccccc-cccc-4ccc-8ccc-ccccccccccc5",
+    "user",
+    "rewound question",
+  )
+  const removedAgent = sessionMessage(
+    sessionId,
+    "cccccccc-cccc-4ccc-8ccc-ccccccccccc6",
+    "assistant",
+    "removed answer",
+    undefined,
+    "end_turn",
+  )
   const newUser = sessionMessage(sessionId, "cccccccc-cccc-4ccc-8ccc-ccccccccccc3", "user", "new question")
   const newAgent = sessionMessage(
     sessionId,
@@ -2197,7 +2493,7 @@ sleep 30
     undefined,
     "end_turn",
   )
-  let transcript: SessionMessage[] = [oldUser, oldAgent]
+  let transcript: SessionMessage[] = [oldUser, oldAgent, rewoundUser, removedAgent]
   let transcriptReads = 0
   const provider = new ClaudeProvider(project, fakeClaude, {
     async list(): Promise<SDKSessionInfo[]> {
@@ -2226,9 +2522,15 @@ sleep 30
       setup,
       (frame) => frame.includes("Agent") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
     )
+    ;(app as unknown as {
+      liveRewindAnchors: Map<string, { targetMessageId: string; submitted: boolean }>
+    }).liveRewindAnchors.set(sessionId, {
+      targetMessageId: rewoundUser.uuid,
+      submitted: true,
+    })
 
     const readsBeforeIdle = transcriptReads
-    transcript = [oldUser, oldAgent, newUser]
+    transcript = [oldUser, oldAgent]
     await writeFile(finishMarker, "")
     await waitUntil(() => transcriptReads > readsBeforeIdle)
     const pending = await waitForFrame(
@@ -2237,6 +2539,12 @@ sleep 30
     )
     expect(pending).not.toContain("new question")
     expect(pending).not.toContain("Draft")
+    const pendingState = app as unknown as {
+      liveRewindAnchors: Map<string, unknown>
+      pendingCompletionRefreshes: Map<string, number>
+    }
+    expect(pendingState.liveRewindAnchors.has(sessionId)).toBeTrue()
+    expect(pendingState.pendingCompletionRefreshes.has(sessionId)).toBeTrue()
 
     transcript = [oldUser, oldAgent, newUser, newAgent]
     const completed = await waitForFrame(
@@ -2244,6 +2552,316 @@ sleep 30
       (frame) => frame.includes("new question") && frame.includes("new answer") && frame.includes("Draft"),
     )
     expect(completed.indexOf("new question")).toBeLessThan(completed.indexOf("new answer"))
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("does not accept a stale shorter transcript without a rewind boundary", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const finishMarker = join(root, "finish")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+${String.raw`printf '\033]0;\342\240\213 Claude Code\007'`}
+while [ ! -f ${JSON.stringify(finishMarker)} ]; do sleep 0.01; done
+${String.raw`printf '\033]0;\342\234\263 Claude Code\007'`}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "44444444-4444-4444-8444-444444444444"
+  const firstUser = sessionMessage(sessionId, "dddddddd-dddd-4ddd-8ddd-ddddddddddd1", "user", "keep question")
+  const firstAgent = sessionMessage(
+    sessionId,
+    "dddddddd-dddd-4ddd-8ddd-ddddddddddd2",
+    "assistant",
+    "keep answer",
+    undefined,
+    "end_turn",
+  )
+  const removedUser = sessionMessage(sessionId, "dddddddd-dddd-4ddd-8ddd-ddddddddddd3", "user", "remove question")
+  const removedAgent = sessionMessage(
+    sessionId,
+    "dddddddd-dddd-4ddd-8ddd-ddddddddddd4",
+    "assistant",
+    "remove answer",
+    undefined,
+    "end_turn",
+  )
+  let transcript: SessionMessage[] = [firstUser, firstAgent, removedUser, removedAgent]
+  let transcriptReads = 0
+  const provider = new ClaudeProvider(project, fakeClaude, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [{ sessionId, summary: "Rewound conversation", firstPrompt: "keep question", lastModified: 1 }]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      transcriptReads += 1
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Rewound conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("remove answer"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(50)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(
+      setup,
+      (frame) => frame.includes("remove answer") && BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
+    )
+
+    const readsBeforeIdle = transcriptReads
+    transcript = [firstUser, firstAgent]
+    await writeFile(finishMarker, "")
+    await waitUntil(() => transcriptReads > readsBeforeIdle)
+    await setup.renderOnce()
+    const retained = setup.captureCharFrame()
+    expect(retained).toContain("remove question")
+    expect(retained).toContain("remove answer")
+    expect(retained).not.toContain("Draft")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("projects a live Claude undo draft before the rewritten transcript is persisted", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, "#!/bin/sh\nsleep 30\n")
+  await chmod(executable, 0o755)
+
+  const session: AgentSession = { id: "rewind-draft-session", title: "Live rewind", lastModified: 1 }
+  const transcript: AgentMessage[] = [
+    { id: "kept-user", role: "user", preview: "kept question", ordinal: 0, visible: true },
+    { id: "kept-agent", role: "agent", preview: "kept answer", ordinal: 1, visible: true },
+    { id: "rewound-user", role: "user", preview: "restore this prompt", ordinal: 2, visible: true },
+    { id: "removed-agent", role: "agent", preview: "remove this answer", ordinal: 3, visible: true },
+  ]
+  let draftObservations = 0
+  const rewindObserver: TerminalObserver = {
+    observeOutput() { return [] },
+    observeScreen() { return undefined },
+    observeDraft() {
+      draftObservations += 1
+      return draftObservations === 1
+        ? { text: "restore this prompt", exact: false, rewind: true }
+        : { text: "restore this prompt", exact: false }
+    },
+  }
+  let listCalls = 0
+  let transcriptReads = 0
+  let resolveDelayedList!: (sessions: AgentSession[]) => void
+  const delayedList = new Promise<AgentSession[]>((resolve) => {
+    resolveDelayedList = resolve
+  })
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      listCalls += 1
+      if (listCalls > 1) return delayedList
+      return [session]
+    },
+    async readTranscripts(sessionIds) {
+      transcriptReads += 1
+      return new Map(sessionIds.map((sessionId) => [sessionId, transcript]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() {
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer: rewindObserver,
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Live rewind"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("remove this answer"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+
+    const rewound = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("kept answer") &&
+        frame.includes("Draft") &&
+        frame.includes("restore this prompt") &&
+        !frame.includes("remove this answer"),
+    )
+    expect(isSelected(setup, "Draft")).toBeTrue()
+    expect(rewound.indexOf("kept answer")).toBeLessThan(rewound.indexOf("Draft"))
+
+    await waitUntil(() => listCalls > 1)
+    resolveDelayedList([session])
+    await waitUntil(() => transcriptReads > 1)
+    await Bun.sleep(10)
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    const rewoundAgain = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("kept answer") &&
+        frame.includes("Draft") &&
+        !frame.includes("remove this answer"),
+    )
+    expect(draftObservations).toBe(2)
+    expect(isSelected(setup, "Draft")).toBeTrue()
+    expect(rewoundAgain.indexOf("kept answer")).toBeLessThan(rewoundAgain.indexOf("Draft"))
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("moves a live rewind projection again when the same session is rewound twice", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const session: AgentSession = { id: "double-rewind", title: "Double rewind", lastModified: 1 }
+  const transcript: AgentMessage[] = [
+    { id: "first-user", role: "user", preview: "first question", ordinal: 0, visible: true },
+    { id: "first-agent", role: "agent", preview: "first answer", ordinal: 1, visible: true },
+    { id: "second-user", role: "user", preview: "second question", ordinal: 2, visible: true },
+    { id: "second-agent", role: "agent", preview: "second answer", ordinal: 3, visible: true },
+    { id: "third-user", role: "user", preview: "third question", ordinal: 4, visible: true },
+    { id: "third-agent", role: "agent", preview: "third answer", ordinal: 5, visible: true },
+  ]
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [session] },
+    async readTranscripts() { return new Map([[session.id, transcript]]) },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Double rewind"))
+    const rewindState = app as unknown as {
+      captureLiveRewindAnchor(sessionId: string, draft: DraftPreview): void
+      projectedTranscriptsForLiveRewinds(): Map<string, AgentMessage[]>
+    }
+    rewindState.captureLiveRewindAnchor(session.id, {
+      text: "third question",
+      exact: false,
+      rewind: true,
+      rewindTarget: "third question",
+    })
+    expect(
+      rewindState.projectedTranscriptsForLiveRewinds().get(session.id)?.map((message) => message.id),
+    ).toEqual(["first-user", "first-agent", "second-user", "second-agent"])
+
+    rewindState.captureLiveRewindAnchor(session.id, {
+      text: "second question",
+      exact: false,
+      rewind: true,
+      rewindTarget: "second question",
+    })
+    expect(
+      rewindState.projectedTranscriptsForLiveRewinds().get(session.id)?.map((message) => message.id),
+    ).toEqual(["first-user", "first-agent"])
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
+test("does not project a live rewind when its prompt matches multiple messages", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const executable = join(root, "agent")
+  await writeFile(executable, "#!/bin/sh\nsleep 30\n")
+  await chmod(executable, 0o755)
+
+  const session: AgentSession = { id: "ambiguous-rewind", title: "Ambiguous rewind", lastModified: 1 }
+  const transcript: AgentMessage[] = [
+    { id: "first-user", role: "user", preview: "repeated prompt", ordinal: 0, visible: true },
+    { id: "first-agent", role: "agent", preview: "first answer", ordinal: 1, visible: true },
+    { id: "second-user", role: "user", preview: "repeated prompt", ordinal: 2, visible: true },
+    { id: "second-agent", role: "agent", preview: "answer must remain", ordinal: 3, visible: true },
+  ]
+  const observer: TerminalObserver = {
+    observeOutput() { return [] },
+    observeScreen() { return undefined },
+    observeDraft() {
+      return {
+        text: "repeated prompt",
+        exact: false,
+        rewind: true,
+        rewindTarget: "repeated prompt",
+      }
+    },
+  }
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() { return [session] },
+    async readTranscripts() { return new Map([[session.id, transcript]]) },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() {
+      return {
+        sessionId: session.id,
+        command: [executable],
+        cwd: project,
+        observer,
+      }
+    },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Ambiguous rewind"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("answer must remain"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => !frame.includes("claude-tree"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+
+    const graph = await waitForFrame(
+      setup,
+      (frame) => frame.includes("answer must remain") && frame.includes("Draft"),
+    )
+    expect(graph.indexOf("answer must remain")).toBeLessThan(graph.indexOf("Draft"))
   } finally {
     await app.stop()
     await running
@@ -2428,6 +3046,71 @@ test("restarts an active refresh and ignores its late result", async () => {
   }
 })
 
+test("coalesces transcript intents when an incremental refresh is restarted", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  await mkdir(project)
+  const firstSession: AgentSession = { id: "refresh-first", title: "First", lastModified: 2 }
+  const secondSession: AgentSession = { id: "refresh-second", title: "Second", lastModified: 1 }
+  const sessions = [firstSession, secondSession]
+  let resolveInterrupted!: (sessions: AgentSession[]) => void
+  const interrupted = new Promise<AgentSession[]>((resolve) => {
+    resolveInterrupted = resolve
+  })
+  let listCalls = 0
+  const transcriptReads: string[][] = []
+  const provider: AgentProvider = {
+    id: "test-agent",
+    displayName: "Test Agent",
+    navigatorIdentity: { label: "Agent", color: theme.secondary },
+    async listSessions() {
+      listCalls += 1
+      return listCalls === 2 ? interrupted : sessions
+    },
+    async readTranscripts(sessionIds) {
+      transcriptReads.push([...sessionIds])
+      return new Map(sessionIds.map((sessionId) => [sessionId, [{
+        id: `${sessionId}-message`,
+        role: "user" as const,
+        preview: `${sessionId} prompt`,
+        ordinal: 0,
+        visible: true,
+      }]]))
+    },
+    async prepareNewSession() { throw new Error("not used") },
+    async prepareResume() { throw new Error("not used") },
+  }
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("First") && frame.includes("Second"))
+    transcriptReads.length = 0
+    const requestRefresh = (
+      app as unknown as {
+        requestRefresh(
+          focusSessionId: string | undefined,
+          showWarnings: boolean,
+          transcriptSessionIds: ReadonlySet<string>,
+        ): Promise<void>
+      }
+    ).requestRefresh.bind(app)
+    const firstRefresh = requestRefresh(undefined, false, new Set([firstSession.id]))
+    await waitUntil(() => listCalls === 2)
+    await requestRefresh(undefined, false, new Set([secondSession.id]))
+
+    expect(transcriptReads.at(-1)?.sort()).toEqual([firstSession.id, secondSession.id].sort())
+    resolveInterrupted(sessions)
+    await firstRefresh
+  } finally {
+    resolveInterrupted(sessions)
+    await app.stop()
+    await running
+  }
+})
+
 test("preserves return-to-graph focus when that refresh is restarted", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")
@@ -2510,6 +3193,24 @@ async function temporaryDirectory(): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), "claude-tree-app-test-"))
   temporaryDirectories.push(path)
   return path
+}
+
+function appTransitionSource(): {
+  source: TerminalSessionTransitionSource
+  emit(transition: TerminalSessionTransition): void
+} {
+  let listener: ((transition: TerminalSessionTransition) => void) | undefined
+  return {
+    source: {
+      subscribe(onTransition) {
+        listener = onTransition
+        return () => { listener = undefined }
+      },
+    },
+    emit(transition) {
+      listener?.(transition)
+    },
+  }
 }
 
 function sessionMessage(

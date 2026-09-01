@@ -16,6 +16,7 @@ export interface AgentMessage {
   visible: boolean
   displayGroupId?: string
   turnComplete?: boolean
+  copyIdentity?: string
 }
 
 export interface MessageRef {
@@ -26,14 +27,30 @@ export interface MessageRef {
 export interface DraftPreview {
   text: string
   exact: boolean
+  rewind?: boolean
+  rewindTarget?: string
+  submitted?: boolean
 }
 
 export type AgentActivity = "working" | "idle"
 
 export interface TerminalObserver {
+  observeInput?(data: Uint8Array): void
   observeOutput(data: Uint8Array): readonly AgentActivity[]
   observeScreen(screen: EmbeddedTerminalScreen): AgentActivity | undefined
-  observeDraft(screen: EmbeddedTerminalScreen): string | undefined
+  observeDraft(screen: EmbeddedTerminalScreen): DraftPreview | undefined
+}
+
+export interface TerminalSessionTransition {
+  session: AgentSession
+  derivation?: Promise<BranchDerivation | undefined>
+}
+
+export interface TerminalSessionTransitionSource {
+  subscribe(
+    onTransition: (transition: TerminalSessionTransition) => void,
+    onError: (error: Error) => void,
+  ): () => void
 }
 
 export interface TerminalLaunch {
@@ -43,6 +60,7 @@ export interface TerminalLaunch {
   env?: Record<string, string>
   observer: TerminalObserver
   initialDraft?: DraftPreview
+  sessionTransitions?: TerminalSessionTransitionSource
   cleanup?: () => Promise<void>
 }
 
@@ -107,6 +125,7 @@ export interface AgentProvider {
 }
 
 export class NullTerminalObserver implements TerminalObserver {
+  observeInput(): void {}
   observeOutput(): readonly AgentActivity[] {
     return []
   }

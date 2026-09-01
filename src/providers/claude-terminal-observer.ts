@@ -1,11 +1,80 @@
 import type { EmbeddedTerminalScreen } from "@opentui/core"
 
-import type { AgentActivity, TerminalObserver } from "../agent-provider"
+import type { AgentActivity, DraftPreview, TerminalObserver } from "../agent-provider"
 import { OscSequenceParser } from "../osc"
+
+type RewindPhase = "idle" | "armed" | "picker" | "awaitingComposer" | "captured"
 
 export class ClaudeTerminalObserver implements TerminalObserver {
   private readonly parser = new OscSequenceParser()
   private titleActivity: AgentActivity | undefined
+  private inputBuffer = ""
+  private rewindPhase: RewindPhase = "idle"
+  private rewindTarget: string | undefined
+  private ignoredRewindTarget: string | undefined
+  private rewindSubmitted = false
+  private rewindWorkingSeen = false
+  private lastStandaloneEscapeAt = 0
+
+  observeInput(bytes: Uint8Array): void {
+    const data = Buffer.from(bytes).toString("utf8")
+    if (this.rewindPhase === "picker") {
+      if (isStandaloneEscape(data)) {
+        this.rewindPhase = "idle"
+        this.rewindTarget = undefined
+        this.ignoredRewindTarget = undefined
+        this.rewindSubmitted = false
+        this.rewindWorkingSeen = false
+      } else if (hasEnter(data)) {
+        this.rewindPhase = "awaitingComposer"
+      }
+      return
+    }
+    if (this.rewindPhase === "armed") {
+      if (hasEnter(data)) this.rewindPhase = "awaitingComposer"
+      return
+    }
+    if (this.rewindPhase === "awaitingComposer") return
+
+    const escapeCount = standaloneEscapeCount(data)
+    if (escapeCount > 0) {
+      const now = Date.now()
+      if (escapeCount >= 2 || now - this.lastStandaloneEscapeAt <= 500) {
+        this.ignoredRewindTarget = this.rewindTarget
+        this.rewindPhase = "armed"
+        this.rewindTarget = undefined
+        this.rewindSubmitted = false
+        this.rewindWorkingSeen = false
+        this.inputBuffer = ""
+      }
+      this.lastStandaloneEscapeAt = now
+      return
+    }
+    this.lastStandaloneEscapeAt = 0
+
+    const submissions = this.observeComposerSubmissions(data)
+    if (this.rewindPhase === "captured") {
+      if (submissions.some(isRewindCommand)) {
+        this.ignoredRewindTarget = this.rewindTarget
+        this.rewindPhase = "armed"
+        this.rewindTarget = undefined
+        this.rewindSubmitted = false
+        this.rewindWorkingSeen = false
+      } else if (submissions.length > 0) {
+        this.rewindSubmitted = true
+      }
+      return
+    }
+    for (const submitted of submissions) {
+      if (isRewindCommand(submitted)) {
+        this.rewindPhase = "armed"
+        this.rewindTarget = undefined
+        this.ignoredRewindTarget = undefined
+        this.rewindSubmitted = false
+        this.rewindWorkingSeen = false
+      }
+    }
+  }
 
   observeOutput(bytes: Uint8Array): readonly AgentActivity[] {
     const observed: AgentActivity[] = []
@@ -13,23 +82,135 @@ export class ClaudeTerminalObserver implements TerminalObserver {
       const title = decodeOscTitle(body)
       if (title === undefined) continue
       const activity = claudeActivityFromTitle(title)
-      if (activity !== undefined) observed.push(activity)
+      if (activity !== undefined) {
+        observed.push(activity)
+        this.observeRewindActivity(activity)
+      }
     }
-    if (observed.length > 0) this.titleActivity = observed.at(-1)
+    if (observed.length > 0) {
+      this.titleActivity = observed.at(-1)
+    }
     return observed
   }
 
   observeScreen(screen: EmbeddedTerminalScreen): AgentActivity | undefined {
+    const rewindMenuVisible = isClaudeRewindPicker(screen)
+    if (
+      rewindMenuVisible &&
+      (this.rewindPhase === "armed" || this.rewindPhase === "picker")
+    ) {
+      this.rewindPhase = "picker"
+      this.rewindTarget = undefined
+    }
+    if (
+      !rewindMenuVisible &&
+      (this.rewindPhase === "armed" || this.rewindPhase === "awaitingComposer") &&
+      this.rewindTarget === undefined
+    ) {
+      const composer = observeClaudeDraft(screen)
+      if (composer !== undefined && this.canCaptureRewindTarget(composer)) {
+        this.rewindTarget = composer
+        this.ignoredRewindTarget = undefined
+        this.rewindPhase = "captured"
+      }
+    }
     const activity = observeClaudeActivity(screen)
     if (activity !== undefined && this.titleActivity !== undefined && activity !== this.titleActivity) {
       return undefined
     }
+    this.observeRewindActivity(activity)
     return activity
   }
 
-  observeDraft(screen: EmbeddedTerminalScreen): string | undefined {
-    return observeClaudeDraft(screen)
+  observeDraft(screen: EmbeddedTerminalScreen): DraftPreview | undefined {
+    if (isClaudeRewindPicker(screen)) return undefined
+    const text = observeClaudeDraft(screen)
+    if (
+      text !== undefined &&
+      this.rewindTarget === undefined &&
+      (this.rewindPhase === "armed" || this.rewindPhase === "awaitingComposer") &&
+      this.canCaptureRewindTarget(text)
+    ) {
+      this.rewindTarget = text
+      this.ignoredRewindTarget = undefined
+      this.rewindPhase = "captured"
+    }
+    return text === undefined
+      ? undefined
+      : {
+          text,
+          exact: false,
+          ...(this.rewindPhase === "captured"
+            ? {
+                rewind: true,
+                ...(this.rewindTarget === undefined ? {} : { rewindTarget: this.rewindTarget }),
+                ...(this.rewindSubmitted ? { submitted: true } : {}),
+              }
+            : {}),
+        }
   }
+
+  private observeRewindActivity(activity: AgentActivity | undefined): void {
+    if (!this.rewindSubmitted || activity === undefined) return
+    if (activity === "working") {
+      this.rewindWorkingSeen = true
+      return
+    }
+    if (!this.rewindWorkingSeen) return
+    this.rewindPhase = "idle"
+    this.rewindTarget = undefined
+    this.ignoredRewindTarget = undefined
+    this.rewindSubmitted = false
+    this.rewindWorkingSeen = false
+  }
+
+  private observeComposerSubmissions(data: string): string[] {
+    const submissions: string[] = []
+    const composerInput = data
+      .replace(/\u001b\[200~/gu, "")
+      .replace(/\u001b\[201~/gu, "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    for (const character of composerInput) {
+      if (character === "\r" || character === "\n") {
+        submissions.push(this.inputBuffer.trim())
+        this.inputBuffer = ""
+      } else if (character === "\u0015" || character === "\u0003") {
+        this.inputBuffer = ""
+      } else if (character === "\u007f" || character === "\b") {
+        this.inputBuffer = this.inputBuffer.slice(0, -1)
+      } else if (character >= " ") {
+        this.inputBuffer += character
+      }
+    }
+    return submissions
+  }
+
+  private canCaptureRewindTarget(composer: string): boolean {
+    return !isRewindCommand(composer) && composer !== this.ignoredRewindTarget
+  }
+}
+
+function isClaudeRewindPicker(screen: EmbeddedTerminalScreen): boolean {
+  return screen.lines.some(
+    (line) => /^\s*Rewind\b.*\b(?:message|conversation)\b/iu.test(line),
+  )
+}
+
+function isRewindCommand(input: string): boolean {
+  return /^\/(?:undo|rewind)(?:\s|$)/u.test(input)
+}
+
+function isStandaloneEscape(data: string): boolean {
+  return standaloneEscapeCount(data) === 1
+}
+
+function standaloneEscapeCount(data: string): number {
+  const tokens = data.match(/\u001b(?:\[27(?:;\d+)*u)?/gu) ?? []
+  return tokens.join("") === data ? tokens.length : 0
+}
+
+function hasEnter(data: string): boolean {
+  return /[\r\n]/u.test(data) || /\u001b\[13(?:;\d+)*u/u.test(data)
 }
 
 export function observeClaudeDraft(screen: EmbeddedTerminalScreen): string | undefined {

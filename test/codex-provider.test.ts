@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { NullTerminalObserver } from "../src/agent-provider"
+import { BranchCreatedError, NullTerminalObserver } from "../src/agent-provider"
 import type {
   CodexAppServer,
   CodexThread,
@@ -12,6 +12,7 @@ import { CodexRpcError } from "../src/providers/codex-app-server"
 import {
   codexCompatibilityWarning,
   CodexProvider,
+  type CodexResumeSessionFactory,
   createCodexProvider,
   EXPECTED_CODEX_VERSION,
   formatCodexUserInput,
@@ -226,6 +227,11 @@ describe("Codex sessions", () => {
     const events: string[] = []
     const observer = new NullTerminalObserver()
     const cleanup = async () => { events.push("cleanup") }
+    const transitions = {
+      subscribe() {
+        return () => undefined
+      },
+    }
     const provider = new CodexProvider(
       "/canonical/project",
       "/usr/bin/codex",
@@ -237,10 +243,11 @@ describe("Codex sessions", () => {
         return {
           sessionId: "pending-codex-test",
           threadStarted: Promise.resolve(
-            codexThread(CHILD, [], { name: null, preview: "", updatedAt: 21 }),
+            { id: CHILD, title: "Untitled conversation", lastModified: 21_000 },
           ),
           remoteUrl: "unix:///tmp/codex.sock",
           bearerToken: "secret-token",
+          transitions,
           cleanup,
         }
       },
@@ -270,16 +277,57 @@ describe("Codex sessions", () => {
       cwd: "/canonical/project",
       env: { CLAUDE_TREE_CODEX_TOKEN: "secret-token" },
       observer,
+      sessionTransitions: transitions,
       cleanup,
     })
     await prepared.launch.cleanup?.()
     expect(events).toEqual(["start:/usr/bin/codex:/canonical/project", "returned", "cleanup"])
   })
 
-  test("resume uses the same stock command", async () => {
+  test("does not invent ancestry when the stock TUI forks before the first turn", async () => {
+    const parent = codexThread(ROOT, [
+      turn("turn-1", "completed", [user("parent-user", [{ type: "text", text: "Question" }])]),
+    ])
+    const child = codexThread(CHILD, [])
+    const server = fakeServer({
+      async readThread(id) { return id === ROOT ? parent : child },
+    })
+    let derivation: Promise<unknown> | undefined
+    const provider = new CodexProvider(
+      "/canonical/project",
+      "/usr/bin/codex",
+      undefined,
+      async () => server,
+      undefined,
+      undefined,
+      async (_executable, _cwd, _sessionId, transitionFor) => {
+        derivation = transitionFor({
+          previousThreadId: ROOT,
+          thread: child,
+          method: "thread/fork",
+          params: { beforeTurnId: "turn-1" },
+        }).derivation
+        return fakeResumeSessionFactory(_executable, _cwd, _sessionId, transitionFor)
+      },
+    )
+
+    await provider.prepareResume({ id: ROOT, title: "Root", lastModified: 1 })
+    expect(await derivation).toBeUndefined()
+  })
+
+  test("resume uses the stock TUI through its observed app-server", async () => {
     const provider = providerFrom(fakeServer())
     const launch = await provider.prepareResume({ id: ROOT, title: "Root", lastModified: 0 })
-    expect(launch.command).toEqual(["/usr/bin/codex", "resume", ROOT])
+    expect(launch.command).toEqual([
+      "/usr/bin/codex",
+      "resume",
+      "--remote",
+      "ws://127.0.0.1:12345",
+      "--remote-auth-token-env",
+      "CLAUDE_TREE_CODEX_TOKEN",
+      ROOT,
+    ])
+    expect(launch.sessionTransitions).toBeDefined()
   })
 })
 
@@ -329,8 +377,92 @@ describe("Codex branching", () => {
         { parentMessageId: "parent-agent-1", childMessageId: "child-agent-1" },
       ],
     })
-    expect(prepared.launch.command).toEqual(["/usr/bin/codex", "resume", CHILD])
+    expect(prepared.launch.command).toEqual([
+      "/usr/bin/codex",
+      "resume",
+      "--remote",
+      "ws://127.0.0.1:12345",
+      "--remote-auth-token-env",
+      "CLAUDE_TREE_CODEX_TOKEN",
+      CHILD,
+    ])
     expect(server.closeCalls).toBe(1)
+  })
+
+  test("reports the created child when terminal preparation fails after a fork", async () => {
+    const parent = codexThread(ROOT, [
+      turn("turn-1", "completed", [
+        user("parent-user", [{ type: "text", text: "Question" }]),
+        { type: "agentMessage", id: "parent-agent", text: "Answer" },
+      ]),
+    ])
+    const child = codexThread(CHILD, [
+      turn("child-turn-1", "completed", [
+        user("child-user", [{ type: "text", text: "Question" }]),
+        { type: "agentMessage", id: "child-agent", text: "Answer" },
+      ]),
+    ])
+    const server = fakeServer({
+      async readThread(id) { return id === ROOT ? parent : child },
+      async forkThread() { return child },
+    })
+    const provider = new CodexProvider(
+      "/canonical/project",
+      "/usr/bin/codex",
+      undefined,
+      async () => server,
+      undefined,
+      undefined,
+      async () => { throw new Error("proxy startup failed") },
+    )
+
+    let failure: unknown
+    try {
+      await provider.branchFrom({ sessionId: ROOT, messageId: "parent-agent" })
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(BranchCreatedError)
+    const created = failure as BranchCreatedError
+    expect(created.session.id).toBe(CHILD)
+    expect(created.transcript.map((message) => message.id)).toEqual(["child-user", "child-agent"])
+    expect(created.transcriptAvailable).toBeTrue()
+  })
+
+  test("does not start an observed sidecar until the metadata server closes", async () => {
+    const parent = codexThread(ROOT, [
+      turn("turn-1", "completed", [
+        { type: "agentMessage", id: "parent-agent", text: "Answer" },
+      ]),
+    ])
+    const child = codexThread(CHILD, [
+      turn("child-turn-1", "completed", [
+        { type: "agentMessage", id: "child-agent", text: "Answer" },
+      ]),
+    ])
+    const server = fakeServer({
+      async readThread(id) { return id === ROOT ? parent : child },
+      async forkThread() { return child },
+      async close() { throw new Error("close failed") },
+    })
+    let resumeCalls = 0
+    const provider = new CodexProvider(
+      "/canonical/project",
+      "/usr/bin/codex",
+      undefined,
+      async () => server,
+      undefined,
+      undefined,
+      async (...args) => {
+        resumeCalls += 1
+        return fakeResumeSessionFactory(...args)
+      },
+    )
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: "parent-agent" }),
+    ).rejects.toThrow("close failed")
+    expect(resumeCalls).toBe(0)
   })
 
   test.each([
@@ -423,6 +555,7 @@ describe("Codex compatibility", () => {
         return "/canonical/project"
       },
       appServerFactory: async () => server,
+      resumeSessionFactory: fakeResumeSessionFactory,
     })
 
     expect(calls).toEqual([
@@ -490,8 +623,21 @@ function providerFrom(server: FakeServer, observerFactory?: () => NullTerminalOb
     undefined,
     async () => server,
     observerFactory,
+    undefined,
+    fakeResumeSessionFactory,
   )
 }
+
+const fakeResumeSessionFactory: CodexResumeSessionFactory = async () => ({
+  remoteUrl: "ws://127.0.0.1:12345",
+  bearerToken: "resume-token",
+  transitions: {
+    subscribe() {
+      return () => undefined
+    },
+  },
+  async cleanup() {},
+})
 
 function codexThread(
   id: string,

@@ -5,10 +5,16 @@ import { join } from "node:path"
 
 import { createTestRenderer } from "@opentui/core/testing"
 
-import type { TerminalLaunch } from "../src/agent-provider"
+import type {
+  TerminalLaunch,
+  TerminalObserver,
+  TerminalSessionTransition,
+  TerminalSessionTransitionSource,
+} from "../src/agent-provider"
 import { ClaudeTerminalObserver } from "../src/providers/claude-terminal-observer"
 import {
   TerminalManager,
+  type TerminalExitEvent,
 } from "../src/terminal-manager"
 
 const temporaryDirectories: string[] = []
@@ -49,6 +55,68 @@ test("runs provider cleanup when the terminal process exits", async () => {
     await manager.show(terminalLaunch)
     await waitUntil(() => exited)
     expect(cleaned).toBeTrue()
+  } finally {
+    await manager.shutdown(0)
+    setup.renderer.destroy()
+  }
+})
+
+test("retains ownership and reports provider cleanup failure after process exit", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  let exitEvent: TerminalExitEvent | undefined
+  const manager = new TerminalManager(setup.renderer, (event) => { exitEvent = event })
+  const terminalLaunch = launch(process.execPath, sessionId, ["-e", ""])
+  terminalLaunch.cleanup = async () => { throw new Error("sidecar cleanup failed") }
+
+  try {
+    await manager.show(terminalLaunch)
+    await waitUntil(() => exitEvent !== undefined)
+    expect(exitEvent?.cleanupError?.message).toBe("sidecar cleanup failed")
+    expect(manager.ownedSessionIds()).toEqual(new Set([sessionId]))
+    await expect(manager.shutdown(0)).rejects.toThrow("Unable to stop every agent process")
+  } finally {
+    await manager.shutdown(0).catch(() => undefined)
+    setup.renderer.destroy()
+  }
+})
+
+test("includes a submitted rewind boundary when the terminal process exits", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const executable = await createFakeClaude("read _")
+  let submitted = false
+  let exitEvent: TerminalExitEvent | undefined
+  const observer: TerminalObserver = {
+    observeInput(data) {
+      if (new TextDecoder().decode(data).includes("\r")) submitted = true
+    },
+    observeOutput() { return [] },
+    observeScreen() { return undefined },
+    observeDraft() {
+      return {
+        text: "restored prompt",
+        exact: false,
+        rewind: true,
+        rewindTarget: "restored prompt",
+        ...(submitted ? { submitted: true } : {}),
+      }
+    },
+  }
+  const manager = new TerminalManager(setup.renderer, (event) => { exitEvent = event })
+  const terminalLaunch = launch(executable, "11111111-1111-4111-8111-111111111111")
+  terminalLaunch.observer = observer
+
+  try {
+    await manager.show(terminalLaunch)
+    setup.mockInput.pressEnter()
+    await waitUntil(() => exitEvent !== undefined)
+    expect(exitEvent?.draftPreview).toEqual({
+      text: "restored prompt",
+      exact: false,
+      rewind: true,
+      rewindTarget: "restored prompt",
+      submitted: true,
+    })
   } finally {
     await manager.shutdown(0)
     setup.renderer.destroy()
@@ -197,6 +265,43 @@ test("uses launch arguments and initial draft only when spawning a process", asy
     expect(manager.draftPreviews().get(sessionId)?.exact).toBeTrue()
     await manager.show(launch(executable, sessionId, ["--resume", sessionId, "--prefill=replacement"], "replacement"))
     expect((await readFile(argumentsPath, "utf8")).trim()).not.toContain("replacement")
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("refreshes a captured rewind draft across terminal re-entry", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const executable = await createFakeClaude("sleep 30")
+  const manager = new TerminalManager(setup.renderer, () => undefined)
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  let draftObservations = 0
+  const observer: TerminalObserver = {
+    observeOutput() { return [] },
+    observeScreen() { return undefined },
+    observeDraft() {
+      draftObservations += 1
+      return draftObservations === 1
+        ? { text: "restored prompt", exact: false, rewind: true }
+        : { text: "restored prompt", exact: false }
+    },
+  }
+  const terminalLaunch = launch(executable, sessionId)
+  terminalLaunch.observer = observer
+
+  try {
+    await manager.show(terminalLaunch)
+    manager.hideActive()
+    expect(manager.draftPreviews().get(sessionId)?.rewind).toBeTrue()
+
+    await manager.show(terminalLaunch)
+    manager.hideActive()
+    expect(draftObservations).toBe(2)
+    expect(manager.draftPreviews().get(sessionId)).toEqual({
+      text: "restored prompt",
+      exact: false,
+    })
   } finally {
     await manager.shutdown(50)
     setup.renderer.destroy()
@@ -405,6 +510,74 @@ test("a hidden process exit preserves the active terminal selection", async () =
   }
 })
 
+test("moves a running terminal and its draft to a provider-selected session", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const fakeClaude = await createFakeClaude("sleep 30")
+  const transitions = transitionSource()
+  const changes: Array<{ previousSessionId: string; sessionId: string; wasActive: boolean }> = []
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    () => undefined,
+    (event) => changes.push({
+      previousSessionId: event.previousSessionId,
+      sessionId: event.session.id,
+      wasActive: event.wasActive,
+    }),
+  )
+  const launched = launch(fakeClaude, "session-a", undefined, "preserved draft")
+  launched.sessionTransitions = transitions.source
+
+  try {
+    await manager.show(launched)
+    transitions.emit({ session: { id: "session-b", title: "Fork", lastModified: 2 } })
+
+    expect(manager.runningSessionIds()).toEqual(new Set(["session-b"]))
+    expect(manager.draftPreviews().get("session-b")).toEqual({
+      text: "preserved draft",
+      exact: true,
+    })
+    expect(manager.draftPreviews().has("session-a")).toBeFalse()
+    expect(changes).toEqual([
+      { previousSessionId: "session-a", sessionId: "session-b", wasActive: true },
+    ])
+    expect(manager.hideActive()).toBe("session-b")
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
+test("stops a switched process instead of allowing two owners for the target session", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8 })
+  const fakeClaude = await createFakeClaude("sleep 30")
+  const transitions = transitionSource()
+  const failures: string[] = []
+  const manager = new TerminalManager(
+    setup.renderer,
+    () => undefined,
+    () => undefined,
+    () => undefined,
+    (event) => failures.push(event.error.message),
+  )
+  const source = launch(fakeClaude, "session-a")
+  source.sessionTransitions = transitions.source
+
+  try {
+    await manager.show(source)
+    await manager.show(launch(fakeClaude, "session-b"))
+    transitions.emit({ session: { id: "session-b", title: "Fork", lastModified: 2 } })
+
+    expect(manager.runningSessionIds()).toEqual(new Set(["session-b"]))
+    expect(failures).toEqual([
+      "Agent session session-b already has an owned terminal; stopped the duplicate process",
+    ])
+  } finally {
+    await manager.shutdown(50)
+    setup.renderer.destroy()
+  }
+})
+
 async function createFakeClaude(body: string): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-fake-claude-"))
   temporaryDirectories.push(directory)
@@ -428,6 +601,24 @@ function launch(
     ...(initialDraft === undefined
       ? {}
       : { initialDraft: { text: initialDraft, exact: true } }),
+  }
+}
+
+function transitionSource(): {
+  source: TerminalSessionTransitionSource
+  emit(transition: TerminalSessionTransition): void
+} {
+  let listener: ((transition: TerminalSessionTransition) => void) | undefined
+  return {
+    source: {
+      subscribe(onTransition) {
+        listener = onTransition
+        return () => { listener = undefined }
+      },
+    },
+    emit(transition) {
+      listener?.(transition)
+    },
   }
 }
 

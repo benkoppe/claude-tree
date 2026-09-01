@@ -171,7 +171,322 @@ describe("buildConversationForest", () => {
     ).toBeUndefined()
   })
 
-  test("fails closed and exposes a child as an independent root when its boundary is invalid", () => {
+  test("keeps descendant history when its parent rewinds before the descendant source", () => {
+    const rootMessages = [message("root-source", "agent", "shared root", 0)]
+    const originalChildMessages = [
+      message("child-root", "agent", "shared root", 0),
+      message("child-question", "user", "old question", 1),
+      message("child-answer", "agent", "old answer", 2),
+    ]
+    const rewoundChildMessages = originalChildMessages.slice(0, 1)
+    const grandchildMessages = [
+      message("grandchild-root", "agent", "shared root", 0),
+      message("grandchild-question", "user", "old question", 1),
+      message("grandchild-answer", "agent", "old answer", 2),
+      message("grandchild-tail", "user", "continued descendant", 3),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 30), session(CHILD, "Rewound", 20), session(GRANDCHILD, "Retained", 10)],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, rewoundChildMessages],
+        [GRANDCHILD, grandchildMessages],
+      ]),
+      [
+        relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, originalChildMessages, 1), 1),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          originalChildMessages[2]!.id,
+          shared(originalChildMessages, grandchildMessages, 3),
+          2,
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const graph = forest.graphs[0]!
+    expect(messagePreviews(graph)).toEqual([
+      "shared root",
+      "old question",
+      "old answer",
+      "continued descendant",
+    ])
+    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(graph.rootNodeId)
+    const oldAnswer = messageNodes(graph).find((node) => node.preview === "old answer")!
+    expect(oldAnswer.aliases).toContainEqual({
+      sessionId: CHILD,
+      messageId: originalChildMessages[2]!.id,
+    })
+    expect(oldAnswer.aliases).toContainEqual({
+      sessionId: GRANDCHILD,
+      messageId: grandchildMessages[2]!.id,
+    })
+    expect(oldAnswer.forkTarget).toEqual({
+      sessionId: GRANDCHILD,
+      messageId: grandchildMessages[2]!.id,
+    })
+  })
+
+  test("renders rewound and retained descendant continuations as sibling paths", () => {
+    const rootMessages = [message("root-source", "agent", "shared root", 0)]
+    const originalChildMessages = [
+      message("child-root", "agent", "shared root", 0),
+      message("child-old", "user", "old path", 1),
+    ]
+    const rewoundChildMessages = [
+      originalChildMessages[0]!,
+      message("child-new", "user", "new path", 1),
+    ]
+    const grandchildMessages = [
+      message("grandchild-root", "agent", "shared root", 0),
+      message("grandchild-old", "user", "old path", 1),
+      message("grandchild-tail", "agent", "old path answer", 2),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 30), session(CHILD, "Rewound", 20), session(GRANDCHILD, "Retained", 10)],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, rewoundChildMessages],
+        [GRANDCHILD, grandchildMessages],
+      ]),
+      [
+        relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, originalChildMessages, 1), 1),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          originalChildMessages[1]!.id,
+          shared(originalChildMessages, grandchildMessages, 2),
+          2,
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const graph = forest.graphs[0]!
+    const rootNode = graph.nodes.get(graph.rootNodeId)!
+    expect(rootNode.childIds.flatMap((id) => {
+      const node = graph.nodes.get(id)
+      return node?.kind === "message" ? [node.preview] : []
+    })).toEqual(["new path", "old path"])
+    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(
+      messageNodes(graph).find((node) => node.preview === "new path")!.id,
+    )
+  })
+
+  test("merges sibling copies of history missing from their rewound parent", () => {
+    const rootMessages = [message("root-source", "agent", "shared root", 0)]
+    const originalChildMessages = [
+      message("child-root", "agent", "shared root", 0),
+      message("child-old", "user", "old path", 1),
+    ]
+    const firstGrandchildMessages = [
+      message("first-root", "agent", "shared root", 0),
+      message("first-old", "user", "old path", 1),
+      message("first-tail", "agent", "first tail", 2),
+    ]
+    const secondGrandchild = "44444444-4444-4444-8444-444444444444"
+    const secondGrandchildMessages = [
+      message("second-root", "agent", "shared root", 0),
+      message("second-old", "user", "old path", 1),
+      message("second-tail", "agent", "second tail", 2),
+    ]
+    const forest = buildConversationForest(
+      [
+        session(ROOT, "Root", 40),
+        session(CHILD, "Rewound", 30),
+        session(GRANDCHILD, "First", 20),
+        session(secondGrandchild, "Second", 10),
+      ],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, originalChildMessages.slice(0, 1)],
+        [GRANDCHILD, firstGrandchildMessages],
+        [secondGrandchild, secondGrandchildMessages],
+      ]),
+      [
+        relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, originalChildMessages, 1), 1),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          originalChildMessages[1]!.id,
+          shared(originalChildMessages, firstGrandchildMessages, 2),
+          2,
+        ),
+        relation(
+          secondGrandchild,
+          CHILD,
+          originalChildMessages[1]!.id,
+          shared(originalChildMessages, secondGrandchildMessages, 2),
+          3,
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const oldPathNodes = messageNodes(forest.graphs[0]!).filter((node) => node.preview === "old path")
+    expect(oldPathNodes).toHaveLength(1)
+    expect(oldPathNodes[0]!.aliases.map((alias) => alias.sessionId)).toEqual([
+      GRANDCHILD,
+      CHILD,
+      secondGrandchild,
+    ])
+  })
+
+  test("recovers retained history through multiple rewound generations", () => {
+    const greatGrandchild = "55555555-5555-4555-8555-555555555555"
+    const rootOriginal = [
+      message("root-kept", "agent", "root kept", 0),
+      message("root-old", "user", "root old", 1),
+    ]
+    const childOriginal = [
+      message("child-kept", "agent", "root kept", 0),
+      message("child-root-old", "user", "root old", 1),
+      message("child-old", "agent", "child old", 2),
+    ]
+    const grandchildOriginal = [
+      message("grandchild-kept", "agent", "root kept", 0),
+      message("grandchild-root-old", "user", "root old", 1),
+      message("grandchild-child-old", "agent", "child old", 2),
+    ]
+    const retained = [
+      message("great-kept", "agent", "root kept", 0),
+      message("great-root-old", "user", "root old", 1),
+      message("great-child-old", "agent", "child old", 2),
+      message("great-tail", "user", "retained tail", 3),
+    ]
+    const forest = buildConversationForest(
+      [
+        session(ROOT, "Root", 40),
+        session(CHILD, "Child", 30),
+        session(GRANDCHILD, "Grandchild", 20),
+        session(greatGrandchild, "Great-grandchild", 10),
+      ],
+      new Map([
+        [ROOT, rootOriginal.slice(0, 1)],
+        [CHILD, childOriginal.slice(0, 1)],
+        [GRANDCHILD, grandchildOriginal.slice(0, 1)],
+        [greatGrandchild, retained],
+      ]),
+      [
+        relation(CHILD, ROOT, rootOriginal[1]!.id, shared(rootOriginal, childOriginal, 2), 1),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          childOriginal[2]!.id,
+          shared(childOriginal, grandchildOriginal, 3),
+          2,
+        ),
+        relation(
+          greatGrandchild,
+          GRANDCHILD,
+          grandchildOriginal[2]!.id,
+          shared(grandchildOriginal, retained, 3),
+          3,
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    expect(messagePreviews(forest.graphs[0]!)).toEqual([
+      "root kept",
+      "root old",
+      "child old",
+      "retained tail",
+    ])
+    expect(forest.graphs[0]!.sessionIds).toEqual(
+      new Set([ROOT, CHILD, GRANDCHILD, greatGrandchild]),
+    )
+    const currentIds = new Map([
+      [ROOT, new Set(rootOriginal.slice(0, 1).map((item) => item.id))],
+      [CHILD, new Set(childOriginal.slice(0, 1).map((item) => item.id))],
+      [GRANDCHILD, new Set(grandchildOriginal.slice(0, 1).map((item) => item.id))],
+      [greatGrandchild, new Set(retained.map((item) => item.id))],
+    ])
+    for (const node of messageNodes(forest.graphs[0]!)) {
+      if (!node.forkTarget) continue
+      expect(currentIds.get(node.forkTarget.sessionId)?.has(node.forkTarget.messageId)).toBeTrue()
+    }
+  })
+
+  test("keeps a recorded family when both sides completely rewrite their copied history", () => {
+    const parent = [message("new-parent", "user", "new parent path", 0)]
+    const child = [message("new-child", "user", "new child path", 0)]
+    const forest = buildConversationForest(
+      [session(ROOT, "Parent", 20), session(CHILD, "Child", 10)],
+      new Map([
+        [ROOT, parent],
+        [CHILD, child],
+      ]),
+      [relation(CHILD, ROOT, "old-parent", [{
+        parentMessageId: "old-parent",
+        childMessageId: "old-child",
+      }])],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    expect(forest.graphs[0]!.sessionIds).toEqual(new Set([ROOT, CHILD]))
+    expect(messagePreviews(forest.graphs[0]!)).toEqual(["new parent path", "new child path"])
+  })
+
+  test("fails closed when descendants disagree about retained history", () => {
+    const sibling = "66666666-6666-4666-8666-666666666666"
+    const rootMessages = [message("root", "agent", "root", 0)]
+    const childOriginal = [
+      message("child-root", "agent", "root", 0),
+      message("child-old", "user", "old path", 1),
+    ]
+    const firstCopy = [
+      message("first-root", "agent", "root", 0),
+      message("first-old", "user", "old path", 1),
+    ]
+    const contradictoryCopy = [
+      message("second-root", "agent", "root", 0),
+      message("second-old", "user", "different old path", 1),
+    ]
+    const forest = buildConversationForest(
+      [
+        session(ROOT, "Root", 40),
+        session(CHILD, "Child", 30),
+        session(GRANDCHILD, "First", 20),
+        session(sibling, "Second", 10),
+      ],
+      new Map([
+        [ROOT, rootMessages],
+        [CHILD, childOriginal.slice(0, 1)],
+        [GRANDCHILD, firstCopy],
+        [sibling, contradictoryCopy],
+      ]),
+      [
+        relation(CHILD, ROOT, rootMessages[0]!.id, shared(rootMessages, childOriginal, 1), 1),
+        relation(
+          GRANDCHILD,
+          CHILD,
+          childOriginal[1]!.id,
+          shared(childOriginal, firstCopy, 2),
+          2,
+        ),
+        relation(
+          sibling,
+          CHILD,
+          childOriginal[1]!.id,
+          shared(childOriginal, contradictoryCopy, 2),
+          3,
+        ),
+      ],
+    )
+
+    expect(forest.warnings.some((warning) => warning.includes("contradictory"))).toBeTrue()
+    expect(forest.graphBySessionId.get(GRANDCHILD)?.rootSessionId).toBe(GRANDCHILD)
+    expect(forest.graphBySessionId.get(sibling)?.rootSessionId).toBe(sibling)
+  })
+
+  test("accepts a rewritten child prefix when the retained parent validates its ancestry", () => {
     const source = message("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "source", 0)
     const copied = message("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "source", 0)
     const forest = buildConversationForest(
@@ -190,9 +505,103 @@ describe("buildConversationForest", () => {
       ],
     )
 
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.graphBySessionId.get(CHILD)?.rootSessionId).toBe(ROOT)
+    expect(forest.warnings).toEqual([])
+  })
+
+  test("renders a fully rewritten Claude child chain from the family origin", () => {
+    const parentMessages = [
+      message("parent-user", "user", "initial prompt", 0),
+      message("parent-thinking", "agent", "thinking", 1, false),
+      message("parent-answer", "agent", "initial answer", 2),
+    ]
+    const originalChildMessages = [
+      message("old-child-user", "user", "initial prompt", 0),
+      message("old-child-thinking", "agent", "thinking", 1, false),
+      message("old-child-answer", "agent", "initial answer", 2),
+    ]
+    const rewrittenChildMessages = [
+      message("new-child-user", "user", "edited prompt", 0),
+      message("new-child-answer", "agent", "new answer", 1),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Parent", 20), session(CHILD, "Rewound child", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, rewrittenChildMessages],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[2]!.id,
+          shared(parentMessages, originalChildMessages, 3),
+        ),
+      ],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const graph = forest.graphs[0]!
+    const childEndpoint = graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)!
+    const newAnswer = graph.nodes.get(childEndpoint.parentId!)!
+    const editedPrompt = graph.nodes.get(newAnswer.parentId!)!
+    expect(newAnswer.kind === "message" ? newAnswer.preview : undefined).toBe("new answer")
+    expect(editedPrompt.kind === "message" ? editedPrompt.preview : undefined).toBe("edited prompt")
+    expect(editedPrompt.parentId).toBe(graph.originNodeId)
+    expect(messagePreviews(graph)).toContain("initial answer")
+  })
+
+  test("fails closed when rewound history reuses a mapped ID after diverging", () => {
+    const parentMessages = [
+      message("parent-a", "user", "A", 0),
+      message("parent-b", "agent", "B", 1),
+    ]
+    const originalChild = [
+      message("child-a", "user", "A", 0),
+      message("child-b", "agent", "B", 1),
+    ]
+    const malformedChild = [
+      originalChild[0]!,
+      message("child-new", "user", "new path", 1),
+      { ...originalChild[1]!, ordinal: 2 },
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, malformedChild],
+      ]),
+      [
+        relation(
+          CHILD,
+          ROOT,
+          parentMessages[1]!.id,
+          shared(parentMessages, originalChild, 2),
+        ),
+      ],
+    )
+
     expect(forest.graphs).toHaveLength(2)
-    expect(forest.graphBySessionId.get(CHILD)?.rootSessionId).toBe(CHILD)
-    expect(forest.warnings[0]).toContain("shared history does not match")
+    expect(forest.warnings[0]).toContain("recorded order")
+    const parentGraph = forest.graphBySessionId.get(ROOT)!
+    expect(
+      messageNodes(parentGraph).flatMap((node) => node.aliases).some(
+        (alias) => alias.sessionId === CHILD,
+      ),
+    ).toBeFalse()
+
+    const removedChild = buildConversationForest(
+      [session(ROOT, "Root", 20), session(CHILD, "Fork", 10)],
+      new Map([
+        [ROOT, parentMessages],
+        [CHILD, malformedChild],
+      ]),
+      [relation(CHILD, ROOT, parentMessages[1]!.id, shared(parentMessages, originalChild, 2))],
+      [messageRemoval([{ sessionId: CHILD, messageId: originalChild[0]!.id }])],
+    )
+    expect(removedChild.graphBySessionId.has(ROOT)).toBeTrue()
   })
 })
 
@@ -440,7 +849,7 @@ describe("persisted removals", () => {
     const invalidRelation = relation(
       CHILD,
       ROOT,
-      rootMessage.id,
+      "missing-source",
       [{ parentMessageId: rootMessage.id, childMessageId: "wrong-child-message" }],
     )
     const rawForest = buildConversationForest(

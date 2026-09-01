@@ -1,6 +1,6 @@
 import type { EmbeddedTerminalScreen } from "@opentui/core"
 
-import type { AgentActivity, TerminalObserver } from "../agent-provider"
+import type { AgentActivity, DraftPreview, TerminalObserver } from "../agent-provider"
 import { OscSequenceParser } from "../osc"
 
 const ACTIVE_TITLE_STATUSES = new Set(["Starting", "Working", "Thinking", "Waiting"])
@@ -54,8 +54,9 @@ export class CodexTerminalObserver implements TerminalObserver {
     return observation.activity
   }
 
-  observeDraft(screen: EmbeddedTerminalScreen): string | undefined {
-    return observeCodexDraft(screen)
+  observeDraft(screen: EmbeddedTerminalScreen): DraftPreview | undefined {
+    const text = observeCodexDraft(screen)
+    return text === undefined ? undefined : { text, exact: false }
   }
 }
 

@@ -257,6 +257,7 @@ export class ClaudeProvider implements AgentProvider {
         ordinal,
         visible,
         rawMessage: message.message,
+        copyIdentity: JSON.stringify(message.message) ?? "undefined",
         ...(message.type === "assistant" && assistantDisplayGroupId !== undefined
           ? { displayGroupId: assistantDisplayGroupId }
           : {}),

@@ -4,16 +4,20 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { isDeepStrictEqual } from "node:util"
 
-import type {
-  AgentMessage,
-  AgentProvider,
-  AgentSession,
-  AgentSessionSnapshot,
-  MessageRef,
-  PreparedBranch,
-  PreparedSession,
-  TerminalLaunch,
-  TerminalObserver,
+import {
+  BranchCreatedError,
+  type AgentMessage,
+  type AgentProvider,
+  type AgentSession,
+  type AgentSessionSnapshot,
+  type BranchDerivation,
+  type MessageRef,
+  type PreparedBranch,
+  type PreparedSession,
+  type TerminalLaunch,
+  type TerminalObserver,
+  type TerminalSessionTransition,
+  type TerminalSessionTransitionSource,
 } from "../agent-provider"
 import { theme } from "../theme"
 import {
@@ -29,6 +33,10 @@ import {
   type CodexUserInput,
 } from "./codex-app-server"
 import { CodexTerminalObserver } from "./codex-terminal-observer"
+import {
+  createCodexTuiProxy,
+  type CodexTuiSwitch,
+} from "./codex-tui-proxy"
 
 export const EXPECTED_CODEX_VERSION = "0.150.1"
 const TRANSCRIPT_READ_CONCURRENCY = 16
@@ -49,20 +57,40 @@ export interface CodexProviderDependencies {
   readVersion?: (executable: string) => Promise<string>
   canonicalize?: (path: string) => Promise<string>
   newSessionFactory?: CodexNewSessionFactory
+  resumeSessionFactory?: CodexResumeSessionFactory
 }
 
 export interface CodexNewSession {
   sessionId: string
-  threadStarted: Promise<CodexThread>
+  threadStarted: Promise<AgentSession>
   remoteUrl: string
   bearerToken: string
+  transitions: TerminalSessionTransitionSource
   cleanup(): Promise<void>
 }
 
 export type CodexNewSessionFactory = (
   executable: string,
   projectPath: string,
+  transitionFor: Parameters<CodexResumeSessionFactory>[3],
 ) => Promise<CodexNewSession>
+
+export interface CodexResumeSession {
+  remoteUrl: string
+  bearerToken: string
+  transitions: TerminalSessionTransitionSource
+  cleanup(): Promise<void>
+}
+
+export type CodexResumeSessionFactory = (
+  executable: string,
+  projectPath: string,
+  sessionId: string,
+  transitionFor: (observed: CodexTuiSwitch) => {
+    session: AgentSession
+    derivation?: Promise<BranchDerivation | undefined>
+  },
+) => Promise<CodexResumeSession>
 
 export class CodexProvider implements AgentProvider {
   readonly id = "codex"
@@ -76,6 +104,7 @@ export class CodexProvider implements AgentProvider {
     private readonly appServerFactory: CodexAppServerFactory = createCodexAppServerFactory(executable),
     private readonly observerFactory: () => TerminalObserver = () => new CodexTerminalObserver(),
     private readonly newSessionFactory: CodexNewSessionFactory = createCodexNewSession,
+    private readonly resumeSessionFactory: CodexResumeSessionFactory = createCodexResumeSession,
   ) {}
 
   async listSessions(): Promise<AgentSession[]> {
@@ -100,8 +129,17 @@ export class CodexProvider implements AgentProvider {
   }
 
   async prepareNewSession(): Promise<PreparedSession> {
-    const created = await this.newSessionFactory(this.executable, this.projectPath)
-    const startedSession = created.threadStarted.then((thread) => ({ ...toSession(thread), transient: true }))
+    const created = await this.newSessionFactory(
+      this.executable,
+      this.projectPath,
+      (transition) => ({
+        session: sessionFromObservedThread(transition.thread),
+        ...(transition.method === "thread/fork"
+          ? { derivation: this.deriveNativeFork(transition) }
+          : {}),
+      }),
+    )
+    const startedSession = created.threadStarted.then((session) => ({ ...session, transient: true }))
     void startedSession.catch(() => undefined)
     const session = {
       id: created.sessionId,
@@ -125,6 +163,7 @@ export class CodexProvider implements AgentProvider {
         cwd: this.projectPath,
         env: { CLAUDE_TREE_CODEX_TOKEN: created.bearerToken },
         observer: this.observerFactory(),
+        sessionTransitions: created.transitions,
         cleanup: created.cleanup,
       },
       startedSession,
@@ -132,11 +171,11 @@ export class CodexProvider implements AgentProvider {
   }
 
   async prepareResume(session: AgentSession): Promise<TerminalLaunch> {
-    return this.launch(session.id)
+    return this.prepareObservedLaunch(session.id)
   }
 
   async branchFrom(target: MessageRef): Promise<PreparedBranch> {
-    return this.withServer(async (server) => {
+    const prepared = await this.withServer(async (server) => {
       const parentThread = await server.readThread(target.sessionId)
       const parentTranscript = normalizeCodexThread(parentThread)
       const selectedIndex = parentTranscript.findIndex((message) => message.id === target.messageId)
@@ -160,7 +199,7 @@ export class CodexProvider implements AgentProvider {
 
       return {
         session: toSession(readChildThread),
-        launch: this.launch(childThread.id),
+        transcript: childTranscript,
         derivation: {
           childSessionId: childThread.id,
           parentSessionId: target.sessionId,
@@ -173,6 +212,21 @@ export class CodexProvider implements AgentProvider {
         providerSessionCreated: true,
       }
     })
+    const { transcript, ...branch } = prepared
+    try {
+      return {
+        ...branch,
+        launch: await this.prepareObservedLaunch(prepared.session.id),
+      }
+    } catch (error) {
+      throw new BranchCreatedError(
+        prepared.session,
+        transcript,
+        true,
+        `Fork ${prepared.session.id} was created, but its terminal could not be prepared: ${errorMessage(error)}`,
+        { cause: error },
+      )
+    }
   }
 
   private launch(
@@ -180,6 +234,7 @@ export class CodexProvider implements AgentProvider {
     remoteUrl?: string,
     bearerToken?: string,
     cleanup?: () => Promise<void>,
+    sessionTransitions?: TerminalSessionTransitionSource,
   ): TerminalLaunch {
     return {
       sessionId,
@@ -197,8 +252,65 @@ export class CodexProvider implements AgentProvider {
       cwd: this.projectPath,
       ...(bearerToken === undefined ? {} : { env: { CLAUDE_TREE_CODEX_TOKEN: bearerToken } }),
       observer: this.observerFactory(),
+      ...(sessionTransitions === undefined ? {} : { sessionTransitions }),
       ...(cleanup === undefined ? {} : { cleanup }),
     }
+  }
+
+  private async prepareObservedLaunch(sessionId: string): Promise<TerminalLaunch> {
+    const observed = await this.resumeSessionFactory(
+      this.executable,
+      this.projectPath,
+      sessionId,
+      (transition) => ({
+        session: sessionFromObservedThread(transition.thread),
+        ...(transition.method === "thread/fork"
+          ? { derivation: this.deriveNativeFork(transition) }
+          : {}),
+      }),
+    )
+    return this.launch(
+      sessionId,
+      observed.remoteUrl,
+      observed.bearerToken,
+      observed.cleanup,
+      observed.transitions,
+    )
+  }
+
+  private deriveNativeFork(observed: CodexTuiSwitch): Promise<BranchDerivation | undefined> {
+    return this.withServer(async (server) => {
+      const childSessionId = observed.thread.id
+      if (typeof childSessionId !== "string") {
+        throw new Error("Codex reported a fork without a thread ID")
+      }
+      const [parentThread, childThread] = await Promise.all([
+        server.readThread(observed.previousThreadId),
+        server.readThread(childSessionId),
+      ])
+      const parent = normalizeCodexThread(parentThread)
+      const child = normalizeCodexThread(childThread)
+      if (child.length > parent.length) {
+        throw new Error(`Fork ${childSessionId} contains history not present in its source`)
+      }
+      for (let index = 0; index < child.length; index += 1) {
+        if (!sameCopiedCodexMessage(parent[index]!, child[index]!)) {
+          throw new Error(`Fork ${childSessionId} copied history does not match its source`)
+        }
+      }
+
+      const sourceMessageId = parent[child.length - 1]?.id
+      if (!sourceMessageId) return undefined
+      return {
+        childSessionId,
+        parentSessionId: observed.previousThreadId,
+        sourceMessageId,
+        sharedMessages: child.map((message, index) => ({
+          parentMessageId: parent[index]!.id,
+          childMessageId: message.id,
+        })),
+      }
+    })
   }
 
   private async listSessionsFrom(server: CodexAppServer): Promise<AgentSession[]> {
@@ -277,13 +389,65 @@ export async function createCodexProvider(
     dependencies.appServerFactory ?? createCodexAppServerFactory(executable),
     dependencies.observerFactory,
     dependencies.newSessionFactory,
+    dependencies.resumeSessionFactory,
   )
 }
 
-export async function createCodexNewSession(
+export async function createCodexResumeSession(
   executable: string,
-  projectPath: string,
-): Promise<CodexNewSession> {
+  _projectPath: string,
+  sessionId: string,
+  transitionFor: Parameters<CodexResumeSessionFactory>[3],
+): Promise<CodexResumeSession> {
+  const sidecar = await startCodexSidecar(executable)
+  let proxy: Awaited<ReturnType<typeof createCodexTuiProxy>> | undefined
+  let cleanupPromise: Promise<void> | undefined
+  const cleanup = (): Promise<void> => {
+    cleanupPromise ??= (async () => {
+      const results = await Promise.allSettled([
+        proxy?.cleanup() ?? Promise.resolve(),
+        sidecar.cleanup(),
+      ])
+      const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
+      if (errors.length > 0) throw new AggregateError(errors, "Unable to stop the Codex session services")
+    })()
+    return cleanupPromise
+  }
+  try {
+    const probe = await connectToCodexAppServer(
+      sidecar.remoteUrl,
+      sidecar.bearerToken,
+      sidecar.process,
+      sidecar.stderr,
+    )
+    await probe.close()
+    proxy = await createCodexTuiProxy(
+      sidecar.remoteUrl,
+      sidecar.bearerToken,
+      sessionId,
+      transitionFor,
+    )
+    return {
+      remoteUrl: proxy.remoteUrl,
+      bearerToken: sidecar.bearerToken,
+      transitions: proxy.transitions,
+      cleanup,
+    }
+  } catch (error) {
+    await cleanup()
+    throw error
+  }
+}
+
+interface CodexSidecar {
+  remoteUrl: string
+  bearerToken: string
+  process: Bun.Subprocess
+  stderr: Promise<string>
+  cleanup(): Promise<void>
+}
+
+async function startCodexSidecar(executable: string): Promise<CodexSidecar> {
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-codex-"))
   const tokenPath = join(directory, "token")
   const bearerToken = crypto.randomUUID().replaceAll("-", "")
@@ -305,16 +469,49 @@ export async function createCodexNewSession(
     stderr: "pipe",
   })
   const stderr = readBoundedText(process.stderr, SIDECAR_STDERR_LIMIT)
+  let cleanupPromise: Promise<void> | undefined
+  return {
+    remoteUrl,
+    bearerToken,
+    process,
+    stderr,
+    cleanup() {
+      cleanupPromise ??= (async () => {
+        if (process.exitCode === null) signalProcessGroup(process, "SIGTERM")
+        if (!(await settlesWithin(process.exited, 1_000)) && process.exitCode === null) {
+          signalProcessGroup(process, "SIGKILL")
+          await settlesWithin(process.exited, 1_000)
+        }
+        if (process.exitCode === null) {
+          process.unref()
+          throw new Error("Codex app-server did not stop after SIGKILL")
+        }
+      })().finally(async () => {
+        await rm(directory, { recursive: true, force: true })
+      })
+      return cleanupPromise
+    },
+  }
+}
+
+export async function createCodexNewSession(
+  executable: string,
+  _projectPath: string,
+  transitionFor: Parameters<CodexNewSessionFactory>[2],
+): Promise<CodexNewSession> {
+  const sidecar = await startCodexSidecar(executable)
   const sessionId = `pending-codex-${crypto.randomUUID()}`
   let threadSettled = false
-  let resolveThread!: (thread: CodexThread) => void
+  let resolveThread!: (session: AgentSession) => void
   let rejectThread!: (error: Error) => void
-  const threadStarted = new Promise<CodexThread>((resolve, reject) => {
+  const threadStarted = new Promise<AgentSession>((resolve, reject) => {
     resolveThread = resolve
     rejectThread = reject
   })
   void threadStarted.catch(() => undefined)
-  let allocationClient: CodexAppServerClient | undefined
+  const laterTransitions = transitionChannel()
+  let proxy: Awaited<ReturnType<typeof createCodexTuiProxy>> | undefined
+  let unsubscribeProxy: (() => void) | undefined
   let cleanupPromise: Promise<void> | undefined
   const cleanup = (): Promise<void> => {
     cleanupPromise ??= (async () => {
@@ -322,34 +519,56 @@ export async function createCodexNewSession(
         threadSettled = true
         rejectThread(new Error("Codex exited before starting its new thread"))
       }
-      await allocationClient?.close().catch(() => undefined)
-      allocationClient = undefined
-      if (process.exitCode === null) signalProcessGroup(process, "SIGTERM")
-      if (!(await settlesWithin(process.exited, 1_000)) && process.exitCode === null) {
-        signalProcessGroup(process, "SIGKILL")
-        await settlesWithin(process.exited, 1_000)
-      }
-      if (process.exitCode === null) process.unref()
-      await rm(directory, { recursive: true, force: true })
+      unsubscribeProxy?.()
+      const results = await Promise.allSettled([
+        proxy?.cleanup() ?? Promise.resolve(),
+        sidecar.cleanup(),
+      ])
+      const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
+      if (errors.length > 0) throw new AggregateError(errors, "Unable to stop the Codex session services")
     })()
     return cleanupPromise
   }
 
   try {
-    allocationClient = await connectToCodexAppServer(remoteUrl, bearerToken, process, stderr)
-    void waitForLoadedThread(allocationClient).then(
-      (thread) => {
-        if (threadSettled) return
-        threadSettled = true
-        resolveThread(thread)
+    const probe = await connectToCodexAppServer(
+      sidecar.remoteUrl,
+      sidecar.bearerToken,
+      sidecar.process,
+      sidecar.stderr,
+    )
+    await probe.close()
+    proxy = await createCodexTuiProxy(
+      sidecar.remoteUrl,
+      sidecar.bearerToken,
+      sessionId,
+      transitionFor,
+    )
+    unsubscribeProxy = proxy.transitions.subscribe(
+      (transition) => {
+        if (!threadSettled) {
+          threadSettled = true
+          resolveThread(transition.session)
+        }
+        laterTransitions.emit(transition)
       },
-      (error: unknown) => {
-        if (threadSettled) return
-        threadSettled = true
-        rejectThread(error instanceof Error ? error : new Error(String(error)))
+      (error) => {
+        if (threadSettled) {
+          laterTransitions.fail(error)
+        } else {
+          threadSettled = true
+          rejectThread(error)
+        }
       },
     )
-    return { sessionId, threadStarted, remoteUrl, bearerToken, cleanup }
+    return {
+      sessionId,
+      threadStarted,
+      remoteUrl: proxy.remoteUrl,
+      bearerToken: sidecar.bearerToken,
+      transitions: laterTransitions.source,
+      cleanup,
+    }
   } catch (error) {
     await cleanup()
     throw error
@@ -366,6 +585,7 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): CodexM
         ...normalized,
         ordinal: messages.length,
         rawItem: item,
+        copyIdentity: JSON.stringify(withoutItemId(item)) ?? "undefined",
         turnId: turn.id,
         turnStatus: turn.status,
         itemIndex,
@@ -454,16 +674,20 @@ function validateCopiedPrefix(
   for (let index = 0; index < parent.length; index += 1) {
     const parentMessage = parent[index]!
     const childMessage = child[index]!
-    if (
-      parentMessage.role !== childMessage.role ||
-      parentMessage.visible !== childMessage.visible ||
-      parentMessage.turnStatus !== childMessage.turnStatus ||
-      parentMessage.itemIndex !== childMessage.itemIndex ||
-      !isDeepStrictEqual(withoutItemId(parentMessage.rawItem), withoutItemId(childMessage.rawItem))
-    ) {
+    if (!sameCopiedCodexMessage(parentMessage, childMessage)) {
       throw new Error(`Fork ${childSessionId} was created, but its copied prefix does not match the source`)
     }
   }
+}
+
+function sameCopiedCodexMessage(parent: CodexMessage, child: CodexMessage): boolean {
+  return (
+    parent.role === child.role &&
+    parent.visible === child.visible &&
+    parent.turnStatus === child.turnStatus &&
+    parent.itemIndex === child.itemIndex &&
+    isDeepStrictEqual(withoutItemId(parent.rawItem), withoutItemId(child.rawItem))
+  )
 }
 
 function withoutItemId(item: CodexThreadItem): Record<string, unknown> {
@@ -478,6 +702,21 @@ function toSession(thread: CodexThread): AgentSession {
     title: normalizePreview(title),
     lastModified: thread.updatedAt * 1_000,
     ...(thread.gitInfo?.branch ? { gitBranch: thread.gitInfo.branch } : {}),
+  }
+}
+
+function sessionFromObservedThread(thread: Record<string, unknown>): AgentSession {
+  const gitInfo = typeof thread.gitInfo === "object" && thread.gitInfo !== null
+    ? thread.gitInfo as Record<string, unknown>
+    : undefined
+  return {
+    id: String(thread.id),
+    title: normalizePreview(firstNonempty(
+      typeof thread.name === "string" ? thread.name : undefined,
+      typeof thread.preview === "string" ? thread.preview : undefined,
+    ) ?? "Untitled conversation"),
+    lastModified: typeof thread.updatedAt === "number" ? thread.updatedAt * 1_000 : Date.now(),
+    ...(typeof gitInfo?.branch === "string" ? { gitBranch: gitInfo.branch } : {}),
   }
 }
 
@@ -531,17 +770,6 @@ async function connectToCodexAppServer(
   )
 }
 
-async function waitForLoadedThread(client: CodexAppServerClient): Promise<CodexThread> {
-  while (true) {
-    const sessionIds = await client.listLoadedThreadIds()
-    if (sessionIds.length > 1) {
-      throw new Error("The dedicated Codex app-server loaded more than one thread")
-    }
-    if (sessionIds[0]) return client.readThread(sessionIds[0], false)
-    await Bun.sleep(10)
-  }
-}
-
 async function readThreadWithOverloadRetry(
   server: CodexAppServer,
   sessionId: string,
@@ -555,6 +783,32 @@ async function readThreadWithOverloadRetry(
     }
   }
   return server.readThread(sessionId)
+}
+
+function transitionChannel(): {
+  source: TerminalSessionTransitionSource
+  emit(transition: TerminalSessionTransition): void
+  fail(error: Error): void
+} {
+  const listeners = new Set<{
+    transition: (transition: TerminalSessionTransition) => void
+    error: (error: Error) => void
+  }>()
+  return {
+    source: {
+      subscribe(onTransition, onError) {
+        const listener = { transition: onTransition, error: onError }
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+    },
+    emit(transition) {
+      for (const listener of listeners) listener.transition(transition)
+    },
+    fail(error) {
+      for (const listener of listeners) listener.error(error)
+    },
+  }
 }
 
 async function availableLoopbackPort(): Promise<number> {
