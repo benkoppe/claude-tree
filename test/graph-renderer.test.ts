@@ -9,6 +9,7 @@ import {
   graphNodeAt,
   initialVisibleGraphNodeId,
   layoutConversationGraph,
+  topVisibleGraphNodeId,
   visibleGraphNodeId,
 } from "../src/graph-layout"
 import {
@@ -481,6 +482,22 @@ describe("spatial graph navigation", () => {
 
     expect(up.nodeId).toBe(graph.rootNodeId)
     expect(down?.nodeId).toBe(shortChildId)
+  })
+
+  test("finds the top of the selected visible parent chain", () => {
+    const graph = unevenBranchGraph()
+    const layout = layoutConversationGraph(graph, 100, new Set([ROOT, CHILD]))
+    const tallDeepId = nodeIdByPreview(graph, "tall three")
+    const shortEndpointId = graph.endpointBySessionId.get(CHILD)!
+
+    expect(topVisibleGraphNodeId(layout, tallDeepId)).toBe(graph.rootNodeId)
+    expect(topVisibleGraphNodeId(layout, shortEndpointId)).toBe(graph.rootNodeId)
+    expect(topVisibleGraphNodeId(layout, "missing")).toBeUndefined()
+
+    const replay = rootReplayGraph()
+    const replayEndpointId = replay.endpointBySessionId.get(CHILD)!
+    const replayLayout = layoutConversationGraph(replay, 100, new Set([CHILD]))
+    expect(topVisibleGraphNodeId(replayLayout, replayEndpointId)).toBe(replayEndpointId)
   })
 
   test("preserves depth when crossing a shorter branch and ignores blocked moves", () => {

@@ -85,6 +85,21 @@ export function initialVisibleGraphNodeId(
   return undefined
 }
 
+export function topVisibleGraphNodeId(
+  layout: ConversationGraphLayout,
+  nodeId: string,
+): string | undefined {
+  let current = layout.nodes.get(nodeId)
+  if (!current) return undefined
+
+  while (current.node.parentId) {
+    const parent = layout.nodes.get(current.node.parentId)
+    if (!parent) break
+    current = parent
+  }
+  return current.node.id
+}
+
 export function layoutConversationGraph(
   graph: ConversationGraph,
   viewportWidth: number,
