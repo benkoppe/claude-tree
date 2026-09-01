@@ -27,6 +27,7 @@ interface OpenLeafPickerRequest {
   selectedSessionId?: string
   activeSessionIds?: ReadonlySet<string>
   newUpdateSessionIds?: ReadonlySet<string>
+  needsUserSessionIds?: ReadonlySet<string>
 }
 
 export class OpenLeafPicker {
@@ -38,6 +39,7 @@ export class OpenLeafPicker {
   private options: ReachableSessionEndpoint[] = []
   private activeSessionIds: ReadonlySet<string> = new Set()
   private newUpdateSessionIds: ReadonlySet<string> = new Set()
+  private needsUserSessionIds: ReadonlySet<string> = new Set()
   private onSelect: ((option: ReachableSessionEndpoint) => void) | undefined
   private selectedIndex = 0
   private pendingMouseIndex: number | null = null
@@ -131,6 +133,7 @@ export class OpenLeafPicker {
       selectedSessionId,
       activeSessionIds = new Set(),
       newUpdateSessionIds = new Set(),
+      needsUserSessionIds = new Set(),
     } = request
     this.clearRows()
     this.title.content = title
@@ -138,6 +141,7 @@ export class OpenLeafPicker {
     this.onSelect = onSelect
     this.activeSessionIds = new Set(activeSessionIds)
     this.newUpdateSessionIds = new Set(newUpdateSessionIds)
+    this.needsUserSessionIds = new Set(needsUserSessionIds)
     const selectedIndex = selectedSessionId
       ? options.findIndex((option) => option.endpoint.session.id === selectedSessionId)
       : -1
@@ -244,6 +248,7 @@ export class OpenLeafPicker {
       const selected = index === this.selectedIndex
       const active = this.activeSessionIds.has(option.endpoint.session.id)
       const hasNewUpdates = this.newUpdateSessionIds.has(option.endpoint.session.id)
+      const needsUser = this.needsUserSessionIds.has(option.endpoint.session.id)
       const background = selected ? theme.selected : theme.element
       const foreground = selected ? theme.selectedText : theme.text
       const distance =
@@ -262,9 +267,10 @@ export class OpenLeafPicker {
       )
       row.container.backgroundColor = background
       row.marker.bg = theme.element
-      row.marker.fg = hasNewUpdates ? theme.warning : theme.success
-      row.marker.attributes = selected || hasNewUpdates ? TextAttributes.BOLD : TextAttributes.NONE
-      row.marker.content = hasNewUpdates ? "● " : active ? "• " : "  "
+      row.marker.fg = needsUser ? theme.danger : hasNewUpdates ? theme.warning : theme.success
+      row.marker.attributes =
+        selected || needsUser || hasNewUpdates ? TextAttributes.BOLD : TextAttributes.NONE
+      row.marker.content = needsUser || hasNewUpdates ? "● " : active ? "• " : "  "
       row.text.bg = background
       row.text.fg = foreground
       row.text.attributes = selected ? TextAttributes.BOLD : TextAttributes.NONE

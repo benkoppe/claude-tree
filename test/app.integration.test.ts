@@ -2464,6 +2464,94 @@ sleep 30
   }
 })
 
+test("shows a blocked Agent in the graph and conversation roots", async () => {
+  const root = await temporaryDirectory()
+  const project = join(root, "project")
+  const state = join(root, "state")
+  const blockerMarker = join(root, "block")
+  await mkdir(project)
+  const fakeClaude = join(root, "claude")
+  await writeFile(
+    fakeClaude,
+    `#!/bin/sh
+${String.raw`printf '\033]0;\342\240\213 Claude Code\007'`}
+while [ ! -f ${JSON.stringify(blockerMarker)} ]; do sleep 0.01; done
+${String.raw`printf '\033[2J\033[HWould you like to proceed?\r\n\342\235\257 1. Allow once\r\n  2. Deny\r\nEsc to cancel'`}
+sleep 30
+`,
+  )
+  await chmod(fakeClaude, 0o755)
+
+  const sessionId = "11111111-1111-4111-8111-111111111111"
+  const transcript = [
+    sessionMessage(
+      sessionId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "user",
+      "question requiring approval",
+    ),
+  ]
+  const provider = new ClaudeProvider(project, fakeClaude, {
+    async list(): Promise<SDKSessionInfo[]> {
+      return [{
+        sessionId,
+        summary: "Input conversation",
+        firstPrompt: "question requiring approval",
+        lastModified: Date.now(),
+      }]
+    },
+    async messages(): Promise<SessionMessage[]> {
+      return transcript
+    },
+    async fork(): Promise<{ sessionId: string }> {
+      throw new Error("not used")
+    },
+  })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const app = await AgentTreeApp.create(setup.renderer, project, provider, state)
+  const running = app.run()
+
+  try {
+    await waitForFrame(setup, (frame) => frame.includes("Input conversation"))
+    setup.mockInput.pressEnter()
+    await waitForFrame(setup, (frame) => frame.includes("question requiring approval"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(50)
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await waitForFrame(
+      setup,
+      (frame) => BRAILLE_SPINNER_FRAMES.some((spinner) => frame.includes(spinner)),
+    )
+    await writeFile(blockerMarker, "")
+    const waiting = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("Needs user") &&
+        frame.includes("Selected agent · needs user"),
+    )
+    expect(waiting).not.toContain("Draft")
+    expect(BRAILLE_SPINNER_FRAMES.every((spinner) => !waiting.includes(spinner))).toBeTrue()
+
+    setup.mockInput.pressKey("x")
+    await waitForFrame(setup, (frame) => frame.includes("Kill this Agent that needs user input?"))
+    setup.mockInput.pressEscape()
+    await waitForFrame(setup, (frame) => !frame.includes("Kill live session"))
+
+    setup.mockInput.pressKey("q")
+    const roots = await waitForFrame(
+      setup,
+      (frame) =>
+        frame.includes("Conversation roots") &&
+        frame.includes("● Needs user · Input conversation"),
+    )
+    expect(roots).toContain(" ●  Input conversation")
+    expect(roots).not.toContain("● Live · Input conversation")
+  } finally {
+    await app.stop()
+    await running
+  }
+})
+
 test("replaces a completed agent spinner with a message and new draft leaf", async () => {
   const root = await temporaryDirectory()
   const project = join(root, "project")

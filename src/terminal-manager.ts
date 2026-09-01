@@ -11,6 +11,8 @@ import { NULL_HERDR_REPORTER, type HerdrReporter } from "./herdr-reporter"
 
 const SHUTDOWN_GRACE_PERIOD_MS = 200
 const FORCED_SHUTDOWN_PERIOD_MS = 200
+const ACTIVE_TERMINAL_Z_INDEX = 10
+const INACTIVE_TERMINAL_Z_INDEX = 0
 const NESTED_HERDR_ENVIRONMENT_KEYS = [
   "HERDR_ENV",
   "HERDR_BIN_PATH",
@@ -107,17 +109,17 @@ export class TerminalManager {
       this.renderer.clearSelection()
       if (active) this.captureDraft(active)
       active?.terminal.blur()
-      if (active) active.terminal.visible = false
+      if (active) setTerminalPresentation(active.terminal, false)
     }
 
     this.activeSessionId = managed.sessionId
-    managed.terminal.visible = true
+    setTerminalPresentation(managed.terminal, true)
     try {
       managed.terminal.focus()
       this.herdrReporter.report(managed.activity)
     } catch (error) {
       this.activeSessionId = null
-      managed.terminal.visible = false
+      setTerminalPresentation(managed.terminal, false)
       this.herdrReporter.report("idle")
       throw error
     }
@@ -131,7 +133,7 @@ export class TerminalManager {
       const managed = this.terminals.get(previous)
       if (managed) this.captureDraft(managed)
       managed?.terminal.blur()
-      if (managed) managed.terminal.visible = false
+      if (managed) setTerminalPresentation(managed.terminal, false)
     }
     this.pruneExited()
     this.herdrReporter.report("idle")
@@ -189,12 +191,25 @@ export class TerminalManager {
     )
   }
 
-  workingSessionIds(): Set<string> {
+  nonIdleSessionIds(): Set<string> {
     return new Set(
       [...this.terminals.values()]
         .filter(
           (managed) =>
             managed.state === "running" && managed.exitCode === null && managed.activity !== "idle",
+        )
+        .map((managed) => managed.sessionId),
+    )
+  }
+
+  activitySessionIds(activity: AgentActivity): Set<string> {
+    return new Set(
+      [...this.terminals.values()]
+        .filter(
+          (managed) =>
+            managed.state === "running" &&
+            managed.exitCode === null &&
+            managed.activity === activity,
         )
         .map((managed) => managed.sessionId),
     )
@@ -332,8 +347,9 @@ export class TerminalManager {
       left: 0,
       width: "100%",
       height: "100%",
-      zIndex: 10,
-      visible: false,
+      zIndex: INACTIVE_TERMINAL_Z_INDEX,
+      visible: true,
+      opacity: 0,
       cols,
       rows,
       maxScrollback: 1_000_000,
@@ -498,6 +514,11 @@ export class TerminalManager {
     const selectedText = selection.getSelectedText()
     if (selectedText.length > 0) this.renderer.copyToClipboardOSC52(selectedText)
   }
+}
+
+function setTerminalPresentation(terminal: EmbeddedTerminalRenderable, active: boolean): void {
+  terminal.zIndex = active ? ACTIVE_TERMINAL_Z_INDEX : INACTIVE_TERMINAL_Z_INDEX
+  terminal.opacity = active ? 1 : 0
 }
 
 async function waitForPtyDrain(ptyClosed: Promise<void>, timeoutMs = 250): Promise<void> {
