@@ -48,8 +48,10 @@ test("does not expose the outer Herdr pane identity to nested providers", async 
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-herdr-env-test-"))
   temporaryDirectories.push(directory)
   const environmentMarker = join(directory, "environment")
+  const pendingEnvironmentMarker = `${environmentMarker}.tmp`
   const executable = await createFakeClaude(
-    `printf '%s\n' "\${HERDR_ENV-unset}" "\${HERDR_BIN_PATH-unset}" "\${HERDR_SOCKET_PATH-unset}" "\${HERDR_PANE_ID-unset}" "\${HERDR_TAB_ID-unset}" "\${HERDR_WORKSPACE_ID-unset}" "$TERM" "$COLORTERM" "$CUSTOM_PROVIDER_VALUE" > ${JSON.stringify(environmentMarker)}
+    `printf '%s\n' "\${HERDR_ENV-unset}" "\${HERDR_BIN_PATH-unset}" "\${HERDR_SOCKET_PATH-unset}" "\${HERDR_PANE_ID-unset}" "\${HERDR_TAB_ID-unset}" "\${HERDR_WORKSPACE_ID-unset}" "$TERM" "$COLORTERM" "$CUSTOM_PROVIDER_VALUE" > ${JSON.stringify(pendingEnvironmentMarker)}
+    mv ${JSON.stringify(pendingEnvironmentMarker)} ${JSON.stringify(environmentMarker)}
     sleep 30`,
   )
   const terminalLaunch = launch(executable, "nested-provider-session")
