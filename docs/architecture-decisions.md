@@ -24,7 +24,7 @@ The generic terminal manager executes provider-prepared commands and delegates a
 
 Use supported provider APIs for session discovery, message reads, and historical forks. For the Claude adapter, historical branching is based on `forkSession(sessionId, { upToMessageId })` rather than direct transcript manipulation. For Codex, short-lived `codex app-server --stdio` processes perform thread listing, reading, and forking; interactive work remains in the stock `codex resume <thread-id>` TUI.
 
-The SDK and CLI compatibility baseline is `@anthropic-ai/claude-agent-sdk` 0.3.251 with Claude Code 2.1.251. Upgrade them deliberately and verify session compatibility together. A different installed Claude Code version is shown as a compatibility warning, and historical branching is disabled before creating a child because transcript parsing and fork semantics are version-sensitive.
+The packaged SDK and CLI baseline is `@anthropic-ai/claude-agent-sdk` 0.3.251 with Claude Code 2.1.251. Upgrade the pinned SDK deliberately and verify session compatibility. Do not version-gate an externally installed Claude Code executable: metadata reads and historical forks use the pinned SDK, and every created fork must pass strict copied-prefix validation before its ancestry is saved. If a changed transcript format prevents that validation, preserve the created child as an independent session rather than guessing its relationship.
 
 The validated Codex baseline is 0.150.1. The app-server protocol and terminal telemetry are version-sensitive, so a different installed version is shown as a compatibility warning. One refresh batches all transcript reads through one app-server process, and every metadata operation closes its process after a bounded wait.
 

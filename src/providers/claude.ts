@@ -36,14 +36,12 @@ export interface ClaudeSdk {
 }
 
 export interface ClaudeProviderOptions {
-  compatibilityWarning?: string
   forkValidationRetryDelaysMs?: readonly number[]
 }
 
 export interface ClaudeProviderDependencies {
   sdk?: ClaudeSdk
   which?: (executable: string) => string | null
-  readVersion?: (executable: string) => Promise<string>
 }
 
 const defaultSdk: ClaudeSdk = {
@@ -59,8 +57,6 @@ const LOCAL_COMMAND_OUTPUT_PATTERN =
 const NO_RESPONSE_REQUESTED = "No response requested."
 const FORK_VALIDATION_RETRY_DELAYS_MS = [25, 50, 100, 200]
 
-export const EXPECTED_CLAUDE_VERSION = "2.1.251"
-
 interface ClaudeMessage extends AgentMessage {
   replayText?: string
   rawMessage: unknown
@@ -70,7 +66,6 @@ export class ClaudeProvider implements AgentProvider {
   readonly id = "claude"
   readonly displayName = "Claude Code"
   readonly navigatorIdentity = { label: "Claude", color: theme.claude }
-  readonly compatibilityWarning: string | undefined
 
   private readonly forkValidationRetryDelaysMs: readonly number[]
 
@@ -80,7 +75,6 @@ export class ClaudeProvider implements AgentProvider {
     private readonly sdk: ClaudeSdk = defaultSdk,
     options: ClaudeProviderOptions = {},
   ) {
-    this.compatibilityWarning = options.compatibilityWarning
     this.forkValidationRetryDelaysMs =
       options.forkValidationRetryDelaysMs ?? FORK_VALIDATION_RETRY_DELAYS_MS
   }
@@ -155,9 +149,6 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     this.validateDraft(replayText)
-    if (this.compatibilityWarning) {
-      throw new Error(`${this.compatibilityWarning}. Historical branching is disabled for this version pair`)
-    }
 
     const forkMessage = parentTranscript[forkIndex]!
     const parentSession = (await this.listSessions()).find((session) => session.id === target.sessionId)
@@ -313,33 +304,7 @@ export async function createClaudeProvider(
 ): Promise<ClaudeProvider> {
   const executable = (dependencies.which ?? Bun.which)("claude")
   if (!executable) throw new Error("Claude Code was not found on PATH")
-  const installedVersion = await (dependencies.readVersion ?? readClaudeVersion)(executable)
-  const compatibilityWarning = claudeCompatibilityWarning(installedVersion)
-  return new ClaudeProvider(
-    projectPath,
-    executable,
-    dependencies.sdk ?? defaultSdk,
-    compatibilityWarning === undefined ? {} : { compatibilityWarning },
-  )
-}
-
-export function claudeCompatibilityWarning(installedVersion: string): string | undefined {
-  const escaped = EXPECTED_CLAUDE_VERSION.replace(/\./g, "\\.")
-  if (new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(installedVersion.trim())) return undefined
-  return `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found ${installedVersion.trim()}`
-}
-
-export async function readClaudeVersion(executable: string): Promise<string> {
-  const child = Bun.spawn([executable, "--version"], { stdout: "pipe", stderr: "pipe" })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (exitCode !== 0) {
-    throw new Error(`Unable to run Claude Code: ${stderr.trim() || `exit ${exitCode}`}`)
-  }
-  return stdout.trim()
+  return new ClaudeProvider(projectPath, executable, dependencies.sdk ?? defaultSdk)
 }
 
 export function formatMessage(message: unknown): string {

@@ -5,9 +5,7 @@ import type { SDKSessionInfo, SessionMessage } from "@anthropic-ai/claude-agent-
 import { BranchCreatedError } from "../src/agent-provider"
 import {
   ClaudeProvider,
-  claudeCompatibilityWarning,
   createClaudeProvider,
-  EXPECTED_CLAUDE_VERSION,
   extractUserPromptText,
   formatMessage,
   type ClaudeSdk,
@@ -474,23 +472,19 @@ describe("Claude branching", () => {
   })
 })
 
-describe("Claude compatibility", () => {
-  test("warns unless the installed CLI exactly matches the validated baseline", () => {
-    expect(claudeCompatibilityWarning(`${EXPECTED_CLAUDE_VERSION} (Claude Code)`)).toBeUndefined()
-    expect(claudeCompatibilityWarning("2.1.250 (Claude Code)")).toBe(
-      `Warning: validated with Claude Code ${EXPECTED_CLAUDE_VERSION}; found 2.1.250 (Claude Code)`,
-    )
-    expect(claudeCompatibilityWarning("12.1.2510 (Claude Code)")).toContain("Warning")
-  })
-
-  test("checks the CLI version and blocks historical forks before creation on mismatch", async () => {
+describe("Claude provider creation", () => {
+  test("locates Claude without version-gating historical forks", async () => {
     const parent = [
       message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
       message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
     ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
     let forked = false
     const fakeSdk = sdk({
       parent,
+      child,
       onFork() { forked = true },
     })
     const calls: string[] = []
@@ -500,18 +494,14 @@ describe("Claude compatibility", () => {
         calls.push(`which:${name}`)
         return "/usr/local/bin/claude"
       },
-      async readVersion(executable) {
-        calls.push(`version:${executable}`)
-        return "2.1.250 (Claude Code)"
-      },
     })
 
-    expect(calls).toEqual(["which:claude", "version:/usr/local/bin/claude"])
-    expect(provider.compatibilityWarning).toContain("2.1.250")
-    await expect(
-      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
-    ).rejects.toThrow("Historical branching is disabled for this version pair")
-    expect(forked).toBeFalse()
+    const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+
+    expect(calls).toEqual(["which:claude"])
+    expect(forked).toBeTrue()
+    expect(prepared.session.id).toBe(CHILD)
+    expect(prepared.launch.command).toEqual(["/usr/local/bin/claude", "--resume", CHILD])
   })
 
   test("fails when Claude Code is not on PATH", async () => {
