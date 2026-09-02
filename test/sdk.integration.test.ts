@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import {
   forkSession,
@@ -132,6 +135,128 @@ test("the pinned SDK returns streamed assistant blocks as separate transcript re
     apiMessageId,
     apiMessageId,
   ])
+})
+
+test("the pinned SDK preserves provenance when compaction shortens a fork's active transcript", async () => {
+  const store = new InMemorySessionStore()
+  const sessionId = crypto.randomUUID()
+  const timestamp = "2026-08-30T12:00:00.000Z"
+  const projectKey = process.cwd().replaceAll("/", "-")
+  const anchorId = crypto.randomUUID()
+  const anchor = userEntry(sessionId, anchorId, null, "anchor", timestamp)
+  const preserved = Array.from({ length: 13 }, (_, index) =>
+    agentEntry(
+      sessionId,
+      crypto.randomUUID(),
+      anchorId,
+      `preserved ${index + 1}`,
+      timestamp,
+    )
+  )
+  const compactBoundary: SessionStoreEntry = {
+    type: "system",
+    subtype: "compact_boundary",
+    uuid: crypto.randomUUID(),
+    parentUuid: anchorId,
+    sessionId,
+    timestamp,
+    compactMetadata: {
+      preservedMessages: {
+        anchorUuid: anchorId,
+        uuids: preserved.map((entry) => entry.uuid!),
+      },
+    },
+  }
+  const active = [anchor]
+  let parentId = anchorId
+  for (let index = 1; index < 340; index += 1) {
+    const uuid = crypto.randomUUID()
+    const entry = index % 2 === 0
+      ? userEntry(sessionId, uuid, parentId, `user ${index}`, timestamp)
+      : agentEntry(sessionId, uuid, parentId, `agent ${index}`, timestamp)
+    active.push(entry)
+    parentId = uuid
+  }
+  await store.append(
+    { projectKey, sessionId },
+    [anchor, ...preserved, compactBoundary, ...active.slice(1)],
+  )
+
+  const sourceMessages = await getSessionMessages(sessionId, {
+    dir: process.cwd(),
+    sessionStore: store,
+  })
+  const result = await forkSession(sessionId, {
+    dir: process.cwd(),
+    sessionStore: store,
+    upToMessageId: active.at(-1)!.uuid!,
+  })
+  const childMessages = await getSessionMessages(result.sessionId, {
+    dir: process.cwd(),
+    sessionStore: store,
+  })
+  const copiedConversationRecords = store
+    .getEntries({ projectKey, sessionId: result.sessionId })
+    .filter((entry) => entry.type === "user" || entry.type === "assistant")
+
+  expect(sourceMessages).toHaveLength(353)
+  expect(childMessages).toHaveLength(340)
+  expect(copiedConversationRecords).toHaveLength(353)
+  expect(copiedConversationRecords.every((entry) => {
+    const forkedFrom = entry.forkedFrom as Record<string, unknown> | undefined
+    return forkedFrom?.sessionId === sessionId && typeof forkedFrom.messageUuid === "string"
+  })).toBeTrue()
+})
+
+test("the Claude provider validates SDK-imported source and child records", async () => {
+  const configDir = await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-"))
+  const projectDir = join(configDir, "project")
+  const sourceSessionId = crypto.randomUUID()
+  const userId = crypto.randomUUID()
+  const agentId = crypto.randomUUID()
+  const timestamp = "2026-08-30T12:00:00.000Z"
+  const entries = [
+    userEntry(sourceSessionId, userId, null, "hello", timestamp),
+    agentEntry(sourceSessionId, agentId, userId, "hello back", timestamp),
+  ]
+
+  try {
+    await mkdir(projectDir, { recursive: true })
+    const projectKey = projectDir.replaceAll("/", "-")
+    const transcriptDir = join(configDir, "projects", projectKey)
+    await mkdir(transcriptDir, { recursive: true })
+    await writeFile(
+      join(transcriptDir, `${sourceSessionId}.jsonl`),
+      `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    )
+
+    const script = `
+      import { ClaudeProvider } from "./src/providers/claude.ts"
+      const provider = new ClaudeProvider(${JSON.stringify(projectDir)}, "/usr/bin/claude")
+      const prepared = await provider.branchFrom({
+        sessionId: ${JSON.stringify(sourceSessionId)},
+        messageId: ${JSON.stringify(agentId)},
+      })
+      console.log(prepared.derivation.sharedMessages.length)
+    `
+    const subprocess = Bun.spawn([globalThis.process.execPath, "-e", script], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...globalThis.process.env, CLAUDE_CONFIG_DIR: configDir },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      subprocess.exited,
+      Bun.readableStreamToText(subprocess.stdout),
+      Bun.readableStreamToText(subprocess.stderr),
+    ])
+
+    expect(stderr).toBe("")
+    expect(exitCode).toBe(0)
+    expect(stdout.trim()).toBe("2")
+  } finally {
+    await rm(configDir, { recursive: true, force: true })
+  }
 })
 
 function userEntry(

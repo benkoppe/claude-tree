@@ -8,6 +8,7 @@ import {
   createClaudeProvider,
   extractUserPromptText,
   formatMessage,
+  type ClaudeForkRecord,
   type ClaudeSdk,
 } from "../src/providers/claude"
 
@@ -349,6 +350,243 @@ describe("Claude branching", () => {
     expect(prepared.session.id).toBe(CHILD)
   })
 
+  test("validates a copied prefix from provenance when the active child omits records", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "preserved answer"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "user", "follow-up"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", "assistant", "final answer"),
+    ]
+    const copied = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const child = [copied[0]!, copied[2]!, copied[3]!].map((entry, ordinal) => ({
+      ...entry,
+      timestamp: `${ordinal}`,
+    }))
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", sdk({
+      parent,
+      child,
+      forkRecords: parent.map((entry, index) => forkRecord(entry, copied[index]!, index)),
+    }))
+
+    const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[3]!.uuid })
+
+    expect(prepared.derivation.sharedMessages).toEqual(
+      parent.map((entry, index) => ({
+        parentMessageId: entry.uuid,
+        childMessageId: copied[index]!.uuid,
+      })),
+    )
+  })
+
+  test("fails closed when a short active child lacks complete copy provenance", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = [
+      message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "user", "question"),
+      message(CHILD, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "assistant", "answer"),
+    ]
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        child,
+        forkRecords: [forkRecord(parent[1]!, child[1]!, 1)],
+      }),
+      { forkValidationRetryDelaysMs: [] },
+    )
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow(
+      `Fork ${CHILD} was created, but its copied prefix could not be validated (expected 2 messages; found 1)`,
+    )
+  })
+
+  test("fails closed when copied provenance is physically out of order", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        child,
+        forkRecords: [
+          forkRecord(parent[1]!, child[1]!, 1),
+          forkRecord(parent[0]!, child[0]!, 0),
+        ],
+      }),
+      { forkValidationRetryDelaysMs: [] },
+    )
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow(`Fork ${CHILD} was created, but its copied prefix does not match the source`)
+  })
+
+  test("fails closed when an inactive copied record differs from its provenance source", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const inactiveParent = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "assistant",
+      "inactive source",
+    )
+    const inactiveChild = message(
+      CHILD,
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9",
+      "assistant",
+      "tampered copy",
+    )
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        child,
+        forkRecords: [
+          forkRecord(parent[0]!, child[0]!, 0),
+          forkRecord(inactiveParent, inactiveChild, 1),
+          forkRecord(parent[1]!, child[1]!, 2),
+        ],
+      }),
+      { forkValidationRetryDelaysMs: [] },
+    )
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow(`Fork ${CHILD} was created, but its copied prefix does not match the source`)
+  })
+
+  test("fails closed when an inactive source record is missing from the physical copy", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        child,
+        forkRecords: [
+          forkRecord(parent[0]!, child[0]!, 0),
+          forkRecord(parent[1]!, child[1]!, 2),
+        ],
+      }),
+      { forkValidationRetryDelaysMs: [] },
+    )
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow(`Fork ${CHILD} was created, but its copied prefix does not match the source`)
+  })
+
+  test("fails closed when the physical copy continues past the requested source", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const laterParent = message(
+      ROOT,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      "user",
+      "later question",
+    )
+    const laterChild = message(
+      CHILD,
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9",
+      "user",
+      "later question",
+    )
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({
+        parent,
+        child,
+        forkRecords: [
+          forkRecord(parent[0]!, child[0]!, 0),
+          forkRecord(parent[1]!, child[1]!, 1),
+          forkRecord(laterParent, laterChild, 2),
+        ],
+      }),
+      { forkValidationRetryDelaysMs: [] },
+    )
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow(`Fork ${CHILD} was created, but its copied prefix does not match the source`)
+  })
+
+  test("retries temporarily unavailable copied-prefix provenance", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    const child = parent.map((entry, index) =>
+      message(CHILD, `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb${index + 1}`, entry.type, textOf(entry)),
+    )
+    const records = parent.map((entry, index) => forkRecord(entry, child[index]!, index))
+    const provider = new ClaudeProvider(
+      "/project",
+      "/usr/bin/claude",
+      sdk({ parent, child, forkRecordReads: [new Error("not visible"), records] }),
+      { forkValidationRetryDelaysMs: [0] },
+    )
+
+    const prepared = await provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid })
+
+    expect(prepared.derivation.sharedMessages).toHaveLength(2)
+  })
+
+  test("requires fork provenance before creating a provider session", async () => {
+    const parent = [
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
+      message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "assistant", "answer"),
+    ]
+    let forkCalls = 0
+    const provider = new ClaudeProvider("/project", "/usr/bin/claude", {
+      async list(): Promise<SDKSessionInfo[]> {
+        return [{ sessionId: ROOT, summary: "Root", firstPrompt: "question", lastModified: 1 }]
+      },
+      async messages(): Promise<SessionMessage[]> {
+        return parent
+      },
+      async fork(): Promise<{ sessionId: string }> {
+        forkCalls += 1
+        return { sessionId: CHILD }
+      },
+    })
+
+    await expect(
+      provider.branchFrom({ sessionId: ROOT, messageId: parent[1]!.uuid }),
+    ).rejects.toThrow("Claude SDK fork provenance is unavailable")
+    expect(forkCalls).toBe(0)
+  })
+
   test("reports a permanently short child as a created branch failure", async () => {
     const parent = [
       message(ROOT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "user", "question"),
@@ -515,10 +753,15 @@ function sdk(options: {
   parent: SessionMessage[]
   child?: SessionMessage[]
   childReads?: Array<SessionMessage[] | Error>
+  forkRecords?: ClaudeForkRecord[]
+  forkRecordReads?: Array<ClaudeForkRecord[] | Error>
   onChildRead?: () => void
   onFork?: (messageId: string) => void
 }): ClaudeSdk {
   let childReadIndex = 0
+  let forkRecordReadIndex = 0
+  const finalChild = options.child ?? options.childReads
+    ?.findLast((result): result is SessionMessage[] => Array.isArray(result)) ?? []
   return {
     async list(): Promise<SDKSessionInfo[]> {
       return [{ sessionId: ROOT, summary: "Root", firstPrompt: "root prompt", lastModified: 1 }]
@@ -537,6 +780,35 @@ function sdk(options: {
       options.onFork?.(forkOptions.upToMessageId)
       return { sessionId: CHILD }
     },
+    async forkRecords(): Promise<ClaudeForkRecord[]> {
+      const result = options.forkRecordReads?.[
+        Math.min(forkRecordReadIndex, Math.max(0, options.forkRecordReads.length - 1))
+      ]
+      forkRecordReadIndex += 1
+      if (result instanceof Error) throw result
+      return result ?? options.forkRecords ?? options.parent.flatMap((entry, index) => {
+        const child = finalChild[index]
+        return child ? [forkRecord(entry, child, index)] : []
+      })
+    },
+  }
+}
+
+function forkRecord(
+  parent: SessionMessage,
+  child: SessionMessage,
+  parentOrdinal: number,
+): ClaudeForkRecord {
+  const parentType = parent.type === "assistant" ? "assistant" : "user"
+  return {
+    childMessageId: child.uuid,
+    parentSessionId: ROOT,
+    parentMessageId: parent.uuid,
+    parentOrdinal,
+    parentType,
+    parentMessage: parent.message,
+    type: child.type === "assistant" ? "assistant" : "user",
+    message: child.message,
   }
 }
 

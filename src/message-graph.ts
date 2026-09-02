@@ -498,6 +498,17 @@ function attachChildSession(
     return null
   }
   const sharedChildMessages: AgentMessage[] = []
+  const childIdByParentId = new Map(
+    relation.sharedMessages.map((pair) => [pair.parentMessageId, pair.childMessageId]),
+  )
+  const sharedParentIds = new Set(relation.sharedMessages.map((pair) => pair.parentMessageId))
+  const sharedChildIds = new Set(relation.sharedMessages.map((pair) => pair.childMessageId))
+  const sharedChildIndexById = new Map(
+    relation.sharedMessages.map((pair, index) => [pair.childMessageId, index]),
+  )
+  const preferParentMessages =
+    parentContext.transcript.filter((message) => sharedParentIds.has(message.id)).length >=
+    transcript.filter((message) => sharedChildIds.has(message.id)).length
   for (let index = 0; index < relation.sharedMessages.length; index += 1) {
     const pair = relation.sharedMessages[index]!
     const retainedChildMessage = retainedChildMessages.get(pair.childMessageId)
@@ -512,10 +523,15 @@ function attachChildSession(
     ) {
       return `Cannot attach ${child.id}: retained shared history is contradictory`
     }
-    const retainedMessage = retainedChildMessage ?? (
-      retainedParentMessage === undefined
-        ? undefined
-        : { ...retainedParentMessage, id: pair.childMessageId }
+    const copiedParentMessage = retainedParentMessage === undefined
+      ? undefined
+      : copyRetainedMessage(retainedParentMessage, pair.childMessageId, childIdByParentId)
+    const retainedMessage = selectRetainedMessage(
+      copiedParentMessage,
+      retainedChildMessage,
+      index,
+      sharedChildIndexById,
+      preferParentMessages,
     )
     if (retainedMessage === undefined) {
       return transcript[index] === undefined
@@ -525,116 +541,64 @@ function attachChildSession(
     sharedChildMessages.push(retainedMessage)
   }
 
-  let currentParentPrefixLength = 0
-  while (
-    currentParentPrefixLength < sharedPrefixLength &&
-    parentContext.transcript[currentParentPrefixLength]?.id ===
-      relation.sharedMessages[currentParentPrefixLength]?.parentMessageId
-  ) {
-    currentParentPrefixLength += 1
-  }
-  if (sourceIndex >= 0) {
-    if (sharedPrefixLength !== sourceIndex + 1 || currentParentPrefixLength !== sharedPrefixLength) {
-      return `Cannot attach ${child.id}: shared history does not match its transcripts`
-    }
-  } else {
-    const mappedParentIds = new Set(
-      relation.sharedMessages.slice(currentParentPrefixLength).map((pair) => pair.parentMessageId),
-    )
-    if (
-      parentContext.transcript
-        .slice(currentParentPrefixLength)
-        .some((message) => mappedParentIds.has(message.id))
-    ) {
-      return `Cannot attach ${child.id}: shared history does not match its transcripts`
-    }
-  }
-
-  let knownPrefixLength = 0
-  while (
-    knownPrefixLength < sharedPrefixLength &&
-    parentContext.knownMessageIds.has(relation.sharedMessages[knownPrefixLength]!.parentMessageId)
-  ) {
-    knownPrefixLength += 1
-  }
-  if (
-    relation.sharedMessages
-      .slice(knownPrefixLength)
-      .some((pair) => parentContext.knownMessageIds.has(pair.parentMessageId))
-  ) {
-    return `Cannot attach ${child.id}: shared history does not match its recorded order`
-  }
-
-  let currentChildPrefixLength = 0
-  while (
-    currentChildPrefixLength < transcript.length &&
-    currentChildPrefixLength < sharedPrefixLength &&
-    transcript[currentChildPrefixLength]?.id ===
-      relation.sharedMessages[currentChildPrefixLength]?.childMessageId
-  ) {
-    currentChildPrefixLength += 1
-  }
-  const sharedChildMessageIds = new Set(
-    relation.sharedMessages.map((pair) => pair.childMessageId),
+  const sharedIndexByParentMessageId = new Map(
+    relation.sharedMessages.map((pair, index) => [pair.parentMessageId, index]),
   )
-  if (
-    transcript
-      .slice(currentChildPrefixLength)
-      .some((message) => sharedChildMessageIds.has(message.id))
-  ) {
-    return `Cannot attach ${child.id}: shared history does not match its recorded order`
+  let previousParentSharedIndex = -1
+  let parentDiverged = false
+  for (const message of parentContext.transcript) {
+    const sharedIndex = sharedIndexByParentMessageId.get(message.id)
+    if (sharedIndex === undefined) {
+      parentDiverged = true
+      continue
+    }
+    if (parentDiverged || sharedIndex <= previousParentSharedIndex) {
+      return `Cannot attach ${child.id}: shared history does not match its transcripts`
+    }
+    previousParentSharedIndex = sharedIndex
   }
 
-  let previousLogicalNodeId = graph.originNodeId
-  for (let index = 0; index < knownPrefixLength; index += 1) {
-    const pair = relation.sharedMessages[index]!
-    const logicalNodeId = parentContext.nodeIdByMessageId.get(pair.parentMessageId)
-    if (!logicalNodeId) continue
-    if (previousLogicalNodeId !== graph.originNodeId && logicalNodeId !== previousLogicalNodeId) {
-      const logicalNode = graph.nodes.get(logicalNodeId)
-      if (logicalNode?.parentId !== previousLogicalNodeId) {
-        return `Cannot attach ${child.id}: shared history has contradictory ancestry`
-      }
+  const sharedIndexByChildMessageId = new Map(
+    relation.sharedMessages.map((pair, index) => [pair.childMessageId, index]),
+  )
+  const currentSharedIndexesByTranscriptIndex = new Map<number, number>()
+  let childSpecificStartIndex = transcript.length
+  let previousSharedIndex = -1
+  for (let transcriptIndex = 0; transcriptIndex < transcript.length; transcriptIndex += 1) {
+    const message = transcript[transcriptIndex]!
+    const sharedIndex = sharedIndexByChildMessageId.get(message.id)
+    if (sharedIndex === undefined) {
+      childSpecificStartIndex = Math.min(childSpecificStartIndex, transcriptIndex)
+      continue
     }
-    previousLogicalNodeId = logicalNodeId
-  }
-  for (let index = 0; index < knownPrefixLength; index += 1) {
-    const pair = relation.sharedMessages[index]!
-    const logicalNodeId = parentContext.nodeIdByMessageId.get(pair.parentMessageId)
-    if (!logicalNodeId) continue
-    const logicalNode = graph.nodes.get(logicalNodeId)
-    if (logicalNode?.kind === "message") {
-      const childMessage = sharedChildMessages[index]!
-      addAlias(logicalNode, { sessionId: child.id, messageId: childMessage.id })
+    if (childSpecificStartIndex < transcript.length || sharedIndex <= previousSharedIndex) {
+      return `Cannot attach ${child.id}: shared history does not match its recorded order`
     }
+    currentSharedIndexesByTranscriptIndex.set(transcriptIndex, sharedIndex)
+    previousSharedIndex = sharedIndex
   }
 
-  const historicalContext = createContext(sharedChildMessages)
-  appendSessionMessages(
-    graph,
+  const reconciledGraph = cloneGraphForReconciliation(graph)
+  const reconciledParentContext: SessionGraphContext = {
+    ...parentContext,
+    nodeIdByMessageId: new Map(parentContext.nodeIdByMessageId),
+    knownMessageIds: new Set(parentContext.knownMessageIds),
+  }
+  const reconciliationError = reconcileSharedPath(
+    reconciledGraph,
+    relation,
     child.id,
     sharedChildMessages,
-    knownPrefixLength,
-    previousLogicalNodeId,
+    reconciledParentContext,
+    retainedMessagesBySession,
     exactBranchPointIdsBySession.get(child.id) ?? new Set(),
     displayGroupEndIdsBySession.get(child.id) ?? new Set(),
-    historicalContext,
   )
-
-  for (let index = knownPrefixLength; index < sharedPrefixLength; index += 1) {
-    const pair = relation.sharedMessages[index]!
-    parentContext.knownMessageIds.add(pair.parentMessageId)
-    const logicalNodeId = historicalContext.rawLogicalNodeIds[index]
-    if (!logicalNodeId) continue
-    parentContext.nodeIdByMessageId.set(pair.parentMessageId, logicalNodeId)
-    const logicalNode = graph.nodes.get(logicalNodeId)
-    if (logicalNode?.kind === "message") {
-      addAlias(logicalNode, {
-        sessionId: relation.parentSessionId,
-        messageId: pair.parentMessageId,
-      })
-    }
-  }
+  if (reconciliationError) return `Cannot attach ${child.id}: ${reconciliationError}`
+  graph.nodes = reconciledGraph.nodes
+  graph.rootNodeId = reconciledGraph.rootNodeId
+  parentContext.nodeIdByMessageId = reconciledParentContext.nodeIdByMessageId
+  parentContext.knownMessageIds = reconciledParentContext.knownMessageIds
 
   const sourceNodeId = parentContext.nodeIdByMessageId.get(relation.sourceMessageId)
   if (!sourceNodeId) {
@@ -648,12 +612,12 @@ function attachChildSession(
     context.knownMessageIds.add(pair.childMessageId)
     context.nodeIdByMessageId.set(pair.childMessageId, logicalNodeId)
   }
-  for (let index = 0; index < currentChildPrefixLength; index += 1) {
-    const pair = relation.sharedMessages[index]!
+  for (const [transcriptIndex, sharedIndex] of currentSharedIndexesByTranscriptIndex) {
+    const pair = relation.sharedMessages[sharedIndex]!
     const logicalNodeId = parentContext.nodeIdByMessageId.get(pair.parentMessageId)
-    const childMessage = transcript[index]
+    const childMessage = transcript[transcriptIndex]
     if (!logicalNodeId || !childMessage) continue
-    context.rawLogicalNodeIds[index] = logicalNodeId
+    context.rawLogicalNodeIds[transcriptIndex] = logicalNodeId
     context.nodeIdByMessageId.set(childMessage.id, logicalNodeId)
   }
   const currentParentId = lastDefined(context.rawLogicalNodeIds) ?? graph.originNodeId
@@ -661,7 +625,7 @@ function attachChildSession(
     graph,
     child.id,
     transcript,
-    currentChildPrefixLength,
+    childSpecificStartIndex,
     currentParentId,
     exactBranchPointIdsBySession.get(child.id) ?? new Set(),
     displayGroupEndIdsBySession.get(child.id) ?? new Set(),
@@ -677,6 +641,290 @@ function attachChildSession(
   )
   contextFor(graph).set(child.id, context)
   return null
+}
+
+interface ProjectedSharedGroup {
+  indexes: number[]
+  role: AgentMessage["role"]
+  preview: string
+  internal: boolean
+  existingNodeId?: string
+  splitFromNodeId?: string
+}
+
+function cloneGraphForReconciliation(graph: ConversationGraph): ConversationGraph {
+  return {
+    ...graph,
+    nodes: new Map([...graph.nodes].map(([nodeId, node]) => [
+      nodeId,
+      node.kind === "message"
+        ? { ...node, childIds: [...node.childIds], aliases: [...node.aliases] }
+        : { ...node, childIds: [...node.childIds] },
+    ])),
+  }
+}
+
+function reconcileSharedPath(
+  graph: ConversationGraph,
+  relation: BranchRelation,
+  childSessionId: string,
+  sharedMessages: AgentMessage[],
+  parentContext: SessionGraphContext,
+  retainedMessagesBySession: Map<string, Map<string, RetainedMessage>>,
+  exactBranchPoints: Set<string>,
+  displayGroupEndPoints: Set<string>,
+): string | null {
+  const groups = projectSharedPath(sharedMessages, exactBranchPoints, displayGroupEndPoints)
+  const claimedExistingNodeIds = new Set<string>()
+  for (const group of groups) {
+    const existingNodeIds = new Set(
+      group.indexes.flatMap((index) => {
+        const pair = relation.sharedMessages[index]
+        if (!pair) return []
+        const nodeId = parentContext.nodeIdByMessageId.get(pair.parentMessageId)
+        return nodeId === undefined ? [] : [nodeId]
+      }),
+    )
+    if (existingNodeIds.size > 1) return "shared history has contradictory ancestry"
+    const existingNodeId = existingNodeIds.values().next().value
+    if (existingNodeId !== undefined) {
+      if (claimedExistingNodeIds.has(existingNodeId)) group.splitFromNodeId = existingNodeId
+      else {
+        group.existingNodeId = existingNodeId
+        claimedExistingNodeIds.add(existingNodeId)
+      }
+    }
+  }
+
+  let previousExistingIndex = -1
+  let previousExistingNodeId = graph.originNodeId
+  for (let index = 0; index < groups.length; index += 1) {
+    const nodeId = groups[index]!.existingNodeId
+    if (!nodeId) continue
+    const node = graph.nodes.get(nodeId)
+    if (node?.kind !== "message" || node.role !== groups[index]!.role) {
+      return "shared history has contradictory ancestry"
+    }
+    if (index > previousExistingIndex + 1) {
+      if (
+        node.parentId !== previousExistingNodeId ||
+        !graph.nodes.get(previousExistingNodeId)?.childIds.includes(nodeId)
+      ) {
+        return "shared history has contradictory ancestry"
+      }
+    } else if (
+      previousExistingIndex >= 0 &&
+      !isLogicalAncestor(graph, previousExistingNodeId, nodeId)
+    ) {
+      return "shared history has contradictory ancestry"
+    }
+    previousExistingIndex = index
+    previousExistingNodeId = nodeId
+  }
+
+  for (const group of groups) {
+    if (group.existingNodeId) continue
+    const lastIndex = group.indexes.at(-1)!
+    const pair = relation.sharedMessages[lastIndex]!
+    const nodeId = `message:${encodeURIComponent(childSessionId)}:${encodeURIComponent(pair.childMessageId)}`
+    if (graph.nodes.has(nodeId)) return "shared history has contradictory ancestry"
+  }
+
+  let validationIndex = 0
+  while (validationIndex < groups.length) {
+    if (groups[validationIndex]!.existingNodeId) {
+      validationIndex += 1
+      continue
+    }
+    const runStart = validationIndex
+    while (validationIndex < groups.length && !groups[validationIndex]!.existingNodeId) {
+      validationIndex += 1
+    }
+    const leftNodeId = runStart === 0
+      ? graph.originNodeId
+      : groups[runStart - 1]!.existingNodeId!
+    const splitFromNodeIds = new Set(
+      groups
+        .slice(runStart, validationIndex)
+        .flatMap((group) => group.splitFromNodeId === undefined ? [] : [group.splitFromNodeId]),
+    )
+    if (
+      !graph.nodes.has(leftNodeId) ||
+      splitFromNodeIds.size > 1 ||
+      (splitFromNodeIds.size === 1 && !splitFromNodeIds.has(leftNodeId))
+    ) {
+      return "shared history has contradictory ancestry"
+    }
+  }
+
+  let index = 0
+  while (index < groups.length) {
+    if (groups[index]!.existingNodeId) {
+      index += 1
+      continue
+    }
+    const runStart = index
+    while (index < groups.length && !groups[index]!.existingNodeId) index += 1
+    const runEnd = index
+    const leftNodeId = runStart === 0
+      ? graph.originNodeId
+      : groups[runStart - 1]!.existingNodeId!
+    const rightNodeId = runEnd < groups.length ? groups[runEnd]!.existingNodeId : undefined
+    const insertedNodeIds: string[] = []
+    let parentId = leftNodeId
+    for (let groupIndex = runStart; groupIndex < runEnd; groupIndex += 1) {
+      const group = groups[groupIndex]!
+      const lastIndex = group.indexes.at(-1)!
+      const lastPair = relation.sharedMessages[lastIndex]!
+      const nodeId = `message:${encodeURIComponent(childSessionId)}:${encodeURIComponent(lastPair.childMessageId)}`
+      const aliases = group.indexes.flatMap((messageIndex) => {
+        const pair = relation.sharedMessages[messageIndex]!
+        return [
+          { sessionId: childSessionId, messageId: pair.childMessageId },
+          { sessionId: relation.parentSessionId, messageId: pair.parentMessageId },
+        ]
+      })
+      graph.nodes.set(nodeId, {
+        id: nodeId,
+        kind: "message",
+        parentId,
+        childIds: [],
+        role: group.role,
+        preview: group.preview,
+        internal: group.internal,
+        aliases,
+        forkTarget: { sessionId: childSessionId, messageId: lastPair.childMessageId },
+      })
+      if (group.splitFromNodeId) {
+        const splitFromNode = graph.nodes.get(group.splitFromNodeId)
+        if (splitFromNode?.kind !== "message") return "shared history has contradictory ancestry"
+        const splitMessages = group.indexes.map((messageIndex) => sharedMessages[messageIndex]!)
+        const movedAliases = splitFromNode.aliases.filter((alias) => {
+          const retainedMessage = retainedMessagesBySession
+            .get(alias.sessionId)
+            ?.get(alias.messageId)
+          return retainedMessage != null && splitMessages.some(
+            (splitMessage) => sameCopiedMessage(retainedMessage, splitMessage),
+          )
+        })
+        const movedAliasKeys = new Set([
+          ...aliases.map((alias) => aliasKey(alias)),
+          ...movedAliases.map((alias) => aliasKey(alias)),
+        ])
+        splitFromNode.aliases = splitFromNode.aliases.filter((alias) =>
+          !movedAliasKeys.has(aliasKey(alias))
+        )
+        const splitNode = graph.nodes.get(nodeId)
+        if (splitNode?.kind !== "message") return "shared history has contradictory ancestry"
+        for (const alias of movedAliases) addAlias(splitNode, alias)
+        if (splitFromNode.forkTarget && movedAliasKeys.has(aliasKey(splitFromNode.forkTarget))) {
+          const fallbackTarget = splitFromNode.aliases.at(-1)
+          if (fallbackTarget) splitFromNode.forkTarget = fallbackTarget
+          else delete splitFromNode.forkTarget
+        }
+      }
+      if (insertedNodeIds.length > 0) graph.nodes.get(parentId)?.childIds.push(nodeId)
+      insertedNodeIds.push(nodeId)
+      group.existingNodeId = nodeId
+      parentId = nodeId
+    }
+
+    const leftNode = graph.nodes.get(leftNodeId)!
+    const firstInsertedNodeId = insertedNodeIds[0]!
+    const splitFromNodeId = groups
+      .slice(runStart, runEnd)
+      .find((group) => group.splitFromNodeId)?.splitFromNodeId
+    if (splitFromNodeId) {
+      const movedChildren = [...leftNode.childIds]
+      leftNode.childIds = [firstInsertedNodeId]
+      const lastInsertedNode = graph.nodes.get(insertedNodeIds.at(-1)!)
+      for (const movedChildId of movedChildren) {
+        const movedChild = graph.nodes.get(movedChildId)
+        if (movedChild) movedChild.parentId = lastInsertedNode!.id
+        lastInsertedNode?.childIds.push(movedChildId)
+      }
+    } else if (rightNodeId) {
+      const rightIndex = leftNode?.childIds.indexOf(rightNodeId) ?? -1
+      if (rightIndex < 0) throw new Error("Validated shared path edge is unavailable")
+      leftNode!.childIds[rightIndex] = firstInsertedNodeId
+      const rightNode = graph.nodes.get(rightNodeId)
+      if (!rightNode) throw new Error("Validated shared path node is unavailable")
+      rightNode.parentId = insertedNodeIds.at(-1)!
+      graph.nodes.get(insertedNodeIds.at(-1)!)?.childIds.push(rightNodeId)
+      if (graph.rootNodeId === rightNodeId) graph.rootNodeId = firstInsertedNodeId
+    } else {
+      leftNode?.childIds.push(firstInsertedNodeId)
+    }
+  }
+
+  for (const group of groups) {
+    const nodeId = group.existingNodeId
+    const node = nodeId === undefined ? undefined : graph.nodes.get(nodeId)
+    if (node?.kind !== "message") return "shared history has contradictory ancestry"
+    node.preview = group.preview
+    node.internal = group.internal
+    for (const messageIndex of group.indexes) {
+      const pair = relation.sharedMessages[messageIndex]!
+      parentContext.nodeIdByMessageId.set(pair.parentMessageId, nodeId!)
+      addAlias(node, { sessionId: childSessionId, messageId: pair.childMessageId })
+      addAlias(node, { sessionId: relation.parentSessionId, messageId: pair.parentMessageId })
+    }
+  }
+  for (const pair of relation.sharedMessages) {
+    parentContext.knownMessageIds.add(pair.parentMessageId)
+  }
+  return null
+}
+
+function isLogicalAncestor(
+  graph: ConversationGraph,
+  ancestorNodeId: string,
+  descendantNodeId: string,
+): boolean {
+  let currentNodeId: string | null = descendantNodeId
+  const visited = new Set<string>()
+  while (currentNodeId !== null && !visited.has(currentNodeId)) {
+    if (currentNodeId === ancestorNodeId) return true
+    visited.add(currentNodeId)
+    currentNodeId = graph.nodes.get(currentNodeId)?.parentId ?? null
+  }
+  return false
+}
+
+function projectSharedPath(
+  messages: AgentMessage[],
+  exactBranchPoints: Set<string>,
+  displayGroupEndPoints: Set<string>,
+): ProjectedSharedGroup[] {
+  const groups: ProjectedSharedGroup[] = []
+  let openDisplayGroup: { id: string; group: ProjectedSharedGroup } | undefined
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!
+    if (!message.visible && !exactBranchPoints.has(message.id)) {
+      if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+      continue
+    }
+    const preview = message.visible ? message.preview : "[internal branch point]"
+    if (message.displayGroupId !== undefined && openDisplayGroup?.id === message.displayGroupId) {
+      openDisplayGroup.group.indexes.push(index)
+      openDisplayGroup.group.preview = `${openDisplayGroup.group.preview} ${preview}`
+      openDisplayGroup.group.internal = openDisplayGroup.group.internal && !message.visible
+      if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+      continue
+    }
+    const group: ProjectedSharedGroup = {
+      indexes: [index],
+      role: message.role,
+      preview,
+      internal: !message.visible,
+    }
+    groups.push(group)
+    openDisplayGroup = message.displayGroupId === undefined
+      ? undefined
+      : { id: message.displayGroupId, group }
+    if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+  }
+  return groups
 }
 
 function appendSessionMessages(
@@ -824,33 +1072,90 @@ function collectRetainedMessages(
   while (changed) {
     changed = false
     for (const relation of sortedRelations) {
-      const childMessages = retained.get(relation.childSessionId)
-      if (!childMessages) continue
+      const childMessages = retained.get(relation.childSessionId) ?? new Map<string, RetainedMessage>()
       const parentMessages = retained.get(relation.parentSessionId) ?? new Map<string, RetainedMessage>()
+      retained.set(relation.childSessionId, childMessages)
       retained.set(relation.parentSessionId, parentMessages)
+      const childIdByParentId = new Map(
+        relation.sharedMessages.map((pair) => [pair.parentMessageId, pair.childMessageId]),
+      )
+      const parentIdByChildId = new Map(
+        relation.sharedMessages.map((pair) => [pair.childMessageId, pair.parentMessageId]),
+      )
       for (const pair of relation.sharedMessages) {
-        if (!childMessages.has(pair.childMessageId)) continue
-        const childMessage = childMessages.get(pair.childMessageId) ?? null
-        const candidate = childMessage === null
-          ? null
-          : { ...childMessage, id: pair.parentMessageId }
-        if (!parentMessages.has(pair.parentMessageId)) {
-          parentMessages.set(pair.parentMessageId, candidate)
-          changed = true
-          continue
+        const childMessage = childMessages.get(pair.childMessageId)
+        if (childMessage !== undefined || childMessages.has(pair.childMessageId)) {
+          const candidate = childMessage == null
+            ? null
+            : copyRetainedMessage(childMessage, pair.parentMessageId, parentIdByChildId)
+          if (mergeRetainedMessage(parentMessages, pair.parentMessageId, candidate)) changed = true
         }
-        const existing = parentMessages.get(pair.parentMessageId) ?? null
-        if (
-          existing !== null &&
-          (candidate === null || !sameCopiedMessage(existing, candidate))
-        ) {
-          parentMessages.set(pair.parentMessageId, null)
-          changed = true
+
+        const parentMessage = parentMessages.get(pair.parentMessageId)
+        if (parentMessage !== undefined || parentMessages.has(pair.parentMessageId)) {
+          const candidate = parentMessage == null
+          ? null
+            : copyRetainedMessage(parentMessage, pair.childMessageId, childIdByParentId)
+          if (mergeRetainedMessage(childMessages, pair.childMessageId, candidate)) changed = true
         }
       }
     }
   }
   return retained
+}
+
+function copyRetainedMessage(
+  message: AgentMessage,
+  id: string,
+  translatedIds: Map<string, string>,
+): AgentMessage {
+  const { displayGroupId: _displayGroupId, ...copy } = message
+  const displayGroupId = message.displayGroupId === undefined
+    ? undefined
+    : translatedIds.get(message.displayGroupId) ?? message.displayGroupId
+  return {
+    ...copy,
+    id,
+    ...(displayGroupId === undefined ? {} : { displayGroupId }),
+  }
+}
+
+function selectRetainedMessage(
+  parentMessage: AgentMessage | undefined,
+  childMessage: AgentMessage | undefined,
+  messageIndex: number,
+  childIndexById: Map<string, number>,
+  preferParent: boolean,
+): AgentMessage | undefined {
+  if (!parentMessage) return childMessage
+  if (!childMessage) return parentMessage
+  const parentGroupIndex = parentMessage.displayGroupId === undefined
+    ? -1
+    : childIndexById.get(parentMessage.displayGroupId) ?? -1
+  const childGroupIndex = childMessage.displayGroupId === undefined
+    ? -1
+    : childIndexById.get(childMessage.displayGroupId) ?? -1
+  const validParentGroupIndex = parentGroupIndex < messageIndex ? parentGroupIndex : -1
+  const validChildGroupIndex = childGroupIndex < messageIndex ? childGroupIndex : -1
+  if (validParentGroupIndex !== validChildGroupIndex) {
+    return validParentGroupIndex > validChildGroupIndex ? parentMessage : childMessage
+  }
+  return preferParent ? parentMessage : childMessage
+}
+
+function mergeRetainedMessage(
+  messages: Map<string, RetainedMessage>,
+  messageId: string,
+  candidate: RetainedMessage,
+): boolean {
+  if (!messages.has(messageId)) {
+    messages.set(messageId, candidate)
+    return true
+  }
+  const existing = messages.get(messageId) ?? null
+  if (existing === null || (candidate !== null && sameCopiedMessage(existing, candidate))) return false
+  messages.set(messageId, null)
+  return true
 }
 
 function sameCopiedMessage(left: AgentMessage, right: AgentMessage): boolean {
@@ -954,6 +1259,10 @@ function addAlias(node: MessageGraphNode, alias: ForkTarget): void {
     return
   }
   node.aliases.push(alias)
+}
+
+function aliasKey(alias: ForkTarget): string {
+  return `${alias.sessionId}\0${alias.messageId}`
 }
 
 function forkTargetForLastMessage(
