@@ -231,12 +231,16 @@ test("the Claude provider validates SDK-imported source and child records", asyn
     )
 
     const script = `
-      import { ClaudeProvider } from "./src/providers/claude.ts"
-      const provider = new ClaudeProvider(${JSON.stringify(projectDir)}, "/usr/bin/claude")
-      const prepared = await provider.branchFrom({
+      import { Effect } from "effect"
+      import { makeClaudeProvider } from "./src/infrastructure/providers/claude/provider.ts"
+      const provider = makeClaudeProvider(${JSON.stringify(projectDir)}, {
+        resolveExecutable: () => "/usr/bin/claude",
+      })
+      const prepared = await Effect.runPromise(provider.branchFrom({
         sessionId: ${JSON.stringify(sourceSessionId)},
         messageId: ${JSON.stringify(agentId)},
-      })
+      }))
+      if (prepared._tag !== "ValidatedBranch") throw new Error("Unexpected branch outcome")
       console.log(prepared.derivation.sharedMessages.length)
     `
     const subprocess = Bun.spawn([globalThis.process.execPath, "-e", script], {
