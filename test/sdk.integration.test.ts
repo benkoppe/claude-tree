@@ -211,6 +211,7 @@ test("the pinned SDK preserves provenance when compaction shortens a fork's acti
 test("the Claude provider validates SDK-imported source and child records", async () => {
   const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-")))
   const projectDir = join(configDir, "project")
+  const projectKey = "sdk-provenance-fixture"
   const sourceSessionId = crypto.randomUUID()
   const userId = crypto.randomUUID()
   const agentId = crypto.randomUUID()
@@ -222,7 +223,6 @@ test("the Claude provider validates SDK-imported source and child records", asyn
 
   try {
     await mkdir(projectDir, { recursive: true })
-    const projectKey = projectDir.replaceAll("/", "-")
     const transcriptDir = join(configDir, "projects", projectKey)
     await mkdir(transcriptDir, { recursive: true })
     await writeFile(
@@ -245,7 +245,11 @@ test("the Claude provider validates SDK-imported source and child records", asyn
     `
     const subprocess = Bun.spawn([globalThis.process.execPath, "-e", script], {
       cwd: join(import.meta.dir, ".."),
-      env: { ...globalThis.process.env, CLAUDE_CONFIG_DIR: configDir },
+      env: {
+        ...globalThis.process.env,
+        CLAUDE_CONFIG_DIR: configDir,
+        CLAUDE_CODE_PROJECT_DIR_NAME: projectKey,
+      },
       stdout: "pipe",
       stderr: "pipe",
     })
