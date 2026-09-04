@@ -29,7 +29,6 @@ import type {
   NavigatorSurface,
   PendingCompletion,
   RewindAnchor,
-  TerminalState,
 } from "./state"
 
 export const MAX_COMPLETION_REFRESH_ATTEMPTS = 4

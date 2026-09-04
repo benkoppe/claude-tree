@@ -16,7 +16,6 @@ import {
   PersistenceError,
   ProviderError,
   ProviderCleanupError,
-  type ProviderProtocolError,
   SessionOwnedError,
   TerminalError,
 } from "../../src/domain/errors"

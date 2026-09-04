@@ -13,7 +13,6 @@ import { ProviderError, ProviderProtocolError } from "../../src/domain/errors"
 import {
   ClaudeProvider,
   claudeProviderLayer,
-  type ClaudeProviderDependencies,
   type ClaudeSdk,
 } from "../../src/infrastructure/providers/claude/provider"
 import {
