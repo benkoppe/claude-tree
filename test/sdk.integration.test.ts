@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -209,7 +209,7 @@ test("the pinned SDK preserves provenance when compaction shortens a fork's acti
 })
 
 test("the Claude provider validates SDK-imported source and child records", async () => {
-  const configDir = await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-"))
+  const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-")))
   const projectDir = join(configDir, "project")
   const sourceSessionId = crypto.randomUUID()
   const userId = crypto.randomUUID()
