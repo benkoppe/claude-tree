@@ -4,7 +4,7 @@ import type {
   TerminalObserver,
   TerminalScreen,
 } from "../../../domain/model"
-import { OscSequenceParser } from "./osc"
+import { OscSequenceParser } from "../../../osc"
 
 type RewindPhase = "idle" | "armed" | "picker" | "awaitingComposer" | "captured"
 
