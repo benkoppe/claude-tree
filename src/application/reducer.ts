@@ -71,6 +71,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       return {
         ...state,
         refresh: {
+          ...state.refresh,
           generation: Math.max(state.refresh.generation, event.refresh.generation),
           active,
           initialPending: state.refresh.initialPending,
@@ -234,6 +235,21 @@ function refreshSucceeded(
   const transcripts = active.mode === "full"
     ? preserveOwnedTranscripts(state, snapshot.transcripts)
     : new Map([...state.provider.transcripts, ...snapshot.transcripts])
+  const appliedGenerationBySession = new Map(state.refresh.appliedGenerationBySession)
+  const staleSessionIds = new Set<string>()
+  for (const [sessionId, appliedGeneration] of appliedGenerationBySession) {
+    if (appliedGeneration <= generation) continue
+    staleSessionIds.add(sessionId)
+    const session = state.provider.sessions.get(sessionId)
+    const transcript = state.provider.transcripts.get(sessionId)
+    if (session) sessions.set(sessionId, session)
+    else sessions.delete(sessionId)
+    if (transcript) transcripts.set(sessionId, transcript)
+    else transcripts.delete(sessionId)
+  }
+  for (const sessionId of snapshot.transcripts.keys()) {
+    if (!staleSessionIds.has(sessionId)) appliedGenerationBySession.set(sessionId, generation)
+  }
   const localSessions = new Map(state.local.sessions)
   const localTranscripts = new Map(state.local.transcripts)
   const temporarySessionIds = new Set(state.local.temporarySessionIds)
@@ -242,6 +258,7 @@ function refreshSucceeded(
   const unviewedSessionIds = new Set(state.unviewedSessionIds)
 
   for (const [sessionId, incoming] of snapshot.transcripts) {
+    if (staleSessionIds.has(sessionId)) continue
     const completion = pendingCompletions.get(sessionId)
     const completionReady = completion !== undefined && incoming._tag === "Available" &&
       completionTranscriptReady(completion.baseline, incoming.messages, rewindAnchors.get(sessionId))
@@ -323,7 +340,7 @@ function refreshSucceeded(
     rewindAnchors,
     pendingCompletions,
     unviewedSessionIds,
-    refresh: { ...without.refresh, initialPending: false },
+    refresh: { ...without.refresh, initialPending: false, appliedGenerationBySession },
     ...(completionExhausted
       ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
       : {}),
@@ -572,7 +589,11 @@ function adoptSessionIdentity(
     rewindAnchors: migrateMapKey(state.rewindAnchors, previousSessionId, sessionId),
     pendingCompletions: migrateMapKey(state.pendingCompletions, previousSessionId, sessionId),
     unviewedSessionIds: migrateSet(state.unviewedSessionIds, previousSessionId, sessionId),
-    refresh: { ...state.refresh, active },
+    refresh: {
+      ...state.refresh,
+      active,
+      appliedGenerationBySession: migrateMapKey(state.refresh.appliedGenerationBySession, previousSessionId, sessionId),
+    },
   }
 }
 

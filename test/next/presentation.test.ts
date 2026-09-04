@@ -1402,7 +1402,7 @@ function canonicalView(
       sessions: new Map(sessions.map((session) => [session.id, session])),
       transcripts: new Map([...transcripts].map(([sessionId, messages]) => [sessionId, available(messages)])),
     },
-    refresh: { generation: 1, active: new Map(), initialPending: false },
+    refresh: { generation: 1, active: new Map(), initialPending: false, appliedGenerationBySession: new Map() },
   }
   return projectApplicationViewModel(state)
 }
