@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util"
 
 import { Cause, Deferred, Effect, Exit, Scope } from "effect"
 
-import type { PersistenceError } from "../domain/errors"
+import { PersistenceError } from "../domain/errors"
 import type { NavigationState } from "../domain/model"
 import type { ProjectState } from "../domain/persistence"
 
@@ -32,7 +32,11 @@ export function makeNavigationWriter(
 ): Effect.Effect<NavigationWriter, never, Scope.Scope> {
   return Effect.gen(function*() {
     const drainScope = yield* Scope.make("sequential")
-    const close = Effect.suspend(() => Scope.closeUnsafe(drainScope, Exit.void) ?? Effect.void)
+    let closed = false
+    const close = Effect.suspend(() => {
+      closed = true
+      return Scope.closeUnsafe(drainScope, Exit.void) ?? Effect.void
+    })
     yield* Effect.addFinalizer(() => Effect.interruptible(close).pipe(Effect.timeoutOrElse({
       duration: DRAIN_SCOPE_CLOSE_TIMEOUT_MS,
       orElse: () => Effect.void,
@@ -102,9 +106,17 @@ export function makeNavigationWriter(
 
     const write = (navigation: NavigationState): Effect.Effect<void, PersistenceError> =>
       Effect.gen(function*() {
+        if (closed) {
+          return yield* Effect.fail(new PersistenceError({
+            operation: "save navigation",
+            path: "",
+            message: "Cannot save navigation after the navigation writer has closed",
+          }))
+        }
         const waiter = yield* Deferred.make<void, PersistenceError>()
         const json = JSON.stringify(navigation)
-        if (queued?.json === json) queued.waiters.push(waiter)
+        if (queued === undefined && current?.json === json) current.waiters.push(waiter)
+        else if (queued?.json === json) queued.waiters.push(waiter)
         else {
           queued = {
             navigation,

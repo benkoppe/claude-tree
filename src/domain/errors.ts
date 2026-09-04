@@ -32,7 +32,11 @@ export class SessionOwnedError extends Data.TaggedError("SessionOwnedError")<{
   readonly providerId: string
   readonly sessionId: string
   readonly ownerPid: number
-}> {}
+}> {
+  override get message(): string {
+    return `Session ${this.sessionId} is already owned by another terminal (PID ${this.ownerPid}). Return to that claude-tree instance or stop its terminal before opening this session here.`
+  }
+}
 
 export class SessionRemovedError extends Data.TaggedError("SessionRemovedError")<{
   readonly providerId: string
