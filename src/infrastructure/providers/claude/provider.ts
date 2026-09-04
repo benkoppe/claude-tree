@@ -107,7 +107,7 @@ interface ConversationRecord {
 
 interface SourcePrefix {
   readonly records: readonly ConversationRecord[]
-  readonly requestedRecordIndex: number
+  readonly activeMessageIds: readonly string[]
 }
 
 interface OperationDeadline {
@@ -649,7 +649,6 @@ export class ClaudeProvider implements AgentProviderApi {
       }
       const records = physicalRecords.slice(0, requestedRecordIndex + 1)
       const physicalIndexById = new Map(physicalRecords.map((record, index) => [record.id, index]))
-      let previousIndex = -1
       for (const message of activePrefix) {
         const physicalIndex = physicalIndexById.get(message.id)
         const physical = physicalIndex === undefined ? undefined : physicalRecords[physicalIndex]
@@ -664,22 +663,19 @@ export class ClaudeProvider implements AgentProviderApi {
             `Claude's active source transcript does not match its physical records for session ${sessionId}`,
           ))
         }
-        if (physicalIndex > requestedRecordIndex) continue
-        if (physicalIndex <= previousIndex) {
-          return yield* Effect.fail(this.protocolError(
-            "branchFrom",
-            `Claude's active source transcript does not match its physical records for session ${sessionId}`,
-          ))
-        }
-        previousIndex = physicalIndex
       }
-      if (activePrefix.at(-1)?.id !== requestedMessageId || previousIndex !== requestedRecordIndex) {
+      if (activePrefix.at(-1)?.id !== requestedMessageId) {
         return yield* Effect.fail(this.protocolError(
           "branchFrom",
           "The selected Claude source boundary could not be validated exactly",
         ))
       }
-      return { records, requestedRecordIndex }
+      return {
+        records,
+        activeMessageIds: activePrefix
+          .filter((message) => physicalIndexById.get(message.id)! <= requestedRecordIndex)
+          .map((message) => message.id),
+      }
     })
   }
 
@@ -1090,8 +1086,7 @@ function validateFork(
     }
   }
 
-  const parentIndexByChildId = new Map<string, number>()
-  const sharedMessages: Array<{ parentMessageId: string; childMessageId: string }> = []
+  const childByParentId = new Map<string, ConversationRecord>()
   for (const [index, parent] of sourcePrefix.records.entries()) {
     const child = physicalChild[index]
     if (child === undefined) {
@@ -1108,14 +1103,21 @@ function validateFork(
         reason: "its physical copied prefix does not exactly match the source role, payload, and provenance",
       }
     }
-    parentIndexByChildId.set(child.id, index)
-    sharedMessages.push({ parentMessageId: parent.id, childMessageId: child.id })
+    childByParentId.set(parent.id, child)
   }
+
+  // Physical copy order proves integrity; SDK reconstruction defines graph order.
+  const sharedMessages = sourcePrefix.activeMessageIds.map((parentMessageId) => ({
+    parentMessageId,
+    childMessageId: childByParentId.get(parentMessageId)!.id,
+  }))
+  const logicalIndexByChildId = new Map(sharedMessages.map((pair, index) => [pair.childMessageId, index]))
+  const physicalByChildId = new Map(physicalChild.map((record) => [record.id, record]))
 
   let previousParentIndex = -1
   for (const child of activeChild) {
-    const parentIndex = parentIndexByChildId.get(child.id)
-    const physical = parentIndex === undefined ? undefined : physicalChild[parentIndex]
+    const parentIndex = logicalIndexByChildId.get(child.id)
+    const physical = physicalByChildId.get(child.id)
     if (
       parentIndex === undefined ||
       parentIndex <= previousParentIndex ||
@@ -1125,12 +1127,12 @@ function validateFork(
     ) {
       return {
         _tag: "Invalid",
-        reason: "its active transcript is not an ordered subsequence of the physical copied prefix",
+        reason: "its active transcript is not an ordered subsequence of the source conversation",
       }
     }
     previousParentIndex = parentIndex
   }
-  if (previousParentIndex !== sourcePrefix.requestedRecordIndex) {
+  if (previousParentIndex !== sharedMessages.length - 1) {
     return {
       _tag: "Short",
       reason: "its active transcript has not reached the requested source boundary",
