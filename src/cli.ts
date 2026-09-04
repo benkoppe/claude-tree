@@ -8,7 +8,7 @@ import { CLI_HELP } from "./cli-help"
 import { parseCliArguments, resolveProjectDirectory, type CliOptions } from "./cli-options"
 import { setProcessTitle } from "./process-title"
 import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
-import { makeAppRuntime, type AppRuntime } from "./application"
+import { makeAppRuntime } from "./application"
 import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
 import { makeLiveHerdrReporter, makeTerminalHerdrReporter } from "./infrastructure/herdr"
 import { makeClaudeProvider } from "./infrastructure/providers/claude"
@@ -18,9 +18,8 @@ import {
   OpenTuiTerminalRenderer,
 } from "./infrastructure/terminal"
 import { makeOpenTuiPresentation, presentationTheme } from "./presentation"
-import { makeMetadataRepository } from "./services/metadata-repository"
 import type { AgentProviderApi } from "./services/provider"
-import { makeSessionLeases } from "./services/session-leases"
+import { makeProviderStateRepository } from "./services/provider-state-repository"
 import {
   makeTerminalSupervisor,
   type TerminalSupervisorEvents,
@@ -93,10 +92,7 @@ export function composeProductionApplication(
     const provider = yield* makeProvider(options.provider, projectPath)
     const renderer = yield* makeOpenTuiRenderer()
     const persistenceOptions = { projectDirectory: projectPath, providerId: provider.id }
-    const metadata = yield* makeMetadataRepository(persistenceOptions).pipe(
-      Effect.provideService(PersistencePlatform, nativePersistencePlatform),
-    )
-    const leases = yield* makeSessionLeases(persistenceOptions).pipe(
+    const repository = yield* makeProviderStateRepository(persistenceOptions).pipe(
       Effect.provideService(PersistencePlatform, nativePersistencePlatform),
     )
     const herdr = yield* makeLiveHerdrReporter()
@@ -104,20 +100,33 @@ export function composeProductionApplication(
     const terminals = yield* makeTerminalSupervisor({
       renderer: new OpenTuiTerminalRenderer(renderer),
       processes: new BunPtyProcessFactory(),
-      leases,
+      ownership: repository,
       events: bridge.events,
       herdr: makeTerminalHerdrReporter(herdr),
     })
-    const appRuntime = yield* makeAppRuntime({ provider, metadata, terminals })
-    yield* addVerifiedShutdownFinalizer(appRuntime)
+    const appRuntime = yield* makeAppRuntime({ provider, metadata: repository, terminals })
     bridge.bind(appRuntime.terminalEvents)
     const presentation = yield* makeOpenTuiPresentation(renderer, appRuntime, provider, {
       setProcessTitle,
     })
 
-    yield* presentation.run
-    yield* presentation.wait
+    yield* runPresentationLifecycle(
+      presentation.run,
+      presentation.wait,
+      appRuntime.shutdown,
+    )
   })
+}
+
+export function runPresentationLifecycle<E, E2>(
+  start: Effect.Effect<void, E>,
+  wait: Effect.Effect<void, E>,
+  shutdown: Effect.Effect<void, E2>,
+): Effect.Effect<void, E | E2> {
+  return start.pipe(
+    Effect.andThen(wait),
+    Effect.onInterrupt(() => shutdown),
+  )
 }
 
 export function runScopedApplication<E>(
@@ -225,18 +234,6 @@ function makeOpenTuiRenderer(): Effect.Effect<CliRenderer, Error, Scope.Scope> {
       if (!renderer.isDestroyed) renderer.destroy()
     }),
   )
-}
-
-function addVerifiedShutdownFinalizer(appRuntime: AppRuntime): Effect.Effect<void, never, Scope.Scope> {
-  return Effect.addFinalizer(() => Effect.gen(function*() {
-    const completed = yield* appRuntime.shutdown
-    if (completed) return
-    const viewModel = yield* appRuntime.getViewModel
-    const detail = viewModel.modal?._tag === "Error"
-      ? viewModel.modal.message
-      : "Application shutdown did not complete cleanly"
-    return yield* Effect.die(new Error(detail))
-  }))
 }
 
 function failureMessage(error: unknown): string {

@@ -110,7 +110,7 @@ export function projectApplicationViewModel(state: ApplicationState): Applicatio
   return {
     surface: projectSurface(state),
     modal: state.modal,
-    refreshing: state.refresh.active !== null,
+    refreshing: state.refresh.active.size > 0,
     initialLoadPending: state.refresh.initialPending,
     shuttingDown: state.shutdown !== "running",
     liveSessionIds: new Set(state.terminals.keys()),

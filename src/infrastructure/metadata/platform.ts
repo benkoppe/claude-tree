@@ -4,6 +4,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -23,20 +24,26 @@ export interface PersistenceFileHandle {
 
 export interface PersistencePlatformApi {
   readonly pid: number
+  readonly instanceId: string
   readonly stateHome: () => string
   readonly now: () => string
   readonly randomToken: () => string
-  readonly mkdir: (path: string, options: { readonly recursive: boolean; readonly mode: number }) => Promise<void>
+  readonly mkdir: (
+    path: string,
+    options: { readonly recursive: boolean; readonly mode: number },
+  ) => Promise<string | undefined>
   readonly realpath: (path: string) => Promise<string>
   readonly readFile: (path: string) => Promise<string>
+  readonly readDirectory: (path: string) => Promise<readonly string[]>
   readonly open: (path: string, flags: string, mode?: number) => Promise<PersistenceFileHandle>
   readonly link: (existingPath: string, newPath: string) => Promise<void>
   readonly rename: (oldPath: string, newPath: string) => Promise<void>
   readonly remove: (path: string, options?: { readonly force?: boolean }) => Promise<void>
   readonly processLiveness: (pid: number) => Promise<ProcessLiveness>
   readonly processGroupLiveness: (processGroupId: number) => Promise<ProcessLiveness>
-  readonly sleep: (milliseconds: number) => Promise<void>
 }
+
+const processInstanceId = randomUUID()
 
 export class PersistencePlatform extends Context.Service<
   PersistencePlatform,
@@ -56,6 +63,7 @@ function livenessFromSignal(target: number): ProcessLiveness {
 
 export const nativePersistencePlatform: PersistencePlatformApi = {
   pid: process.pid,
+  instanceId: processInstanceId,
   stateHome: () => {
     const configured = process.env.XDG_STATE_HOME
     if (configured !== undefined) return configured
@@ -64,10 +72,11 @@ export const nativePersistencePlatform: PersistencePlatformApi = {
   now: () => new Date().toISOString(),
   randomToken: randomUUID,
   mkdir: async (path, options) => {
-    await mkdir(path, options)
+    return await mkdir(path, options)
   },
   realpath,
   readFile: (path) => readFile(path, "utf8"),
+  readDirectory: readdir,
   open: async (path, flags, mode) => {
     const handle = await open(path, flags, mode)
     return {
@@ -85,7 +94,6 @@ export const nativePersistencePlatform: PersistencePlatformApi = {
   },
   processLiveness: async (pid) => livenessFromSignal(pid),
   processGroupLiveness: async (processGroupId) => livenessFromSignal(-processGroupId),
-  sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 }
 
 export const PersistencePlatformLive = Layer.succeed(

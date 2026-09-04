@@ -1,13 +1,17 @@
 import { expect, test } from "bun:test"
 
-import { Deferred, Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import {
+  HERDR_PROCESS_CLEANUP_PERIOD_MS,
+  makeHerdrCommandExecutor,
   makeLiveHerdrReporter,
   makeTerminalHerdrReporter,
+  type HerdrCommandProcess,
 } from "../../src/infrastructure/herdr"
 import {
+  HERDR_COMMAND_TIMEOUT_MS,
   NULL_HERDR_REPORTER,
   type HerdrCommandExecutor,
   type HerdrReporterApi,
@@ -122,15 +126,61 @@ test("heartbeats the latest state every ten seconds", async () => {
       expect(calls).toHaveLength(3)
       yield* TestClock.adjust(1)
       yield* waitFor(() => calls.length === 4)
+
+      yield* TestClock.adjust(9_999)
+      expect(calls).toHaveLength(4)
+      yield* TestClock.adjust(1)
+      yield* waitFor(() => calls.length === 5)
     }),
   )
 
-  expect(calls.slice(0, 4)).toEqual([
+  expect(calls.slice(0, 5)).toEqual([
+    reportCommand("idle"),
     reportCommand("idle"),
     reportCommand("idle"),
     reportCommand("idle"),
     reportCommand("idle"),
   ])
+})
+
+test("bounds TERM and KILL cleanup for an unresponsive Herdr command", async () => {
+  const subprocess = new UnresponsiveHerdrProcess()
+  const execute = makeHerdrCommandExecutor(() => {
+    subprocess.started = true
+    return subprocess
+  })
+
+  await Effect.runPromise(
+    Effect.provide(
+      Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(
+          execute(["/tmp/herdr", "version"]).pipe(
+            Effect.timeoutOrElse({
+              duration: HERDR_COMMAND_TIMEOUT_MS,
+              orElse: () => Effect.void,
+            }),
+          ),
+        )
+        yield* waitFor(() => subprocess.started)
+
+        yield* TestClock.adjust(HERDR_COMMAND_TIMEOUT_MS)
+        yield* waitFor(() => subprocess.signals.length === 1)
+        expect(subprocess.signals).toEqual(["SIGTERM"])
+
+        yield* TestClock.adjust(HERDR_PROCESS_CLEANUP_PERIOD_MS - 1)
+        expect(subprocess.signals).toEqual(["SIGTERM"])
+        yield* TestClock.adjust(1)
+        yield* waitFor(() => subprocess.signals.length === 2)
+        expect(subprocess.signals).toEqual(["SIGTERM", "SIGKILL"])
+
+        yield* TestClock.adjust(HERDR_PROCESS_CLEANUP_PERIOD_MS)
+        yield* Fiber.join(fiber)
+      }),
+      TestClock.layer(),
+    ),
+  )
+
+  expect(subprocess.unrefCalls).toBe(1)
 })
 
 test("times out and ignores failed commands without blocking later state", async () => {
@@ -242,4 +292,20 @@ function releaseCommand(): string[] {
     "--agent",
     "claude-tree",
   ]
+}
+
+class UnresponsiveHerdrProcess implements HerdrCommandProcess {
+  readonly exited = new Promise<number>(() => {})
+  readonly signals: Array<number | NodeJS.Signals> = []
+  exitCode: number | null = null
+  started = false
+  unrefCalls = 0
+
+  kill(signal: number | NodeJS.Signals = "SIGTERM"): void {
+    this.signals.push(signal)
+  }
+
+  unref(): void {
+    this.unrefCalls += 1
+  }
 }

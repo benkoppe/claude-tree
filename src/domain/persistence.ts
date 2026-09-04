@@ -38,6 +38,52 @@ export interface ProjectState {
   readonly navigation?: NavigationState
 }
 
+export type TerminalOwnerStatus =
+  | "reserved"
+  | "running"
+  | "stopping"
+  | "cleanup-incomplete"
+
+export interface TerminalOwner {
+  readonly instanceId: string
+  readonly sessionId: string
+  readonly ownerToken: string
+  readonly lastMutationToken?: string
+  readonly ownerPid: number
+  readonly status: TerminalOwnerStatus
+  readonly processGroupId?: number
+  readonly reservedAt: string
+  readonly updatedAt: string
+}
+
+export type IdentityTransitionKind = "temporary-adoption" | "native-fork"
+
+export interface InstanceNavigation {
+  readonly instanceId: string
+  readonly navigation: NavigationState
+}
+
+export interface PendingIdentityAdoption {
+  readonly adoptionToken: string
+  readonly kind: IdentityTransitionKind
+  readonly instanceId: string
+  readonly ownerToken: string
+  readonly ownerPid: number
+  readonly processGroupId: number
+  readonly previousSessionId: string
+  readonly sessionId: string
+  readonly createdAt: string
+  readonly relation?: BranchRelation
+}
+
+export interface ProviderState {
+  readonly relations: readonly BranchRelation[]
+  readonly removals: readonly ConversationRemoval[]
+  readonly navigations: readonly InstanceNavigation[]
+  readonly terminalOwners: readonly TerminalOwner[]
+  readonly pendingIdentityAdoptions: readonly PendingIdentityAdoption[]
+}
+
 export const EMPTY_PROJECT_STATE: ProjectState = {
   relations: [],
   removals: [],

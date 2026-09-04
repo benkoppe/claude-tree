@@ -1,13 +1,14 @@
 import { EventEmitter } from "node:events"
 
 import { expect, test } from "bun:test"
-import { Cause, Effect, Exit } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 
 import {
   makeCliProgram,
   makeShutdownSignals,
   makeTerminalEventBridge,
   reportCliFailures,
+  runPresentationLifecycle,
   runScopedApplication,
   SHUTDOWN_SIGNALS,
   type ShutdownSignalTarget,
@@ -56,6 +57,8 @@ test("terminal callback bridge preserves events emitted during runtime startup",
   const bridge = makeTerminalEventBridge()
   const observed: string[] = []
   bridge.events.onActivityChanged?.({
+    ownerId: "owner-startup",
+    sequenceId: 1,
     sessionId: "startup",
     activity: "working",
     wasActive: true,
@@ -64,6 +67,8 @@ test("terminal callback bridge preserves events emitted during runtime startup",
     onActivityChanged: (event) => observed.push(`${event.sessionId}:${event.activity}`),
   })
   bridge.events.onActivityChanged?.({
+    ownerId: "owner-running",
+    sequenceId: 1,
     sessionId: "running",
     activity: "idle",
     wasActive: false,
@@ -78,9 +83,11 @@ test("all shutdown signals interrupt the scoped application and remove listeners
     const emitter = new EventEmitter()
     let acquired = 0
     let released = 0
+    const ready = Deferred.makeUnsafe<void>()
     const application = Effect.acquireRelease(
       Effect.sync(() => {
         acquired += 1
+        Deferred.doneUnsafe(ready, Effect.void)
       }),
       () => Effect.sync(() => {
         released += 1
@@ -89,7 +96,7 @@ test("all shutdown signals interrupt the scoped application and remove listeners
     const running = Effect.runPromiseExit(
       runScopedApplication(application, makeShutdownSignals(emitter as ShutdownSignalTarget)),
     )
-    while (acquired === 0) await Bun.sleep(1)
+    await Effect.runPromise(Deferred.await(ready))
 
     emitter.emit(signal)
     const exit = await running
@@ -98,6 +105,35 @@ test("all shutdown signals interrupt the scoped application and remove listeners
     expect(released).toBe(1)
     expect(emitter.eventNames()).toEqual([])
   }
+})
+
+test("presentation interruption invokes direct runtime shutdown before teardown", async () => {
+  const started = Deferred.makeUnsafe<void, never>()
+  const shutdownStarted = Deferred.makeUnsafe<void, never>()
+  const finishShutdown = Deferred.makeUnsafe<void, never>()
+  let shutdowns = 0
+
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const lifecycle = yield* Effect.forkScoped(runPresentationLifecycle(
+      Deferred.succeed(started, undefined),
+      Effect.never,
+      Effect.gen(function*() {
+        shutdowns += 1
+        yield* Deferred.succeed(shutdownStarted, undefined)
+        yield* Deferred.await(finishShutdown)
+      }),
+    ))
+    yield* Deferred.await(started)
+    const interruption = yield* Effect.forkScoped(Fiber.interrupt(lifecycle))
+    yield* Deferred.await(shutdownStarted)
+    expect(interruption.pollUnsafe()).toBeUndefined()
+    yield* Deferred.succeed(finishShutdown, undefined)
+    yield* Fiber.join(interruption)
+    return yield* Fiber.await(lifecycle)
+  })))
+
+  expect(Exit.isFailure(result) && Cause.hasInterruptsOnly(result.cause)).toBeTrue()
+  expect(shutdowns).toBe(1)
 })
 
 test("partial startup failure releases acquired resources exactly once", async () => {

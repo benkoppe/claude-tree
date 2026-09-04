@@ -1,12 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Effect, Exit, Fiber, PubSub } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, PubSub } from "effect"
+import { TestClock } from "effect/testing"
 
 import {
   CodexCleanupError,
   CodexConnectionError,
+  CodexMutationAmbiguousError,
   CodexProcessError,
   CodexProtocolError,
   CodexRequestTimeout,
+  CodexRpcError,
   connectCodexAppServerSidecar,
   makeCodexAppServerClient,
   type CodexAppServerProcess,
@@ -17,6 +20,24 @@ import {
 } from "../../src/infrastructure/providers/codex/tui-proxy"
 
 describe("Effect Codex app-server transport", () => {
+  test("aggregates initialization failure with incomplete app-server rollback", async () => {
+    const transport = fakeProcess(() => {}, { ignoreEnd: true })
+
+    const error = await Effect.runPromise(Effect.flip(Effect.scoped(
+      makeCodexAppServerClient("codex", {
+        spawn: () => transport.process,
+        requestTimeoutMs: 5,
+        shutdownTimeoutMs: 2,
+      }),
+    )))
+
+    expect(error).toBeInstanceOf(CodexCleanupError)
+    expect(error.cause).toBeInstanceOf(AggregateError)
+    expect((error.cause as AggregateError).errors).toHaveLength(2)
+    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL"])
+    expect(transport.unrefs).toBe(2)
+  })
+
   test("initializes and correlates split, out-of-order JSONL responses", async () => {
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") {
@@ -135,6 +156,169 @@ describe("Effect Codex app-server transport", () => {
       transport.respond(blockedId, { thread: thread("blocked") })
       yield* Effect.sleep(5)
       expect((yield* client.readThread("live")).id).toBe("live")
+    })))
+  })
+
+  test("never sends a queued request after its fiber is cancelled", async () => {
+    let releaseBlocker!: () => void
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+      if (message.method === "thread/read") {
+        const params = message.params as { threadId: string }
+        if (params.threadId === "blocker") {
+          controls.respond(message.id, { thread: thread("blocker") })
+        }
+      }
+    }, {
+      write(data, messages) {
+        if (!messages.some((message) =>
+          message.method === "thread/read" &&
+          (message.params as { threadId?: string }).threadId === "blocker"
+        )) return data.length
+        return new Promise<number>((resolve) => {
+          releaseBlocker = () => resolve(data.length)
+        })
+      },
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      const blocker = yield* Effect.forkChild(client.readThread("blocker"))
+      yield* Effect.promise(() => waitUntil(() => transport.messages.some((message) =>
+        message.method === "thread/read" &&
+        (message.params as { threadId?: string }).threadId === "blocker"
+      )))
+      const cancelled = yield* Effect.forkChild(client.readThread("cancelled"))
+      yield* Effect.sleep(5)
+      yield* Fiber.interrupt(cancelled)
+      releaseBlocker()
+      expect((yield* Fiber.join(blocker)).id).toBe("blocker")
+      yield* Effect.sleep(5)
+      expect(transport.messages.some((message) =>
+        message.method === "thread/read" &&
+        (message.params as { threadId?: string }).threadId === "cancelled"
+      )).toBeFalse()
+    })))
+  })
+
+  test("reports a sent fork as ambiguous when its response deadline expires", async () => {
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", {
+        spawn: () => transport.process,
+        requestTimeoutMs: 10,
+      })
+      const error = yield* Effect.flip(client.forkThread("parent", "turn", "/project"))
+      expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
+      expect(error).toMatchObject({ method: "thread/fork" })
+    })))
+  })
+
+  test("uses TestClock to settle a dispatched mutation timeout exactly once", async () => {
+    const error = await Effect.runPromise(Effect.provide(Effect.scoped(Effect.gen(function*() {
+      const forkDispatched = yield* Deferred.make<void>()
+      const transport = fakeProcess((message, controls) => {
+        if (message.method === "initialize") controls.respond(message.id, {})
+        if (message.method === "thread/fork") Deferred.doneUnsafe(forkDispatched, Effect.void)
+      })
+      const client = yield* makeCodexAppServerClient("codex", {
+        spawn: () => transport.process,
+        requestTimeoutMs: 10,
+      })
+      const fiber = yield* Effect.forkChild(client.forkThread("parent", "turn", "/project"))
+      yield* Deferred.await(forkDispatched)
+      yield* TestClock.adjust(10)
+      return yield* Fiber.join(fiber).pipe(Effect.flip)
+    })), TestClock.layer()))
+
+    expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
+  })
+
+  test("settles a dispatched fork as ambiguous when close drains pending requests", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const forkDispatched = yield* Deferred.make<void>()
+      const transport = fakeProcess((message, controls) => {
+        if (message.method === "initialize") controls.respond(message.id, {})
+        if (message.method === "thread/fork") Deferred.doneUnsafe(forkDispatched, Effect.void)
+      })
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      const fiber = yield* Effect.forkChild(client.forkThread("parent", "turn", "/project"))
+      yield* Deferred.await(forkDispatched)
+      yield* client.close()
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
+      expect(error.cause).toBeInstanceOf(CodexProcessError)
+    })))
+  })
+
+  test("settles a dispatched mutation whose active transport write is still blocked", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const forkDispatched = yield* Deferred.make<void>()
+      let releaseWrite!: () => void
+      const transport = fakeProcess((message, controls) => {
+        if (message.method === "initialize") controls.respond(message.id, {})
+        if (message.method === "thread/fork") Deferred.doneUnsafe(forkDispatched, Effect.void)
+      }, {
+        write(data, messages) {
+          if (!messages.some((message) => message.method === "thread/fork")) return data.length
+          return new Promise<number>((resolve) => {
+            releaseWrite = () => resolve(data.length)
+          })
+        },
+      })
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      const mutation = yield* Effect.forkChild(client.forkThread("parent", "turn", "/project"))
+      yield* Deferred.await(forkDispatched)
+      const closing = yield* Effect.forkChild(client.close())
+      const error = yield* Fiber.join(mutation).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
+      releaseWrite()
+      yield* Fiber.join(closing)
+    })))
+  })
+
+  test("reports interruption after fork dispatch as explicit ambiguity", async () => {
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      const fiber = yield* Effect.forkChild(client.forkThread("parent", "turn", "/project"))
+      yield* Effect.promise(() => waitUntil(() => transport.messages.some(
+        (message) => message.method === "thread/fork",
+      )))
+      yield* Fiber.interrupt(fiber)
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
+      expect(error).toMatchObject({ method: "thread/fork" })
+    })))
+  })
+
+  test("treats malformed fork success as ambiguous but preserves explicit RPC rejection", async () => {
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+      if (message.method !== "thread/fork") return
+      const params = message.params as { lastTurnId: string }
+      if (params.lastTurnId === "malformed") {
+        controls.respond(message.id, { thread: {} })
+      } else {
+        controls.emit(`${JSON.stringify({
+          id: message.id,
+          error: { code: -32600, message: "fork rejected" },
+        })}\n`)
+      }
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      expect(yield* Effect.flip(client.forkThread("parent", "malformed", "/project")))
+        .toBeInstanceOf(CodexMutationAmbiguousError)
+      expect(yield* Effect.flip(client.forkThread("parent", "rejected", "/project")))
+        .toBeInstanceOf(CodexRpcError)
     })))
   })
 
@@ -292,20 +476,23 @@ describe("Effect Codex app-server transport", () => {
       if (message.method === "initialize") controls.respond(message.id, {})
     }, { ignoreEnd: true })
 
-    const error = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const exit = await Effect.runPromise(Effect.exit(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", {
         spawn: () => transport.process,
         shutdownTimeoutMs: 5,
       })
       return yield* Effect.flip(client.close())
-    })))
+    }))))
 
-    expect(error).toBeInstanceOf(CodexCleanupError)
-    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL"])
+    expect(Exit.isFailure(exit)).toBeTrue()
+    if (Exit.isSuccess(exit)) throw new Error("expected cleanup failure")
+    expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
+    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
     expect(transport.readersCancelled.sort()).toEqual(["stderr", "stdout"])
+    expect(transport.unrefs).toBe(3)
   })
 
-  test("propagates cleanup failure from the resource scope", async () => {
+  test("reports typed scope cleanup failure", async () => {
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") controls.respond(message.id, {})
     }, { ignoreEnd: true })
@@ -318,8 +505,10 @@ describe("Effect Codex app-server transport", () => {
     }))))
 
     expect(Exit.isFailure(exit)).toBeTrue()
-    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
+    if (Exit.isSuccess(exit)) throw new Error("expected cleanup failure")
+    expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
     expect(transport.signals).toEqual(["SIGTERM", "SIGKILL"])
+    expect(transport.unrefs).toBe(2)
   })
 
   test("cleanup continues after transport close and signal failures", async () => {
@@ -331,17 +520,41 @@ describe("Effect Codex app-server transport", () => {
       killError: new Error("kill failed"),
     })
 
-    const error = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const exit = await Effect.runPromise(Effect.exit(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", {
         spawn: () => transport.process,
         shutdownTimeoutMs: 5,
       })
       return yield* Effect.flip(client.close())
+    }))))
+
+    expect(Exit.isFailure(exit)).toBeTrue()
+    if (Exit.isSuccess(exit)) throw new Error("expected cleanup failure")
+    expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
+    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
+    expect(transport.readersCancelled.sort()).toEqual(["stderr", "stdout"])
+    expect(transport.unrefs).toBe(3)
+  })
+
+  test("retries typed cleanup and repeats TERM/KILL escalation", async () => {
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+    }, {
+      ignoreEnd: true,
+      exitOnKill: "SIGKILL",
+      exitOnKillAttempt: 2,
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", {
+        spawn: () => transport.process,
+        shutdownTimeoutMs: 5,
+      })
+      expect(yield* Effect.flip(client.close())).toBeInstanceOf(CodexCleanupError)
+      yield* client.close()
     })))
 
-    expect(error).toBeInstanceOf(CodexCleanupError)
-    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL"])
-    expect(transport.readersCancelled.sort()).toEqual(["stderr", "stdout"])
+    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
   })
 })
 
@@ -430,9 +643,9 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         const subscription = yield* PubSub.subscribe(proxy.transitions)
         const transitionsFiber = yield* Effect.forkChild(
           Effect.all([
-            PubSub.take(subscription),
-            PubSub.take(subscription),
-            PubSub.take(subscription),
+            takeAndAcknowledgeProxyTransition(subscription),
+            takeAndAcknowledgeProxyTransition(subscription),
+            takeAndAcknowledgeProxyTransition(subscription),
           ], { concurrency: 1 }),
         )
         const client = new WebSocket(proxy.remoteUrl, {
@@ -597,7 +810,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         const malformed = topLevelThread("thread-b")
         delete malformed.updatedAt
         upstream.respond(1, malformed)
-        const transition = yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
+        const transition = yield* takeAndAcknowledgeProxyTransition(subscription).pipe(Effect.timeout(1_000))
         expect(transition._tag).toBe("TransitionFailed")
         if (transition._tag === "TransitionFailed") {
           expect(transition.error).toBeInstanceOf(CodexTuiProxyError)
@@ -605,6 +818,76 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         }
         client.close()
       })))
+    } finally {
+      await upstream.close()
+    }
+  })
+
+  test("does not forward a switch response until its transition is acknowledged", async () => {
+    const token = "proxy-secret"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
+          bearerToken: token,
+          initialThreadId: "thread-a",
+        })
+        const subscription = yield* PubSub.subscribe(proxy.transitions)
+        const client = new WebSocket(proxy.remoteUrl, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        yield* Effect.promise(() => socketOpened(client))
+        let forwarded = false
+        const response = socketMessage(client).then((message) => {
+          forwarded = true
+          return message
+        })
+        client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        upstream.respond(1, topLevelThread("thread-b"))
+
+        const request = yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
+        yield* Effect.sleep(20)
+        expect(forwarded).toBeFalse()
+        yield* Deferred.succeed(request.acknowledgment, undefined)
+        expect(JSON.parse(yield* Effect.promise(() => response))).toMatchObject({
+          id: 1,
+          result: { thread: { id: "thread-b" } },
+        })
+        client.close()
+      })))
+    } finally {
+      await upstream.close()
+    }
+  })
+
+  test("bounds transition acknowledgment and closes without forwarding", async () => {
+    const token = "proxy-secret"
+    const upstream = controlledProtocolServer(token)
+    try {
+      const exit = await Effect.runPromise(Effect.exit(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
+          bearerToken: token,
+          initialThreadId: "thread-a",
+          transitionAcknowledgmentTimeoutMs: 10,
+        })
+        const subscription = yield* PubSub.subscribe(proxy.transitions)
+        const client = new WebSocket(proxy.remoteUrl, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        yield* Effect.promise(() => socketOpened(client))
+        const closed = socketClosed(client)
+        client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        upstream.respond(1, topLevelThread("thread-b"))
+        yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
+        expect((yield* Effect.promise(() => closed)).code).toBe(1011)
+      }))))
+      expect(Exit.isFailure(exit)).toBeTrue()
+      if (Exit.isSuccess(exit)) throw new Error("expected cleanup failure")
+      expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexTuiProxyError)
     } finally {
       await upstream.close()
     }
@@ -652,6 +935,16 @@ interface WireMessage {
   readonly error?: unknown
 }
 
+function takeAndAcknowledgeProxyTransition(
+  subscription: PubSub.Subscription<import("../../src/infrastructure/providers/codex/tui-proxy").CodexTuiProxyTransitionRequest>,
+): Effect.Effect<import("../../src/infrastructure/providers/codex/tui-proxy").CodexTuiProxyTransition> {
+  return Effect.gen(function*() {
+    const request = yield* PubSub.take(subscription)
+    yield* Deferred.succeed(request.acknowledgment, undefined)
+    return request.transition
+  })
+}
+
 interface FakeControls {
   emit(text: string): void
   stderr(text: string): void
@@ -665,6 +958,7 @@ interface FakeProcess extends FakeControls {
   readonly ended: boolean
   readonly signals: NodeJS.Signals[]
   readonly readersCancelled: string[]
+  readonly unrefs: number
 }
 
 function fakeProcess(
@@ -672,6 +966,7 @@ function fakeProcess(
   options: {
     readonly ignoreEnd?: boolean
     readonly exitOnKill?: NodeJS.Signals
+    readonly exitOnKillAttempt?: number
     readonly endError?: unknown
     readonly killError?: unknown
     readonly write?: (data: string, messages: readonly WireMessage[]) => number | Promise<number>
@@ -685,13 +980,14 @@ function fakeProcess(
   const messages: WireMessage[] = []
   const signals: NodeJS.Signals[] = []
   const readersCancelled: string[] = []
+  let unrefs = 0
   const encoder = new TextEncoder()
   const close = (code: number) => {
     if (exited) return
     exited = true
     ended = true
-    stdoutController.close()
-    stderrController.close()
+    try { stdoutController.close() } catch {}
+    try { stderrController.close() } catch {}
     resolveExited(code)
   }
   const controls: FakeControls = {
@@ -741,14 +1037,18 @@ function fakeProcess(
       const normalized = typeof signal === "string" ? signal : "SIGTERM"
       signals.push(normalized)
       if (options.killError !== undefined) throw options.killError
-      if (normalized === options.exitOnKill) close(0)
+      const matchingAttempts = signals.filter((signal) => signal === options.exitOnKill).length
+      if (normalized === options.exitOnKill &&
+        matchingAttempts >= (options.exitOnKillAttempt ?? 1)) close(0)
     },
+    unref() { unrefs += 1 },
   }
   return {
     process,
     messages,
     signals,
     readersCancelled,
+    get unrefs() { return unrefs },
     get ended() { return ended },
     ...controls,
   }

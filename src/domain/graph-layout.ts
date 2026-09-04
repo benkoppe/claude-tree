@@ -77,10 +77,8 @@ export function visibleGraphNodeId(
     visited.add(currentNodeId)
     const node = graph.nodes.get(currentNodeId)
     if (!node || node.kind === "origin") return undefined
-    if (isPositionedNode(graph, node, visibleEndpointSessionIds)) return node.id
-    currentNodeId = node.kind === "endpoint" && node.fork?.empty
-      ? node.fork.sourceNodeId
-      : node.parentId ?? undefined
+    if (isPositionedNode(node, visibleEndpointSessionIds)) return node.id
+    currentNodeId = node.parentId ?? undefined
   }
   return undefined
 }
@@ -127,7 +125,7 @@ export function layoutConversationGraph(
   const origin = graph.nodes.get(graph.originNodeId)
   for (const rootId of origin?.childIds ?? []) {
     const root = graph.nodes.get(rootId)
-    if (!root || root.kind === "origin" || !isPositionedNode(graph, root, visibleEndpointSessionIds)) {
+    if (!root || root.kind === "origin" || !isPositionedNode(root, visibleEndpointSessionIds)) {
       continue
     }
 
@@ -194,27 +192,18 @@ function visibleChildren(
     .filter((child): child is MessageGraphNodeOrEndpoint =>
       child !== undefined &&
       child.kind !== "origin" &&
-      isPositionedNode(graph, child, visibleEndpointSessionIds)
+      isPositionedNode(child, visibleEndpointSessionIds)
     )
 }
 
 function isPositionedNode(
-  graph: ConversationGraph,
   node: ConversationGraphNode,
   visibleEndpointSessionIds: ReadonlySet<string>,
 ): boolean {
   if (node.kind === "message") return true
   if (node.kind === "origin") return false
   if (visibleEndpointSessionIds.has(node.session.id)) return true
-  if (!node.fork?.empty) return false
-
-  const source = graph.nodes.get(node.fork.sourceNodeId)
-  return (source?.childIds ?? []).some((childId) => {
-    if (childId === node.id) return false
-    const child = graph.nodes.get(childId)
-    return child?.kind === "message" ||
-      (child?.kind === "endpoint" && visibleEndpointSessionIds.has(child.session.id))
-  })
+  return node.fork?.empty === true
 }
 
 export function directionalMove(

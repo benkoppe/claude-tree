@@ -1,10 +1,11 @@
 import { randomUUID as nodeRandomUUID } from "node:crypto"
 import { realpath } from "node:fs/promises"
+import { isAbsolute } from "node:path"
 import { isDeepStrictEqual } from "node:util"
 
-import { Clock, Effect, Layer, PubSub, Scope } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Layer, PubSub, Scope } from "effect"
 
-import { ProviderError, ProviderProtocolError } from "../../../domain/errors"
+import { ProviderCleanupError, ProviderError, ProviderProtocolError } from "../../../domain/errors"
 import type {
   AgentMessage,
   AgentSession,
@@ -17,12 +18,17 @@ import type {
 import {
   AgentProvider,
   type AgentProviderApi,
+  type AmbiguousBranchMutation,
   type BranchOutcome,
+  makeBranchMutationReconciliationSignal,
   type PreparedTerminal,
   type TerminalLaunch,
+  type TerminalTransitionAcknowledgmentError,
   type TerminalTransitionEvent,
+  type TerminalTransitionRequest,
 } from "../../../services/provider"
 import {
+  CodexMutationAmbiguousError,
   CodexProtocolError,
   CodexRpcError,
   connectCodexAppServerSidecar,
@@ -44,16 +50,21 @@ import {
 import { CodexTerminalObserver } from "./terminal-observer"
 import {
   makeCodexTuiProxy,
+  CodexTuiProxyError,
   type CodexThreadTransition,
   type CodexTuiProxyTransition,
-  type CodexTuiProxyError,
+  type CodexTuiProxyTransitionRequest,
 } from "./tui-proxy"
 
 const TRANSCRIPT_READ_CONCURRENCY = 16
 const OVERLOAD_RETRY_DELAYS_MS = [25, 50, 100, 200]
 const SIDECAR_START_TIMEOUT_MS = 5_000
+const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = 1_000
 const SIDECAR_RETRY_DELAY_MS = 10
 const TOKEN_ENVIRONMENT_VARIABLE = "CLAUDE_TREE_CODEX_TOKEN"
+const METADATA_DEADLINE_MS = 30_000
+const THREAD_LIST_PAGE_LIMIT = 100
+const SNAPSHOT_SESSION_LIMIT = 10_000
 
 export interface CodexMessage extends AgentMessage {
   readonly rawItem: CodexThreadItem
@@ -72,7 +83,8 @@ export type CodexAppServerFactory = () => Effect.Effect<
 export interface CodexObservedServices {
   readonly remoteUrl: string
   readonly bearerToken: string
-  readonly transitions: PubSub.PubSub<CodexTuiProxyTransition>
+  readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly close: () => Effect.Effect<void, CodexObservedServicesError>
 }
 
 export type CodexObservedServicesError =
@@ -85,21 +97,34 @@ export type CodexObservedServicesFactory = (
   initialThreadId: string,
 ) => Effect.Effect<CodexObservedServices, CodexObservedServicesError, Scope.Scope>
 
+export interface CodexObservedServicesDependencies {
+  readonly sidecarFactory?: (
+    executable: string,
+  ) => Effect.Effect<CodexSidecar, CodexSidecarError, Scope.Scope>
+  readonly waitUntilReady?: (
+    sidecar: CodexSidecar,
+  ) => Effect.Effect<void, CodexAppServerError | CodexSidecarError>
+  readonly proxyFactory?: typeof makeCodexTuiProxy
+}
+
 export interface CodexProviderRuntimeDependencies {
   readonly appServerFactory?: CodexAppServerFactory
   readonly observedServicesFactory?: CodexObservedServicesFactory
   readonly observerFactory?: () => TerminalObserver
   readonly randomUUID?: () => string
+  readonly canonicalize?: (path: string) => string | PromiseLike<string>
 }
 
 export interface CodexProviderDependencies extends CodexProviderRuntimeDependencies {
   readonly resolveExecutable?: () => string | null | PromiseLike<string | null>
-  readonly canonicalize?: (path: string) => string | PromiseLike<string>
 }
 
 export interface CodexProviderOptions {
   readonly transcriptReadConcurrency?: number
   readonly overloadRetryDelaysMs?: readonly number[]
+  readonly metadataDeadlineMs?: number
+  readonly maxThreadListPages?: number
+  readonly maxSnapshotSessions?: number
 }
 
 export class CodexProvider implements AgentProviderApi {
@@ -122,13 +147,19 @@ export class CodexProvider implements AgentProviderApi {
     PreparedTerminal,
     ProviderError | ProviderProtocolError
   >
+  readonly takeBranchMutationReconciliation: Effect.Effect<AmbiguousBranchMutation>
 
   private readonly appServerFactory: CodexAppServerFactory
   private readonly observedServicesFactory: CodexObservedServicesFactory
   private readonly observerFactory: () => TerminalObserver
   private readonly makeUuid: () => string
+  private readonly canonicalizePath: (path: string) => string | PromiseLike<string>
   private readonly readConcurrency: number
   private readonly overloadRetryDelays: readonly number[]
+  private readonly metadataDeadlineMs: number
+  private readonly maxThreadListPages: number
+  private readonly maxSnapshotSessions: number
+  private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
 
   constructor(
     private readonly projectPath: string,
@@ -141,11 +172,16 @@ export class CodexProvider implements AgentProviderApi {
     this.observedServicesFactory = dependencies.observedServicesFactory ?? makeObservedServices
     this.observerFactory = dependencies.observerFactory ?? (() => new CodexTerminalObserver())
     this.makeUuid = dependencies.randomUUID ?? nodeRandomUUID
+    this.canonicalizePath = dependencies.canonicalize ?? realpath
     this.readConcurrency = positiveInteger(
       options.transcriptReadConcurrency,
       TRANSCRIPT_READ_CONCURRENCY,
     )
     this.overloadRetryDelays = options.overloadRetryDelaysMs ?? OVERLOAD_RETRY_DELAYS_MS
+    this.metadataDeadlineMs = positiveDuration(options.metadataDeadlineMs, METADATA_DEADLINE_MS)
+    this.maxThreadListPages = positiveInteger(options.maxThreadListPages, THREAD_LIST_PAGE_LIMIT)
+    this.maxSnapshotSessions = positiveInteger(options.maxSnapshotSessions, SNAPSHOT_SESSION_LIMIT)
+    this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
 
     this.loadSessionSnapshot = this.withServer((server) => Effect.gen({ self: this }, function*() {
       const sessions = yield* this.listSessionsFrom(server)
@@ -154,7 +190,7 @@ export class CodexProvider implements AgentProviderApi {
         sessions.map((session) => session.id),
       )
       return { sessions, transcripts }
-    }), "loadSessionSnapshot")
+    }), "loadSessionSnapshot", true)
 
     this.prepareNewSession = Effect.gen({ self: this }, function*() {
       const sessionId = yield* Effect.try({
@@ -186,6 +222,7 @@ export class CodexProvider implements AgentProviderApi {
     return this.withServer(
       (server) => this.readTranscriptsFrom(server, sessionIds),
       "readTranscripts",
+      true,
     )
   }
 
@@ -196,7 +233,7 @@ export class CodexProvider implements AgentProviderApi {
       const sessions = yield* this.listSessionsFrom(server)
       const transcripts = yield* this.readTranscriptsFrom(server, sessionIds)
       return { sessions, transcripts }
-    }), "loadSessionSnapshotFor")
+    }), "loadSessionSnapshotFor", true)
   }
 
   prepareResume(
@@ -213,9 +250,17 @@ export class CodexProvider implements AgentProviderApi {
   branchFrom(
     target: MessageRef,
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
-    return this.withServer((server) => Effect.gen({ self: this }, function*() {
+    let mutationMayHaveDispatched = false
+    let deadlineExpired = false
+    const operation = this.withServer((server) => Effect.gen({ self: this }, function*() {
       yield* this.validateSessionId(target.sessionId, "branchFrom")
       const parentThread = yield* this.requireThread(server, target.sessionId, "branchFrom")
+      if (!(yield* this.threadBelongsToProject(parentThread))) {
+        return yield* Effect.fail(this.protocolError(
+          "branchFrom",
+          `Codex session ${target.sessionId} belongs to another project`,
+        ))
+      }
       const parentTranscript = yield* this.normalizeThread(parentThread, "branchFrom")
       const selectedIndex = parentTranscript.findIndex((message) => message.id === target.messageId)
       const selected = parentTranscript[selectedIndex]
@@ -228,10 +273,38 @@ export class CodexProvider implements AgentProviderApi {
       yield* this.validateForkTarget(selected, parentThread)
 
       const copiedParent = parentTranscript.slice(0, selectedIndex + 1)
-      const childThread = yield* this.transport(
-        server.forkThread(target.sessionId, selected.turnId, this.projectPath),
-        "branchFrom",
+      mutationMayHaveDispatched = true
+      const mutation = yield* server.forkThread(
+        target.sessionId,
+        selected.turnId,
+        this.projectPath,
+      ).pipe(
+        Effect.map((thread) => ({ _tag: "Success" as const, thread })),
+        Effect.catch((error) => Effect.succeed({ _tag: "Failure" as const, error })),
       )
+      if (mutation._tag === "Failure") {
+        if (mutation.error instanceof CodexMutationAmbiguousError) {
+          return {
+            _tag: "AmbiguousBranchMutation" as const,
+            providerId: this.id,
+            parentSessionId: target.sessionId,
+            sourceMessageId: selected.id,
+            reason: mutation.error.message,
+            reconciliation: "full-snapshot" as const,
+          }
+        }
+        return yield* Effect.fail(this.mapTransportError("branchFrom", mutation.error))
+      }
+      const childThread = mutation.thread
+      const childIdValid = isValidSessionId(childThread.id) && childThread.id !== target.sessionId
+      const childInProject = yield* this.threadBelongsToProject(childThread)
+      if (!childIdValid || !childInProject) {
+        return ambiguity(
+          !childIdValid
+            ? "Codex thread/fork returned an invalid or non-distinct child thread ID after dispatch"
+            : `Codex thread/fork returned child ${childThread.id} outside the canonical project after dispatch`,
+        )
+      }
       const now = yield* Clock.currentTimeMillis
       const provisionalSession = provisionalSessionFromThread(childThread, now)
       let transcript: TranscriptRead = {
@@ -244,6 +317,11 @@ export class CodexProvider implements AgentProviderApi {
         const childRead = yield* this.readThreadWithOverloadRetry(server, childThread.id).pipe(
           Effect.mapError((error) => this.mapTransportError("validateFork", error)),
         )
+        if (!(yield* this.threadBelongsToProject(childRead))) {
+          return ambiguity(
+            `Codex fork child ${childThread.id} resolved outside the canonical project after dispatch`,
+          )
+        }
         const childTranscript = yield* this.normalizeThread(childRead, "validateFork")
         transcript = { _tag: "Available", messages: childTranscript }
         yield* this.validateCopiedPrefix(childThread.id, copiedParent, childTranscript)
@@ -281,6 +359,35 @@ export class CodexProvider implements AgentProviderApi {
         }),
       )
     }), "branchFrom")
+    const ambiguity = (reason: string): AmbiguousBranchMutation => ({
+      _tag: "AmbiguousBranchMutation",
+      providerId: this.id,
+      parentSessionId: target.sessionId,
+      sourceMessageId: target.messageId,
+      reason,
+      reconciliation: "full-snapshot",
+    })
+    const deadline = Effect.sleep(this.metadataDeadlineMs).pipe(
+      Effect.tap(() => Effect.sync(() => {
+        deadlineExpired = true
+      })),
+      Effect.flatMap(() => mutationMayHaveDispatched
+        ? Effect.succeed(ambiguity(
+            `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline after thread/fork dispatch`,
+          ))
+        : Effect.fail(this.providerError(
+            "branchFrom",
+            `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline`,
+          ))),
+    )
+    return Effect.raceFirst(
+      operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !deadlineExpired
+        ? Effect.sync(() => this.branchMutationReconciliations.offer(ambiguity(
+            "Codex thread/fork was interrupted after dispatch and may have created a child thread",
+          )))
+        : Effect.void)),
+      deadline,
+    )
   }
 
   private withServer<A>(
@@ -288,13 +395,86 @@ export class CodexProvider implements AgentProviderApi {
       server: CodexAppServerClient,
     ) => Effect.Effect<A, ProviderError | ProviderProtocolError>,
     operation: string,
+    bounded = false,
   ): Effect.Effect<A, ProviderError | ProviderProtocolError> {
-    return Effect.scoped(
-      this.appServerFactory().pipe(
-        Effect.mapError((error) => this.mapTransportError(operation, error)),
-        Effect.flatMap(use),
-      ),
-    )
+    const operationEffect = Effect.uninterruptibleMask((restore) => Effect.gen({ self: this }, function*() {
+      const scope = yield* Scope.make("sequential")
+      const acquisition = yield* Effect.exit(restore(Scope.provide(
+        this.appServerFactory().pipe(
+          Effect.mapError((error) => this.mapTransportError(operation, error)),
+        ),
+        scope,
+      )))
+      if (Exit.isFailure(acquisition)) {
+        const scopeCleanup = yield* Effect.exit(this.boundedServerCleanup(
+          Scope.close(scope, acquisition),
+          operation,
+        ))
+        if (Exit.isFailure(scopeCleanup)) {
+          return yield* Effect.fail(this.mapTransportError(operation, new AggregateError([
+            Cause.squash(acquisition.cause),
+            Cause.squash(scopeCleanup.cause),
+          ])))
+        }
+        return yield* Effect.failCause(acquisition.cause)
+      }
+
+      const outcome = yield* Effect.exit(restore(use(acquisition.value)))
+      const explicitCleanup = yield* Effect.exit(this.boundedServerCleanup(
+        acquisition.value.close(),
+        operation,
+      ))
+      const scopeCleanup = yield* Effect.exit(this.boundedServerCleanup(
+        Scope.close(scope, outcome),
+        operation,
+      ))
+      const cleanupFailures = [explicitCleanup, scopeCleanup].flatMap((exit) =>
+        Exit.isFailure(exit) ? [Cause.squash(exit.cause)] : [])
+      if (cleanupFailures.length > 0) {
+        const cleanupError = this.mapTransportError(
+          operation,
+          cleanupFailures.length === 1
+            ? cleanupFailures[0]
+            : new AggregateError(cleanupFailures),
+        )
+        if (Exit.isSuccess(outcome) && isBranchOutcome(outcome.value)) {
+          yield* Effect.logError(
+            `Codex ${operation} committed, but app-server cleanup failed: ${cleanupError.message}`,
+          )
+          return outcome.value
+        }
+        if (Exit.isFailure(outcome)) {
+          yield* Effect.logError(
+            `Codex ${operation} also encountered an app-server cleanup failure: ${cleanupError.message}`,
+          )
+          return yield* Effect.failCause(outcome.cause)
+        }
+        return yield* Effect.fail(cleanupError)
+      }
+      if (Exit.isFailure(outcome)) return yield* Effect.failCause(outcome.cause)
+      return outcome.value
+    }))
+    if (!bounded) return operationEffect
+    return operationEffect.pipe(Effect.timeoutOrElse({
+      duration: this.metadataDeadlineMs,
+      orElse: () => Effect.fail(this.providerError(
+        operation,
+        `Codex ${operation} exceeded the ${this.metadataDeadlineMs}ms overall deadline`,
+      )),
+    }))
+  }
+
+  private boundedServerCleanup<A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    operation: string,
+  ): Effect.Effect<A, E | ProviderError, R> {
+    return effect.pipe(Effect.timeoutOrElse({
+      duration: this.metadataDeadlineMs,
+      orElse: () => Effect.fail(this.providerError(
+        operation,
+        `Codex ${operation} app-server cleanup exceeded ${this.metadataDeadlineMs}ms`,
+      )),
+    }))
   }
 
   private listSessionsFrom(
@@ -312,11 +492,24 @@ export class CodexProvider implements AgentProviderApi {
       }
 
       while (true) {
+        if (seenCursors.size >= this.maxThreadListPages) {
+          return yield* Effect.fail(this.protocolError(
+            "listSessions",
+            `Codex thread/list exceeded ${this.maxThreadListPages} pages`,
+          ))
+        }
         const page = yield* this.transport(
           server.listThreads({ ...filters, ...(cursor === undefined ? {} : { cursor }) }),
           "listSessions",
         )
         for (const thread of page.data) {
+          if (!(yield* this.threadBelongsToProject(thread))) continue
+          if (sessions.length >= this.maxSnapshotSessions) {
+            return yield* Effect.fail(this.protocolError(
+              "listSessions",
+              `Codex thread/list exceeded ${this.maxSnapshotSessions} sessions`,
+            ))
+          }
           sessions.push(yield* this.sessionFromThread(thread, "listSessions"))
         }
         if (page.nextCursor === null) return sessions
@@ -335,7 +528,13 @@ export class CodexProvider implements AgentProviderApi {
   private readTranscriptsFrom(
     server: CodexAppServerClient,
     sessionIds: readonly string[],
-  ): Effect.Effect<ReadonlyMap<string, TranscriptRead>> {
+  ): Effect.Effect<ReadonlyMap<string, TranscriptRead>, ProviderProtocolError> {
+    if (sessionIds.length > this.maxSnapshotSessions) {
+      return Effect.fail(this.protocolError(
+        "readTranscripts",
+        `Codex transcript read exceeded ${this.maxSnapshotSessions} sessions`,
+      ))
+    }
     return Effect.all(
       sessionIds.map((sessionId) => this.readTranscriptOutcome(server, sessionId).pipe(
         Effect.map((transcript): readonly [string, TranscriptRead] => [sessionId, transcript]),
@@ -417,6 +616,20 @@ export class CodexProvider implements AgentProviderApi {
         cause,
       ),
     })
+  }
+
+  private threadBelongsToProject(thread: CodexThread): Effect.Effect<boolean> {
+    if (!isCanonicalPathCandidate(thread.cwd)) return Effect.succeed(false)
+    if (thread.cwd === this.projectPath) return Effect.succeed(true)
+    return Effect.tryPromise({
+      try: () => Promise.resolve(this.canonicalizePath(thread.cwd)),
+      catch: () => undefined,
+    }).pipe(
+      Effect.match({
+        onFailure: () => false,
+        onSuccess: (path) => isCanonicalPathCandidate(path) && path === this.projectPath,
+      }),
+    )
   }
 
   private validateForkTarget(
@@ -516,26 +729,69 @@ export class CodexProvider implements AgentProviderApi {
         observer: this.observerFactory(),
         transitions,
       }
-      return launch
+      return {
+        launch,
+        close: observed.close().pipe(
+          Effect.mapError((cause) => new ProviderCleanupError({
+            providerId: this.id,
+            operation: "closeLaunch",
+            message: "Unable to clean up Codex terminal services",
+            cause,
+          })),
+        ),
+      }
     })
   }
 
   private adaptTransitions(
-    source: PubSub.PubSub<CodexTuiProxyTransition>,
-  ): Effect.Effect<PubSub.PubSub<TerminalTransitionEvent>, never, Scope.Scope> {
+    source: PubSub.PubSub<CodexTuiProxyTransitionRequest>,
+  ): Effect.Effect<PubSub.PubSub<TerminalTransitionRequest>, never, Scope.Scope> {
     return Effect.gen({ self: this }, function*() {
       const transitions = yield* Effect.acquireRelease(
-        PubSub.bounded<TerminalTransitionEvent>(64),
+        PubSub.bounded<TerminalTransitionRequest>(64),
         PubSub.shutdown,
       )
       const subscription = yield* PubSub.subscribe(source)
       yield* Effect.forkScoped(Effect.forever(
-        PubSub.take(subscription).pipe(
-          Effect.flatMap((observed) => PubSub.publish(transitions, this.toTransition(observed))),
-        ),
+        PubSub.take(subscription).pipe(Effect.flatMap((request) => this.forwardTransition(
+          transitions,
+          request,
+        ))),
       ))
       return transitions
     })
+  }
+
+  private forwardTransition(
+    target: PubSub.PubSub<TerminalTransitionRequest>,
+    request: CodexTuiProxyTransitionRequest,
+  ): Effect.Effect<void> {
+    const self = this
+    const forwarded = Effect.gen(function*() {
+      const acknowledgment = yield* Deferred.make<void, TerminalTransitionAcknowledgmentError>()
+      const published = yield* PubSub.publish(target, {
+        event: self.toTransition(request.transition),
+        acknowledgment,
+      })
+      if (!published) {
+        return yield* Effect.fail(self.providerError(
+          "nativeSessionTransition",
+          "Codex terminal transition channel was closed",
+        ))
+      }
+      yield* Deferred.await(acknowledgment)
+    })
+    return forwarded.pipe(
+      Effect.onExit((exit) => Exit.isSuccess(exit)
+        ? Deferred.succeed(request.acknowledgment, undefined)
+        : Deferred.fail(request.acknowledgment, new CodexTuiProxyError({
+          operation: "publish-transition",
+          message: "The Codex terminal transition was not acknowledged",
+          cause: Cause.squash(exit.cause),
+        }))),
+      Effect.exit,
+      Effect.asVoid,
+    )
   }
 
   private toTransition(observed: CodexTuiProxyTransition): TerminalTransitionEvent {
@@ -585,6 +841,16 @@ export class CodexProvider implements AgentProviderApi {
         this.requireThread(server, parentSessionId, "deriveNativeFork"),
         this.requireThread(server, observed.threadId, "deriveNativeFork"),
       ], { concurrency: 2 })
+      const [parentInProject, childInProject] = yield* Effect.all([
+        this.threadBelongsToProject(parentThread),
+        this.threadBelongsToProject(childThread),
+      ])
+      if (!parentInProject || !childInProject) {
+        return yield* Effect.fail(this.protocolError(
+          "deriveNativeFork",
+          `Fork ${observed.threadId} is outside the canonical project`,
+        ))
+      }
       const [parent, child] = yield* Effect.all([
         this.normalizeThread(parentThread, "deriveNativeFork"),
         this.normalizeThread(childThread, "deriveNativeFork"),
@@ -630,7 +896,7 @@ export class CodexProvider implements AgentProviderApi {
           childMessageId: message.id,
         })),
       }
-    }), "deriveNativeFork")
+    }), "deriveNativeFork", true)
   }
 
   private validateSessionId(
@@ -719,7 +985,7 @@ export function createCodexProvider(
         cause,
       }),
     })
-    if (typeof canonicalPath !== "string" || canonicalPath.length === 0 || canonicalPath.includes("\0")) {
+    if (!isCanonicalPathCandidate(canonicalPath)) {
       return yield* Effect.fail(new ProviderProtocolError({
         providerId: "codex",
         operation: "createProvider",
@@ -821,32 +1087,109 @@ export function sameCopiedCodexMessage(parent: CodexMessage, child: CodexMessage
 export function makeObservedServices(
   executable: string,
   initialThreadId: string,
+  dependencies: CodexObservedServicesDependencies = {},
 ): Effect.Effect<CodexObservedServices, CodexObservedServicesError, Scope.Scope> {
-  return Effect.gen(function*() {
-    const sidecar = yield* makeCodexSidecar(executable)
-    yield* waitForSidecar(sidecar)
-    const proxy = yield* makeCodexTuiProxy({
+  return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+    const sidecar = yield* restore((dependencies.sidecarFactory ?? makeCodexSidecar)(executable))
+    const readiness = yield* Effect.exit(
+      restore((dependencies.waitUntilReady ?? waitForSidecar)(sidecar).pipe(
+        Effect.timeoutOrElse({
+          duration: SIDECAR_START_TIMEOUT_MS,
+          orElse: () => Effect.fail(new CodexSidecarError({
+            operation: "connect",
+            message: `Codex app-server did not become ready within ${SIDECAR_START_TIMEOUT_MS}ms`,
+          })),
+        }),
+      )),
+    )
+    if (Exit.isFailure(readiness)) {
+      const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
+      if (Exit.isFailure(rollback)) {
+        return yield* Effect.fail(new CodexSidecarError({
+          operation: "acquire-rollback",
+          message: "Codex sidecar readiness failed and rollback was incomplete",
+          cause: new AggregateError([
+            Cause.squash(readiness.cause),
+            Cause.squash(rollback.cause),
+          ]),
+        }))
+      }
+      return yield* Effect.failCause(readiness.cause)
+    }
+
+    const proxyAcquisition = yield* Effect.exit(restore((dependencies.proxyFactory ?? makeCodexTuiProxy)({
       upstreamUrl: sidecar.remoteUrl,
       bearerToken: sidecar.bearerToken,
       initialThreadId,
+    }).pipe(Effect.timeoutOrElse({
+      duration: SIDECAR_START_TIMEOUT_MS,
+      orElse: () => Effect.fail(new CodexTuiProxyError({
+        operation: "listen",
+        message: `Codex TUI proxy did not start within ${SIDECAR_START_TIMEOUT_MS}ms`,
+      })),
+    }))))
+    if (Exit.isFailure(proxyAcquisition)) {
+      const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
+      if (Exit.isFailure(rollback)) {
+        return yield* Effect.fail(new CodexSidecarError({
+          operation: "acquire-rollback",
+          message: "Codex TUI proxy acquisition failed and sidecar rollback was incomplete",
+          cause: new AggregateError([
+            Cause.squash(proxyAcquisition.cause),
+            Cause.squash(rollback.cause),
+          ]),
+        }))
+      }
+      return yield* Effect.failCause(proxyAcquisition.cause)
+    }
+    const proxy = proxyAcquisition.value
+    const close = () => Effect.gen(function*() {
+      const failures: unknown[] = []
+      yield* boundedObservedCleanup(proxy.close()).pipe(
+        Effect.catch((error) => Effect.sync(() => failures.push(error))),
+      )
+      yield* boundedObservedCleanup(sidecar.close()).pipe(
+        Effect.catch((error) => Effect.sync(() => failures.push(error))),
+      )
+      if (failures.length > 0) {
+        return yield* Effect.fail(new CodexSidecarError({
+          operation: "cleanup",
+          message: "Unable to clean up Codex observed terminal services",
+          cause: failures.length === 1 ? failures[0] : new AggregateError(failures),
+        }))
+      }
     })
     return {
       remoteUrl: proxy.remoteUrl,
       bearerToken: sidecar.bearerToken,
       transitions: proxy.transitions,
+      close,
     }
-  })
+  }))
+}
+
+function boundedObservedCleanup<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E | CodexSidecarError> {
+  return effect.pipe(Effect.timeoutOrElse({
+    duration: OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS,
+    orElse: () => Effect.fail(new CodexSidecarError({
+      operation: "cleanup",
+      message: `Codex observed-services cleanup timed out after ${OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS}ms`,
+    })),
+  }))
 }
 
 function waitForSidecar(
   sidecar: CodexSidecar,
 ): Effect.Effect<void, CodexAppServerError | CodexSidecarError> {
   return Effect.gen(function*() {
-    const deadline = performance.now() + SIDECAR_START_TIMEOUT_MS
+    const startedAt = yield* Clock.currentTimeMillis
+    const deadline = startedAt + SIDECAR_START_TIMEOUT_MS
     let lastError: CodexAppServerError | undefined
-    while (performance.now() < deadline) {
+    while (true) {
+      const now = yield* Clock.currentTimeMillis
+      if (now >= deadline) break
       if (sidecar.process.exitCode !== null) {
-        const detail = yield* Effect.promise(() => sidecar.stderr)
+        const detail = yield* sidecar.stderr
         return yield* Effect.fail(new CodexSidecarError({
           operation: "connect",
           message: `Codex app-server exited before accepting connections${detail ? `: ${detail}` : ""}`,
@@ -855,8 +1198,8 @@ function waitForSidecar(
       const result = yield* Effect.matchEffect(
         Effect.scoped(connectCodexAppServerSidecar(sidecar.remoteUrl, {
           bearerToken: sidecar.bearerToken,
-          connectTimeoutMs: Math.min(250, Math.max(1, deadline - performance.now())),
-          requestTimeoutMs: Math.min(250, Math.max(1, deadline - performance.now())),
+          connectTimeoutMs: Math.min(250, Math.max(1, deadline - now)),
+          requestTimeoutMs: Math.min(250, Math.max(1, deadline - now)),
           shutdownTimeoutMs: 100,
         })),
         {
@@ -953,6 +1296,10 @@ function isValidSessionId(value: string): boolean {
   return value.length > 0 && !value.includes("\0")
 }
 
+function isCanonicalPathCandidate(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !value.includes("\0") && isAbsolute(value)
+}
+
 function isTurnStatus(value: unknown): value is CodexTurnStatus {
   return value === "completed" || value === "interrupted" || value === "failed" ||
     value === "inProgress"
@@ -962,10 +1309,22 @@ function positiveInteger(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback
 }
 
+function positiveDuration(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isBranchOutcome(value: unknown): boolean {
+  return isRecord(value) && (
+    value._tag === "ValidatedBranch" ||
+    value._tag === "CreatedIndependentSession" ||
+    value._tag === "AmbiguousBranchMutation"
+  )
 }

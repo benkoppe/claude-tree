@@ -10,10 +10,11 @@ import {
   type RGBA as Color,
   type TextChunk,
 } from "@opentui/core"
-import { Deferred, Effect, PubSub, Queue, Scope } from "effect"
+import { Cause, Deferred, Effect, Queue, Scope, Stream } from "effect"
 
 import type {
   AppRuntime,
+  ApplicationShutdownError,
   ApplicationModal,
   ApplicationViewModel,
   EndpointNodeViewModel,
@@ -72,8 +73,13 @@ export interface OpenTuiPresentationOptions {
 
 export interface OpenTuiPresentation {
   readonly run: Effect.Effect<void>
-  readonly wait: Effect.Effect<void>
-  readonly stop: Effect.Effect<void>
+  readonly wait: Effect.Effect<void, ApplicationShutdownError>
+  readonly stop: Effect.Effect<void, ApplicationShutdownError>
+}
+
+interface QueuedAction {
+  readonly effect: Effect.Effect<unknown, unknown, never>
+  readonly reportFailure: boolean
 }
 
 type FooterAction =
@@ -149,27 +155,46 @@ export function makeOpenTuiPresentation(
   options: OpenTuiPresentationOptions = {},
 ): Effect.Effect<OpenTuiPresentation, never, Scope.Scope> {
   return Effect.gen(function*() {
-    const updates = yield* appRuntime.subscribeViewModels
-    const actions = yield* Queue.unbounded<Effect.Effect<unknown, never, never>>()
-    const stopped = yield* Deferred.make<void>()
+    const actions = yield* Queue.unbounded<QueuedAction>()
+    const stopped = yield* Deferred.make<void, ApplicationShutdownError>()
     const presentation = new OpenTuiPresentationController(
       renderer,
       appRuntime,
       provider,
       options,
-      (action) => Queue.offerUnsafe(actions, action),
+      (action, reportFailure = true) => Queue.offerUnsafe(actions, { effect: action, reportFailure }),
       stopped,
     )
 
     yield* Effect.forkScoped(Effect.forever(
       Queue.take(actions).pipe(
-        Effect.flatMap((action) => action),
-        Effect.catchCause(() => Effect.void),
+        Effect.flatMap((action) => Effect.catchCause(action.effect, (cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          if (!action.reportFailure || presentation.isStopping) {
+            return Effect.logError("Presentation action failed", cause)
+          }
+          const failure = Cause.squash(cause)
+          if (isReportedApplicationFailure(failure)) {
+            return Effect.logError("Presentation action failed after the application reported it", cause)
+          }
+          const message = `Action failed: ${errorMessage(failure)}`
+          return Effect.suspend(() => appRuntime.openModal({ _tag: "Error", message })).pipe(
+            Effect.catchCause((reportCause) => Cause.hasInterrupts(reportCause)
+              ? Effect.failCause(reportCause)
+              : Effect.logError("Unable to report presentation action failure", reportCause)),
+          )
+        })),
       ),
     ))
     yield* Effect.forkScoped(Effect.forever(
-      PubSub.take(updates).pipe(
-        Effect.flatMap((viewModel) => Effect.sync(() => presentation.applyViewModel(viewModel))),
+      Stream.runForEach(
+        appRuntime.viewModels,
+        (viewModel) => Effect.sync(() => presentation.applyViewModel(viewModel)).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            return Effect.sync(() => presentation.reportRenderFailure("Render update", Cause.squash(cause)))
+          }),
+        ),
       ),
     ))
 
@@ -181,7 +206,7 @@ export function makeOpenTuiPresentation(
       wait: Deferred.await(stopped),
       stop: presentation.stop,
     }
-    yield* Effect.addFinalizer(() => api.stop)
+    yield* Effect.addFinalizer(() => api.stop.pipe(Effect.catch((error) => Effect.die(error))))
     return api
   })
 }
@@ -221,14 +246,19 @@ class OpenTuiPresentationController {
   private nextRemovalRequest = 1
   private pendingHostEscapeRelease = false
   private readonly shownGraphWarnings = new Set<string>()
+  private renderFailurePending = false
+
+  get isStopping(): boolean {
+    return this.stopping
+  }
 
   constructor(
     private readonly renderer: CliRenderer,
     private readonly appRuntime: AppRuntime,
     private readonly provider: OpenTuiProviderIdentity,
     private readonly options: OpenTuiPresentationOptions,
-    private readonly enqueue: (action: Effect.Effect<unknown>) => void,
-    private readonly stopped: Deferred.Deferred<void>,
+    private readonly enqueue: (action: Effect.Effect<unknown, unknown>, reportFailure?: boolean) => void,
+    private readonly stopped: Deferred.Deferred<void, ApplicationShutdownError>,
   ) {
     this.navigator = new BoxRenderable(renderer, {
       id: "next-navigator",
@@ -261,9 +291,9 @@ class OpenTuiPresentationController {
       selectable: false,
       wrapMode: "none",
       content: "",
-      onMouseDown: this.onContentMouseDown,
-      onMouseUp: this.onContentMouseUp,
-      onMouseScroll: this.onContentMouseScroll,
+      onMouseDown: this.guardedOnContentMouseDown,
+      onMouseUp: this.guardedOnContentMouseUp,
+      onMouseScroll: this.guardedOnContentMouseScroll,
     })
     this.footerSeparator = this.separator("next-footer-separator")
     this.footer = new TextRenderable(renderer, {
@@ -275,8 +305,8 @@ class OpenTuiPresentationController {
       selectable: false,
       wrapMode: "none",
       content: "",
-      onMouseDown: this.onFooterMouseDown,
-      onMouseUp: this.onFooterMouseUp,
+      onMouseDown: this.guardedOnFooterMouseDown,
+      onMouseUp: this.guardedOnFooterMouseUp,
     })
     this.navigator.add(this.header)
     this.navigator.add(this.headerSeparator)
@@ -297,8 +327,8 @@ class OpenTuiPresentationController {
       paddingTop: Math.floor(renderer.terminalHeight / 4),
       backgroundColor: RGBA.fromInts(0, 0, 0, 150),
       visible: false,
-      onMouseDown: this.onDialogBackdropMouseDown,
-      onMouseUp: this.onDialogBackdropMouseUp,
+      onMouseDown: this.guardedOnDialogBackdropMouseDown,
+      onMouseUp: this.guardedOnDialogBackdropMouseUp,
     })
     this.dialogPanel = new BoxRenderable(renderer, {
       id: "next-dialog-panel",
@@ -310,8 +340,8 @@ class OpenTuiPresentationController {
       paddingRight: 2,
       rowGap: 1,
       backgroundColor: theme.element,
-      onMouseDown: this.stopDialogMouse,
-      onMouseUp: this.stopDialogMouse,
+      onMouseDown: this.guardedStopDialogMouse,
+      onMouseUp: this.guardedStopDialogMouse,
     })
     const dialogHeader = new BoxRenderable(renderer, {
       id: "next-dialog-header",
@@ -333,7 +363,7 @@ class OpenTuiPresentationController {
       bg: theme.element,
       selectable: false,
       content: "esc",
-      onMouseUp: this.onDialogEscapeMouseUp,
+      onMouseUp: this.guardedOnDialogEscapeMouseUp,
     })
     dialogHeader.add(this.dialogTitle)
     dialogHeader.add(this.dialogEscape)
@@ -345,9 +375,9 @@ class OpenTuiPresentationController {
       selectable: false,
       wrapMode: "word",
       content: "",
-      onMouseDown: this.onDialogBodyMouseDown,
-      onMouseUp: this.onDialogBodyMouseUp,
-      onMouseScroll: this.onDialogBodyMouseScroll,
+      onMouseDown: this.guardedOnDialogBodyMouseDown,
+      onMouseUp: this.guardedOnDialogBodyMouseUp,
+      onMouseScroll: this.guardedOnDialogBodyMouseScroll,
     })
     this.dialogActions = new TextRenderable(renderer, {
       id: "next-dialog-actions",
@@ -357,8 +387,8 @@ class OpenTuiPresentationController {
       selectable: false,
       wrapMode: "none",
       content: "",
-      onMouseDown: this.onDialogActionsMouseDown,
-      onMouseUp: this.onDialogActionsMouseUp,
+      onMouseDown: this.guardedOnDialogActionsMouseDown,
+      onMouseUp: this.guardedOnDialogActionsMouseUp,
     })
     this.dialogPanel.add(dialogHeader)
     this.dialogPanel.add(this.dialogBody)
@@ -367,20 +397,13 @@ class OpenTuiPresentationController {
     renderer.root.add(this.dialogOverlay)
   }
 
-  readonly stop: Effect.Effect<void> = Effect.suspend(() => {
+  readonly stop: Effect.Effect<void, ApplicationShutdownError> = Effect.suspend(() => {
     if (this.stopping) return Deferred.await(this.stopped)
     this.stopping = true
     const self = this
     const cleanup = Effect.gen(function*() {
       yield* Effect.sync(() => self.teardown())
-      const completed = yield* self.appRuntime.shutdown
-      if (!completed) {
-        const viewModel = yield* self.appRuntime.getViewModel
-        const detail = viewModel.modal?._tag === "Error"
-          ? viewModel.modal.message
-          : "Application shutdown did not complete cleanly"
-        return yield* Effect.die(new Error(detail))
-      }
+      yield* self.appRuntime.shutdown
     })
     return Effect.uninterruptible(Effect.matchCauseEffect(cleanup, {
       onFailure: (cause) => Effect.sync(() => {
@@ -392,13 +415,13 @@ class OpenTuiPresentationController {
 
   start(initial: ApplicationViewModel): void {
     if (this.started || this.stopping) return
-    this.started = true
     this.applyViewModel(initial)
-    this.renderer.keyInput.on("keypress", this.onKeyPress)
-    this.renderer.keyInput.on("keyrelease", this.onKeyRelease)
-    this.renderer.on(CliRenderEvents.RESIZE, this.onResize)
+    this.started = true
+    this.renderer.keyInput.on("keypress", this.guardedOnKeyPress)
+    this.renderer.keyInput.on("keyrelease", this.guardedOnKeyRelease)
+    this.renderer.on(CliRenderEvents.RESIZE, this.guardedOnResize)
     this.renderer.start()
-    this.render()
+    this.renderSafely("Initial render")
   }
 
   applyViewModel(viewModel: ApplicationViewModel): void {
@@ -430,6 +453,20 @@ class OpenTuiPresentationController {
     this.reconcileModal(viewModel.modal)
     this.surfaceGraphWarning()
     if (this.started) this.render()
+    this.renderFailurePending = false
+  }
+
+  reportRenderFailure(operation: string, cause: unknown): void {
+    if (this.stopping || this.renderFailurePending) return
+    this.renderFailurePending = true
+    try {
+      this.enqueue(this.appRuntime.openModal({
+        _tag: "Error",
+        message: `${operation}: ${errorMessage(cause)}`,
+      }), false)
+    } catch {
+      // A failure in the reporting path must not re-enter the render boundary.
+    }
   }
 
   private separator(id: string): TextRenderable {
@@ -827,19 +864,19 @@ class OpenTuiPresentationController {
     this.runTerminalAction(this.appRuntime.openEndpoint(option.session.id))
   }
 
-  private runTerminalAction(action: Effect.Effect<unknown>): void {
+  private runTerminalAction(action: Effect.Effect<unknown, unknown>): void {
     this.runAction(action, true)
   }
 
-  private runAction(action: Effect.Effect<unknown>, opensTerminal = false): void {
+  private runAction(action: Effect.Effect<unknown, unknown>, opensTerminal = false): void {
     if (this.actionPending || this.stopping) return
     this.actionPending = true
     this.terminalOpening = opensTerminal
-    this.render()
+    this.renderSafely("Render pending action")
     this.enqueue(action.pipe(Effect.ensuring(Effect.sync(() => {
       this.actionPending = false
       this.terminalOpening = false
-      this.render()
+      this.renderSafely("Render action result")
     }))))
   }
 
@@ -1126,7 +1163,7 @@ class OpenTuiPresentationController {
       const timer = setTimeout(() => {
         if (this.spinnerTimer !== timer) return
         this.spinnerFrame += 1
-        this.render()
+        this.renderSafely("Render animation")
         if (this.spinnerTimer === timer) schedule()
       }, SPINNER_INTERVAL_MS)
       this.spinnerTimer = timer
@@ -1145,9 +1182,9 @@ class OpenTuiPresentationController {
     const context = surface?._tag === "Graph" || surface?._tag === "Terminal" ? surface.title : undefined
     const title = context ? `${PROCESS_TITLE_PREFIX}: ${context}` : PROCESS_TITLE_PREFIX
     if (title === this.currentTitle) return
-    this.currentTitle = title
     this.options.setProcessTitle?.(title)
     if (this.started) (this.options.setTerminalTitle ?? this.renderer.setTerminalTitle.bind(this.renderer))(title)
+    this.currentTitle = title
   }
 
   private providerColor(): Color {
@@ -1415,12 +1452,51 @@ class OpenTuiPresentationController {
     return x < displayWidth("Cancel  ") ? "cancel" : "confirm"
   }
 
+  private renderSafely(operation: string): void {
+    try {
+      this.render()
+    } catch (cause) {
+      this.reportRenderFailure(operation, cause)
+    }
+  }
+
+  private guardCallback<A extends readonly unknown[]>(
+    operation: string,
+    callback: (...args: A) => void,
+  ): (...args: A) => void {
+    return (...args) => {
+      try {
+        callback(...args)
+      } catch (cause) {
+        this.reportRenderFailure(operation, cause)
+      }
+    }
+  }
+
+  private readonly guardedOnResize = this.guardCallback("Handle resize", this.onResize)
+  private readonly guardedOnKeyPress = this.guardCallback("Handle keyboard input", this.onKeyPress)
+  private readonly guardedOnKeyRelease = this.guardCallback("Handle keyboard input", this.onKeyRelease)
+  private readonly guardedOnContentMouseDown = this.guardCallback("Handle pointer input", this.onContentMouseDown)
+  private readonly guardedOnContentMouseUp = this.guardCallback("Handle pointer input", this.onContentMouseUp)
+  private readonly guardedOnContentMouseScroll = this.guardCallback("Handle pointer input", this.onContentMouseScroll)
+  private readonly guardedOnFooterMouseDown = this.guardCallback("Handle pointer input", this.onFooterMouseDown)
+  private readonly guardedOnFooterMouseUp = this.guardCallback("Handle pointer input", this.onFooterMouseUp)
+  private readonly guardedOnDialogBackdropMouseDown = this.guardCallback("Handle dialog input", this.onDialogBackdropMouseDown)
+  private readonly guardedOnDialogBackdropMouseUp = this.guardCallback("Handle dialog input", this.onDialogBackdropMouseUp)
+  private readonly guardedStopDialogMouse = this.guardCallback("Handle dialog input", this.stopDialogMouse)
+  private readonly guardedOnDialogEscapeMouseUp = this.guardCallback("Handle dialog input", this.onDialogEscapeMouseUp)
+  private readonly guardedOnDialogBodyMouseDown = this.guardCallback("Handle dialog input", this.onDialogBodyMouseDown)
+  private readonly guardedOnDialogBodyMouseUp = this.guardCallback("Handle dialog input", this.onDialogBodyMouseUp)
+  private readonly guardedOnDialogBodyMouseScroll = this.guardCallback("Handle dialog input", this.onDialogBodyMouseScroll)
+  private readonly guardedOnDialogActionsMouseDown = this.guardCallback("Handle dialog input", this.onDialogActionsMouseDown)
+  private readonly guardedOnDialogActionsMouseUp = this.guardCallback("Handle dialog input", this.onDialogActionsMouseUp)
+
   private teardown(): void {
     this.stopSpinner()
     if (this.started) {
-      this.renderer.keyInput.off("keypress", this.onKeyPress)
-      this.renderer.keyInput.off("keyrelease", this.onKeyRelease)
-      this.renderer.off(CliRenderEvents.RESIZE, this.onResize)
+      this.renderer.keyInput.off("keypress", this.guardedOnKeyPress)
+      this.renderer.keyInput.off("keyrelease", this.guardedOnKeyRelease)
+      this.renderer.off(CliRenderEvents.RESIZE, this.guardedOnResize)
     }
     if (!this.renderer.isDestroyed) this.renderer.destroy()
   }
@@ -1599,4 +1675,19 @@ function sameContentAction(left: ContentMouseAction, right: ContentMouseAction):
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value))
+}
+
+function isReportedApplicationFailure(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || !("_tag" in value)) return false
+  return value._tag === "ApplicationOperationError" || value._tag === "RemovalOperationError"
+}
+
+function errorMessage(error: unknown): string {
+  try {
+    return typeof error === "object" && error !== null && "message" in error
+      ? String(error.message)
+      : String(error)
+  } catch {
+    return "Unknown presentation error"
+  }
 }

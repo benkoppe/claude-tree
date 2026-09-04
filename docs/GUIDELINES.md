@@ -11,6 +11,19 @@ Follow general code best practices, such as:
 - If you're writing a long comment to explain behavior, that behavior is usually wrong. Code should be largely self-explanatory, though some commenting can be good.
 - Avoid reinventing the wheel when a well-known library or tool can accomplish the task effectively.
 
+## TypeScript And Effect
+
+- Model long-lived processes, scopes, subscriptions, temporary files, and terminal surfaces as acquired resources with explicit, idempotent cleanup. Finalizers are mandatory backstops, not substitutes for a lifecycle API that can report incomplete cleanup.
+- Keep application-state mutation behind the application actor. Asynchronous commands and callbacks should return typed events carrying stable owner and sequence identities rather than retaining mutable state references.
+- Make shutdown and rollback uninterruptible only around the ownership transition that must be atomic. Keep external waits individually bounded, verify the resulting state, and preserve ownership when absence cannot be proven.
+- Test timeouts, retries, heartbeats, and escalation with Effect's `TestClock` or controlled deferred values. Do not add real sleeps to deterministic unit tests.
+
+## Persistence
+
+- Provider state schema v3 is strict and reset-only. Do not add implicit migration, deletion, quarantine, fallback parsing, or automatic recreation for incompatible persisted state.
+- Write related metadata, per-instance navigation, terminal ownership, and identity-adoption changes through the unified provider-state transaction when they must remain atomic.
+- Treat provider mutations as ambiguous after they may have been sent and their response is unavailable. Do not retry or infer success; reconcile from a full provider snapshot.
+
 ## Agents
 
 - If subagents are needed, tell those subagents not to create their own subagents, unless explicitly told otherwise.

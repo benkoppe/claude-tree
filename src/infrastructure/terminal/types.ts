@@ -35,6 +35,7 @@ export interface TerminalProcessCallbacks {
 
 export interface TerminalProcess {
   readonly pid: number
+  readonly processGroupId: number
   readonly exited: Promise<number>
   readonly ptyDrained: Promise<void>
   readonly exitCode: number | null
@@ -53,7 +54,7 @@ export interface TerminalProcessFactory {
     launch: TerminalLaunch,
     dimensions: { readonly columns: number; readonly rows: number },
     callbacks: TerminalProcessCallbacks,
-  ): TerminalProcess | Promise<TerminalProcess>
+  ): TerminalProcess
 }
 
 export class TerminalSpawnCleanupError extends Error {
