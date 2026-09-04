@@ -170,6 +170,7 @@ export class ClaudeProvider implements AgentProviderApi {
   private readonly observerFactory: () => TerminalObserver
   private readonly makeUuid: () => string
   private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
+  private sessionTitles: ReadonlyMap<string, string> = new Map()
   private readonly retryDelays: readonly number[]
   private readonly operationTimeoutMs: number
   private readonly executableLookupTimeoutMs: number
@@ -350,6 +351,7 @@ export class ClaudeProvider implements AgentProviderApi {
         sourceRecords,
         forkMessage.id,
       )
+      const parentTitle = this.sessionTitles.get(target.sessionId) ?? "Conversation"
       mutationSourceMessageId = forkMessage.id
       mutationMayHaveDispatched = true
       const forkResult = yield* this.forkSessionOnce(
@@ -363,7 +365,7 @@ export class ClaudeProvider implements AgentProviderApi {
       const now = yield* Clock.currentTimeMillis
       const childSession: AgentSession = {
         id: childId,
-        title: "Conversation (fork)",
+        title: `${parentTitle} (fork)`,
         lastModified: now,
       }
       const postCreate = this.prepareCreatedFork(
@@ -699,6 +701,9 @@ export class ClaudeProvider implements AgentProviderApi {
           "Claude returned invalid session metadata",
           cause,
         ),
+      })),
+      Effect.tap((sessions) => Effect.sync(() => {
+        this.sessionTitles = new Map(sessions.map((session) => [session.id, session.title]))
       })),
     )
   }

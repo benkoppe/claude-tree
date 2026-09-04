@@ -7,13 +7,20 @@ import type {
   NavigationTarget,
   TranscriptRead,
 } from "../domain/model"
+import type { ConversationGraph, ConversationGraphNode } from "../domain/conversation-graph"
+import { initialVisibleGraphNodeId, visibleGraphNodeId } from "../domain/graph-layout"
 import type {
   BranchRelation,
   ConversationRemoval,
   IdentityTransitionKind,
 } from "../domain/persistence"
 import { replaceSessionIdInProjectState } from "../services/provider-state-repository"
-import { selectFamilyRootSessionId, selectTranscriptRead } from "./selectors"
+import {
+  selectConversationForest,
+  selectFamilyRootSessionId,
+  selectTranscriptRead,
+  selectVisibleEndpointSessionIds,
+} from "./selectors"
 import type {
   ActiveRefresh,
   ApplicationModal,
@@ -43,10 +50,10 @@ export type StateEvent =
   | { readonly _tag: "TerminalActivityObserved"; readonly sessionId: string; readonly ownerId: string; readonly activity: "working" | "blocked" | "idle"; readonly wasVisible: boolean }
   | { readonly _tag: "TerminalDraftObserved"; readonly sessionId: string; readonly draft?: DraftPreview }
   | { readonly _tag: "TerminalStopping"; readonly sessionId: string }
-  | { readonly _tag: "TerminalStopped"; readonly sessionId: string; readonly cleanupIncomplete?: boolean }
+  | { readonly _tag: "TerminalStopped"; readonly sessionId: string; readonly cleanupIncomplete?: boolean; readonly focusExitedSession?: boolean }
   | { readonly _tag: "CompletionAttemptAdvanced"; readonly sessionId: string; readonly message?: string }
-  | { readonly _tag: "SessionIdentityAdopted"; readonly previousSessionId: string; readonly session: AgentSession; readonly replacePrevious: boolean; readonly relation?: BranchRelation }
-  | { readonly _tag: "RemovalPersisted"; readonly removal: ConversationRemoval; readonly stoppedSessionIds: readonly string[] }
+  | { readonly _tag: "SessionIdentityAdopted"; readonly previousSessionId: string; readonly session: AgentSession; readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation }
+  | { readonly _tag: "RemovalPersisted"; readonly removal: ConversationRemoval; readonly stoppedSessionIds: readonly string[]; readonly fallback: NavigatorSurface }
   | { readonly _tag: "ModalOpened"; readonly modal: ApplicationModal }
   | { readonly _tag: "ModalClosed" }
   | { readonly _tag: "ShutdownStarted" }
@@ -144,7 +151,12 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
         : state
     }
     case "TerminalStopped":
-      return terminalStopped(state, event.sessionId, event.cleanupIncomplete ?? false)
+      return terminalStopped(
+        state,
+        event.sessionId,
+        event.cleanupIncomplete ?? false,
+        event.focusExitedSession ?? false,
+      )
     case "CompletionAttemptAdvanced":
       return advanceCompletion(state, event.sessionId, event.message)
     case "SessionIdentityAdopted":
@@ -152,13 +164,17 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
         state,
         event.previousSessionId,
         event.session,
-        event.replacePrevious,
+        event.kind,
         event.relation,
       )
     case "RemovalPersisted": {
       let next = state
       for (const sessionId of event.stoppedSessionIds) next = terminalStopped(next, sessionId, false)
-      return { ...next, removals: [...next.removals, event.removal], modal: null }
+      return repairNavigatorSurface({
+        ...next,
+        removals: [...next.removals, event.removal],
+        modal: null,
+      }, event.fallback)
     }
     case "ModalOpened":
       return { ...state, modal: event.modal }
@@ -262,6 +278,25 @@ function refreshSucceeded(
     }
   }
 
+  const cleansUndiscoveredTemporarySessions = active.mode === "full" || active.reason === "stop"
+  if (cleansUndiscoveredTemporarySessions) {
+    for (const sessionId of temporarySessionIds) {
+      if (state.terminals.has(sessionId)) continue
+      const discovered = incomingSessions.get(sessionId)
+      if (discovered) {
+        if (!discovered.transient) {
+          localSessions.set(sessionId, discovered)
+          temporarySessionIds.delete(sessionId)
+        }
+        continue
+      }
+      if (active.mode !== "full" && !active.sessionIds.has(sessionId)) continue
+      localSessions.delete(sessionId)
+      localTranscripts.delete(sessionId)
+      temporarySessionIds.delete(sessionId)
+    }
+  }
+
   for (const [sessionId, completion] of pendingCompletions) {
     transcripts.set(sessionId, { _tag: "Available", messages: completion.baseline })
   }
@@ -281,7 +316,7 @@ function refreshSucceeded(
   }
 
   const without = removeRefresh(state, key, generation)
-  return {
+  return repairNavigatorSurface({
     ...without,
     provider: { sessions, transcripts },
     local: { sessions: localSessions, transcripts: localTranscripts, temporarySessionIds },
@@ -292,7 +327,7 @@ function refreshSucceeded(
     ...(completionExhausted
       ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
       : {}),
-  }
+  })
 }
 
 function projectLocalSession(
@@ -401,7 +436,12 @@ function observeDraft(state: ApplicationState, sessionId: string, draft?: DraftP
   return { ...state, drafts, rewindAnchors }
 }
 
-function terminalStopped(state: ApplicationState, sessionId: string, cleanupIncomplete: boolean): ApplicationState {
+function terminalStopped(
+  state: ApplicationState,
+  sessionId: string,
+  cleanupIncomplete: boolean,
+  focusExitedSession = false,
+): ApplicationState {
   const terminal = state.terminals.get(sessionId)
   const wasVisible = state.surface._tag === "Terminal" && state.surface.sessionId === sessionId
   const terminals = new Map(state.terminals)
@@ -412,7 +452,7 @@ function terminalStopped(state: ApplicationState, sessionId: string, cleanupInco
       phase: "cleanup-incomplete",
     })
   } else terminals.delete(sessionId)
-  return {
+  const stopped = {
     ...state,
     terminals,
     surface: wasVisible ? state.surface.returnTo : state.surface,
@@ -421,6 +461,9 @@ function terminalStopped(state: ApplicationState, sessionId: string, cleanupInco
     pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
     unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
   }
+  return focusExitedSession || wasVisible
+    ? repairNavigatorSurface(stopped, stoppedSessionSurface(state, sessionId))
+    : stopped
 }
 
 function rollbackTransient(
@@ -450,13 +493,13 @@ function adoptSessionIdentity(
   state: ApplicationState,
   previousSessionId: string,
   session: AgentSession,
-  replacePrevious: boolean,
+  kind: IdentityTransitionKind,
   relation?: BranchRelation,
 ): ApplicationState {
   if (previousSessionId === session.id) return state
   const sessionId = session.id
-  if (!replacePrevious) {
-    const replacement = { kind: "native-fork" as const, ...(relation === undefined ? {} : { relation }) }
+  const replacement = { kind, ...(relation === undefined ? {} : { relation }) }
+  if (kind === "native-fork") {
     const metadata = replaceSessionIdInProjectState({
       relations: state.relations,
       removals: state.removals,
@@ -484,6 +527,7 @@ function adoptSessionIdentity(
         sessionId,
         replacement,
       ),
+      modal: replaceSessionIdInModal(state, previousSessionId, sessionId, replacement),
       terminals: migrateMapKey(state.terminals, previousSessionId, sessionId),
       drafts: migrateMapKey(state.drafts, previousSessionId, sessionId),
       rewindAnchors: migrateMapKey(state.rewindAnchors, previousSessionId, sessionId),
@@ -495,16 +539,12 @@ function adoptSessionIdentity(
     relations: state.relations,
     removals: state.removals,
     navigation: navigationForSurface(state.surface),
-  }, previousSessionId, sessionId, {
-    kind: "temporary-adoption",
-    ...(relation === undefined ? {} : { relation }),
-  })
+  }, previousSessionId, sessionId, replacement)
   const localSessions = migrateMapKey(state.local.sessions, previousSessionId, sessionId)
   localSessions.set(sessionId, session)
-  const surface = replaceSessionIdInSurface(state.surface, previousSessionId, sessionId, {
-    kind: "temporary-adoption",
-    ...(relation === undefined ? {} : { relation }),
-  })
+  const temporarySessionIds = without(state.local.temporarySessionIds, previousSessionId)
+  temporarySessionIds.add(sessionId)
+  const surface = replaceSessionIdInSurface(state.surface, previousSessionId, sessionId, replacement)
   const active = new Map<string, ActiveRefresh>()
   for (const [key, refresh] of state.refresh.active) {
     active.set(key, {
@@ -521,12 +561,12 @@ function adoptSessionIdentity(
     local: {
       sessions: localSessions,
       transcripts: migrateMapKey(state.local.transcripts, previousSessionId, sessionId),
-      temporarySessionIds: without(state.local.temporarySessionIds, previousSessionId),
+      temporarySessionIds,
     },
     relations: relation === undefined ? metadata.relations : upsertRelation(metadata.relations, relation),
     removals: metadata.removals,
     surface,
-    modal: replaceSessionIdInModal(state.modal, previousSessionId, sessionId),
+    modal: replaceSessionIdInModal(state, previousSessionId, sessionId, replacement),
     terminals: migrateMapKey(state.terminals, previousSessionId, sessionId),
     drafts: migrateMapKey(state.drafts, previousSessionId, sessionId),
     rewindAnchors: migrateMapKey(state.rewindAnchors, previousSessionId, sessionId),
@@ -682,20 +722,146 @@ function replaceNavigatorSurface(
 }
 
 function replaceSessionIdInModal(
-  modal: ApplicationModal | null,
+  state: ApplicationState,
   previousSessionId: string,
   sessionId: string,
+  options: { readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation },
 ): ApplicationModal | null {
+  const modal = state.modal
   if (modal?._tag === "ConfirmStop") {
     return { ...modal, sessionId: modal.sessionId === previousSessionId ? sessionId : modal.sessionId }
   }
   if (modal?._tag === "ConfirmRemoval") {
+    const metadata = replaceSessionIdInProjectState({
+      relations: state.relations,
+      removals: [modal.removal],
+    }, previousSessionId, sessionId, options)
+    const removal = metadata.removals[0]
+    if (!removal || removalContainsSession(removal, previousSessionId)) return null
     return {
       ...modal,
-      affectedSessionIds: modal.affectedSessionIds.map((id) => id === previousSessionId ? sessionId : id),
+      removal,
+      affectedSessionIds: [...new Set(modal.affectedSessionIds.map((id) =>
+        id === previousSessionId ? sessionId : id))],
     }
   }
   return modal
+}
+
+function stoppedSessionSurface(state: ApplicationState, sessionId: string): NavigatorSurface {
+  const forest = selectConversationForest(state)
+  const graph = forest.graphBySessionId.get(sessionId)
+  const endpointId = graph?.endpointBySessionId.get(sessionId)
+  if (graph && endpointId) {
+    if (!state.local.temporarySessionIds.has(sessionId)) {
+      return {
+        _tag: "Graph",
+        familySessionId: graph.rootSessionId,
+        target: { kind: "endpoint", sessionId },
+      }
+    }
+    let node = graph.nodes.get(endpointId)
+    while (node?.parentId) {
+      node = graph.nodes.get(node.parentId)
+      if (node && node.kind !== "origin") {
+        const target = navigationTargetForNode(node)
+        if (target) {
+          return { _tag: "Graph", familySessionId: graph.rootSessionId, target }
+        }
+      }
+    }
+    const graphIndex = forest.graphs.indexOf(graph)
+    const remaining = forest.graphs.filter((candidate) => candidate !== graph)
+    const selected = remaining[Math.min(
+      Math.max(0, graphIndex),
+      Math.max(0, remaining.length - 1),
+    )]
+    return { _tag: "Roots", selectedSessionId: selected?.rootSessionId ?? null }
+  }
+  if (state.surface._tag === "Terminal") return state.surface.returnTo
+  return state.surface
+}
+
+function repairNavigatorSurface(
+  state: ApplicationState,
+  preferred?: NavigatorSurface,
+): ApplicationState {
+  if (!preferred && state.surface._tag === "Terminal") return state
+  const requested = preferred ?? state.surface as NavigatorSurface
+  const forest = selectConversationForest(state)
+  if (requested._tag === "Roots") {
+    const selected = requested.selectedSessionId === null
+      ? undefined
+      : forest.graphBySessionId.get(requested.selectedSessionId) ??
+        forest.graphByRootSessionId.get(requested.selectedSessionId)
+    return {
+      ...state,
+      surface: {
+        _tag: "Roots",
+        selectedSessionId: selected?.rootSessionId ?? forest.graphs[0]?.rootSessionId ?? null,
+      },
+    }
+  }
+
+  const graph = forest.graphBySessionId.get(requested.familySessionId) ??
+    forest.graphByRootSessionId.get(requested.familySessionId)
+  if (!graph) {
+    return {
+      ...state,
+      surface: { _tag: "Roots", selectedSessionId: forest.graphs[0]?.rootSessionId ?? null },
+    }
+  }
+  const requestedNodeId = nodeIdForNavigationTarget(graph, requested.target)
+  const visibleSessionIds = selectVisibleEndpointSessionIds(state)
+  const selectedNodeId = visibleGraphNodeId(graph, requestedNodeId, visibleSessionIds) ??
+    initialVisibleGraphNodeId(graph, visibleSessionIds)
+  const selected = selectedNodeId ? graph.nodes.get(selectedNodeId) : undefined
+  const target = selected && selected.kind !== "origin"
+    ? navigationTargetForNode(selected)
+    : undefined
+  if (!target) {
+    return {
+      ...state,
+      surface: { _tag: "Roots", selectedSessionId: graph.rootSessionId },
+    }
+  }
+  return {
+    ...state,
+    surface: { _tag: "Graph", familySessionId: graph.rootSessionId, target },
+  }
+}
+
+function nodeIdForNavigationTarget(
+  graph: ConversationGraph,
+  target: NavigationTarget,
+): string | undefined {
+  if (target.kind === "endpoint") return graph.endpointBySessionId.get(target.sessionId)
+  for (const reference of [target.preferred, ...target.aliases]) {
+    for (const node of graph.nodes.values()) {
+      if (
+        node.kind === "message" &&
+        node.aliases.some((alias) =>
+          alias.sessionId === reference.sessionId && alias.messageId === reference.messageId)
+      ) return node.id
+    }
+  }
+  return undefined
+}
+
+function navigationTargetForNode(node: Exclude<ConversationGraphNode, { readonly kind: "origin" }>): NavigationTarget | undefined {
+  if (node.kind === "endpoint") return { kind: "endpoint", sessionId: node.session.id }
+  const preferred = node.forkTarget ?? node.aliases.at(-1) ?? node.aliases[0]
+  return preferred
+    ? { kind: "message", preferred, aliases: node.aliases }
+    : undefined
+}
+
+function removalContainsSession(removal: ConversationRemoval, sessionId: string): boolean {
+  if (removal.kind === "tree") {
+    return removal.rootSessionId === sessionId || removal.memberSessionIds.includes(sessionId)
+  }
+  if (removal.target.kind === "endpoint") return removal.target.sessionId === sessionId
+  return removal.target.aliases.some((alias) => alias.sessionId === sessionId)
 }
 
 function upsertRelation(relations: readonly BranchRelation[], relation: BranchRelation): readonly BranchRelation[] {

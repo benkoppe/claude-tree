@@ -35,6 +35,18 @@ import type {
 } from "../../src/infrastructure/terminal"
 import { BunPtyProcessFactory } from "../../src/infrastructure/terminal"
 import type {
+  CodexAppServerClient,
+  CodexThread,
+} from "../../src/infrastructure/providers/codex/app-server"
+import {
+  CodexProvider,
+  type CodexObservedServicesFactory,
+} from "../../src/infrastructure/providers/codex/provider"
+import {
+  CodexTuiProxyError,
+  type CodexTuiProxyTransitionRequest,
+} from "../../src/infrastructure/providers/codex/tui-proxy"
+import type {
   PreparedTerminal,
   TerminalLaunch,
   TerminalTransitionAcknowledgmentError,
@@ -134,6 +146,7 @@ test("one unbounded semantic queue preserves transition order and sequence IDs u
 
     const acknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("real"),
     })
     yield* Deferred.await(acknowledgment)
@@ -172,6 +185,7 @@ test("a semantic transition defect fails its acknowledgment before supervised cl
 
     const acknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("uncommitted"),
     })
     const error = yield* Effect.flip(Deferred.await(acknowledgment))
@@ -234,6 +248,7 @@ test("a transition enqueue defect settles the request and cleans the owner", asy
 
     const acknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("not-enqueued"),
     })
     const error = yield* Effect.flip(Deferred.await(acknowledgment))
@@ -467,6 +482,7 @@ test("acknowledged identity adoption keeps owner identity and never rolls back a
     const ownerId = yield* supervisor.show(prepared("temporary", fixture, { transitions }))
     const acknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("real"),
     })
     const acknowledgmentExit = yield* Effect.exit(Deferred.await(acknowledgment))
@@ -492,10 +508,12 @@ test("queues two pending transitions per owner until each application acknowledg
     yield* supervisor.show(prepared("source", fixture, { transitions }))
     const first = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("child-one"),
     })
     const second = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("child-two"),
     })
     yield* eventually(() => changed.length === 1)
@@ -530,6 +548,7 @@ test("native fork validates and commits source metadata before notifying the app
     yield* supervisor.show(prepared("source", fixture, { transitions }))
     const providerAcknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("native-child"),
       derivation: Effect.succeed({
         childSessionId: "native-child",
@@ -555,6 +574,119 @@ test("native fork validates and commits source metadata before notifying the app
   }))
 })
 
+test("a first Codex fork adopts its temporary owner with exact ancestry for family projection", async () => {
+  const fixture = makeFixture()
+  const projectPath = process.cwd()
+  const sourceSessionId = "codex-source"
+  const childSessionId = "codex-child"
+  const parentThread: CodexThread = {
+    id: sourceSessionId,
+    name: null,
+    preview: "Source",
+    updatedAt: 1,
+    cwd: projectPath,
+    gitInfo: null,
+    turns: [{
+      id: "source-turn",
+      status: "completed",
+      items: [
+        { id: "source-user", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+        { id: "source-agent", type: "agentMessage", text: "Answer" },
+      ],
+    }],
+  }
+  const childThread: CodexThread = {
+    id: childSessionId,
+    name: null,
+    preview: "First fork",
+    updatedAt: 2,
+    cwd: projectPath,
+    gitInfo: null,
+    turns: [{
+      id: "child-turn",
+      status: "completed",
+      items: [
+        { id: "child-user", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+        { id: "child-agent", type: "agentMessage", text: "Answer" },
+      ],
+    }],
+  }
+  const appServer = {
+    readThread: (sessionId: string) => Effect.succeed(
+      sessionId === sourceSessionId ? parentThread : childThread,
+    ),
+    close: () => Effect.void,
+  } as unknown as CodexAppServerClient
+  let source!: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  const observedServicesFactory: CodexObservedServicesFactory = () => Effect.gen(function*() {
+    source = yield* PubSub.unbounded<CodexTuiProxyTransitionRequest>()
+    return {
+      remoteUrl: "ws://127.0.0.1:12348",
+      bearerToken: "secret",
+      transitions: source,
+      close: () => Effect.void,
+    }
+  })
+  const provider = new CodexProvider(projectPath, "/usr/bin/codex", {
+    appServerFactory: () => Effect.succeed(appServer),
+    observedServicesFactory,
+    randomUUID: () => "first-fork",
+    canonicalize: async (path) => path,
+  })
+  let projected: TerminalSessionChangedEvent | undefined
+  fixture.dependencies.events = {
+    onSessionChanged: (event) => {
+      projected = event
+      acknowledge(event)
+    },
+  }
+
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const prepared = yield* provider.prepareNewSession
+    yield* supervisor.show(prepared)
+    const acknowledgment = yield* Deferred.make<void, CodexTuiProxyError>()
+    yield* PubSub.publish(source, {
+      transition: {
+        _tag: "CodexThreadTransition",
+        operation: "fork",
+        kind: "temporary-adoption",
+        previousThreadId: prepared.session.id,
+        requestedThreadId: sourceSessionId,
+        forkPointTurnId: "source-turn",
+        threadId: childSessionId,
+        title: "First fork",
+        updatedAt: 2,
+        cwd: projectPath,
+      },
+      acknowledgment,
+    })
+    yield* Deferred.await(acknowledgment)
+
+    const relation = {
+      childSessionId,
+      parentSessionId: sourceSessionId,
+      sourceMessageId: "source-agent",
+      sharedMessages: [
+        { parentMessageId: "source-user", childMessageId: "child-user" },
+        { parentMessageId: "source-agent", childMessageId: "child-agent" },
+      ],
+    }
+    expect(fixture.leases.identityCalls[0]).toMatchObject({
+      kind: "temporary-adoption",
+      relation,
+    })
+    expect(fixture.leases.identityCalls[0]!.relation?.createdAt).toMatch(/T/)
+    expect(projected).toMatchObject({
+      previousSessionId: prepared.session.id,
+      kind: "temporary-adoption",
+      session: { id: childSessionId, transient: true },
+      relation,
+    })
+    expect(projected?.relation).toEqual(fixture.leases.identityCalls[0]!.relation)
+    expect(yield* supervisor.runningSessionIds).toEqual(new Set([childSessionId]))
+  }))
+})
+
 test("temporary owners commit a temporary adoption and acknowledge the journal", async () => {
   const fixture = makeFixture()
   const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
@@ -564,11 +696,123 @@ test("temporary owners commit a temporary adoption and acknowledge the journal",
     yield* supervisor.show(prepared("temporary", fixture, { transitions, transient: true }))
     const providerAcknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "temporary-adoption",
       session: session("provider-id"),
     })
     yield* Deferred.await(providerAcknowledgment)
     expect(fixture.leases.identityCalls[0]?.kind).toBe("temporary-adoption")
     expect(fixture.log.some((entry) => entry.startsWith("lease-ack:"))).toBeTrue()
+  }))
+})
+
+test("rejects a transition kind that disagrees with the owner's adoption state", async () => {
+  const fixture = makeFixture()
+  const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
+
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(prepared("temporary", fixture, { transitions, transient: true }))
+    const acknowledgment = yield* publishTransition(transitions, {
+      _tag: "SessionChanged",
+      kind: "native-fork",
+      session: session("untrusted-child"),
+    })
+    expect(yield* Effect.flip(Deferred.await(acknowledgment))).toBeInstanceOf(TerminalError)
+    yield* eventually(() => fixture.leases.current("temporary") === undefined)
+
+    expect(fixture.leases.identityCalls).toEqual([])
+    expect(fixture.leases.current("untrusted-child")).toBeUndefined()
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
+  }))
+})
+
+test("a temporary Codex owner adopts once and treats every later transition as a native fork", async () => {
+  const fixture = makeFixture()
+  const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
+  const changed: TerminalSessionChangedEvent[] = []
+  fixture.dependencies.events = {
+    onSessionChanged: (event) => {
+      changed.push(event)
+      acknowledge(event)
+    },
+  }
+
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(prepared("temporary", fixture, { transitions, transient: true }))
+    for (const transition of [
+      {
+        kind: "temporary-adoption" as const,
+        previousSessionId: "temporary",
+        session: { ...session("real"), transient: true },
+      },
+      {
+        kind: "native-fork" as const,
+        previousSessionId: "real",
+        session: session("fork-one"),
+      },
+      {
+        kind: "native-fork" as const,
+        previousSessionId: "fork-one",
+        session: session("fork-two"),
+      },
+    ]) {
+      const acknowledgment = yield* publishTransition(transitions, {
+        _tag: "SessionChanged",
+        kind: transition.kind,
+        session: transition.session,
+        ...(transition.kind === "native-fork"
+          ? {
+              derivation: Effect.succeed({
+                childSessionId: transition.session.id,
+                parentSessionId: transition.previousSessionId,
+                sourceMessageId: `${transition.previousSessionId}-source`,
+                sharedMessages: [{
+                  parentMessageId: `${transition.previousSessionId}-source`,
+                  childMessageId: `${transition.session.id}-source`,
+                }],
+              }),
+            }
+          : {}),
+      })
+      yield* Deferred.await(acknowledgment)
+    }
+
+    expect(fixture.leases.identityCalls.map((call) => call.kind)).toEqual([
+      "temporary-adoption",
+      "native-fork",
+      "native-fork",
+    ])
+    expect(fixture.leases.replaceCalls).toEqual([
+      "temporary:real",
+      "real:fork-one",
+      "fork-one:fork-two",
+    ])
+    expect(changed.map((event) => ({
+      previousSessionId: event.previousSessionId,
+      sessionId: event.session.id,
+      kind: event.kind,
+      transient: event.session.transient === true,
+    }))).toEqual([
+      {
+        previousSessionId: "temporary",
+        sessionId: "real",
+        kind: "temporary-adoption",
+        transient: true,
+      },
+      {
+        previousSessionId: "real",
+        sessionId: "fork-one",
+        kind: "native-fork",
+        transient: false,
+      },
+      {
+        previousSessionId: "fork-one",
+        sessionId: "fork-two",
+        kind: "native-fork",
+        transient: false,
+      },
+    ])
+    expect(yield* supervisor.runningSessionIds).toEqual(new Set(["fork-two"]))
+    expect(fixture.leases.current("fork-two")?.ownerToken).toBeDefined()
   }))
 })
 
@@ -594,6 +838,7 @@ test("a synchronous identity commit defect fails queued requests and completes f
     yield* supervisor.show(prepared("commit-source", fixture, { transitions }))
     const first = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("commit-child"),
       derivation: Effect.gen(function*() {
         yield* Deferred.succeed(derivationStarted, undefined)
@@ -604,6 +849,7 @@ test("a synchronous identity commit defect fails queued requests and completes f
     yield* Deferred.await(derivationStarted)
     const later = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("too-late"),
     })
     yield* Effect.yieldNow
@@ -642,7 +888,11 @@ test("provider transition failure forces cleanup and emits a sequenced exit", as
   const fixture = makeFixture()
   const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
   const exits: TerminalExitEvent[] = []
-  fixture.dependencies.events = { onProcessExited: (event) => exits.push(event) }
+  const changed: TerminalSessionChangedEvent[] = []
+  fixture.dependencies.events = {
+    onProcessExited: (event) => exits.push(event),
+    onSessionChanged: (event) => changed.push(event),
+  }
 
   await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
     const ownerId = yield* supervisor.show(prepared("failed-transition", fixture, { transitions }))
@@ -659,7 +909,9 @@ test("provider transition failure forces cleanup and emits a sequenced exit", as
 
     expect(exits[0]).toMatchObject({ ownerId, sessionId: "failed-transition" })
     expect(exits[0]!.sequenceId).toBeGreaterThan(1)
+    expect(changed).toEqual([])
     expect(fixture.leases.current("failed-transition")).toBeUndefined()
+    expect(yield* supervisor.runningSessionIds).toEqual(new Set())
   }))
 })
 
@@ -673,6 +925,7 @@ test("invalid derived ancestry fails before the identity commit and reports clea
     yield* supervisor.show(prepared("source", fixture, { transitions }))
     const providerAcknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("child"),
       derivation: Effect.succeed({
         childSessionId: "wrong-child",
@@ -711,6 +964,7 @@ test("application rejection cleans the adopted owner forward-only and retains it
     yield* supervisor.show(prepared("source", fixture, { transitions }))
     const providerAcknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("actual-owner"),
     })
     const acknowledgmentError = yield* Effect.flip(Deferred.await(providerAcknowledgment))
@@ -738,6 +992,7 @@ test("a transition fails with a typed stale-owner error without waiting for clea
     yield* supervisor.show(prepared("stale-source", fixture, { transitions }))
     const acknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
+      kind: "native-fork",
       session: session("stale-child"),
       derivation: Effect.gen(function*() {
         yield* Deferred.succeed(derivationStarted, undefined)

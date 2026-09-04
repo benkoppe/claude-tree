@@ -116,6 +116,24 @@ interface LeafPickerState {
   readonly action: "open" | "jump"
 }
 
+interface PendingGraphSelection {
+  readonly familySessionId: string
+  readonly nodeId: string
+  completed: boolean
+}
+
+interface PreferredOpenSession {
+  readonly familySessionId: string
+  readonly nodeId: string
+  readonly sessionId: string
+}
+
+interface PendingStoppedEndpoint {
+  readonly familySessionId: string
+  readonly nodeId: string
+  readonly sessionId: string
+}
+
 type ContentMouseAction =
   | { readonly kind: "root"; readonly sessionId: string }
   | { readonly kind: "graph"; readonly nodeId: string }
@@ -244,7 +262,12 @@ class OpenTuiPresentationController {
   private spinnerTimer: ReturnType<typeof setTimeout> | undefined
   private currentTitle: string | undefined
   private nextRemovalRequest = 1
-  private pendingHostEscapeRelease = false
+  private readonly consumedKeyReleases = new Set<string>()
+  private readonly pendingGraphSelections: PendingGraphSelection[] = []
+  private preferredOpenSession: PreferredOpenSession | null = null
+  private pendingStoppedEndpoint: PendingStoppedEndpoint | null = null
+  private stopConfirmationSessionId: string | null = null
+  private closingStaleStopModalIdentity: string | null = null
   private readonly shownGraphWarnings = new Set<string>()
   private renderFailurePending = false
 
@@ -429,6 +452,9 @@ class OpenTuiPresentationController {
     const previous = this.viewModel
     this.viewModel = viewModel
     if (viewModel.surface._tag === "Roots") {
+      this.pendingGraphSelections.length = 0
+      this.preferredOpenSession = null
+      this.pendingStoppedEndpoint = null
       const roots = viewModel.surface.roots
       const selectedByRuntime = roots.find((root) => root.selected)?.sessionId
       const localSurvives = roots.some((root) => root.sessionId === this.selectedRootSessionId)
@@ -446,9 +472,15 @@ class OpenTuiPresentationController {
         this.leafPicker = null
       }
       this.graphSignature = signature
+      this.reconcileGraphSelection(viewModel.surface)
+      this.reconcileStoppedEndpointPreference(viewModel)
       if (viewModel.surface.nodes.length === 0 && previous?.surface._tag === "Graph" && previous.surface.nodes.length > 0) {
         this.enqueue(this.appRuntime.selectRoot(null))
       }
+    } else {
+      this.pendingGraphSelections.length = 0
+      this.preferredOpenSession = null
+      this.pendingStoppedEndpoint = null
     }
     this.reconcileModal(viewModel.modal)
     this.surfaceGraphWarning()
@@ -495,34 +527,41 @@ class OpenTuiPresentationController {
     if (surface?._tag === "Terminal") {
       if (!isHostEscape(key)) return
       key.stopPropagation()
-      this.pendingHostEscapeRelease = key.source === "kitty"
+      this.rememberConsumedKeyRelease(key)
       if (!key.repeated) this.runAction(this.appRuntime.returnFromTerminal)
       return
     }
     if (!surface || this.stopping) return
-    if (this.leafPicker) {
-      key.stopPropagation()
-      this.handleLeafPickerKey(key)
-      return
+    try {
+      if (this.leafPicker) {
+        key.stopPropagation()
+        this.handleLeafPickerKey(key)
+        return
+      }
+      if (this.viewModel?.modal) {
+        key.stopPropagation()
+        this.handleModalKey(key)
+        return
+      }
+      if (isQuestionMarkKey(key) && !key.repeated) {
+        key.stopPropagation()
+        this.enqueue(this.appRuntime.openModal({ _tag: "About" }))
+        return
+      }
+      if (surface._tag === "Roots") this.handleRootsKey(key)
+      else if (surface._tag === "Graph") this.handleGraphKey(key)
+    } finally {
+      if (key.propagationStopped) this.rememberConsumedKeyRelease(key)
     }
-    if (this.viewModel?.modal) {
-      key.stopPropagation()
-      this.handleModalKey(key)
-      return
-    }
-    if (isQuestionMarkKey(key) && !key.repeated) {
-      key.stopPropagation()
-      this.enqueue(this.appRuntime.openModal({ _tag: "About" }))
-      return
-    }
-    if (surface._tag === "Roots") this.handleRootsKey(key)
-    else if (surface._tag === "Graph") this.handleGraphKey(key)
   }
 
   private readonly onKeyRelease = (key: KeyEvent) => {
-    if (!this.pendingHostEscapeRelease || !isHostEscape(key)) return
-    this.pendingHostEscapeRelease = false
+    if (!this.consumedKeyReleases.delete(keyIdentity(key))) return
     key.stopPropagation()
+  }
+
+  private rememberConsumedKeyRelease(key: KeyEvent): void {
+    if (key.source === "kitty") this.consumedKeyReleases.add(keyIdentity(key))
   }
 
   private handleRootsKey(key: KeyEvent): void {
@@ -650,6 +689,9 @@ class OpenTuiPresentationController {
   private showRoots(): void {
     const graph = this.graphSurface()
     this.leafPicker = null
+    this.pendingGraphSelections.length = 0
+    this.preferredOpenSession = null
+    this.pendingStoppedEndpoint = null
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.enqueue(this.appRuntime.selectRoot(graph?.familySessionId ?? null))
@@ -670,7 +712,7 @@ class OpenTuiPresentationController {
     if (!target) return
     this.graphNavigationIntent = move.intent
     this.graphViewportOffset = null
-    this.enqueue(this.appRuntime.selectGraph(graph.familySessionId, target.target))
+    this.queueGraphSelection(graph.familySessionId, target)
   }
 
   private jumpGraphToTop(): void {
@@ -715,7 +757,7 @@ class OpenTuiPresentationController {
     if (!graph || !node) return
     this.graphNavigationIntent = null
     this.graphViewportOffset = null
-    this.enqueue(this.appRuntime.selectGraph(graph.familySessionId, node.target))
+    this.queueGraphSelection(graph.familySessionId, node)
   }
 
   private openSelected(): void {
@@ -725,9 +767,22 @@ class OpenTuiPresentationController {
     if (options.length === 0) {
       this.showError(`No ${this.provider.displayName} session is reachable from this node`)
     } else if (options.length === 1) {
+      this.preferredOpenSession = null
       this.runTerminalAction(this.appRuntime.openEndpoint(options[0]!.session.id))
     } else {
-      this.leafPicker = { title: "Open leaf", options, selectedIndex: 0, viewportStart: 0, action: "open" }
+      const preferred = this.preferredOpenSession
+      const preferredIndex = preferred && preferred.familySessionId === this.graphSurface()?.familySessionId &&
+          preferred.nodeId === selected.id
+        ? options.findIndex((option) => option.session.id === preferred.sessionId)
+        : -1
+      if (preferred && preferredIndex < 0) this.preferredOpenSession = null
+      this.leafPicker = {
+        title: "Open leaf",
+        options,
+        selectedIndex: preferredIndex >= 0 ? preferredIndex : 0,
+        viewportStart: 0,
+        action: "open",
+      }
       this.pendingMouseAction = null
       this.render()
     }
@@ -753,11 +808,16 @@ class OpenTuiPresentationController {
 
   private showStopConfirmation(): void {
     const selected = this.selectedGraphNode()
-    if (selected?._tag !== "Endpoint") {
+    if (selected?._tag !== "Endpoint" || !this.viewModel?.liveSessionIds.has(selected.session.id)) {
+      if (selected?._tag === "Endpoint" && selected.fork?.empty) {
+        this.showError("This Fork is already stopped")
+        return
+      }
       this.showError("Select a live Draft or Agent to stop")
       return
     }
     this.modalChoice = "confirm"
+    this.stopConfirmationSessionId = selected.session.id
     this.enqueue(this.appRuntime.openModal({
       _tag: "ConfirmStop",
       sessionId: selected.session.id,
@@ -821,11 +881,26 @@ class OpenTuiPresentationController {
       this.enqueue(this.appRuntime.closeModal)
       return
     }
+    if (modal._tag === "ConfirmStop" && !this.isStopTargetActionable(modal.sessionId)) {
+      this.enqueue(this.appRuntime.closeModal)
+      return
+    }
+    const stoppedEndpoint = modal._tag === "ConfirmStop" ? this.selectedGraphNode() : undefined
+    const stoppedFamilySessionId = modal._tag === "ConfirmStop" ? this.graphSurface()?.familySessionId : undefined
     const self = this
     this.runAction(Effect.gen(function*() {
       yield* self.appRuntime.closeModal
       if (modal._tag === "ConfirmStop") {
+        const actionable = yield* Effect.sync(() => self.isStopTargetActionable(modal.sessionId))
+        if (!actionable) return
         yield* self.appRuntime.stopSession(modal.sessionId)
+        if (stoppedEndpoint?._tag === "Endpoint" && stoppedFamilySessionId) {
+          yield* Effect.sync(() => self.rememberStoppedEndpoint({
+            familySessionId: stoppedFamilySessionId,
+            nodeId: stoppedEndpoint.id,
+            sessionId: modal.sessionId,
+          }))
+        }
       } else {
         yield* self.appRuntime.remove(modal.removal, modal.affectedSessionIds, modal.requestId)
       }
@@ -861,6 +936,7 @@ class OpenTuiPresentationController {
       else this.render()
       return
     }
+    this.preferredOpenSession = null
     this.runTerminalAction(this.appRuntime.openEndpoint(option.session.id))
   }
 
@@ -886,6 +962,20 @@ class OpenTuiPresentationController {
 
   private reconcileModal(modal: ApplicationModal | null): void {
     const identity = modal ? JSON.stringify(modal) : null
+    if (modal?._tag === "ConfirmStop") {
+      this.stopConfirmationSessionId ??= modal.sessionId
+      const stale = modal.sessionId !== this.stopConfirmationSessionId ||
+        !this.isStopTargetActionable(modal.sessionId)
+      if (stale && identity !== this.closingStaleStopModalIdentity) {
+        this.closingStaleStopModalIdentity = identity
+        this.enqueue(this.appRuntime.closeModal)
+      } else if (!stale) {
+        this.closingStaleStopModalIdentity = null
+      }
+    } else {
+      this.stopConfirmationSessionId = null
+      this.closingStaleStopModalIdentity = null
+    }
     if (identity === this.modalIdentity) return
     this.modalIdentity = identity
     this.pendingMouseAction = null
@@ -961,8 +1051,9 @@ class OpenTuiPresentationController {
       ])
       this.footerHitRegions = footer.hitRegions
     } else {
+      const graphSurface = this.graphSurfaceForRendering(surface)
       const rendered = renderGraph(
-        surface,
+        graphSurface,
         width,
         height,
         this.spinnerFrame,
@@ -1049,7 +1140,7 @@ class OpenTuiPresentationController {
 
   private renderDialog(): void {
     const picker = this.leafPicker
-    const modal = this.viewModel?.modal
+    const modal = this.visibleModal()
     if (!picker && !modal) {
       this.dialogOverlay.visible = false
       return
@@ -1214,7 +1305,14 @@ class OpenTuiPresentationController {
   }
 
   private selectedGraphNode(): GraphNodeViewModel | undefined {
-    return this.graphSurface()?.nodes.find((node) => node.selected)
+    const graph = this.graphSurface()
+    if (!graph) return undefined
+    const pending = this.pendingGraphSelections.at(-1)
+    if (pending?.familySessionId === graph.familySessionId) {
+      const selected = graph.nodes.find((node) => node.id === pending.nodeId)
+      if (selected) return selected
+    }
+    return graph.nodes.find((node) => node.selected)
   }
 
   private readonly onContentMouseDown = (event: MouseEvent) => {
@@ -1253,7 +1351,7 @@ class OpenTuiPresentationController {
         const node = graph?.nodes.find((candidate) => candidate.id === action.nodeId)
         if (graph && node) {
           this.graphNavigationIntent = null
-          this.enqueue(this.appRuntime.selectGraph(graph.familySessionId, node.target))
+          this.queueGraphSelection(graph.familySessionId, node)
         }
       }
     }
@@ -1445,7 +1543,7 @@ class OpenTuiPresentationController {
   }
 
   private dialogActionAt(event: MouseEvent): "confirm" | "cancel" | "close" | undefined {
-    const modal = this.viewModel?.modal
+    const modal = this.visibleModal()
     if (!modal || event.y - this.dialogActions.screenY !== 0) return undefined
     if (modal._tag === "About" || modal._tag === "Error") return "close"
     const x = event.x - this.dialogActions.screenX
@@ -1458,6 +1556,128 @@ class OpenTuiPresentationController {
     } catch (cause) {
       this.reportRenderFailure(operation, cause)
     }
+  }
+
+  private queueGraphSelection(familySessionId: string, node: GraphNodeViewModel): void {
+    const pending: PendingGraphSelection = { familySessionId, nodeId: node.id, completed: false }
+    this.pendingGraphSelections.push(pending)
+    this.preferredOpenSession = null
+    this.pendingStoppedEndpoint = null
+    this.graphViewportOffset = null
+    this.enqueue(Effect.suspend(() => {
+      if (!this.pendingGraphSelections.includes(pending)) return Effect.void
+      return Effect.matchCauseEffect(this.appRuntime.selectGraph(familySessionId, node.target), {
+        onFailure: (cause) => Effect.sync(() => this.settleGraphSelection(pending, false)).pipe(
+          Effect.andThen(Effect.failCause(cause)),
+        ),
+        onSuccess: () => Effect.sync(() => this.settleGraphSelection(pending, true)),
+      })
+    }))
+    this.render()
+  }
+
+  private settleGraphSelection(pending: PendingGraphSelection, succeeded: boolean): void {
+    const index = this.pendingGraphSelections.indexOf(pending)
+    if (index < 0) return
+    if (succeeded) {
+      pending.completed = true
+      const graph = this.graphSurface()
+      if (graph) this.reconcileGraphSelection(graph)
+    } else {
+      this.pendingGraphSelections.splice(index, 1)
+      this.graphNavigationIntent = null
+      this.graphViewportOffset = null
+    }
+    this.renderSafely("Render graph selection")
+  }
+
+  private reconcileGraphSelection(
+    graph: Extract<ApplicationViewModel["surface"], { readonly _tag: "Graph" }>,
+  ): void {
+    if (this.pendingGraphSelections.some((pending) =>
+      pending.familySessionId !== graph.familySessionId ||
+      !graph.nodes.some((node) => node.id === pending.nodeId)
+    )) {
+      this.pendingGraphSelections.length = 0
+      return
+    }
+    const selectedNodeId = graph.nodes.find((node) => node.selected)?.id
+    if (!selectedNodeId) return
+    const acknowledgedIndex = this.pendingGraphSelections.findIndex((pending, index) =>
+      pending.nodeId === selectedNodeId &&
+      this.pendingGraphSelections.slice(0, index + 1).every((candidate) => candidate.completed)
+    )
+    if (acknowledgedIndex >= 0) this.pendingGraphSelections.splice(0, acknowledgedIndex + 1)
+  }
+
+  private graphSurfaceForRendering(
+    graph: Extract<ApplicationViewModel["surface"], { readonly _tag: "Graph" }>,
+  ): Extract<ApplicationViewModel["surface"], { readonly _tag: "Graph" }> {
+    const pending = this.pendingGraphSelections.at(-1)
+    if (!pending || pending.familySessionId !== graph.familySessionId) return graph
+    return {
+      ...graph,
+      selectedNodeId: pending.nodeId,
+      nodes: graph.nodes.map((node) => ({ ...node, selected: node.id === pending.nodeId })),
+    }
+  }
+
+  private isStopTargetActionable(sessionId: string): boolean {
+    const selected = this.selectedGraphNode()
+    return Boolean(
+      this.viewModel?.liveSessionIds.has(sessionId) &&
+      selected?._tag === "Endpoint" &&
+      selected.session.id === sessionId,
+    )
+  }
+
+  private visibleModal(): ApplicationModal | null {
+    const modal = this.viewModel?.modal ?? null
+    if (modal?._tag !== "ConfirmStop") return modal
+    if (modal.sessionId !== this.stopConfirmationSessionId) return null
+    return this.isStopTargetActionable(modal.sessionId) ? modal : null
+  }
+
+  private rememberStoppedEndpoint(endpoint: PendingStoppedEndpoint): void {
+    this.pendingStoppedEndpoint = endpoint
+    if (this.viewModel) this.reconcileStoppedEndpointPreference(this.viewModel)
+  }
+
+  private reconcileStoppedEndpointPreference(viewModel: ApplicationViewModel): void {
+    const graph = viewModel.surface._tag === "Graph" ? viewModel.surface : undefined
+    const pending = this.pendingStoppedEndpoint
+    if (pending && !viewModel.liveSessionIds.has(pending.sessionId)) {
+      const selected = this.selectedGraphNode()
+      if (
+        graph?.familySessionId !== pending.familySessionId ||
+        !graph.nodes.some((node) => node.id === pending.nodeId) &&
+          !graph.nodes.some((node) => node.reachableEndpoints.some((endpoint) => endpoint.session.id === pending.sessionId))
+      ) {
+        this.pendingStoppedEndpoint = null
+      } else if (selected && selected.id !== pending.nodeId) {
+        this.preferredOpenSession = selected.reachableEndpoints.some(
+            (endpoint) => endpoint.session.id === pending.sessionId,
+          )
+          ? {
+              familySessionId: graph.familySessionId,
+              nodeId: selected.id,
+              sessionId: pending.sessionId,
+            }
+          : null
+        this.pendingStoppedEndpoint = null
+      }
+    }
+
+    const preferred = this.preferredOpenSession
+    if (!preferred) return
+    const source = graph?.familySessionId === preferred.familySessionId
+      ? graph.nodes.find((node) => node.id === preferred.nodeId)
+      : undefined
+    const selected = this.selectedGraphNode()
+    if (
+      !source || selected?.id !== source.id ||
+      !source.reachableEndpoints.some((endpoint) => endpoint.session.id === preferred.sessionId)
+    ) this.preferredOpenSession = null
   }
 
   private guardCallback<A extends readonly unknown[]>(
@@ -1659,6 +1879,18 @@ function isHostEscape(key: KeyEvent): boolean {
 
 function isQuestionMarkKey(key: KeyEvent): boolean {
   return key.name === "?" && !key.ctrl && !key.meta && !key.option && !key.super && !key.hyper
+}
+
+function keyIdentity(key: KeyEvent): string {
+  return [
+    key.name,
+    key.ctrl,
+    key.shift,
+    key.meta,
+    key.option,
+    key.super,
+    key.hyper,
+  ].join(":")
 }
 
 function hasModifiers(key: KeyEvent): boolean {

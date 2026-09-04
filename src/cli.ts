@@ -53,6 +53,15 @@ export interface CliProgramEnvironment {
   ) => Effect.Effect<void, unknown>
 }
 
+export interface ApplicationLifecycleRuntime<E = never> {
+  readonly shutdown: Effect.Effect<void, E>
+}
+
+export interface ApplicationLifecyclePresentation<E = never> {
+  readonly run: Effect.Effect<void, E>
+  readonly wait: Effect.Effect<void, E>
+}
+
 export function makeCliProgram(environment: CliProgramEnvironment): Effect.Effect<void, unknown> {
   return Effect.gen(function*() {
     const options = yield* Effect.try({
@@ -104,17 +113,42 @@ export function composeProductionApplication(
       events: bridge.events,
       herdr: makeTerminalHerdrReporter(herdr),
     })
-    const appRuntime = yield* makeAppRuntime({ provider, metadata: repository, terminals })
-    bridge.bind(appRuntime.terminalEvents)
-    const presentation = yield* makeOpenTuiPresentation(renderer, appRuntime, provider, {
-      setProcessTitle,
-    })
-
-    yield* runPresentationLifecycle(
-      presentation.run,
-      presentation.wait,
-      appRuntime.shutdown,
+    yield* composeApplicationLifecycle(
+      makeAppRuntime({ provider, metadata: repository, terminals }),
+      (appRuntime) => {
+        bridge.bind(appRuntime.terminalEvents)
+        return makeOpenTuiPresentation(renderer, appRuntime, provider, { setProcessTitle })
+      },
     )
+  })
+}
+
+export function composeApplicationLifecycle<
+  Runtime extends ApplicationLifecycleRuntime<ShutdownError>,
+  RuntimeError,
+  PresentationError,
+  PresentationAcquireError,
+  ShutdownError,
+  RuntimeRequirements,
+  PresentationRequirements,
+>(
+  runtime: Effect.Effect<Runtime, RuntimeError, RuntimeRequirements>,
+  presentation: (
+    runtime: Runtime,
+  ) => Effect.Effect<
+    ApplicationLifecyclePresentation<PresentationError>,
+    PresentationAcquireError,
+    PresentationRequirements
+  >,
+): Effect.Effect<
+  void,
+  RuntimeError | PresentationError | PresentationAcquireError | ShutdownError,
+  RuntimeRequirements | PresentationRequirements
+> {
+  return Effect.gen(function*() {
+    const appRuntime = yield* runtime
+    const surface = yield* presentation(appRuntime)
+    yield* runPresentationLifecycle(surface.run, surface.wait, appRuntime.shutdown)
   })
 }
 

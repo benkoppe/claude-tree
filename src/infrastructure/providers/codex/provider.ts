@@ -95,6 +95,7 @@ export type CodexObservedServicesError =
 export type CodexObservedServicesFactory = (
   executable: string,
   initialThreadId: string,
+  initialThreadIsTemporary: boolean,
 ) => Effect.Effect<CodexObservedServices, CodexObservedServicesError, Scope.Scope>
 
 export interface CodexObservedServicesDependencies {
@@ -169,7 +170,13 @@ export class CodexProvider implements AgentProviderApi {
   ) {
     this.appServerFactory = dependencies.appServerFactory ??
       (() => makeCodexAppServerClient(this.executable))
-    this.observedServicesFactory = dependencies.observedServicesFactory ?? makeObservedServices
+    this.observedServicesFactory = dependencies.observedServicesFactory ??
+      ((executable, initialThreadId, initialThreadIsTemporary) => makeObservedServices(
+        executable,
+        initialThreadId,
+        {},
+        initialThreadIsTemporary,
+      ))
     this.observerFactory = dependencies.observerFactory ?? (() => new CodexTerminalObserver())
     this.makeUuid = dependencies.randomUUID ?? nodeRandomUUID
     this.canonicalizePath = dependencies.canonicalize ?? realpath
@@ -619,10 +626,14 @@ export class CodexProvider implements AgentProviderApi {
   }
 
   private threadBelongsToProject(thread: CodexThread): Effect.Effect<boolean> {
-    if (!isCanonicalPathCandidate(thread.cwd)) return Effect.succeed(false)
-    if (thread.cwd === this.projectPath) return Effect.succeed(true)
+    return this.pathBelongsToProject(thread.cwd)
+  }
+
+  private pathBelongsToProject(path: string): Effect.Effect<boolean> {
+    if (!isCanonicalPathCandidate(path)) return Effect.succeed(false)
+    if (path === this.projectPath) return Effect.succeed(true)
     return Effect.tryPromise({
-      try: () => Promise.resolve(this.canonicalizePath(thread.cwd)),
+      try: () => Promise.resolve(this.canonicalizePath(path)),
       catch: () => undefined,
     }).pipe(
       Effect.match({
@@ -698,7 +709,11 @@ export class CodexProvider implements AgentProviderApi {
   ): PreparedTerminal["acquireLaunch"] {
     return Effect.gen({ self: this }, function*() {
       yield* this.validateSessionId(sessionId, "acquireLaunch")
-      const observed = yield* this.observedServicesFactory(this.executable, sessionId).pipe(
+      const observed = yield* this.observedServicesFactory(
+        this.executable,
+        sessionId,
+        kind === "new",
+      ).pipe(
         Effect.mapError((error) => this.mapTransportError("acquireLaunch", error)),
       )
       const transitions = yield* this.adaptTransitions(observed.transitions)
@@ -770,7 +785,7 @@ export class CodexProvider implements AgentProviderApi {
     const forwarded = Effect.gen(function*() {
       const acknowledgment = yield* Deferred.make<void, TerminalTransitionAcknowledgmentError>()
       const published = yield* PubSub.publish(target, {
-        event: self.toTransition(request.transition),
+        event: yield* self.toTransition(request.transition),
         acknowledgment,
       })
       if (!published) {
@@ -794,42 +809,56 @@ export class CodexProvider implements AgentProviderApi {
     )
   }
 
-  private toTransition(observed: CodexTuiProxyTransition): TerminalTransitionEvent {
+  private toTransition(observed: CodexTuiProxyTransition): Effect.Effect<TerminalTransitionEvent> {
     if (observed._tag === "TransitionFailed") {
-      return {
+      return Effect.succeed({
         _tag: "TransitionFailed",
         error: this.providerError(
           "nativeSessionTransition",
           `Codex ${observed.operation} transition failed: ${observed.error.message}`,
           observed.error,
         ),
-      }
+      })
     }
-    try {
-      const session = sessionFromTransition(observed)
+    return Effect.gen({ self: this }, function*() {
+      const session = yield* Effect.try({
+        try: () => sessionFromTransition(observed),
+        catch: (cause) => this.protocolError(
+          "nativeSessionTransition",
+          "Codex reported invalid session transition metadata",
+          cause,
+        ),
+      })
+      if (!(yield* this.pathBelongsToProject(observed.cwd))) {
+        return yield* Effect.fail(this.protocolError(
+          "nativeSessionTransition",
+          `Codex ${observed.operation} destination ${observed.threadId} belongs to another project`,
+        ))
+      }
       return {
-        _tag: "SessionChanged",
+        _tag: "SessionChanged" as const,
+        kind: observed.kind,
         session,
         ...(observed.operation === "fork"
           ? { derivation: this.deriveNativeFork(observed) }
           : {}),
       }
-    } catch (cause) {
-      return {
-        _tag: "TransitionFailed",
-        error: this.protocolError(
-          "nativeSessionTransition",
-          "Codex reported invalid session transition metadata",
-          cause,
-        ),
-      }
-    }
+    }).pipe(Effect.match({
+      onFailure: (error): TerminalTransitionEvent => ({ _tag: "TransitionFailed", error }),
+      onSuccess: (event): TerminalTransitionEvent => event,
+    }))
   }
 
   private deriveNativeFork(
     observed: CodexThreadTransition,
   ): Effect.Effect<BranchDerivation | undefined, ProviderError | ProviderProtocolError> {
     const parentSessionId = observed.requestedThreadId ?? observed.previousThreadId
+    if (observed.kind === "temporary-adoption" && observed.requestedThreadId === undefined) {
+      return Effect.fail(this.protocolError(
+        "deriveNativeFork",
+        `Fork ${observed.threadId} did not report its requested source thread`,
+      ))
+    }
     return this.withServer((server) => Effect.gen({ self: this }, function*() {
       if (observed.forkPointTurnId === undefined) {
         return yield* Effect.fail(this.protocolError(
@@ -1088,6 +1117,7 @@ export function makeObservedServices(
   executable: string,
   initialThreadId: string,
   dependencies: CodexObservedServicesDependencies = {},
+  initialThreadIsTemporary = false,
 ): Effect.Effect<CodexObservedServices, CodexObservedServicesError, Scope.Scope> {
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const sidecar = yield* restore((dependencies.sidecarFactory ?? makeCodexSidecar)(executable))
@@ -1121,6 +1151,7 @@ export function makeObservedServices(
       upstreamUrl: sidecar.remoteUrl,
       bearerToken: sidecar.bearerToken,
       initialThreadId,
+      initialThreadIsTemporary,
     }).pipe(Effect.timeoutOrElse({
       duration: SIDECAR_START_TIMEOUT_MS,
       orElse: () => Effect.fail(new CodexTuiProxyError({
@@ -1267,7 +1298,7 @@ function sessionFromTransition(transition: CodexThreadTransition): AgentSession 
     id: transition.threadId,
     title: normalizePreview(firstNonempty(transition.title) ?? "Untitled conversation"),
     lastModified: transition.updatedAt * 1_000,
-    transient: true,
+    ...(transition.kind === "temporary-adoption" ? { transient: true } : {}),
   }
 }
 

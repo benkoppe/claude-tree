@@ -349,10 +349,11 @@ describe("application state reducer", () => {
       _tag: "SessionIdentityAdopted",
       previousSessionId: temporary,
       session: session(persisted, "Persisted"),
-      replacePrevious: true,
+      kind: "temporary-adoption",
     })
     expect(state.local.sessions.has(temporary)).toBeFalse()
     expect(state.local.sessions.has(persisted)).toBeTrue()
+    expect(state.local.temporarySessionIds).toEqual(new Set([persisted]))
     expect(state.terminals.has(persisted)).toBeTrue()
     expect(state.drafts.has(persisted)).toBeTrue()
     expect(state.unviewedSessionIds).toEqual(new Set([persisted]))
@@ -405,7 +406,7 @@ describe("application state reducer", () => {
       _tag: "SessionIdentityAdopted",
       previousSessionId: ROOT,
       session: session("native-child", "Native child"),
-      replacePrevious: false,
+      kind: "native-fork",
       relation,
     })
 
@@ -424,6 +425,126 @@ describe("application state reducer", () => {
         ],
       },
     })
+  })
+
+  test("rewrites every temporary-adoption removal confirmation field", () => {
+    const temporary = "temporary"
+    const persisted = "persisted"
+    const removal = {
+      kind: "subtree" as const,
+      target: { kind: "endpoint" as const, sessionId: temporary, afterMessageId: null },
+      createdAt: "2026-09-02T00:00:00.000Z",
+    }
+    let state: ApplicationState = {
+      ...makeInitialApplicationState(),
+      local: {
+        sessions: new Map([[temporary, session(temporary, "Temporary", true)]]),
+        transcripts: new Map([[temporary, available([])]]),
+        temporarySessionIds: new Set([temporary]),
+      },
+      modal: {
+        _tag: "ConfirmRemoval",
+        requestId: "remove-temporary",
+        removal,
+        affectedSessionIds: [temporary, "other", temporary],
+      },
+    }
+
+    state = reduceApplicationState(state, {
+      _tag: "SessionIdentityAdopted",
+      previousSessionId: temporary,
+      session: session(persisted, "Persisted"),
+      kind: "temporary-adoption",
+    })
+
+    expect(state.modal).toEqual({
+      _tag: "ConfirmRemoval",
+      requestId: "remove-temporary",
+      removal: {
+        ...removal,
+        target: { kind: "endpoint", sessionId: persisted, afterMessageId: null },
+      },
+      affectedSessionIds: [persisted, "other"],
+    })
+  })
+
+  test("updates native-fork stop confirmations and cancels stale removal confirmations", () => {
+    const terminal = { ownerId: "owner", activity: "idle" as const, phase: "running" as const }
+    let stopState: ApplicationState = {
+      ...loadedState(),
+      terminals: new Map([[ROOT, terminal]]),
+      modal: { _tag: "ConfirmStop", sessionId: ROOT, activity: "idle" },
+    }
+    stopState = reduceApplicationState(stopState, {
+      _tag: "SessionIdentityAdopted",
+      previousSessionId: ROOT,
+      session: session("native-child", "Native child"),
+      kind: "native-fork",
+    })
+    expect(stopState.modal).toEqual({
+      _tag: "ConfirmStop",
+      sessionId: "native-child",
+      activity: "idle",
+    })
+
+    let removalState: ApplicationState = {
+      ...loadedState(),
+      terminals: new Map([[ROOT, terminal]]),
+      modal: {
+        _tag: "ConfirmRemoval",
+        requestId: "remove-root",
+        removal: {
+          kind: "tree",
+          rootSessionId: ROOT,
+          memberSessionIds: [ROOT],
+          createdAt: "2026-09-02T00:00:00.000Z",
+        },
+        affectedSessionIds: [ROOT],
+      },
+    }
+    removalState = reduceApplicationState(removalState, {
+      _tag: "SessionIdentityAdopted",
+      previousSessionId: ROOT,
+      session: session("native-child", "Native child"),
+      kind: "native-fork",
+    })
+    expect(removalState.modal).toBeNull()
+  })
+
+  test("drops only undiscovered unowned temporary sessions after stop reconciliation", () => {
+    const temporary = session("temporary", "Blank Codex", true)
+    const validatedLocal = session("validated-local", "Validated local")
+    let state: ApplicationState = {
+      ...loadedState(),
+      local: {
+        sessions: new Map([
+          [temporary.id, temporary],
+          [validatedLocal.id, validatedLocal],
+        ]),
+        transcripts: new Map([
+          [temporary.id, available([])],
+          [validatedLocal.id, available([message("local-q", "user", "local", 0)])],
+        ]),
+        temporarySessionIds: new Set([temporary.id]),
+      },
+    }
+    const refresh: ActiveRefresh = {
+      ...activeRefresh("refresh:owner:temporary", 1, "stop", "incremental"),
+      sessionIds: new Set([temporary.id]),
+    }
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, {
+      _tag: "RefreshSucceeded",
+      key: refresh.key,
+      generation: refresh.generation,
+      snapshot: { sessions: [], transcripts: new Map() },
+    })
+
+    expect(state.local.sessions.has(temporary.id)).toBeFalse()
+    expect(state.local.transcripts.has(temporary.id)).toBeFalse()
+    expect(state.local.temporarySessionIds.has(temporary.id)).toBeFalse()
+    expect(state.local.sessions.get(validatedLocal.id)).toEqual(validatedLocal)
+    expect(state.provider.sessions.has(ROOT)).toBeTrue()
   })
 
   test("releases ephemeral state at shutdown and rejects later transforms", () => {

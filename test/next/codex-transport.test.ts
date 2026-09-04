@@ -704,6 +704,81 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }
   })
 
+  for (const firstOperation of ["start", "resume", "fork"] as const) {
+    test(`classifies a temporary terminal's first ${firstOperation} as adoption and its next fork as native`, async () => {
+      const token = "proxy-secret"
+      const upstream = controlledProtocolServer(token)
+      try {
+        await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+          const proxy = yield* makeCodexTuiProxy({
+            upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
+            bearerToken: token,
+            initialThreadId: "pending-codex-one",
+            initialThreadIsTemporary: true,
+          })
+          const subscription = yield* PubSub.subscribe(proxy.transitions)
+          const client = new WebSocket(proxy.remoteUrl, {
+            headers: { Authorization: `Bearer ${token}` },
+          })
+          yield* Effect.promise(() => socketOpened(client))
+
+          const firstResponse = socketMessage(client)
+          client.send(JSON.stringify({
+            id: 1,
+            method: `thread/${firstOperation}`,
+            params: firstOperation === "start"
+              ? { cwd: "/project" }
+              : firstOperation === "resume"
+                ? { threadId: "real" }
+                : { threadId: "source-thread", beforeTurnId: "turn-1" },
+          }))
+          yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+          upstream.respond(1, topLevelThread("real"))
+          const first = yield* takeAndAcknowledgeProxyTransition(subscription).pipe(
+            Effect.timeout(1_000),
+          )
+          yield* Effect.promise(() => firstResponse)
+
+          const forkResponse = socketMessage(client)
+          client.send(JSON.stringify({
+            id: 2,
+            method: "thread/fork",
+            params: { threadId: "real", beforeTurnId: "turn-2" },
+          }))
+          yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 2))
+          upstream.respond(2, topLevelThread("fork-one"))
+          const fork = yield* takeAndAcknowledgeProxyTransition(subscription).pipe(
+            Effect.timeout(1_000),
+          )
+          yield* Effect.promise(() => forkResponse)
+
+          expect(first).toMatchObject({
+            _tag: "CodexThreadTransition",
+            operation: firstOperation,
+            kind: "temporary-adoption",
+            previousThreadId: "pending-codex-one",
+            threadId: "real",
+            cwd: "/project",
+            ...(firstOperation === "fork"
+              ? { requestedThreadId: "source-thread", forkPointTurnId: "turn-1" }
+              : {}),
+          })
+          expect(fork).toMatchObject({
+            _tag: "CodexThreadTransition",
+            operation: "fork",
+            kind: "native-fork",
+            previousThreadId: "real",
+            threadId: "fork-one",
+            cwd: "/project",
+          })
+          client.close()
+        })))
+      } finally {
+        await upstream.close()
+      }
+    })
+  }
+
   test("rejects binary TUI messages and bounds the pre-open queue", async () => {
     const token = "proxy-secret"
     const upstream = controlledProtocolServer(token, 100)
@@ -790,7 +865,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }
   })
 
-  test("publishes TransitionFailed for a malformed successful tracked switch", async () => {
+  test("publishes TransitionFailed when a tracked destination omits required cwd metadata", async () => {
     const token = "proxy-secret"
     const upstream = controlledProtocolServer(token)
     try {
@@ -808,7 +883,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         client.send(JSON.stringify({ id: 1, method: "thread/start", params: { cwd: "/project" } }))
         yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
         const malformed = topLevelThread("thread-b")
-        delete malformed.updatedAt
+        delete malformed.cwd
         upstream.respond(1, malformed)
         const transition = yield* takeAndAcknowledgeProxyTransition(subscription).pipe(Effect.timeout(1_000))
         expect(transition._tag).toBe("TransitionFailed")
@@ -1124,6 +1199,7 @@ function topLevelThread(id: string): Record<string, unknown> {
     id,
     preview: id,
     updatedAt: 12,
+    cwd: "/project",
     ephemeral: false,
     parentThreadId: null,
     futureField: true,

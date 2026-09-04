@@ -65,6 +65,203 @@ test("renders roots and preserves directional graph navigation intent", async ()
   }
 })
 
+test("opens the newly selected graph node without waiting for publication", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Rapid open"))
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("open:left"))
+    expect(setup.captureCharFrame()).not.toContain("Open leaf")
+  } finally {
+    await running.stop()
+  }
+})
+
+test("forks the newly selected graph node without waiting for publication", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Rapid fork"))
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressKey("f")
+    await waitFor(() => running.harness.calls.includes("branch:root-1:left-message"))
+  } finally {
+    await running.stop()
+  }
+})
+
+test("deletes the newly selected graph node without waiting for publication", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Rapid delete"))
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressKey("d")
+    await waitFor(() => running.harness.modalUpdates.some((modal) => modal._tag === "ConfirmRemoval"))
+    const modal = running.harness.modalUpdates.find((candidate) => candidate._tag === "ConfirmRemoval")
+    expect(modal?._tag === "ConfirmRemoval" && modal.removal.kind === "subtree" &&
+      modal.removal.target.kind === "message" && modal.removal.target.aliases[0]?.messageId).toBe("left-message")
+  } finally {
+    await running.stop()
+  }
+})
+
+test("stops the newly selected graph endpoint without waiting for publication", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const graph = withLiveSessions(branchingGraph("root-1", "Rapid stop"), ["left"])
+  const running = await startPresentation(setup.renderer, graph)
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressKey("x")
+    await waitFor(() => running.harness.modalUpdates.some((modal) =>
+      modal._tag === "ConfirmStop" && modal.sessionId === "left"
+    ))
+    expect(running.harness.modalUpdates.at(-1)).toMatchObject({ _tag: "ConfirmStop", sessionId: "left" })
+  } finally {
+    await running.stop()
+  }
+})
+
+test("uses the authoritative selection after a rejected graph move when opening", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(
+    setup.renderer,
+    branchingGraph("root-1", "Rejected open"),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    { selectGraph: () => Effect.fail(new Error("selection rejected")) },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    await frame(setup, (value) => value.includes("selection rejected"))
+    setup.mockInput.pressEscape()
+    await frame(setup, () => isSelected(setup, "branch source"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => value.includes("Open leaf"))
+    expect(running.harness.calls).not.toContain("open:left")
+  } finally {
+    await running.stop()
+  }
+})
+
+test("uses the authoritative selection after a rejected graph move when forking", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(
+    setup.renderer,
+    branchingGraph("root-1", "Rejected fork"),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    { selectGraph: () => Effect.fail(new Error("selection rejected")) },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    await frame(setup, (value) => value.includes("selection rejected"))
+    setup.mockInput.pressEscape()
+    await frame(setup, () => isSelected(setup, "branch source"))
+    setup.mockInput.pressKey("f")
+    await waitFor(() => running.harness.calls.includes("branch:root-1:source"))
+    expect(running.harness.calls).not.toContain("branch:root-1:left-message")
+  } finally {
+    await running.stop()
+  }
+})
+
+test("uses the authoritative selection after a rejected graph move when deleting", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(
+    setup.renderer,
+    branchingGraph("root-1", "Rejected delete"),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    { selectGraph: () => Effect.fail(new Error("selection rejected")) },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    await frame(setup, (value) => value.includes("selection rejected"))
+    setup.mockInput.pressEscape()
+    await frame(setup, () => isSelected(setup, "branch source"))
+    setup.mockInput.pressKey("d")
+    await waitFor(() => running.harness.modalUpdates.some((modal) => modal._tag === "ConfirmRemoval"))
+    const modal = running.harness.modalUpdates.find((candidate) => candidate._tag === "ConfirmRemoval")
+    expect(modal?._tag === "ConfirmRemoval" && modal.removal.kind === "subtree" &&
+      modal.removal.target.kind === "message" && modal.removal.target.aliases[0]?.messageId).toBe("source")
+  } finally {
+    await running.stop()
+  }
+})
+
+test("executes a captured rapid selection after its predecessor rejects", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const rejectFirst = await Effect.runPromise(Deferred.make<void, Error>())
+  let attempt = 0
+  const running = await startPresentation(
+    setup.renderer,
+    branchingGraph("root-1", "Queued selection"),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    {
+      selectGraph: (_familySessionId, _target, publishSelection) => {
+        attempt += 1
+        return attempt === 1 ? Deferred.await(rejectFirst) : publishSelection()
+      },
+    },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressArrow("right")
+    await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:left-message"))
+    expect(running.harness.calls).not.toContain("select-graph:message:root-1:right-message")
+
+    await Effect.runPromise(Deferred.fail(rejectFirst, new Error("first selection rejected")))
+    await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:right-message"))
+    await frame(setup, (value) => value.includes("first selection rejected"))
+    expect(running.harness.calls.filter((call) => call.startsWith("select-graph:"))).toEqual([
+      "select-graph:message:root-1:left-message",
+      "select-graph:message:root-1:right-message",
+    ])
+
+    setup.mockInput.pressEscape()
+    await frame(setup, () => isSelected(setup, "right branch"))
+
+    setup.mockInput.pressKey("f")
+    await waitFor(() => running.harness.calls.includes("branch:root-1:right-message"))
+
+    setup.mockInput.pressKey("d")
+    await waitFor(() => running.harness.modalUpdates.some((modal) => modal._tag === "ConfirmRemoval"))
+    const removal = running.harness.modalUpdates.find((modal) => modal._tag === "ConfirmRemoval")
+    expect(removal?._tag === "ConfirmRemoval" && removal.removal.kind === "subtree" &&
+      removal.removal.target.kind === "message" && removal.removal.target.aliases[0]?.messageId).toBe("right-message")
+    setup.mockInput.pressEscape()
+    await frame(setup, () => isSelected(setup, "right branch"))
+
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("open:right"))
+    expect(running.harness.calls).not.toContain("open:left")
+  } finally {
+    await running.stop()
+  }
+})
+
 test("renders asynchronous runtime updates without polling", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const running = await startPresentation(setup.renderer, rootsView(), new Map())
@@ -106,7 +303,7 @@ test("contains a throwing terminal title update and renders later updates", asyn
     const failure = await frame(setup, (value) => value.includes("Render update") && value.includes("terminal title defect"))
     expect(failure).toContain("Error")
     setup.mockInput.pressEscape()
-    await frame(setup, (value) => value.includes("Conversation roots") && !value.includes("terminal title defect"))
+    await frame(setup, (value) => value.includes("Message graph") && !value.includes("terminal title defect"))
     await Effect.runPromise(running.harness.update(linearGraph("root-1", "Recovered render", "later update")))
     await frame(setup, (value) => value.includes("later update"))
   } finally {
@@ -293,7 +490,7 @@ test("finishes an interrupted stop exactly once without deadlocking later caller
   expect(running.harness.calls.filter((call) => call === "shutdown")).toHaveLength(1)
 })
 
-test("terminal mode intercepts only Ctrl+Space", async () => {
+test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () => {
   const setup = await createTestRenderer({
     width: 80,
     height: 24,
@@ -312,13 +509,17 @@ test("terminal mode intercepts only Ctrl+Space", async () => {
     },
   }
   const running = await startPresentation(setup.renderer, terminal, new Map(), graph)
-  const observed: Array<{ name: string; stopped: boolean }> = []
+  const observed: Array<{ type: "press" | "release"; name: string; stopped: boolean }> = []
   setup.renderer.keyInput.on("keypress", (key) => {
-    observed.push({ name: key.name, stopped: key.propagationStopped })
+    observed.push({ type: "press", name: key.name, stopped: key.propagationStopped })
+  })
+  setup.renderer.keyInput.on("keyrelease", (key) => {
+    observed.push({ type: "release", name: key.name, stopped: key.propagationStopped })
   })
 
   try {
     setup.mockInput.pressKey("q")
+    releaseKittyKey(setup, 113)
     setup.mockInput.pressEscape()
     setup.mockInput.pressEnter()
     await Bun.sleep(10)
@@ -327,8 +528,31 @@ test("terminal mode intercepts only Ctrl+Space", async () => {
 
     setup.mockInput.pressKey(" ", { ctrl: true })
     await frame(setup, (value) => value.includes("Message graph"))
+    releaseKittyKey(setup, 32, 5)
+    await Bun.sleep(10)
     expect(running.harness.calls).toContain("return-terminal")
     expect(observed.some((event) => event.name === "space")).toBeFalse()
+    expect(observed).toContainEqual({ type: "release", name: "q", stopped: false })
+  } finally {
+    await running.stop()
+  }
+})
+
+test("suppresses every consumed Kitty key release", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24, kittyKeyboard: true })
+  const running = await startPresentation(setup.renderer, rootsView())
+  const observed: string[] = []
+  setup.renderer.keyInput.on("keypress", (key) => observed.push(`press:${key.name}`))
+  setup.renderer.keyInput.on("keyrelease", (key) => observed.push(`release:${key.name}`))
+
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressArrow("down")
+    releaseKittyKey(setup, 57353)
+    setup.mockInput.pressKey("z")
+    releaseKittyKey(setup, 122)
+    await Bun.sleep(10)
+    expect(observed).toEqual(["press:z", "release:z"])
   } finally {
     await running.stop()
   }
@@ -355,6 +579,106 @@ test("uses safe removal and affirmative stop confirmation defaults", async () =>
     setup.mockInput.pressEnter()
     await frame(setup, (value) => !value.includes("Delete conversation tree"))
     expect(running.harness.calls.some((call) => call.startsWith("remove:"))).toBeFalse()
+  } finally {
+    await running.stop()
+  }
+})
+
+test("closes a stop confirmation when its session exits", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const graph = endpointGraph()
+  const running = await startPresentation(setup.renderer, graph)
+
+  try {
+    await frame(setup, (value) => value.includes("pending text"))
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Stop live session"))
+    await Effect.runPromise(running.harness.update({
+      ...graph,
+      modal: { _tag: "ConfirmStop", sessionId: "endpoint", activity: "idle" },
+      liveSessionIds: new Set(),
+    }))
+    await frame(setup, (value) => !value.includes("Stop live session"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(10)
+    expect(running.harness.calls).not.toContain("stop:endpoint")
+  } finally {
+    await running.stop()
+  }
+})
+
+test("closes a stop confirmation when the endpoint identity changes", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(setup.renderer, endpointGraph())
+
+  try {
+    await frame(setup, (value) => value.includes("pending text"))
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Stop live session"))
+    const adopted = endpointGraph("adopted")
+    await Effect.runPromise(running.harness.update({
+      ...adopted,
+      modal: { _tag: "ConfirmStop", sessionId: "adopted", activity: "idle" },
+    }))
+    await frame(setup, (value) => !value.includes("Stop live session"))
+    setup.mockInput.pressEnter()
+    await Bun.sleep(10)
+    expect(running.harness.calls.some((call) => call.startsWith("stop:"))).toBeFalse()
+  } finally {
+    await running.stop()
+  }
+})
+
+test("reports a stopped Fork without requesting another stop", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const running = await startPresentation(setup.renderer, canonicalStoppedForkGraph())
+
+  try {
+    await frame(setup, (value) => value.includes("Fork 1"))
+    setup.mockInput.pressKey("x")
+    const rendered = await frame(setup, (value) => value.includes("This Fork is already stopped"))
+    expect(rendered).toContain("Error")
+    expect(running.harness.calls.some((call) => call.startsWith("stop:"))).toBeFalse()
+  } finally {
+    await running.stop()
+  }
+})
+
+test("preserves a stopped endpoint preference through endpoint removal and refresh repair", async () => {
+  const setup = await createTestRenderer({ width: 90, height: 24 })
+  const live = ambiguousStoppedEndpointGraph("endpoint", true)
+  const stoppedEndpoint = ambiguousStoppedEndpointGraph("endpoint", false)
+  const repaired = ambiguousStoppedEndpointGraph("source", false)
+  const running = await startPresentation(
+    setup.renderer,
+    live,
+    new Map(),
+    repaired,
+    Effect.succeed(true),
+    { stopSession: (_sessionId, update) => update(stoppedEndpoint).pipe(Effect.as(true)) },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("shared source") && value.includes("Selected session"))
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Stop live session"))
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("stop:stopped"))
+    await frame(setup, (value) => value.includes("Selected fork · stopped"))
+
+    await Effect.runPromise(running.harness.update(repaired))
+    await frame(setup, () => isSelected(setup, "shared source"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => value.includes("Open leaf"))
+    expect(isSelected(setup, "Stopped fork")).toBeTrue()
+
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("open:stopped"))
+    setup.mockInput.pressKey(" ", { ctrl: true })
+    await frame(setup, () => isSelected(setup, "shared source"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => value.includes("Open leaf"))
+    expect(isSelected(setup, "Other leaf")).toBeTrue()
   } finally {
     await running.stop()
   }
@@ -555,6 +879,15 @@ interface RuntimeHarness {
 interface RuntimeActionOverrides {
   readonly newSession?: Effect.Effect<boolean>
   readonly openEndpoint?: (sessionId: string) => Effect.Effect<boolean>
+  readonly selectGraph?: (
+    familySessionId: string,
+    target: NavigationTarget,
+    publishSelection: () => Effect.Effect<void>,
+  ) => Effect.Effect<unknown, unknown>
+  readonly stopSession?: (
+    sessionId: string,
+    update: (viewModel: ApplicationViewModel) => Effect.Effect<void>,
+  ) => Effect.Effect<boolean>
   readonly beforeRefresh?: () => void
   readonly reportedRefreshFailure?: ApplicationOperationError
   readonly refresh?: () => Effect.Effect<unknown, unknown>
@@ -673,16 +1006,23 @@ function makeHarness(
       },
       selectGraph: (familySessionId: string, target: NavigationTarget) => {
         calls.push(`select-graph:${targetKey(target)}`)
-        if (current.surface._tag !== "Graph") return Effect.succeed(false)
-        const surface: SurfaceViewModel = {
-          ...current.surface,
-          nodes: current.surface.nodes.map((node) => ({
-            ...node,
-            selected: targetKey(node.target) === targetKey(target),
-          })),
-          selectedNodeId: current.surface.nodes.find((node) => targetKey(node.target) === targetKey(target))?.id ?? null,
+        const publishSelection = () => {
+          if (current.surface._tag !== "Graph") return Effect.void
+          const surface: SurfaceViewModel = {
+            ...current.surface,
+            nodes: current.surface.nodes.map((node) => ({
+              ...node,
+              selected: targetKey(node.target) === targetKey(target),
+            })),
+            selectedNodeId: current.surface.nodes.find((node) =>
+              targetKey(node.target) === targetKey(target)
+            )?.id ?? null,
+          }
+          return update({ ...current, surface })
         }
-        return update({ ...current, surface }).pipe(Effect.as(true))
+        const override = actionOverrides.selectGraph?.(familySessionId, target, publishSelection)
+        if (override) return override
+        return publishSelection().pipe(Effect.as(true))
       },
       newSession: Effect.sync(() => calls.push("new")).pipe(
         Effect.andThen(actionOverrides.newSession ?? Effect.succeed(true)),
@@ -720,14 +1060,13 @@ function makeHarness(
       }),
       stopSession: (sessionId: string) => Effect.sync(() => {
         calls.push(`stop:${sessionId}`)
-        return true
-      }),
+      }).pipe(Effect.andThen(actionOverrides.stopSession?.(sessionId, update) ?? Effect.succeed(true))),
       remove: (removal: { kind: string }) => Effect.sync(() => {
         calls.push(`remove:${removal.kind}`)
         return true
       }),
       openModal: (value: ApplicationModal) => modal(value).pipe(Effect.as(true)),
-      closeModal: modal(null).pipe(Effect.as(true)),
+      closeModal: Effect.suspend(() => modal(null)).pipe(Effect.as(true)),
       handleTerminalActivity: () => Effect.succeed(true),
       handleTerminalExit: () => Effect.succeed(true),
       handleTerminalSessionChanged: () => Effect.succeed(true),
@@ -779,13 +1118,50 @@ function branchingGraph(familySessionId: string, title: string): ApplicationView
   return graphView(familySessionId, title, [source, left, right, leftEndpoint, rightEndpoint])
 }
 
-function endpointGraph(): ApplicationViewModel {
-  return graphView("root-1", "Draft conversation", [
-    endpointNode("endpoint", "endpoint", "Draft session", 24, 0, [], true, {
+function endpointGraph(sessionId = "endpoint"): ApplicationViewModel {
+  return withLiveSessions(graphView("root-1", "Draft conversation", [
+    endpointNode("endpoint", sessionId, "Draft session", 24, 0, [], true, {
       text: "pending text",
       exact: false,
     }),
-  ])
+  ]), [sessionId])
+}
+
+function withLiveSessions(
+  viewModel: ApplicationViewModel,
+  sessionIds: readonly string[],
+): ApplicationViewModel {
+  return { ...viewModel, liveSessionIds: new Set(sessionIds) }
+}
+
+function ambiguousStoppedEndpointGraph(
+  selection: "endpoint" | "source",
+  live: boolean,
+): ApplicationViewModel {
+  const source = messageNode(
+    "source",
+    "shared source",
+    20,
+    0,
+    [],
+    ["stopped-endpoint", "other-endpoint"],
+    selection === "source",
+    "root",
+  )
+  const stopped = {
+    ...endpointNode("stopped-endpoint", "stopped", "Stopped fork", 0, 4, [source.id], selection === "endpoint"),
+    fork: {
+      sourceNodeId: source.id,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      empty: true,
+    },
+  }
+  const other = {
+    ...endpointNode("other-endpoint", "other", "Other leaf", 40, 4, [source.id], false),
+    session: { id: "other", title: "Other leaf", lastModified: 2 },
+  }
+  const view = graphView("root", "Stopped preference", [source, stopped, other])
+  return withLiveSessions(view, live ? ["stopped"] : [])
 }
 
 function graphView(
@@ -1088,6 +1464,14 @@ function endpointTitle(viewModel: ApplicationViewModel | undefined, sessionId: s
     node._tag === "Endpoint" && node.session.id === sessionId
   )
   return endpoint?._tag === "Endpoint" ? endpoint.session.title : sessionId
+}
+
+function releaseKittyKey(
+  setup: Awaited<ReturnType<typeof createTestRenderer>>,
+  codepoint: number,
+  modifiers = 1,
+): void {
+  setup.renderer.stdin.emit("data", Buffer.from(`\x1B[${codepoint};${modifiers}:3u`))
 }
 
 function isSelected(
