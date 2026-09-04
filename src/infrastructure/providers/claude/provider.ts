@@ -19,12 +19,15 @@ import type {
   AgentSession,
   AgentSessionSnapshot,
   MessageRef,
+  TerminalObserver,
   TranscriptRead,
 } from "../../../domain/model"
 import {
   AgentProvider,
   type AgentProviderApi,
+  type AmbiguousBranchMutation,
   type BranchOutcome,
+  makeBranchMutationReconciliationSignal,
   type PreparedTerminal,
   type TerminalLaunch,
 } from "../../../services/provider"
@@ -54,10 +57,14 @@ export interface ClaudeSdk {
 export interface ClaudeProviderDependencies {
   readonly sdk?: ClaudeSdk
   readonly resolveExecutable?: () => string | null | PromiseLike<string | null>
+  readonly observerFactory?: () => TerminalObserver
   readonly randomUUID?: () => string
 }
 
 export interface ClaudeProviderOptions {
+  readonly operationTimeoutMs?: number
+  readonly executableLookupTimeoutMs?: number
+  readonly forkSessionTimeoutMs?: number
   readonly forkValidationRetryDelaysMs?: readonly number[]
   readonly forkValidationTimeoutMs?: number
   readonly listSessionsTimeoutMs?: number
@@ -103,6 +110,17 @@ interface SourcePrefix {
   readonly requestedRecordIndex: number
 }
 
+interface OperationDeadline {
+  readonly operation: string
+  readonly expiresAt: number
+  readonly timeoutMs: number
+}
+
+interface TimeoutBudget {
+  readonly durationMs: number
+  readonly error: ProviderError
+}
+
 type ForkValidation =
   | {
       readonly _tag: "Valid"
@@ -145,11 +163,17 @@ export class ClaudeProvider implements AgentProviderApi {
     PreparedTerminal,
     ProviderError | ProviderProtocolError
   >
+  readonly takeBranchMutationReconciliation: Effect.Effect<AmbiguousBranchMutation>
 
   private readonly sdk: ClaudeSdk
   private readonly resolveExecutable: () => string | null | PromiseLike<string | null>
+  private readonly observerFactory: () => TerminalObserver
   private readonly makeUuid: () => string
+  private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
   private readonly retryDelays: readonly number[]
+  private readonly operationTimeoutMs: number
+  private readonly executableLookupTimeoutMs: number
+  private readonly forkSessionTimeoutMs: number
   private readonly forkValidationTimeoutMs: number
   private readonly listSessionsTimeoutMs: number
   private readonly transcriptReadTimeoutMs: number
@@ -162,9 +186,15 @@ export class ClaudeProvider implements AgentProviderApi {
   ) {
     this.sdk = dependencies.sdk ?? defaultSdk
     this.resolveExecutable = dependencies.resolveExecutable ?? (() => Bun.which("claude"))
+    this.observerFactory = dependencies.observerFactory ?? (() => new ClaudeTerminalObserver())
     this.makeUuid = dependencies.randomUUID ?? nodeRandomUUID
+    this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
     this.retryDelays =
       options.forkValidationRetryDelaysMs ?? DEFAULT_FORK_VALIDATION_RETRY_DELAYS_MS
+    this.operationTimeoutMs = options.operationTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
+    this.executableLookupTimeoutMs =
+      options.executableLookupTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
+    this.forkSessionTimeoutMs = options.forkSessionTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
     this.forkValidationTimeoutMs =
       options.forkValidationTimeoutMs ?? DEFAULT_FORK_VALIDATION_TIMEOUT_MS
     this.listSessionsTimeoutMs =
@@ -175,8 +205,12 @@ export class ClaudeProvider implements AgentProviderApi {
       options.provenanceImportTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
 
     this.loadSessionSnapshot = Effect.gen({ self: this }, function*() {
-      const sessions = yield* this.listSessionSummaries()
-      const transcripts = yield* this.readTranscripts(sessions.map((session) => session.id))
+      const deadline = yield* this.makeDeadline("loadSessionSnapshot", this.operationTimeoutMs)
+      const sessions = yield* this.listSessionSummaries(deadline)
+      const transcripts = yield* this.readTranscriptsWithin(
+        sessions.map((session) => session.id),
+        deadline,
+      )
       return { sessions, transcripts }
     })
 
@@ -186,9 +220,30 @@ export class ClaudeProvider implements AgentProviderApi {
   readTranscripts(
     sessionIds: readonly string[],
   ): Effect.Effect<ReadonlyMap<string, TranscriptRead>, ProviderError | ProviderProtocolError> {
+    return Effect.gen({ self: this }, function*() {
+      const deadline = yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs)
+      return yield* this.readTranscriptsWithin(sessionIds, deadline)
+    })
+  }
+
+  loadSessionSnapshotFor(
+    sessionIds: readonly string[],
+  ): Effect.Effect<AgentSessionSnapshot, ProviderError | ProviderProtocolError> {
+    return Effect.gen({ self: this }, function*() {
+      const deadline = yield* this.makeDeadline("loadSessionSnapshotFor", this.operationTimeoutMs)
+      const sessions = yield* this.listSessionSummaries(deadline)
+      const transcripts = yield* this.readTranscriptsWithin(sessionIds, deadline)
+      return { sessions, transcripts }
+    })
+  }
+
+  private readTranscriptsWithin(
+    sessionIds: readonly string[],
+    deadline: OperationDeadline,
+  ): Effect.Effect<ReadonlyMap<string, TranscriptRead>> {
     return Effect.all(
-      sessionIds.map((sessionId) =>
-        this.readClaudeTranscript(sessionId, "readTranscripts").pipe(
+      unique(sessionIds).map((sessionId) =>
+        this.readClaudeTranscript(sessionId, "readTranscripts", deadline).pipe(
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
               sessionId,
@@ -221,8 +276,18 @@ export class ClaudeProvider implements AgentProviderApi {
   branchFrom(
     target: MessageRef,
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
-    return Effect.gen({ self: this }, function*() {
-      const sourceTranscript = yield* this.requireTranscript(target.sessionId, "branchFrom")
+    let mutationMayHaveDispatched = false
+    let mutationSourceMessageId = target.messageId
+    const operation = Effect.gen({ self: this }, function*() {
+      const deadline = yield* this.makeDeadline(
+        "branchFrom",
+        Math.min(this.operationTimeoutMs, this.forkValidationTimeoutMs),
+      )
+      const sourceTranscript = yield* this.requireTranscript(
+        target.sessionId,
+        "branchFrom",
+        deadline,
+      )
       const selectedIndex = sourceTranscript.findIndex((message) => message.id === target.messageId)
       const selected = sourceTranscript[selectedIndex]
       if (selected === undefined) {
@@ -255,7 +320,7 @@ export class ClaudeProvider implements AgentProviderApi {
       if (forkIndex < 0) {
         const prepared = yield* this.prepareTransientSession(replayText)
         return {
-          _tag: "ValidatedBranch",
+          _tag: "ValidatedBranch" as const,
           ...prepared,
           derivation: {
             childSessionId: prepared.session.id,
@@ -274,25 +339,30 @@ export class ClaudeProvider implements AgentProviderApi {
         ))
       }
 
-      const sourceRecords = yield* this.readConversationRecords(target.sessionId, "branchFrom")
+      const sourceRecords = yield* this.readConversationRecords(
+        target.sessionId,
+        "branchFrom",
+        deadline,
+      )
       const sourcePrefix = yield* this.validateSourcePrefix(
         target.sessionId,
         sourceTranscript.slice(0, forkIndex + 1),
         sourceRecords,
         forkMessage.id,
       )
-      const forkResult = yield* this.callSdk(
-        "forkSession",
-        () => this.sdk.forkSession(target.sessionId, {
-          dir: this.projectPath,
-          upToMessageId: forkMessage.id,
-        }),
+      mutationSourceMessageId = forkMessage.id
+      mutationMayHaveDispatched = true
+      const forkResult = yield* this.forkSessionOnce(
+        target.sessionId,
+        forkMessage.id,
+        deadline,
       )
+      if (forkResult._tag === "AmbiguousBranchMutation") return forkResult
 
-      const childId = forkResult?.sessionId
+      const childId = forkResult.sessionId
       const now = yield* Clock.currentTimeMillis
       const childSession: AgentSession = {
-        id: typeof childId === "string" ? childId : "",
+        id: childId,
         title: "Conversation (fork)",
         lastModified: now,
       }
@@ -301,6 +371,7 @@ export class ClaudeProvider implements AgentProviderApi {
         target.sessionId,
         forkMessage.id,
         sourcePrefix,
+        deadline,
         replayText,
       )
       return yield* postCreate.pipe(
@@ -318,6 +389,91 @@ export class ClaudeProvider implements AgentProviderApi {
         }),
       )
     })
+    return operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched
+      ? Effect.sync(() => this.branchMutationReconciliations.offer(
+          this.ambiguousBranchMutation(
+            target.sessionId,
+            mutationSourceMessageId,
+            "Claude forkSession was interrupted after invocation; Claude may have created a child session",
+          ),
+        ))
+      : Effect.void))
+  }
+
+  private forkSessionOnce(
+    parentSessionId: string,
+    sourceMessageId: string,
+    deadline: OperationDeadline,
+  ): Effect.Effect<
+    | { readonly _tag: "Created"; readonly sessionId: string }
+    | AmbiguousBranchMutation,
+    ProviderError | ProviderProtocolError
+  > {
+    return Effect.gen({ self: this }, function*() {
+      const budget = yield* this.timeoutBudget(
+        "forkSession",
+        this.forkSessionTimeoutMs,
+        deadline,
+      )
+      const request = Effect.tryPromise({
+        try: () => handledPromise(() => this.sdk.forkSession(parentSessionId, {
+          dir: this.projectPath,
+          upToMessageId: sourceMessageId,
+        })),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.match({
+          onFailure: (cause) => this.ambiguousBranchMutation(
+            parentSessionId,
+            sourceMessageId,
+            `Claude forkSession failed after invocation: ${errorMessage(cause)}; Claude may have created a child session`,
+          ),
+          onSuccess: (value) => {
+            if (
+              !isRecord(value) ||
+              typeof value.sessionId !== "string" ||
+              !isValidSessionId(value.sessionId) ||
+              value.sessionId === parentSessionId
+            ) {
+              const ambiguity = this.ambiguousBranchMutation(
+                parentSessionId,
+                sourceMessageId,
+                "Claude returned an invalid or non-distinct child session ID after creating a fork",
+              )
+              this.branchMutationReconciliations.offer(ambiguity)
+              return ambiguity
+            }
+            return { _tag: "Created" as const, sessionId: value.sessionId }
+          },
+        }),
+      )
+      const result = yield* request.pipe(
+        Effect.timeoutOrElse({
+          duration: budget.durationMs,
+          orElse: () => Effect.succeed(this.ambiguousBranchMutation(
+            parentSessionId,
+            sourceMessageId,
+            `${budget.error.message}; Claude may have created a child session`,
+          )),
+        }),
+      )
+      return result
+    })
+  }
+
+  private ambiguousBranchMutation(
+    parentSessionId: string,
+    sourceMessageId: string,
+    reason: string,
+  ): AmbiguousBranchMutation {
+    return {
+      _tag: "AmbiguousBranchMutation",
+      providerId: this.id,
+      parentSessionId,
+      sourceMessageId,
+      reason,
+      reconciliation: "full-snapshot",
+    }
   }
 
   private prepareTransientSession(
@@ -353,6 +509,7 @@ export class ClaudeProvider implements AgentProviderApi {
     parentSessionId: string,
     sourceMessageId: string,
     sourcePrefix: SourcePrefix,
+    deadline: OperationDeadline,
     replayText?: string,
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
@@ -361,32 +518,9 @@ export class ClaudeProvider implements AgentProviderApi {
         session.id,
         parentSessionId,
         sourcePrefix,
-      ).pipe(
-        Effect.timeoutOrElse({
-          duration: this.forkValidationTimeoutMs,
-          orElse: () => Effect.fail(this.timeoutError(
-            "validateFork",
-            this.forkValidationTimeoutMs,
-          )),
-        }),
+        deadline,
       )
-      const launchResult = yield* this.resolveLaunch("resume", session.id, replayText).pipe(
-        Effect.match({
-          onFailure: (error) => ({ _tag: "Failure" as const, error }),
-          onSuccess: (launch) => ({ _tag: "Success" as const, launch }),
-        }),
-      )
-      if (launchResult._tag === "Failure") {
-        return {
-          _tag: "CreatedIndependentSession",
-          session,
-          transcript: validation.transcript,
-          reason: launchResult.error.message,
-          acquireLaunch: this.acquireLaunch("resume", session.id, replayText),
-        }
-      }
-      const launch = launchResult.launch
-      const acquireLaunch = this.acquireResolvedLaunch(launch)
+      const acquireLaunch = this.acquireLaunch("resume", session.id, replayText)
       if (validation._tag === "Invalid") {
         return {
           _tag: "CreatedIndependentSession",
@@ -414,6 +548,7 @@ export class ClaudeProvider implements AgentProviderApi {
     childSessionId: string,
     parentSessionId: string,
     sourcePrefix: SourcePrefix,
+    deadline: OperationDeadline,
   ): Effect.Effect<ForkReadResult> {
     return Effect.gen({ self: this }, function*() {
       let transcript: TranscriptRead = {
@@ -423,9 +558,20 @@ export class ClaudeProvider implements AgentProviderApi {
       let lastReason = "its copied prefix was not yet complete"
 
       for (let attempt = 0; attempt <= this.retryDelays.length; attempt += 1) {
-        if (attempt > 0) yield* Effect.sleep(this.retryDelays[attempt - 1] ?? 0)
+        if (attempt > 0) {
+          const remaining = yield* this.remainingMillis(deadline)
+          if (remaining <= 0) {
+            lastReason = this.deadlineError(deadline).message
+            break
+          }
+          yield* Effect.sleep(Math.min(this.retryDelays[attempt - 1] ?? 0, remaining))
+        }
 
-        const activeRead = yield* this.readClaudeTranscript(childSessionId, "validateFork").pipe(
+        const activeRead = yield* this.readClaudeTranscript(
+          childSessionId,
+          "validateFork",
+          deadline,
+        ).pipe(
           Effect.match({
             onFailure: (error) => ({ _tag: "Failure" as const, error }),
             onSuccess: (messages) => ({ _tag: "Success" as const, messages }),
@@ -444,7 +590,11 @@ export class ClaudeProvider implements AgentProviderApi {
         }
         transcript = { _tag: "Available", messages: activeRead.messages }
 
-        const physicalRead = yield* this.readConversationRecords(childSessionId, "validateFork").pipe(
+        const physicalRead = yield* this.readConversationRecords(
+          childSessionId,
+          "validateFork",
+          deadline,
+        ).pipe(
           Effect.match({
             onFailure: (error) => ({ _tag: "Failure" as const, error }),
             onSuccess: (records) => ({ _tag: "Success" as const, records }),
@@ -525,7 +675,7 @@ export class ClaudeProvider implements AgentProviderApi {
     })
   }
 
-  private listSessionSummaries(): Effect.Effect<
+  private listSessionSummaries(deadline: OperationDeadline): Effect.Effect<
     readonly AgentSession[],
     ProviderError | ProviderProtocolError
   > {
@@ -537,6 +687,7 @@ export class ClaudeProvider implements AgentProviderApi {
         includeProgrammatic: true,
       }),
       this.listSessionsTimeoutMs,
+      deadline,
     ).pipe(
       Effect.flatMap((sessions) => Effect.try({
         try: () => {
@@ -555,8 +706,9 @@ export class ClaudeProvider implements AgentProviderApi {
   private requireTranscript(
     sessionId: string,
     operation: string,
+    deadline: OperationDeadline,
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
-    return this.readClaudeTranscript(sessionId, operation).pipe(
+    return this.readClaudeTranscript(sessionId, operation, deadline).pipe(
       Effect.flatMap((messages) => messages === undefined
         ? Effect.fail(this.providerError(operation, `Claude session ${sessionId} was not found`))
         : Effect.succeed(messages)),
@@ -566,11 +718,13 @@ export class ClaudeProvider implements AgentProviderApi {
   private readClaudeTranscript(
     sessionId: string,
     operation: string,
+    deadline: OperationDeadline,
   ): Effect.Effect<readonly ClaudeMessage[] | undefined, ProviderError | ProviderProtocolError> {
     return this.callSdk(
       operation,
       () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath }),
       this.transcriptReadTimeoutMs,
+      deadline,
     ).pipe(
       Effect.flatMap((messages) => {
         if (messages === null || messages === undefined) return Effect.succeed(undefined)
@@ -589,6 +743,7 @@ export class ClaudeProvider implements AgentProviderApi {
   private readConversationRecords(
     sessionId: string,
     operation: string,
+    deadline: OperationDeadline,
   ): Effect.Effect<readonly ConversationRecord[], ProviderError | ProviderProtocolError> {
     const entries: SessionStoreEntry[] = []
     const store: SessionStore = {
@@ -606,6 +761,7 @@ export class ClaudeProvider implements AgentProviderApi {
         includeSubagents: false,
       }),
       this.provenanceImportTimeoutMs,
+      deadline,
     ).pipe(
       Effect.flatMap(() => Effect.try({
         try: () => normalizeConversationRecords(entries),
@@ -623,7 +779,9 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     draft?: string,
   ): PreparedTerminal["acquireLaunch"] {
-    return Effect.acquireRelease(this.resolveLaunch(kind, sessionId, draft), () => Effect.void)
+    return this.resolveLaunch(kind, sessionId, draft).pipe(
+      Effect.map((launch) => ({ launch, close: Effect.void })),
+    )
   }
 
   private resolveLaunch(
@@ -640,13 +798,27 @@ export class ClaudeProvider implements AgentProviderApi {
           "Could not locate the Claude Code executable",
           cause,
         ),
-      })
-      if (executable === null || executable.length === 0 || executable.includes("\0")) {
+      }).pipe(Effect.timeoutOrElse({
+        duration: this.executableLookupTimeoutMs,
+        orElse: () => Effect.fail(this.timeoutError(
+          "acquireLaunch",
+          this.executableLookupTimeoutMs,
+        )),
+      }))
+      if (typeof executable !== "string" || executable.length === 0 || executable.includes("\0")) {
         return yield* Effect.fail(this.providerError(
           "acquireLaunch",
           "Claude Code was not found on PATH",
         ))
       }
+      const observer = yield* Effect.try({
+        try: this.observerFactory,
+        catch: (cause) => this.providerError(
+          "acquireLaunch",
+          "Could not create a Claude terminal observer",
+          cause,
+        ),
+      })
       const command: [string, ...string[]] = kind === "new"
         ? [executable, "--session-id", sessionId]
         : [executable, "--resume", sessionId]
@@ -655,17 +827,11 @@ export class ClaudeProvider implements AgentProviderApi {
         sessionId,
         command,
         cwd: this.projectPath,
-        observer: new ClaudeTerminalObserver(),
+        observer,
         ...(draft === undefined ? {} : { initialDraft: { text: draft, exact: true } }),
       }
       return launch
     })
-  }
-
-  private acquireResolvedLaunch(
-    launch: TerminalLaunch,
-  ): PreparedTerminal["acquireLaunch"] {
-    return Effect.acquireRelease(Effect.succeed(launch), () => Effect.void)
   }
 
   private validateLaunchInput(
@@ -697,28 +863,67 @@ export class ClaudeProvider implements AgentProviderApi {
   private callSdk<A>(
     operation: string,
     call: () => PromiseLike<A>,
-    timeoutMs?: number,
+    timeoutMs: number,
+    deadline: OperationDeadline,
   ): Effect.Effect<A, ProviderError> {
-    const request = Effect.tryPromise({
-      try: () => handledPromise(call),
-      catch: (cause) => this.providerError(
-        operation,
-        `Claude ${operation} failed: ${errorMessage(cause)}`,
-        cause,
-      ),
+    return Effect.gen({ self: this }, function*() {
+      const budget = yield* this.timeoutBudget(operation, timeoutMs, deadline)
+      return yield* Effect.tryPromise({
+        try: () => handledPromise(call),
+        catch: (cause) => this.providerError(
+          operation,
+          `Claude ${operation} failed: ${errorMessage(cause)}`,
+          cause,
+        ),
+      }).pipe(Effect.timeoutOrElse({
+        duration: budget.durationMs,
+        orElse: () => Effect.fail(budget.error),
+      }))
     })
-    return timeoutMs === undefined
-      ? request
-      : request.pipe(Effect.timeoutOrElse({
-          duration: timeoutMs,
-          orElse: () => Effect.fail(this.timeoutError(operation, timeoutMs)),
-        }))
+  }
+
+  private makeDeadline(
+    operation: string,
+    timeoutMs: number,
+  ): Effect.Effect<OperationDeadline> {
+    return Clock.currentTimeMillis.pipe(Effect.map((now) => ({
+      operation,
+      timeoutMs,
+      expiresAt: now + timeoutMs,
+    })))
+  }
+
+  private remainingMillis(deadline: OperationDeadline): Effect.Effect<number> {
+    return Clock.currentTimeMillis.pipe(
+      Effect.map((now) => Math.max(0, deadline.expiresAt - now)),
+    )
+  }
+
+  private timeoutBudget(
+    operation: string,
+    timeoutMs: number,
+    deadline: OperationDeadline,
+  ): Effect.Effect<TimeoutBudget, ProviderError> {
+    return Effect.gen({ self: this }, function*() {
+      const remaining = yield* this.remainingMillis(deadline)
+      if (remaining <= 0) return yield* Effect.fail(this.deadlineError(deadline))
+      return timeoutMs <= remaining
+        ? { durationMs: timeoutMs, error: this.timeoutError(operation, timeoutMs) }
+        : { durationMs: remaining, error: this.deadlineError(deadline) }
+    })
   }
 
   private timeoutError(operation: string, timeoutMs: number): ProviderError {
     return this.providerError(
       operation,
       `Claude ${operation} timed out after ${timeoutMs}ms`,
+    )
+  }
+
+  private deadlineError(deadline: OperationDeadline): ProviderError {
+    return this.providerError(
+      deadline.operation,
+      `Claude ${deadline.operation} timed out after ${deadline.timeoutMs}ms`,
     )
   }
 
@@ -1042,6 +1247,10 @@ function isExactUtf8Text(value: string): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function unique(values: readonly string[]): readonly string[] {
+  return [...new Set(values)]
 }
 
 function handledPromise<A>(call: () => A | PromiseLike<A>): Promise<A> {

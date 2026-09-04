@@ -233,15 +233,25 @@ function applyConversationRemovals(
     string,
     Map<string, IndexedMessageNode[]>
   >()
+  const forkEndpointsBySourceNodeId = new Map<string, IndexedMessageNode[]>()
   for (const graph of rawGraphs) {
     for (const node of graph.nodes.values()) {
-      if (node.kind !== "message") continue
-      for (const alias of node.aliases) {
-        const nodesByMessageId = messageNodesBySessionId.get(alias.sessionId) ?? new Map()
-        const matches = nodesByMessageId.get(alias.messageId) ?? []
+      if (node.kind === "message") {
+        for (const alias of node.aliases) {
+          const nodesByMessageId = messageNodesBySessionId.get(alias.sessionId) ?? new Map()
+          const matches = nodesByMessageId.get(alias.messageId) ?? []
+          matches.push({ graph, nodeId: node.id })
+          nodesByMessageId.set(alias.messageId, matches)
+          messageNodesBySessionId.set(alias.sessionId, nodesByMessageId)
+        }
+      } else if (
+        node.kind === "endpoint" &&
+        node.fork &&
+        !isAncestorNode(graph, node.fork.sourceNodeId, node.id)
+      ) {
+        const matches = forkEndpointsBySourceNodeId.get(node.fork.sourceNodeId) ?? []
         matches.push({ graph, nodeId: node.id })
-        nodesByMessageId.set(alias.messageId, matches)
-        messageNodesBySessionId.set(alias.sessionId, nodesByMessageId)
+        forkEndpointsBySourceNodeId.set(node.fork.sourceNodeId, matches)
       }
     }
   }
@@ -272,6 +282,10 @@ function applyConversationRemovals(
       for (const alias of removal.target.aliases) {
         const matches = messageNodesBySessionId.get(alias.sessionId)?.get(alias.messageId) ?? []
         for (const match of matches) addTarget(match.graph, match.nodeId)
+        const sourceNodeId = messageNodeId(alias.sessionId, alias.messageId)
+        for (const match of forkEndpointsBySourceNodeId.get(sourceNodeId) ?? []) {
+          addTarget(match.graph, detachedPathRootNodeId(match.graph, match.nodeId))
+        }
       }
       continue
     }
@@ -329,6 +343,27 @@ function applyConversationRemovals(
     graphByRootSessionId,
     warnings: graphs.flatMap((graph) => graph.warnings),
   }
+}
+
+function detachedPathRootNodeId(graph: ConversationGraph, endpointId: string): string {
+  let nodeId = endpointId
+  let node = graph.nodes.get(nodeId)
+  while (node?.parentId && node.parentId !== graph.originNodeId) {
+    nodeId = node.parentId
+    node = graph.nodes.get(nodeId)
+  }
+  return nodeId
+}
+
+function isAncestorNode(graph: ConversationGraph, ancestorNodeId: string, nodeId: string): boolean {
+  const visited = new Set<string>()
+  let currentNodeId: string | null = nodeId
+  while (currentNodeId && !visited.has(currentNodeId)) {
+    if (currentNodeId === ancestorNodeId) return true
+    visited.add(currentNodeId)
+    currentNodeId = graph.nodes.get(currentNodeId)?.parentId ?? null
+  }
+  return false
 }
 
 function intersects(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
@@ -503,11 +538,17 @@ function attachChildSession(
       displayGroupEndIdsBySession.get(child.id) ?? new Set(),
       context,
     )
+    const finalMessageNodeId = lastDefined(context.rawLogicalNodeIds)
     appendEndpoint(
       graph,
       child,
-      lastDefined(context.rawLogicalNodeIds) ?? graph.originNodeId,
+      finalMessageNodeId ?? graph.originNodeId,
       forkTargetForLastMessage(child.id, transcript),
+      {
+        sourceNodeId: messageNodeId(relation.parentSessionId, relation.sourceMessageId),
+        createdAt: relation.createdAt,
+        empty: finalMessageNodeId === undefined,
+      },
     )
     contextFor(graph).set(child.id, context)
     return null

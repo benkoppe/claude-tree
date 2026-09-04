@@ -5,7 +5,6 @@ import {
   Fiber,
   Layer,
   Queue,
-  Schedule,
   Scope,
 } from "effect"
 
@@ -156,16 +155,16 @@ function makeEnabledHerdrReporter(
       { startImmediately: true },
     )
     const heartbeatFiber = yield* Effect.forkScoped(
-      Effect.sleep(HERDR_HEARTBEAT_INTERVAL_MS).pipe(
-        Effect.andThen(
-          Effect.sync(() => currentActivity).pipe(
-            Effect.flatMap((activity) =>
-              activity === undefined ? Effect.void : enqueueCurrent(activity)
+      Effect.forever(
+        Effect.sleep(HERDR_HEARTBEAT_INTERVAL_MS).pipe(
+          Effect.andThen(
+            Effect.sync(() => currentActivity).pipe(
+              Effect.flatMap((activity) =>
+                activity === undefined ? Effect.void : enqueueCurrent(activity)
+              ),
             ),
           ),
         ),
-        Effect.repeat(Schedule.spaced(HERDR_HEARTBEAT_INTERVAL_MS)),
-        Effect.asVoid,
       ),
       { startImmediately: true },
     )

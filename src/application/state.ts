@@ -2,7 +2,6 @@ import type {
   AgentActivity,
   AgentMessage,
   AgentSession,
-  BranchDerivation,
   DraftPreview,
   NavigationTarget,
   TranscriptRead,
@@ -44,15 +43,9 @@ export type ApplicationModal =
     }
 
 export interface TerminalState {
+  readonly ownerId?: string
   readonly activity: AgentActivity
   readonly phase: "showing" | "running" | "stopping" | "cleanup-incomplete"
-}
-
-export interface PendingTerminalShow {
-  readonly sessionId: string
-  readonly returnTo: NavigatorSurface
-  readonly reportFailure: boolean
-  readonly previous?: TerminalState
 }
 
 export interface RewindAnchor {
@@ -61,6 +54,7 @@ export interface RewindAnchor {
 }
 
 export interface PendingCompletion {
+  readonly ownerId: string
   readonly version: number
   readonly baseline: readonly AgentMessage[]
   readonly markUnviewed: boolean
@@ -68,21 +62,13 @@ export interface PendingCompletion {
 }
 
 export interface ActiveRefresh {
+  readonly key: string
   readonly generation: number
-  readonly reason: "initial" | "manual" | "terminal-return" | "completion" | "stop"
+  readonly reason: "initial" | "manual" | "terminal-return" | "completion" | "stop" | "ambiguity"
   readonly mode: "full" | "incremental"
-  readonly focusSessionId?: string
-  readonly sessionIds?: ReadonlySet<string>
-  readonly completionVersions: ReadonlyMap<string, number>
-}
-
-export interface PendingRemoval {
-  readonly removal: ConversationRemoval
-  readonly waitingForSessionIds: ReadonlySet<string>
-}
-
-export interface PendingIdentityAdoption {
-  readonly session: AgentSession
+  readonly sessionIds: ReadonlySet<string>
+  readonly completionVersion?: number
+  readonly ambiguityReason?: string
 }
 
 export interface ProviderSnapshotState {
@@ -104,17 +90,13 @@ export interface ApplicationState {
   readonly surface: ApplicationSurface
   readonly modal: ApplicationModal | null
   readonly terminals: ReadonlyMap<string, TerminalState>
-  readonly pendingTerminalShow: PendingTerminalShow | null
   readonly drafts: ReadonlyMap<string, DraftPreview>
   readonly rewindAnchors: ReadonlyMap<string, RewindAnchor>
   readonly pendingCompletions: ReadonlyMap<string, PendingCompletion>
   readonly unviewedSessionIds: ReadonlySet<string>
-  readonly pendingRemovals: ReadonlyMap<string, PendingRemoval>
-  readonly pendingRelations: ReadonlyMap<string, BranchDerivation>
-  readonly pendingIdentityAdoptions: ReadonlyMap<string, PendingIdentityAdoption>
   readonly refresh: {
     readonly generation: number
-    readonly active: ActiveRefresh | null
+    readonly active: ReadonlyMap<string, ActiveRefresh>
     readonly initialPending: boolean
   }
   readonly nextCompletionVersion: number
@@ -138,15 +120,11 @@ export function makeInitialApplicationState(
     surface: initial.surface ?? { _tag: "Roots", selectedSessionId: null },
     modal: null,
     terminals: new Map(),
-    pendingTerminalShow: null,
     drafts: new Map(),
     rewindAnchors: new Map(),
     pendingCompletions: new Map(),
     unviewedSessionIds: new Set(),
-    pendingRemovals: new Map(),
-    pendingRelations: new Map(),
-    pendingIdentityAdoptions: new Map(),
-    refresh: { generation: 0, active: null, initialPending: true },
+    refresh: { generation: 0, active: new Map(), initialPending: true },
     nextCompletionVersion: 0,
     shutdown: "running",
   }

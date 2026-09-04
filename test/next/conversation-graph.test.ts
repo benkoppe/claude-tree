@@ -111,6 +111,42 @@ describe("next conversation graph", () => {
     expect(graph.warnings).toEqual([])
   })
 
+  test("materializes an empty fork after compaction removes all mapped history", () => {
+    const currentParent = message("current-parent", "user", "after compaction", 0)
+    const sessions = [session(ROOT, 20), session(CHILD, 10)]
+    const transcripts = new Map([[ROOT, [currentParent]], [CHILD, []]])
+    const relations = [relation(CHILD, ROOT, "missing-source", [{
+      parentMessageId: "missing-source",
+      childMessageId: "missing-copy",
+    }])]
+    const graph = buildConversationForest(
+      sessions,
+      transcripts,
+      relations,
+    ).graphs[0]!
+    const endpointId = graph.endpointBySessionId.get(CHILD)!
+    const endpoint = graph.nodes.get(endpointId)
+    const layout = layoutConversationGraph(graph, 100)
+
+    expect(endpoint).toMatchObject({
+      kind: "endpoint",
+      parentId: graph.originNodeId,
+      fork: {
+        sourceNodeId: `message:${encodeURIComponent(ROOT)}:${encodeURIComponent("missing-source")}`,
+        empty: true,
+      },
+    })
+    expect(layout.nodes.has(endpointId)).toBeTrue()
+
+    const removed = buildConversationForest(
+      sessions,
+      transcripts,
+      relations,
+      [messageRemoval([{ sessionId: ROOT, messageId: "missing-source" }])],
+    ).graphs[0]!
+    expect(removed.endpointBySessionId.has(CHILD)).toBeFalse()
+  })
+
   test("retains descendant history after its parent rewinds", () => {
     const root = [message("root-source", "agent", "root", 0)]
     const originalChild = [
@@ -231,6 +267,28 @@ describe("next conversation graph", () => {
     expect(aliasPruned.graphBySessionId.size).toBe(0)
   })
 
+  test("source removal preserves ancestors of an ordinarily attached empty fork", () => {
+    const parent = [
+      message("before", "user", "before", 0),
+      message("source", "agent", "source", 1),
+      message("parent-tail", "user", "parent tail", 2),
+    ]
+    const child = [
+      message("child-before", "user", "before", 0),
+      message("child-source", "agent", "source", 1),
+    ]
+    const forest = buildConversationForest(
+      [session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, parent], [CHILD, child]]),
+      [relation(CHILD, ROOT, parent[1]!.id, shared(parent, child, 2))],
+      [messageRemoval([{ sessionId: ROOT, messageId: parent[1]!.id }])],
+    )
+
+    expect(forest.graphs).toHaveLength(1)
+    expect(previews(forest.graphs[0]!)).toEqual(["before"])
+    expect(forest.graphs[0]!.endpointBySessionId.has(CHILD)).toBeFalse()
+  })
+
   test("groups assistant records and forks from the latest represented record", () => {
     const messages = [
       message("user", "user", "question", 0),
@@ -256,10 +314,13 @@ describe("next conversation graph", () => {
   test("keeps zero-prefix replay paths in one synthetic family", () => {
     const rootMessage = message("root prompt", "user", "original", 0)
     const replayMessage = message("replay prompt", "user", "edited", 0)
+    const sessions = [session(ROOT, 20), session(CHILD, 10)]
+    const transcripts = new Map([[ROOT, [rootMessage]], [CHILD, [replayMessage]]])
+    const relations = [relation(CHILD, ROOT, rootMessage.id, [])]
     const graph = buildConversationForest(
-      [session(ROOT, 20), session(CHILD, 10)],
-      new Map([[ROOT, [rootMessage]], [CHILD, [replayMessage]]]),
-      [relation(CHILD, ROOT, rootMessage.id, [])],
+      sessions,
+      transcripts,
+      relations,
     ).graphs[0]!
     const origin = graph.nodes.get(graph.originNodeId)!
 
@@ -270,6 +331,12 @@ describe("next conversation graph", () => {
     ])
     expect(reachableSessionEndpoints(graph, graph.rootNodeId).map(({ endpoint }) => endpoint.session.id))
       .toEqual([ROOT])
+    expect(buildConversationForest(
+      sessions,
+      transcripts,
+      relations,
+      [messageRemoval([{ sessionId: ROOT, messageId: rootMessage.id }])],
+    ).graphs).toEqual([])
   })
 
   test("materializes empty forks and preserves reversible navigation intent", () => {

@@ -6,13 +6,14 @@ import type {
   SessionStore,
   SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk"
-import { Effect, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
-import { ProviderProtocolError } from "../../src/domain/errors"
+import { ProviderError, ProviderProtocolError } from "../../src/domain/errors"
 import {
   ClaudeProvider,
   claudeProviderLayer,
+  type ClaudeProviderDependencies,
   type ClaudeSdk,
 } from "../../src/infrastructure/providers/claude/provider"
 import {
@@ -89,6 +90,30 @@ describe("Effect Claude provider", () => {
     expect(transcript.messages[4]?.copyIdentity).toBe(JSON.stringify(secondAgent.message))
   })
 
+  test("loads incremental snapshots with all metadata and deduplicated requested reads", async () => {
+    const reads: string[] = []
+    const provider = providerWith({
+      messages: {
+        [ROOT]: () => {
+          reads.push(ROOT)
+          return [message(ROOT, "root-message", "user", "root")]
+        },
+        [CHILD]: () => {
+          reads.push(CHILD)
+          return [message(CHILD, "child-message", "user", "child")]
+        },
+      },
+    })
+
+    const snapshot = await Effect.runPromise(provider.loadSessionSnapshotFor([CHILD, CHILD]))
+    expect(snapshot.sessions.map((session) => session.id)).toEqual([ROOT, CHILD])
+    expect([...snapshot.transcripts.keys()]).toEqual([CHILD])
+    expect(reads).toEqual([CHILD])
+
+    await Effect.runPromise(provider.readTranscripts([ROOT, ROOT, CHILD, ROOT]))
+    expect(reads).toEqual([CHILD, ROOT, CHILD])
+  })
+
   test("allocates new sessions with TestClock and acquires exact commands lazily in scope", async () => {
     let executableReads = 0
     const provider = providerWith({
@@ -110,9 +135,10 @@ describe("Effect Claude provider", () => {
     })
     expect(executableReads).toBe(0)
 
-    const launch = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
+    const acquired = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
     expect(executableReads).toBe(1)
-    expect(launch.command).toEqual(["/usr/local/bin/claude", "--session-id", NEW])
+    expect(acquired.launch.command).toEqual(["/usr/local/bin/claude", "--session-id", NEW])
+    await Effect.runPromise(acquired.close)
 
     const resumed = await Effect.runPromise(provider.prepareResume({
       id: ROOT,
@@ -120,11 +146,37 @@ describe("Effect Claude provider", () => {
       lastModified: 1,
     }))
     expect(executableReads).toBe(1)
-    expect((await Effect.runPromise(Effect.scoped(resumed.acquireLaunch))).command).toEqual([
+    expect((await Effect.runPromise(Effect.scoped(resumed.acquireLaunch))).launch.command).toEqual([
       "/usr/local/bin/claude",
       "--resume",
       ROOT,
     ])
+  })
+
+  test("returns an explicit close effect and creates a fresh observer for every acquisition", async () => {
+    const observers: ClaudeTerminalObserver[] = []
+    const provider = providerWith({
+      observerFactory: () => {
+        const observer = new ClaudeTerminalObserver()
+        observers.push(observer)
+        return observer
+      },
+    })
+    const prepared = await Effect.runPromise(provider.prepareResume({
+      id: ROOT,
+      title: "Root",
+      lastModified: 1,
+    }))
+
+    const first = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
+    const second = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
+
+    expect(observers).toHaveLength(2)
+    expect(first.launch.observer).toBe(observers[0]!)
+    expect(second.launch.observer).toBe(observers[1]!)
+    expect(first.launch.observer).not.toBe(second.launch.observer)
+    await Effect.runPromise(first.close)
+    await Effect.runPromise(second.close)
   })
 
   test("replays user text from the nearest agent with exact prefill", async () => {
@@ -168,7 +220,7 @@ describe("Effect Claude provider", () => {
         { parentMessageId: "agent-1", childMessageId: "child-2" },
       ],
     })
-    const launch = await Effect.runPromise(Effect.scoped(outcome.acquireLaunch))
+    const launch = (await Effect.runPromise(Effect.scoped(outcome.acquireLaunch))).launch
     expect(launch.command).toEqual([
       "/usr/bin/claude",
       "--resume",
@@ -205,7 +257,7 @@ describe("Effect Claude provider", () => {
       sourceMessageId: "user-1",
       sharedMessages: [],
     })
-    expect((await Effect.runPromise(Effect.scoped(outcome.acquireLaunch))).command).toEqual([
+    expect((await Effect.runPromise(Effect.scoped(outcome.acquireLaunch))).launch.command).toEqual([
       "/usr/bin/claude",
       "--session-id",
       NEW,
@@ -323,6 +375,207 @@ describe("Effect Claude provider", () => {
     expect(childReads).toBe(2)
   })
 
+  test("returns ambiguity when forkSession rejects immediately after invocation", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    let forkCalls = 0
+    const provider = providerWith({
+      messages: { [ROOT]: parent },
+      physical: { [ROOT]: parent },
+      forkSession: () => {
+        forkCalls += 1
+        return Promise.reject(new Error("write result unavailable"))
+      },
+    })
+
+    const outcome = await Effect.runPromise(provider.branchFrom({
+      sessionId: ROOT,
+      messageId: "parent-1",
+    }))
+
+    expect(outcome).toEqual({
+      _tag: "AmbiguousBranchMutation",
+      providerId: "claude",
+      parentSessionId: ROOT,
+      sourceMessageId: "parent-1",
+      reason:
+        "Claude forkSession failed after invocation: write result unavailable; Claude may have created a child session",
+      reconciliation: "full-snapshot",
+    })
+    expect(forkCalls).toBe(1)
+  })
+
+  test("returns ambiguity when fork creation times out and never retries after late settlement", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    let forkCalls = 0
+    let rejectFork: ((cause: unknown) => void) | undefined
+    const unhandled: unknown[] = []
+    const onUnhandled = (cause: unknown) => unhandled.push(cause)
+    process.on("unhandledRejection", onUnhandled)
+    const provider = providerWith({
+      messages: { [ROOT]: parent },
+      physical: { [ROOT]: parent },
+      forkSession: () => new Promise((_resolve, reject) => {
+        forkCalls += 1
+        rejectFork = reject
+      }),
+      forkSessionTimeoutMs: 10,
+      forkValidationTimeoutMs: 100,
+      operationTimeoutMs: 100,
+    })
+
+    try {
+      const outcome = await Effect.runPromise(Effect.provide(
+        Effect.gen(function*() {
+          const fiber = yield* Effect.forkChild(provider.branchFrom({
+            sessionId: ROOT,
+            messageId: "parent-1",
+          }))
+          yield* Effect.yieldNow
+          yield* TestClock.adjust(10)
+          return yield* Fiber.join(fiber)
+        }),
+        TestClock.layer(),
+      ))
+
+      expect(outcome).toEqual({
+        _tag: "AmbiguousBranchMutation",
+        providerId: "claude",
+        parentSessionId: ROOT,
+        sourceMessageId: "parent-1",
+        reason: "Claude forkSession timed out after 10ms; Claude may have created a child session",
+        reconciliation: "full-snapshot",
+      })
+      expect(forkCalls).toBe(1)
+      rejectFork?.(new Error("late fork rejection"))
+      await Bun.sleep(5)
+      expect(forkCalls).toBe(1)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+
+  test("ignores a late fork success after timeout without retrying or validating it", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    let forkCalls = 0
+    let childReads = 0
+    let resolveFork: ((result: { readonly sessionId: string }) => void) | undefined
+    const provider = providerWith({
+      messages: {
+        [ROOT]: parent,
+        [CHILD]: () => {
+          childReads += 1
+          return []
+        },
+      },
+      physical: { [ROOT]: parent },
+      forkSession: () => new Promise((resolve) => {
+        forkCalls += 1
+        resolveFork = resolve
+      }),
+      forkSessionTimeoutMs: 10,
+      forkValidationTimeoutMs: 100,
+      operationTimeoutMs: 100,
+    })
+
+    const outcome = await Effect.runPromise(Effect.provide(
+      Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(provider.branchFrom({
+          sessionId: ROOT,
+          messageId: "parent-1",
+        }))
+        yield* Effect.yieldNow
+        yield* TestClock.adjust(10)
+        return yield* Fiber.join(fiber)
+      }),
+      TestClock.layer(),
+    ))
+
+    expect(outcome._tag).toBe("AmbiguousBranchMutation")
+    resolveFork?.({ sessionId: CHILD })
+    await Promise.resolve()
+    expect(forkCalls).toBe(1)
+    expect(childReads).toBe(0)
+  })
+
+  test("queues reconciliation and preserves interruption after forkSession invocation", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    let forkCalls = 0
+    let rejectFork: ((cause: unknown) => void) | undefined
+    const unhandled: unknown[] = []
+    const onUnhandled = (cause: unknown) => unhandled.push(cause)
+    process.on("unhandledRejection", onUnhandled)
+    const provider = providerWith({
+      messages: { [ROOT]: parent },
+      physical: { [ROOT]: parent },
+      forkSession: () => new Promise((_resolve, reject) => {
+        forkCalls += 1
+        rejectFork = reject
+      }),
+    })
+
+    try {
+      const fiber = Effect.runFork(provider.branchFrom({
+        sessionId: ROOT,
+        messageId: "parent-1",
+      }))
+      await waitUntil(() => rejectFork !== undefined)
+      await Effect.runPromise(Fiber.interrupt(fiber))
+      const exit = await Effect.runPromise(Fiber.await(fiber))
+
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+      expect(await Effect.runPromise(provider.takeBranchMutationReconciliation)).toEqual({
+        _tag: "AmbiguousBranchMutation",
+        providerId: "claude",
+        parentSessionId: ROOT,
+        sourceMessageId: "parent-1",
+        reason:
+          "Claude forkSession was interrupted after invocation; Claude may have created a child session",
+        reconciliation: "full-snapshot",
+      })
+      expect(forkCalls).toBe(1)
+
+      rejectFork?.(new Error("late interrupted rejection"))
+      await Bun.sleep(5)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+
+  test("queues reconciliation when interrupted after the fork child ID is known", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+
+    const signal = await Effect.runPromise(Effect.gen(function*() {
+      const childReadStarted = yield* Deferred.make<void>()
+      const provider = providerWith({
+        messages: {
+          [ROOT]: parent,
+          [CHILD]: () => {
+            Deferred.doneUnsafe(childReadStarted, Effect.void)
+            return new Promise<never>(() => undefined)
+          },
+        },
+        physical: { [ROOT]: parent },
+      })
+      const fiber = yield* Effect.forkChild(provider.branchFrom({
+        sessionId: ROOT,
+        messageId: "parent-1",
+      }))
+      yield* Deferred.await(childReadStarted)
+      yield* Fiber.interrupt(fiber)
+      return yield* provider.takeBranchMutationReconciliation
+    }))
+
+    expect(signal).toMatchObject({
+      _tag: "AmbiguousBranchMutation",
+      providerId: "claude",
+      parentSessionId: ROOT,
+      sourceMessageId: "parent-1",
+      reconciliation: "full-snapshot",
+    })
+  })
+
   test("returns CreatedIndependentSession after post-create payload validation fails", async () => {
     const parent = [
       message(ROOT, "parent-1", "user", "question"),
@@ -385,23 +638,32 @@ describe("Effect Claude provider", () => {
     })
   })
 
-  test("returns CreatedIndependentSession after post-create launch preparation fails", async () => {
+  test("retains reconciliation for every unusable returned child ID", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
-    const provider = providerWith({
-      messages: { [ROOT]: parent },
-      physical: { [ROOT]: parent },
-      childSessionId: "invalid\0child",
-    })
 
-    const outcome = await Effect.runPromise(provider.branchFrom({
-      sessionId: ROOT,
-      messageId: "parent-1",
-    }))
+    for (const childSessionId of ["", "invalid\0child", ROOT]) {
+      const provider = providerWith({
+        messages: { [ROOT]: parent },
+        physical: { [ROOT]: parent },
+        childSessionId,
+      })
+      const outcome = await Effect.runPromise(provider.branchFrom({
+        sessionId: ROOT,
+        messageId: "parent-1",
+      }))
 
-    expect(outcome._tag).toBe("CreatedIndependentSession")
-    if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected independent")
-    expect(outcome.reason).toBe("Claude session IDs must be non-empty and cannot contain null bytes")
-    expect(outcome.acquireLaunch).toBeUndefined()
+      expect(outcome._tag).toBe("AmbiguousBranchMutation")
+      if (outcome._tag !== "AmbiguousBranchMutation") throw new Error("expected ambiguity")
+      expect(outcome).toMatchObject({
+        parentSessionId: ROOT,
+        sourceMessageId: "parent-1",
+        reconciliation: "full-snapshot",
+        reason: "Claude returned an invalid or non-distinct child session ID after creating a fork",
+      })
+      expect(await Effect.runPromise(provider.takeBranchMutationReconciliation)).toEqual(outcome)
+      expect("acquireLaunch" in outcome).toBeFalse()
+      expect("session" in outcome).toBeFalse()
+    }
   })
 
   test("times out a hung session list through the typed provider error channel", async () => {
@@ -422,6 +684,48 @@ describe("Effect Claude provider", () => {
 
     expect(error.message).toBe("Claude listSessions timed out after 10ms")
     expect(error.operation).toBe("listSessions")
+  })
+
+  test("uses one absolute deadline across session listing and transcript reads", async () => {
+    let resolveList: ((sessions: readonly SDKSessionInfo[]) => void) | undefined
+    let rootReads = 0
+    const provider = providerWith({
+      listSessions: () => new Promise((resolve) => {
+        resolveList = resolve
+      }),
+      messages: {
+        [ROOT]: () => {
+          rootReads += 1
+          return new Promise<never>(() => undefined)
+        },
+      },
+      operationTimeoutMs: 10,
+      listSessionsTimeoutMs: 100,
+      transcriptReadTimeoutMs: 100,
+    })
+
+    const snapshot = await Effect.runPromise(Effect.provide(
+      Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(provider.loadSessionSnapshot)
+        yield* Effect.yieldNow
+        yield* TestClock.adjust(6)
+        resolveList?.([
+          { sessionId: ROOT, summary: "Root", lastModified: 1 },
+          { sessionId: CHILD, summary: "Child", lastModified: 1 },
+        ])
+        yield* Effect.yieldNow
+        yield* Effect.yieldNow
+        expect(rootReads).toBe(1)
+        yield* TestClock.adjust(4)
+        return yield* Fiber.join(fiber)
+      }),
+      TestClock.layer(),
+    ))
+
+    expect(snapshot.transcripts.get(ROOT)).toEqual({
+      _tag: "Unavailable",
+      reason: "Claude loadSessionSnapshot timed out after 10ms",
+    })
   })
 
   test("bounds transcript reads and turns a hung read into an unavailable transcript", async () => {
@@ -589,24 +893,25 @@ describe("Effect Claude provider", () => {
     expect(outcome._tag).toBe("CreatedIndependentSession")
     if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected independent")
     expect(outcome.session.id).toBe(CHILD)
-    expect(outcome.reason).toBe("Claude validateFork timed out after 10ms")
+    expect(outcome.reason).toContain("Claude branchFrom timed out after 10ms")
   })
 
-  test("represents a created child independently when executable lookup fails and can retry launch", async () => {
+  test("retains validated ancestry when bounded executable lookup later times out", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     const copied = [copyMessage(parent[0]!, CHILD, "child-1")]
     let executableReads = 0
+    let rejectLate: ((cause: unknown) => void) | undefined
     const provider = providerWith({
       messages: { [ROOT]: parent, [CHILD]: copied },
       physical: {
         [ROOT]: parent,
         [CHILD]: [copiedRecord(copied[0]!, ROOT, parent[0]!.uuid)],
       },
-      resolveExecutable: () => {
+      resolveExecutable: () => new Promise<never>((_resolve, reject) => {
         executableReads += 1
-        if (executableReads === 1) throw new Error("temporary lookup failure")
-        return "/usr/bin/claude"
-      },
+        rejectLate = reject
+      }),
+      executableLookupTimeoutMs: 10,
     })
 
     const outcome = await Effect.runPromise(provider.branchFrom({
@@ -614,14 +919,28 @@ describe("Effect Claude provider", () => {
       messageId: "parent-1",
     }))
 
-    expect(outcome._tag).toBe("CreatedIndependentSession")
-    if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected independent")
-    expect(outcome.reason).toBe("Could not locate the Claude Code executable")
-    expect(outcome.transcript._tag).toBe("Available")
-    expect(outcome.acquireLaunch).toBeDefined()
-    const launch = await Effect.runPromise(Effect.scoped(outcome.acquireLaunch!))
-    expect(launch.command).toEqual(["/usr/bin/claude", "--resume", CHILD])
-    expect(executableReads).toBe(2)
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error("expected validated branch")
+    expect(outcome.derivation.sharedMessages).toEqual([
+      { parentMessageId: "parent-1", childMessageId: "child-1" },
+    ])
+    expect(executableReads).toBe(0)
+
+    const error = await Effect.runPromise(Effect.provide(
+      Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(Effect.scoped(outcome.acquireLaunch))
+        yield* Effect.yieldNow
+        yield* TestClock.adjust(10)
+        return yield* Fiber.join(fiber).pipe(Effect.flip)
+      }),
+      TestClock.layer(),
+    ))
+    expect(error).toBeInstanceOf(ProviderError)
+    expect(error.operation).toBe("acquireLaunch")
+    expect(error.message).toBe("Claude acquireLaunch timed out after 10ms")
+    expect(executableReads).toBe(1)
+    rejectLate?.(new Error("late lookup rejection"))
+    await Promise.resolve()
   })
 })
 
@@ -680,10 +999,18 @@ interface FakeOptions {
       (() => readonly SessionStoreEntry[] | PromiseLike<readonly SessionStoreEntry[]>)
   >>
   readonly childSessionId?: string
+  readonly forkSession?: (
+    sessionId: string,
+    options: { readonly dir: string; readonly upToMessageId: string },
+  ) => { readonly sessionId: string } | PromiseLike<{ readonly sessionId: string }>
   readonly onFork?: (messageId: string) => void
   readonly resolveExecutable?: () => string | null | PromiseLike<string | null>
+  readonly observerFactory?: () => ClaudeTerminalObserver
   readonly randomUUID?: () => string
   readonly retryDelays?: readonly number[]
+  readonly operationTimeoutMs?: number
+  readonly executableLookupTimeoutMs?: number
+  readonly forkSessionTimeoutMs?: number
   readonly forkValidationTimeoutMs?: number
   readonly listSessionsTimeoutMs?: number
   readonly transcriptReadTimeoutMs?: number
@@ -706,10 +1033,22 @@ function providerWith(options: FakeOptions = {}): ClaudeProvider {
     {
       sdk,
       resolveExecutable: options.resolveExecutable ?? (() => "/usr/bin/claude"),
+      ...(options.observerFactory === undefined
+        ? {}
+        : { observerFactory: options.observerFactory }),
       ...(options.randomUUID === undefined ? {} : { randomUUID: options.randomUUID }),
     },
     {
       forkValidationRetryDelaysMs: options.retryDelays ?? [],
+      ...(options.operationTimeoutMs === undefined
+        ? {}
+        : { operationTimeoutMs: options.operationTimeoutMs }),
+      ...(options.executableLookupTimeoutMs === undefined
+        ? {}
+        : { executableLookupTimeoutMs: options.executableLookupTimeoutMs }),
+      ...(options.forkSessionTimeoutMs === undefined
+        ? {}
+        : { forkSessionTimeoutMs: options.forkSessionTimeoutMs }),
       ...(options.forkValidationTimeoutMs === undefined
         ? {}
         : { forkValidationTimeoutMs: options.forkValidationTimeoutMs }),
@@ -741,8 +1080,9 @@ function fakeSdk(
       if (configured instanceof Error) throw configured
       return typeof configured === "function" ? configured() : configured
     },
-    async forkSession(_sessionId, forkOptions) {
+    async forkSession(sessionId, forkOptions) {
       options.onFork?.(forkOptions.upToMessageId)
+      if (options.forkSession) return options.forkSession(sessionId, forkOptions)
       return { sessionId: options.childSessionId ?? CHILD }
     },
     async importSessionToStore(sessionId, store) {

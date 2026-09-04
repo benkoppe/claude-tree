@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { createTestRenderer } from "@opentui/core/testing"
-import { Deferred, Effect, Fiber, PubSub } from "effect"
+import { Deferred, Effect, Fiber, SubscriptionRef } from "effect"
 
 import type {
   AppRuntime,
@@ -12,6 +12,7 @@ import type {
   SurfaceViewModel,
 } from "../../src/application"
 import {
+  ApplicationOperationError,
   available,
   makeInitialApplicationState,
   projectApplicationViewModel,
@@ -75,6 +76,146 @@ test("renders asynchronous runtime updates without polling", async () => {
     const rendered = await frame(setup, (value) => value.includes("Updated asynchronously"))
     expect(rendered).not.toContain("First conversation")
   } finally {
+    await running.stop()
+  }
+})
+
+test("contains a throwing terminal title update and renders later updates", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  let threw = false
+  const running = await startPresentation(
+    setup.renderer,
+    rootsView(),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    {},
+    {
+      setTerminalTitle: (title) => {
+        if (!threw && title.includes("Broken render")) {
+          threw = true
+          throw new Error("terminal title defect")
+        }
+      },
+    },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("First conversation"))
+    await Effect.runPromise(running.harness.update(linearGraph("root-1", "Broken render", "broken update")))
+    const failure = await frame(setup, (value) => value.includes("Render update") && value.includes("terminal title defect"))
+    expect(failure).toContain("Error")
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => value.includes("Conversation roots") && !value.includes("terminal title defect"))
+    await Effect.runPromise(running.harness.update(linearGraph("root-1", "Recovered render", "later update")))
+    await frame(setup, (value) => value.includes("later update"))
+  } finally {
+    await running.stop()
+  }
+})
+
+test("reports a rejected runtime action and processes a later action", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  let attempts = 0
+  const running = await startPresentation(
+    setup.renderer,
+    rootsView(),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    {
+      refresh: () => {
+        attempts += 1
+        return attempts === 1 ? Effect.fail(new Error("refresh rejected")) : Effect.void
+      },
+    },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("r")
+    await frame(setup, (value) => value.includes("Action failed") && value.includes("refresh rejected"))
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => value.includes("Conversation roots") && !value.includes("refresh rejected"))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => attempts === 2)
+    expect(running.harness.calls.filter((call) => call === "refresh")).toHaveLength(2)
+  } finally {
+    await running.stop()
+  }
+})
+
+test("preserves one operation-specific modal for an application-reported action failure", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(
+    setup.renderer,
+    rootsView(),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    {
+      reportedRefreshFailure: new ApplicationOperationError({
+        intent: "Refresh",
+        operation: "Refresh conversations",
+        message: "snapshot failed",
+      }),
+    },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("r")
+    const rendered = await frame(setup, (value) => value.includes("Refresh conversations: snapshot failed"))
+    expect(rendered).not.toContain("Action failed")
+
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => value.includes("Conversation roots") && !value.includes("snapshot failed"))
+    expect(running.harness.modalUpdates).toEqual([{
+      _tag: "Error",
+      message: "Refresh conversations: snapshot failed",
+    }])
+  } finally {
+    await running.stop()
+  }
+})
+
+test("runs an action and accepts later input when its pending render defects", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  let content: ReturnType<typeof setup.renderer.root.findDescendantById>
+  let defectPending = true
+  const running = await startPresentation(
+    setup.renderer,
+    rootsView(),
+    new Map(),
+    undefined,
+    Effect.succeed(true),
+    {
+      beforeRefresh: () => {
+        if (!defectPending) return
+        defectPending = false
+        content = setup.renderer.root.findDescendantById("next-content")
+        if (!content) throw new Error("Presentation content was not mounted")
+        Object.defineProperty(content, "content", {
+          configurable: true,
+          set: () => {
+            Reflect.deleteProperty(content!, "content")
+            throw new Error("pending render defect")
+          },
+        })
+      },
+    },
+  )
+
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.filter((call) => call === "refresh").length === 1)
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => value.includes("Conversation roots") && !value.includes("pending render defect"))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.filter((call) => call === "refresh").length === 2)
+  } finally {
+    if (content) Reflect.deleteProperty(content, "content")
     await running.stop()
   }
 })
@@ -407,12 +548,16 @@ test("shows minimum dimensions and repairs the navigator after resize", async ()
 interface RuntimeHarness {
   readonly runtime: AppRuntime
   readonly calls: string[]
+  readonly modalUpdates: ApplicationModal[]
   readonly update: (viewModel: ApplicationViewModel) => Effect.Effect<void>
 }
 
 interface RuntimeActionOverrides {
   readonly newSession?: Effect.Effect<boolean>
   readonly openEndpoint?: (sessionId: string) => Effect.Effect<boolean>
+  readonly beforeRefresh?: () => void
+  readonly reportedRefreshFailure?: ApplicationOperationError
+  readonly refresh?: () => Effect.Effect<unknown, unknown>
 }
 
 async function startPresentation(
@@ -422,6 +567,7 @@ async function startPresentation(
   terminalReturn?: ApplicationViewModel,
   shutdown: Effect.Effect<boolean> = Effect.succeed(true),
   actionOverrides: RuntimeActionOverrides = {},
+  presentationOptions: Parameters<typeof makeOpenTuiPresentation>[3] = {},
 ): Promise<{
   presentation: OpenTuiPresentation
   harness: RuntimeHarness
@@ -433,7 +579,7 @@ async function startPresentation(
   })
   const lifecycle = Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const harness = yield* makeHarness(initial, graphs, terminalReturn, shutdown, actionOverrides)
-    const presentation = yield* makeOpenTuiPresentation(renderer, harness.runtime, provider)
+    const presentation = yield* makeOpenTuiPresentation(renderer, harness.runtime, provider, presentationOptions)
     yield* presentation.run
     resolveStarted({ presentation, harness })
     yield* presentation.wait
@@ -456,28 +602,42 @@ function makeHarness(
   actionOverrides: RuntimeActionOverrides = {},
 ): Effect.Effect<RuntimeHarness> {
   return Effect.gen(function*() {
-    const updates = yield* PubSub.unbounded<ApplicationViewModel>()
+    const updates = yield* SubscriptionRef.make(initial)
     const calls: string[] = []
+    const modalUpdates: ApplicationModal[] = []
     let current = initial
     let lastGraph = terminalReturn ?? (initial.surface._tag === "Graph" ? initial : undefined)
     const update = (viewModel: ApplicationViewModel) => Effect.sync(() => {
       current = viewModel
       if (viewModel.surface._tag === "Graph") lastGraph = viewModel
-      PubSub.publishUnsafe(updates, viewModel)
-    })
-    const modal = (value: ApplicationModal | null) => update({ ...current, modal: value })
+    }).pipe(Effect.andThen(SubscriptionRef.set(updates, viewModel)))
+    const modal = (value: ApplicationModal | null) => Effect.sync(() => {
+      if (value) modalUpdates.push(value)
+    }).pipe(Effect.andThen(update({ ...current, modal: value })))
     const runtime = {
       getViewModel: Effect.sync(() => current),
-      subscribeViewModels: PubSub.subscribe(updates),
+      viewModels: SubscriptionRef.changes(updates),
       getState: Effect.die("presentation must not read application state"),
       dispatch: () => Effect.succeed(false),
       shutdown: Effect.sync(() => calls.push("shutdown")).pipe(Effect.andThen(shutdown)),
       preparedTerminals: new Map(),
       terminalEvents: {},
-      refresh: () => Effect.sync(() => {
-        calls.push("refresh")
-        return true
-      }),
+      refresh: () => {
+        actionOverrides.beforeRefresh?.()
+        const refresh = Effect.sync(() => {
+          calls.push("refresh")
+        }).pipe(Effect.andThen(Effect.suspend(() => actionOverrides.refresh?.() ?? Effect.succeed(true))))
+        const failure = actionOverrides.reportedRefreshFailure
+        return failure === undefined
+          ? refresh
+          : refresh.pipe(
+              Effect.andThen(modal({
+                _tag: "Error",
+                message: `${failure.operation}: ${failure.message}`,
+              })),
+              Effect.andThen(Effect.fail(failure)),
+            )
+      },
       selectRoot: (sessionId: string | null) => {
         calls.push(`select-root:${sessionId ?? "none"}`)
         if (current.surface._tag !== "Roots") {
@@ -573,7 +733,7 @@ function makeHarness(
       handleTerminalSessionChanged: () => Effect.succeed(true),
       handleTerminalTransitionError: () => Effect.succeed(true),
     } as unknown as AppRuntime
-    return { runtime, calls, update }
+    return { runtime, calls, modalUpdates, update }
   })
 }
 
@@ -866,7 +1026,7 @@ function canonicalView(
       sessions: new Map(sessions.map((session) => [session.id, session])),
       transcripts: new Map([...transcripts].map(([sessionId, messages]) => [sessionId, available(messages)])),
     },
-    refresh: { generation: 1, active: null, initialPending: false },
+    refresh: { generation: 1, active: new Map(), initialPending: false },
   }
   return projectApplicationViewModel(state)
 }

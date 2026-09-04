@@ -18,11 +18,11 @@ const NESTED_HERDR_ENVIRONMENT_KEYS = [
 ] as const
 
 export class BunPtyProcessFactory implements TerminalProcessFactory {
-  async spawn(
+  spawn(
     launch: TerminalLaunch,
     dimensions: { readonly columns: number; readonly rows: number },
     callbacks: TerminalProcessCallbacks,
-  ): Promise<TerminalProcess> {
+  ): TerminalProcess {
     let pty: Bun.Terminal | undefined
     let resolvePtyDrained!: () => void
     const ptyDrained = new Promise<void>((resolve) => {
@@ -57,10 +57,10 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
     if (!pty) {
       const failures: unknown[] = []
       signalGroup(subprocess.pid, "SIGTERM", failures)
-      if (!await waitForGroupExit(subprocess.pid, 200)) {
+      if (isProcessGroupAlive(subprocess.pid)) {
         signalGroup(subprocess.pid, "SIGKILL", failures)
       }
-      if (!await waitForGroupExit(subprocess.pid, 200)) {
+      if (isProcessGroupAlive(subprocess.pid)) {
         subprocess.unref()
         throw new TerminalSpawnCleanupError(
           subprocess.pid,
@@ -85,14 +85,6 @@ function signalGroup(pid: number, signal: NodeJS.Signals, failures: unknown[]): 
   }
 }
 
-async function waitForGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = performance.now() + timeoutMs
-  while (isProcessGroupAlive(pid) && performance.now() < deadline) {
-    await Bun.sleep(Math.min(10, Math.max(0, deadline - performance.now())))
-  }
-  return !isProcessGroupAlive(pid)
-}
-
 function isProcessGroupAlive(pid: number): boolean {
   try {
     globalThis.process.kill(-pid, 0)
@@ -110,6 +102,10 @@ class BunPtyProcess implements TerminalProcess {
   ) {}
 
   get pid(): number {
+    return this.subprocess.pid
+  }
+
+  get processGroupId(): number {
     return this.subprocess.pid
   }
 

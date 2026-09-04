@@ -49,7 +49,16 @@ export class OpenTuiTerminalRenderer implements TerminalRenderer {
       this.surfaces.delete(terminal)
     })
     this.surfaces.set(terminal, surface)
-    this.renderer.root.add(terminal)
+    try {
+      this.renderer.root.add(terminal)
+    } catch (cause) {
+      try {
+        surface.release()
+      } catch (rollbackCause) {
+        throw new AggregateError([cause, rollbackCause], "Unable to create terminal surface")
+      }
+      throw cause
+    }
     return surface
   }
 
@@ -79,6 +88,11 @@ export class OpenTuiTerminalRenderer implements TerminalRenderer {
 }
 
 class OpenTuiTerminalSurface implements TerminalSurface {
+  private blurred = false
+  private detached = false
+  private destroyed = false
+  private releaseNotified = false
+
   constructor(
     readonly id: string,
     private readonly terminal: EmbeddedTerminalRenderable,
@@ -108,23 +122,46 @@ class OpenTuiTerminalSurface implements TerminalSurface {
   }
 
   release(): void {
-    let failure: unknown
-    for (const release of [
-      () => this.terminal.blur(),
-      () => {
-        if (this.terminal.parent) this.terminal.parent.remove(this.terminal)
+    const stages = [
+      {
+        complete: () => this.blurred,
+        release: () => {
+          this.terminal.blur()
+          this.blurred = true
+        },
       },
-      () => {
-        if (!this.terminal.isDestroyed) this.terminal.destroy()
+      {
+        complete: () => this.detached,
+        release: () => {
+          if (this.terminal.parent) this.terminal.parent.remove(this.terminal)
+          this.detached = true
+        },
       },
-      this.onRelease,
-    ]) {
+      {
+        complete: () => this.destroyed,
+        release: () => {
+          if (!this.terminal.isDestroyed) this.terminal.destroy()
+          this.destroyed = true
+        },
+      },
+      {
+        complete: () => this.releaseNotified,
+        release: () => {
+          this.onRelease()
+          this.releaseNotified = true
+        },
+      },
+    ]
+    const failures: unknown[] = []
+    for (const stage of stages) {
+      if (stage.complete()) continue
       try {
-        release()
+        stage.release()
       } catch (error) {
-        failure ??= error
+        failures.push(error)
       }
     }
-    if (failure !== undefined) throw failure
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, "Unable to release terminal surface")
   }
 }
