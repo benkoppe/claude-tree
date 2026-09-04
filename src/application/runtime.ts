@@ -21,9 +21,11 @@ import type {
   NavigationState,
   NavigationTarget,
 } from "../domain/model"
+import type { ConversationGraph, ConversationGraphNode } from "../domain/conversation-graph"
 import type {
   BranchRelation,
   ConversationRemoval,
+  IdentityTransitionKind,
   PendingIdentityAdoption,
   ProjectState,
 } from "../domain/persistence"
@@ -49,7 +51,6 @@ import {
   type ApplicationOperations,
   type IndependentBranch,
   type PersistedBranch,
-  type RemovalResult,
 } from "./operations"
 import {
   ApplicationOperationError,
@@ -80,11 +81,13 @@ import {
 import {
   projectApplicationViewModel,
   projectGraphViewModel,
+  projectRootsViewModel,
   type ApplicationViewModel,
 } from "./view-model"
 
 const DEFAULT_COMPLETION_DELAYS_MS = [100, 250, 500, 1_000] as const
 const DEFAULT_SHUTDOWN_NAVIGATION_TIMEOUT_MS = 500
+const DEFAULT_SHUTDOWN_TRANSITION_TIMEOUT_MS = 500
 const COMMAND_SCOPE_CLOSE_TIMEOUT_MS = 100
 const RECONCILIATION_FAILURE_BACKOFF_MS = 100
 
@@ -94,6 +97,7 @@ export interface AppRuntimeOptions {
   readonly terminals: TerminalSupervisorApi
   readonly completionDelaysMs?: readonly number[]
   readonly shutdownNavigationTimeoutMs?: number
+  readonly shutdownTransitionTimeoutMs?: number
 }
 
 export interface AppRuntime {
@@ -137,9 +141,11 @@ type CommandCompletedMessage = {
 
 type LifecycleControlMessage =
   | { readonly _tag: "BeginShutdown"; readonly reply: DeferredType.Deferred<void> }
+  | { readonly _tag: "AbortTransitionAcknowledgments"; readonly reason: string; readonly reply: DeferredType.Deferred<void> }
   | { readonly _tag: "FinishShutdown"; readonly error?: ApplicationShutdownError; readonly reply: DeferredType.Deferred<void> }
 
 type ActorMessage =
+  | { readonly _tag: "Startup"; readonly reply: DeferredType.Deferred<void> }
   | IntentEnvelope
   | StateQueryEnvelope
   | (TerminalActorEvent & { readonly reply?: DeferredType.Deferred<boolean> })
@@ -154,13 +160,25 @@ type ActorControlMessage = LifecycleControlMessage | CommandCompletedMessage
 type ActorCommand =
   | { readonly _tag: "Refresh"; readonly refresh: ActiveRefresh; readonly reply?: IntentEnvelope["reply"] }
   | { readonly _tag: "PrepareNew"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Branch"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Show"; readonly prepared: PreparedTerminal; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "Show"; readonly prepared: PreparedTerminal; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Hide"; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Stop"; readonly sessionId: string; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Remove"; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "Stop"; readonly sessionId: string; readonly identityGeneration: number; readonly reply: IntentEnvelope["reply"] }
+  | {
+      readonly _tag: "Remove"
+      readonly workflowKey: string
+      readonly step:
+        | { readonly _tag: "Stop"; readonly sessionId: string }
+        | {
+            readonly _tag: "Commit"
+            readonly removal: ConversationRemoval
+            readonly affectedSessionIds: readonly string[]
+          }
+      readonly reply: IntentEnvelope["reply"]
+    }
   | { readonly _tag: "AcknowledgeTransition"; readonly event: TerminalSessionChangedEvent }
+  | { readonly _tag: "AcknowledgeStartupAdoptions"; readonly adoptions: readonly PendingIdentityAdoption[] }
   | { readonly _tag: "Navigation"; readonly navigation: NavigationState; readonly reply?: IntentEnvelope["reply"] }
   | { readonly _tag: "CompletionTimer"; readonly sessionId: string; readonly ownerId: string; readonly version: number }
 
@@ -173,8 +191,19 @@ interface ActiveCommand {
 interface OwnerCursor {
   sessionId: string
   lastSequenceId: number
+  navigationGeneration: number
   transitioning: boolean
   readonly buffered: Array<TerminalActorEvent & { readonly reply?: DeferredType.Deferred<boolean> }>
+}
+
+interface PendingRemoval {
+  readonly removal: ConversationRemoval
+  readonly affectedSessionIds: readonly string[]
+  readonly identityGeneration: number
+  readonly mutationToken: string
+  readonly reply: IntentEnvelope["reply"]
+  readonly attemptedSessionIds: Set<string>
+  readonly stoppedSessionIds: Set<string>
 }
 
 export function makeAppRuntime(
@@ -190,39 +219,10 @@ export function makeAppRuntime(
     const projectState = yield* options.metadata.loadMetadata
     const pendingAdoptions = [...yield* options.metadata.pendingAdoptions].sort((left, right) =>
       left.adoptionToken.localeCompare(right.adoptionToken))
-    const snapshotExit = yield* Effect.exit(options.provider.loadSessionSnapshot)
-    if (pendingAdoptions.length > 0 && Exit.isFailure(snapshotExit)) {
-      return yield* Effect.failCause(snapshotExit.cause)
-    }
-    const initial = makeInitialApplicationState({
+    let state: ApplicationState = makeInitialApplicationState({
       relations: projectState.relations,
       removals: projectState.removals,
     })
-    const loaded: ApplicationState = Exit.isSuccess(snapshotExit)
-      ? {
-          ...initial,
-          provider: {
-            sessions: new Map(snapshotExit.value.sessions.map((session) => [session.id, session])),
-            transcripts: new Map(snapshotExit.value.transcripts),
-          },
-          refresh: { generation: 0, active: new Map(), initialPending: false },
-        }
-      : {
-          ...initial,
-          refresh: { generation: 0, active: new Map(), initialPending: false },
-          modal: { _tag: "Error", message: errorMessage(Cause.squash(snapshotExit.cause)) },
-        }
-    let state: ApplicationState = {
-      ...loaded,
-      surface: restoreNavigatorSurface(loaded, projectState.navigation),
-    }
-    for (const adoption of pendingAdoptions) {
-      yield* Effect.try({
-        try: () => validateStartupAdoption(state, projectState, adoption),
-        catch: (cause) => cause,
-      })
-      yield* options.metadata.ack(adoption.adoptionToken)
-    }
     const publication = yield* SubscriptionRef.make(projectApplicationViewModel(state))
     const inbox = yield* Queue.unbounded<ActorMessage>()
     const controlInbox = yield* Queue.unbounded<ActorControlMessage>()
@@ -242,20 +242,37 @@ export function makeAppRuntime(
     const owners = new Map<string, OwnerCursor>()
     const unclaimedOwnerEvents = new Map<string, OwnerCursor["buffered"]>()
     const activeCommands = new Map<string, ActiveCommand>()
+    const pendingRemovals = new Map<string, PendingRemoval>()
+    const pendingTransitionAcknowledgments = new Map<string, DeferredType.Deferred<void, unknown>>()
     const completionDelays = options.completionDelaysMs ?? DEFAULT_COMPLETION_DELAYS_MS
     const shutdownNavigationTimeoutMs = options.shutdownNavigationTimeoutMs ??
       DEFAULT_SHUTDOWN_NAVIGATION_TIMEOUT_MS
+    const shutdownTransitionTimeoutMs = options.shutdownTransitionTimeoutMs ??
+      DEFAULT_SHUTDOWN_TRANSITION_TIMEOUT_MS
     let nextCorrelationId = 1
     let nextCommandToken = 1
     let nextRemovalRequestId = 1
     let accepting = true
+    let startupNavigationEligible = true
+    let startupRecoveryPending = true
+    let navigationGeneration = 0
     let shutdownResult: DeferredType.Deferred<void, ApplicationShutdownError> | undefined
+    let identityGeneration = 0
+    const identityTransitions: Array<{
+      readonly generation: number
+      readonly previousSessionId: string
+      readonly sessionId: string
+      readonly kind: IdentityTransitionKind
+      readonly relation?: BranchRelation
+    }> = []
+    const transitionAcknowledgmentFailures = new Map<string, unknown>()
 
     const publish = (event: StateEvent): Effect.Effect<void> => Effect.gen(function*() {
       const next = reduceApplicationState(state, event)
       if (next === state) return
       const viewModel = projectApplicationViewModel(next)
       yield* SubscriptionRef.set(publication, viewModel)
+      if (!isDeepStrictEqual(next.surface, state.surface)) navigationGeneration += 1
       state = next
     })
 
@@ -283,11 +300,26 @@ export function makeAppRuntime(
       yield* Deferred.fail(reply, error)
     })
 
+    const registerTerminalBarrier = (message: TerminalActorEvent): void => {
+      if (message._tag === "TerminalSessionChanged" && message.event.acknowledgment) {
+        pendingTransitionAcknowledgments.set(message.event.adoptionToken, message.event.acknowledgment)
+      }
+    }
+
+    const unregisterTerminalBarrier = (message: Extract<TerminalActorEvent, { readonly _tag: "TerminalSessionChanged" }>): void => {
+      const acknowledgment = message.event.acknowledgment
+      if (
+        acknowledgment &&
+        pendingTransitionAcknowledgments.get(message.event.adoptionToken) === acknowledgment
+      ) pendingTransitionAcknowledgments.delete(message.event.adoptionToken)
+    }
+
     const failTerminalBarrier = (
       message: TerminalActorEvent & { readonly reply?: DeferredType.Deferred<boolean> },
       cause: unknown,
     ): Effect.Effect<void> => Effect.gen(function*() {
       if (message._tag === "TerminalSessionChanged" && message.event.acknowledgment) {
+        unregisterTerminalBarrier(message)
         yield* Deferred.fail(message.event.acknowledgment, cause)
       }
       if (message.reply) yield* Deferred.succeed(message.reply, false)
@@ -316,6 +348,7 @@ export function makeAppRuntime(
         const active = activeCommands.get(key)
         if (!active) return
         activeCommands.delete(key)
+        if (active.command._tag === "Remove") pendingRemovals.delete(active.command.workflowKey)
         active.fiber?.interruptUnsafe()
         if (active.command._tag === "Refresh") {
           yield* publish({
@@ -330,6 +363,7 @@ export function makeAppRuntime(
           yield* reject(reply, intent, "superseded", reason)
         }
         if (active.command._tag === "AcknowledgeTransition") {
+          unregisterTerminalBarrier({ _tag: "TerminalSessionChanged", event: active.command.event })
           const acknowledgment = active.command.event.acknowledgment
           if (acknowledgment) yield* Deferred.fail(acknowledgment, transitionRejected(reason))
         }
@@ -378,6 +412,43 @@ export function makeAppRuntime(
         _tag: "Graph",
         familySessionId: selectConversationForest(state).graphBySessionId.get(sessionId)?.rootSessionId ?? sessionId,
         target: { kind: "endpoint", sessionId },
+      }
+    }
+
+    const currentSessionId = (sessionId: string, operationGeneration: number): string => {
+      let current = sessionId
+      for (const transition of identityTransitions) {
+        if (
+          transition.generation > operationGeneration &&
+          transition.previousSessionId === current
+        ) current = transition.sessionId
+      }
+      return current
+    }
+
+    const currentRemoval = (
+      removal: ConversationRemoval,
+      affectedSessionIds: readonly string[],
+      operationGeneration: number,
+    ): { readonly removal: ConversationRemoval; readonly affectedSessionIds: readonly string[] } => {
+      let canonical = removal
+      let affected = [...affectedSessionIds]
+      for (const transition of identityTransitions) {
+        if (transition.generation <= operationGeneration) continue
+        canonical = replaceSessionIdInInFlightRemoval(
+          canonical,
+          transition.previousSessionId,
+          transition.sessionId,
+          transition.kind,
+          transition.relation,
+        )
+        affected = affected.map((sessionId) =>
+          sessionId === transition.previousSessionId ? transition.sessionId : sessionId)
+      }
+      return {
+        removal: canonical,
+        affectedSessionIds: [...new Set(affected.map((sessionId) =>
+          currentSessionId(sessionId, operationGeneration)))],
       }
     }
 
@@ -431,6 +502,74 @@ export function makeAppRuntime(
       }, operations.loadSnapshot(mode, [...sessionIds]))
     })
 
+    const continueRemoval = (key: string): Effect.Effect<void, never, Scope.Scope> =>
+      Effect.gen(function*() {
+        const workflow = pendingRemovals.get(key)
+        if (!workflow || activeCommands.has(key)) return
+        const canonical = currentRemoval(
+          workflow.removal,
+          workflow.affectedSessionIds,
+          workflow.identityGeneration,
+        )
+
+        const affected = new Set(canonical.affectedSessionIds)
+        const failedTransition = [...transitionAcknowledgmentFailures].find(([sessionId]) =>
+          affected.has(sessionId))
+        if (failedTransition !== undefined) {
+          pendingRemovals.delete(key)
+          const failedTransitionSessionId = failedTransition[0]
+          const stoppedSessionIds = [...workflow.stoppedSessionIds].map((sessionId) =>
+            currentSessionId(sessionId, workflow.identityGeneration))
+          if (stoppedSessionIds.length > 0) {
+            yield* startRefresh("stop", new Set(stoppedSessionIds))
+          }
+          yield* Deferred.fail(workflow.reply, new RemovalOperationError({
+            intent: "Remove",
+            operation: "Remove conversation",
+            message: `Session ${failedTransitionSessionId} has an unacknowledged identity transition`,
+            stoppedSessionIds,
+            cause: failedTransition[1],
+          }))
+          return
+        }
+        if ([...owners.values()].some((cursor) => cursor.transitioning && affected.has(cursor.sessionId))) {
+          return
+        }
+
+        const sessionId = canonical.affectedSessionIds.find((candidate) =>
+          state.terminals.has(candidate) &&
+          !workflow.attemptedSessionIds.has(candidate) &&
+          !workflow.stoppedSessionIds.has(candidate))
+        if (sessionId !== undefined) {
+          workflow.attemptedSessionIds.add(sessionId)
+          yield* launch(key, {
+            _tag: "Remove",
+            workflowKey: key,
+            step: { _tag: "Stop", sessionId },
+            reply: workflow.reply,
+          }, operations.stop(sessionId), false)
+          return
+        }
+
+        yield* launch(key, {
+          _tag: "Remove",
+          workflowKey: key,
+          step: {
+            _tag: "Commit",
+            removal: canonical.removal,
+            affectedSessionIds: canonical.affectedSessionIds,
+          },
+          reply: workflow.reply,
+        }, operations.commitRemoval(
+          canonical.removal,
+          canonical.affectedSessionIds,
+          workflow.mutationToken,
+        ), false)
+      })
+
+    const continuePendingRemovals = (): Effect.Effect<void, never, Scope.Scope> => Effect.suspend(() =>
+      Effect.forEach([...pendingRemovals.keys()], continueRemoval, { discard: true }))
+
     const scheduleCompletion = (sessionId: string): Effect.Effect<void, never, Scope.Scope> => {
       const completion = state.pendingCompletions.get(sessionId)
       if (!completion) return Effect.void
@@ -453,6 +592,7 @@ export function makeAppRuntime(
       reply: IntentEnvelope["reply"],
       reportFailure: boolean,
       rollbackRelation?: BranchRelation,
+      persistFailureFallback = false,
     ): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
       if (activeCommands.has("terminal:show")) {
         yield* reject(reply, "OpenEndpoint", "busy", "Another terminal is still opening")
@@ -479,9 +619,37 @@ export function makeAppRuntime(
         prepared,
         restoreTo,
         reportFailure,
+        ...(persistFailureFallback ? { persistFailureFallback: true } : {}),
         ...(rollbackRelation === undefined ? {} : { rollbackRelation }),
         reply,
       }, show, false)
+    })
+
+    const finishStartup = (): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
+      if (!startupNavigationEligible) return
+      const navigationState = projectState.navigation
+      if (navigationState?.view !== "terminal") return
+      const session = selectProjectedData(state).sessions.get(navigationState.sessionId)
+      if (!session || session.transient) {
+        yield* publish({
+          _tag: "ModalOpened",
+          modal: {
+            _tag: "Error",
+            message: `Could not restore ${options.provider.displayName} session ${navigationState.sessionId}: session is unavailable`,
+          },
+        })
+        yield* startNavigation(state.surface)
+        return
+      }
+      const reply = yield* Deferred.make<void, ApplicationIntentError>()
+      yield* launch(`prepare:startup:${navigationState.sessionId}`, {
+        _tag: "PrepareResume",
+        session,
+        reportFailure: true,
+        startupRestore: true,
+        restoreTo: state.surface as NavigatorSurface,
+        reply,
+      }, operations.prepareResume(session), false)
     })
 
     let processMessageWithBoundary: (message: ActorMessage) => Effect.Effect<void, never, Scope.Scope>
@@ -567,9 +735,13 @@ export function makeAppRuntime(
         if (event.draftPreview) {
           yield* publish({ _tag: "TerminalDraftObserved", sessionId: event.sessionId, draft: event.draftPreview })
         }
+        const focusExitedSession =
+          (state.surface._tag === "Terminal" && state.surface.sessionId === event.sessionId) ||
+          (event.wasActive && cursor.navigationGeneration === navigationGeneration)
         yield* publish({
           _tag: "TerminalStopped",
           sessionId: event.sessionId,
+          focusExitedSession,
           ...(event.cleanupError === undefined ? {} : { cleanupIncomplete: true }),
         })
         preparedTerminals.delete(event.sessionId)
@@ -582,6 +754,7 @@ export function makeAppRuntime(
           ].filter((value): value is string => value !== undefined).join("; ")
           yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: details } })
         }
+        if (focusExitedSession) yield* startNavigation(state.surface)
         yield* startRefresh("stop", new Set([event.sessionId]), ownerId)
       } else if (message._tag === "TerminalSessionChanged") {
         const event = message.event
@@ -594,18 +767,34 @@ export function makeAppRuntime(
           return
         }
         cursor.transitioning = true
-        const replacePrevious = state.local.temporarySessionIds.has(event.previousSessionId)
+        const kind = event.kind
         yield* publish({
           _tag: "SessionIdentityAdopted",
           previousSessionId: event.previousSessionId,
           session: event.session,
-          replacePrevious,
+          kind,
           ...(event.relation === undefined ? {} : { relation: event.relation }),
         })
+        identityGeneration += 1
+        identityTransitions.push({
+          generation: identityGeneration,
+          previousSessionId: event.previousSessionId,
+          sessionId: event.session.id,
+          kind,
+          ...(event.relation === undefined ? {} : { relation: event.relation }),
+        })
+        if (transitionAcknowledgmentFailures.has(event.previousSessionId)) {
+          const failure = transitionAcknowledgmentFailures.get(event.previousSessionId)
+          transitionAcknowledgmentFailures.delete(event.previousSessionId)
+          transitionAcknowledgmentFailures.set(event.session.id, failure)
+        }
         const prepared = preparedTerminals.get(event.previousSessionId)
         preparedTerminals.delete(event.previousSessionId)
         if (prepared) preparedTerminals.set(event.session.id, { ...prepared, session: event.session })
         cursor.sessionId = event.session.id
+        if (state.surface._tag === "Terminal" && state.surface.sessionId === event.session.id) {
+          cursor.navigationGeneration = navigationGeneration
+        }
         yield* launch(
           `transition:${ownerId}`,
           { _tag: "AcknowledgeTransition", event },
@@ -665,6 +854,48 @@ export function makeAppRuntime(
             message: errorMessage(cause),
           })
         }
+        if (startupRecoveryPending && command.refresh.mode === "full" && Exit.isSuccess(exit)) {
+          startupRecoveryPending = false
+          if (command.reply) yield* Deferred.succeed(command.reply, undefined)
+          if (startupNavigationEligible) {
+            const restored = restoreNavigatorSurface(state, projectState.navigation)
+            yield* publish({ _tag: "Navigated", surface: restored })
+          }
+          let validationError: unknown
+          try {
+            for (const adoption of pendingAdoptions) {
+              validateStartupAdoption(state, projectState, adoption)
+            }
+          } catch (cause) {
+            validationError = cause
+          }
+          if (validationError !== undefined) {
+            startupRecoveryPending = true
+            yield* publish({
+              _tag: "ModalOpened",
+              modal: {
+                _tag: "Error",
+                message: `Restore session identity: ${errorMessage(validationError)}`,
+              },
+            })
+            yield* startNavigation(state.surface)
+            return
+          }
+          if (pendingAdoptions.length === 0) {
+            yield* finishStartup()
+          } else {
+            yield* launch("startup:adoptions", {
+              _tag: "AcknowledgeStartupAdoptions",
+              adoptions: pendingAdoptions,
+            }, Effect.forEach(
+              pendingAdoptions,
+              (adoption) => Effect.suspend(() => options.metadata.ack(adoption.adoptionToken)),
+              { discard: true },
+            ), false)
+          }
+          return
+        }
+        if (command.refresh.reason === "initial" && Exit.isFailure(exit)) return
         const completionSessionIds = command.refresh.mode === "full"
           ? [...state.pendingCompletions.keys()]
           : [...command.refresh.sessionIds]
@@ -731,9 +962,17 @@ export function makeAppRuntime(
       if (command._tag === "PrepareResume") {
         if (Exit.isFailure(exit)) {
           yield* failReply(command.reply, "ResumeSession", "Resume session", Cause.squash(exit.cause), command.reportFailure)
+          if (command.startupRestore) yield* startNavigation(command.restoreTo)
           return
         }
-        yield* startShow(exit.value as PreparedTerminal, command.restoreTo, command.reply, command.reportFailure)
+        yield* startShow(
+          exit.value as PreparedTerminal,
+          command.restoreTo,
+          command.reply,
+          command.reportFailure,
+          undefined,
+          command.startupRestore,
+        )
         return
       }
 
@@ -808,6 +1047,7 @@ export function makeAppRuntime(
               restoreTo: command.restoreTo,
             })
           }
+          if (command.persistFailureFallback) yield* startNavigation(state.surface)
           yield* failReply(command.reply, "OpenEndpoint", "Open session", Cause.squash(exit.cause), false)
           return
         }
@@ -817,10 +1057,12 @@ export function makeAppRuntime(
         const cursor = owners.get(ownerId) ?? {
           sessionId,
           lastSequenceId: 0,
+          navigationGeneration,
           transitioning: false,
           buffered: [],
         }
         cursor.sessionId = sessionId
+        cursor.navigationGeneration = navigationGeneration
         owners.set(ownerId, cursor)
         yield* claimBufferedOwnerEvents(ownerId)
         yield* startNavigation(state.surface, command.reply)
@@ -850,62 +1092,86 @@ export function makeAppRuntime(
       }
 
       if (command._tag === "Stop") {
+        const sessionId = currentSessionId(command.sessionId, command.identityGeneration)
         if (Exit.isFailure(exit)) {
-          yield* publish({ _tag: "TerminalStopped", sessionId: command.sessionId, cleanupIncomplete: true })
+          yield* publish({ _tag: "TerminalStopped", sessionId, cleanupIncomplete: true })
           yield* failReply(command.reply, "StopSession", "Stop session", Cause.squash(exit.cause))
           return
         }
-        const terminal = state.terminals.get(command.sessionId)
+        const terminal = state.terminals.get(sessionId)
         const ownerId = terminal?.ownerId
-        preparedTerminals.delete(command.sessionId)
+        preparedTerminals.delete(sessionId)
         if (ownerId) owners.delete(ownerId)
-        yield* publish({ _tag: "TerminalStopped", sessionId: command.sessionId })
-        yield* startRefresh("stop", new Set([command.sessionId]), ownerId)
+        yield* publish({ _tag: "TerminalStopped", sessionId })
+        yield* startRefresh("stop", new Set([sessionId]), ownerId)
         yield* Deferred.succeed(command.reply, undefined)
         return
       }
 
       if (command._tag === "Remove") {
+        const workflow = pendingRemovals.get(command.workflowKey)
+        if (!workflow) return
         if (Exit.isFailure(exit)) {
+          pendingRemovals.delete(command.workflowKey)
           const cause = Cause.squash(exit.cause)
-          if (cause instanceof RemovalOperationError) {
-            for (const sessionId of cause.stoppedSessionIds) {
-              const ownerId = state.terminals.get(sessionId)?.ownerId
-              if (ownerId) owners.delete(ownerId)
-              preparedTerminals.delete(sessionId)
-              yield* publish({ _tag: "TerminalStopped", sessionId })
-            }
-            if (cause.failedSessionId) {
-              yield* publish({
-                _tag: "TerminalStopped",
-                sessionId: cause.failedSessionId,
-                cleanupIncomplete: true,
-              })
-            }
-            if (cause.stoppedSessionIds.length > 0) {
-              yield* startRefresh("stop", new Set(cause.stoppedSessionIds))
-            }
+          const stoppedSessionIds = [...workflow.stoppedSessionIds].map((sessionId) =>
+            currentSessionId(sessionId, workflow.identityGeneration))
+          const failedSessionId = command.step._tag === "Stop"
+            ? currentSessionId(command.step.sessionId, workflow.identityGeneration)
+            : undefined
+          if (failedSessionId !== undefined) {
             yield* publish({
-              _tag: "ModalOpened",
-              modal: { _tag: "Error", message: `Remove conversation: ${cause.message}` },
+              _tag: "TerminalStopped",
+              sessionId: failedSessionId,
+              cleanupIncomplete: true,
             })
-            yield* Deferred.fail(command.reply, cause)
-            return
           }
-          yield* failReply(command.reply, "Remove", "Remove conversation", cause)
+          if (stoppedSessionIds.length > 0) {
+            yield* startRefresh("stop", new Set(stoppedSessionIds))
+          }
+          const failure = new RemovalOperationError({
+            intent: "Remove",
+            operation: "Remove conversation",
+            message: errorMessage(cause),
+            stoppedSessionIds,
+            ...(failedSessionId === undefined ? {} : { failedSessionId }),
+            cause,
+          })
+          yield* publish({
+            _tag: "ModalOpened",
+            modal: { _tag: "Error", message: `Remove conversation: ${failure.message}` },
+          })
+          yield* Deferred.fail(command.reply, failure)
           return
         }
-        const result = exit.value as RemovalResult
-        for (const sessionId of result.stoppedSessionIds) {
-          const ownerId = state.terminals.get(sessionId)?.ownerId
-          if (ownerId) owners.delete(ownerId)
-          preparedTerminals.delete(sessionId)
+
+        if (command.step._tag === "Stop") {
+          if (exit.value as boolean) {
+            const sessionId = currentSessionId(command.step.sessionId, workflow.identityGeneration)
+            workflow.stoppedSessionIds.add(sessionId)
+            const ownerId = state.terminals.get(sessionId)?.ownerId
+            if (ownerId) owners.delete(ownerId)
+            preparedTerminals.delete(sessionId)
+            yield* publish({ _tag: "TerminalStopped", sessionId })
+          }
+          yield* continueRemoval(command.workflowKey)
+          return
         }
-        yield* publish({ _tag: "RemovalPersisted", ...result })
-        if (result.stoppedSessionIds.length > 0) {
-          yield* startRefresh("stop", new Set(result.stoppedSessionIds))
+
+        pendingRemovals.delete(command.workflowKey)
+        const removal = exit.value as ConversationRemoval
+        const stoppedSessionIds = [...workflow.stoppedSessionIds].map((sessionId) =>
+          currentSessionId(sessionId, workflow.identityGeneration))
+        yield* publish({
+          _tag: "RemovalPersisted",
+          removal,
+          stoppedSessionIds,
+          fallback: removalFallbackSurface(state, removal),
+        })
+        if (stoppedSessionIds.length > 0) {
+          yield* startRefresh("stop", new Set(stoppedSessionIds))
         }
-        yield* Deferred.succeed(command.reply, undefined)
+        yield* startNavigation(state.surface, command.reply)
         return
       }
 
@@ -913,25 +1179,49 @@ export function makeAppRuntime(
         const ownerId = command.event.ownerId
         if (Exit.isFailure(exit)) {
           const cause = Cause.squash(exit.cause)
+          transitionAcknowledgmentFailures.set(command.event.session.id, cause)
           yield* publish({
             _tag: "ModalOpened",
             modal: { _tag: "Error", message: `Acknowledge session identity: ${errorMessage(cause)}` },
           })
+          yield* drainOwner(ownerId)
           if (command.event.acknowledgment) {
             yield* Deferred.fail(command.event.acknowledgment, cause)
           }
-          yield* drainOwner(ownerId)
+          unregisterTerminalBarrier({ _tag: "TerminalSessionChanged", event: command.event })
+          if (state.shutdown === "running") yield* continuePendingRemovals()
           return
         }
-        yield* startRefresh(
-          "terminal-return",
-          new Set([command.event.previousSessionId, command.event.session.id]),
-          ownerId,
-        )
+        if (state.shutdown === "running") {
+          yield* startRefresh(
+            "terminal-return",
+            new Set([command.event.previousSessionId, command.event.session.id]),
+            ownerId,
+          )
+        }
+        yield* drainOwner(ownerId)
         if (command.event.acknowledgment) {
           yield* Deferred.succeed(command.event.acknowledgment, undefined)
         }
-        yield* drainOwner(ownerId)
+        unregisterTerminalBarrier({ _tag: "TerminalSessionChanged", event: command.event })
+        if (state.shutdown === "running") yield* continuePendingRemovals()
+        return
+      }
+
+      if (command._tag === "AcknowledgeStartupAdoptions") {
+        if (Exit.isFailure(exit)) {
+          startupRecoveryPending = true
+          yield* publish({
+            _tag: "ModalOpened",
+            modal: {
+              _tag: "Error",
+              message: `Restore session identity: ${errorMessage(Cause.squash(exit.cause))}`,
+            },
+          })
+          yield* startNavigation(state.surface)
+          return
+        }
+        yield* finishStartup()
         return
       }
     })
@@ -947,6 +1237,19 @@ export function makeAppRuntime(
         for (const pending of retained) yield* Queue.offer(controlInbox, pending)
       })
 
+    const drainAdmittedTerminalEvents: Effect.Effect<void, never, Scope.Scope> =
+      Effect.gen(function*() {
+        const retained: ActorMessage[] = []
+        for (const pending of yield* Queue.clear(inbox)) {
+          if (
+            isTerminalActorMessage(pending) ||
+            (pending._tag === "CommandCompleted" && pending.command._tag === "Show")
+          ) yield* processMessageWithBoundary(pending)
+          else retained.push(pending)
+        }
+        for (const pending of retained) yield* Queue.offer(inbox, pending)
+      })
+
     const processIntent = (envelope: IntentEnvelope): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function*() {
         const intent = envelope.intent
@@ -954,6 +1257,12 @@ export function makeAppRuntime(
           yield* reject(envelope.reply, intent._tag, "shutting-down", "Application is shutting down")
           return
         }
+        if (
+          intent._tag === "SelectRoot" || intent._tag === "EnterRoot" ||
+          intent._tag === "SelectGraph" || intent._tag === "NewSession" ||
+          intent._tag === "ResumeSession" || intent._tag === "OpenEndpoint" ||
+          intent._tag === "BranchFrom" || intent._tag === "ReturnFromTerminal"
+        ) startupNavigationEligible = false
         switch (intent._tag) {
           case "Refresh":
             yield* startRefresh("manual", new Set(), undefined, undefined, envelope.reply)
@@ -1054,29 +1363,54 @@ export function makeAppRuntime(
             yield* launch(`hide:${envelope.correlationId}`, { _tag: "Hide", reply: envelope.reply }, operations.hideActive, false)
             return
           case "StopSession": {
-            const terminal = state.terminals.get(intent.sessionId)
+            const sessionId = intent.sessionId
+            const terminal = state.terminals.get(sessionId)
             if (!terminal) {
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not running`)
               return
             }
-            if (activeCommands.has(`stop:${intent.sessionId}`)) {
-              yield* reject(envelope.reply, intent._tag, "busy", `Session ${intent.sessionId} is already stopping`)
+            if (activeCommands.has(`stop:${sessionId}`)) {
+              yield* reject(envelope.reply, intent._tag, "busy", `Session ${sessionId} is already stopping`)
               return
             }
-            yield* publish({ _tag: "TerminalStopping", sessionId: intent.sessionId })
-            yield* launch(`stop:${intent.sessionId}`, {
+            yield* publish({ _tag: "TerminalStopping", sessionId })
+            yield* launch(`stop:${sessionId}`, {
               _tag: "Stop",
-              sessionId: intent.sessionId,
+              sessionId,
+              identityGeneration,
               reply: envelope.reply,
-            }, operations.stop(intent.sessionId), false)
+            }, operations.stop(sessionId), false)
             return
           }
-          case "Remove":
-            yield* launch(`remove:${intent.requestId}`, {
-              _tag: "Remove",
+          case "Remove": {
+            const key = `remove:${intent.requestId}`
+            if (pendingRemovals.has(key) || activeCommands.has(key)) {
+              yield* reject(
+                envelope.reply,
+                intent._tag,
+                "busy",
+                `Operation ${key} is already in progress`,
+              )
+              return
+            }
+            const operationGeneration = identityGeneration
+            const canonical = currentRemoval(
+              intent.removal,
+              intent.affectedSessionIds,
+              operationGeneration,
+            )
+            pendingRemovals.set(key, {
+              removal: canonical.removal,
+              affectedSessionIds: canonical.affectedSessionIds,
+              identityGeneration: operationGeneration,
+              mutationToken: crypto.randomUUID(),
               reply: envelope.reply,
-            }, operations.remove(intent.removal, intent.affectedSessionIds), false)
+              attemptedSessionIds: new Set(),
+              stoppedSessionIds: new Set(),
+            })
+            yield* continueRemoval(key)
             return
+          }
           case "OpenModal":
             yield* publish({ _tag: "ModalOpened", modal: intent.modal })
             yield* Deferred.succeed(envelope.reply, undefined)
@@ -1089,6 +1423,14 @@ export function makeAppRuntime(
       })
 
     const processMessage = (message: ActorMessage): Effect.Effect<void, never, Scope.Scope> => {
+      if (message._tag === "Startup") {
+        return Effect.gen(function*() {
+          if (accepting && state.shutdown === "running") {
+            yield* startRefresh("initial", new Set())
+          }
+          yield* Deferred.succeed(message.reply, undefined)
+        })
+      }
       if (message._tag === "Intent") return processIntent(message)
       if (message._tag === "StateQuery") return Deferred.succeed(message.reply, state).pipe(Effect.asVoid)
       if (message._tag === "CommandCompleted") return completeCommand(message)
@@ -1126,10 +1468,21 @@ export function makeAppRuntime(
         return Effect.gen(function*() {
           yield* Effect.yieldNow
           yield* applyQueuedTransitionCompletions
+          yield* drainAdmittedTerminalEvents
           yield* publish({ _tag: "ShutdownStarted" })
           for (const key of [...activeCommands.keys()]) {
+            if (activeCommands.get(key)?.command._tag === "AcknowledgeTransition") continue
             yield* supersede(key, "Application shutdown cancelled this operation")
           }
+          for (const workflow of pendingRemovals.values()) {
+            yield* reject(
+              workflow.reply,
+              "Remove",
+              "shutting-down",
+              "Application shutdown cancelled this operation",
+            )
+          }
+          pendingRemovals.clear()
           for (const cursor of owners.values()) {
             for (const buffered of cursor.buffered.splice(0)) {
               yield* failTerminalBarrier(
@@ -1147,6 +1500,18 @@ export function makeAppRuntime(
             }
           }
           unclaimedOwnerEvents.clear()
+          yield* Deferred.succeed(message.reply, undefined)
+        })
+      }
+      if (message._tag === "AbortTransitionAcknowledgments") {
+        return Effect.gen(function*() {
+          const ownerIds: string[] = []
+          for (const [key, active] of [...activeCommands]) {
+            if (active.command._tag !== "AcknowledgeTransition") continue
+            ownerIds.push(active.command.event.ownerId)
+            yield* supersede(key, message.reason)
+          }
+          for (const ownerId of ownerIds) yield* drainOwner(ownerId)
           yield* Deferred.succeed(message.reply, undefined)
         })
       }
@@ -1176,11 +1541,16 @@ export function makeAppRuntime(
           : Effect.void))
       }
       if (command._tag === "AcknowledgeTransition") {
-        const cursor = owners.get(command.event.ownerId)
-        if (cursor) cursor.transitioning = false
-        return drainOwner(command.event.ownerId).pipe(Effect.catchCause((recoveryCause) =>
-          Cause.hasInterrupts(recoveryCause) ? Effect.failCause(recoveryCause) : Effect.void))
+        return Effect.gen(function*() {
+          const cursor = owners.get(command.event.ownerId)
+          if (cursor) cursor.transitioning = false
+          yield* drainOwner(command.event.ownerId).pipe(Effect.catchCause((recoveryCause) =>
+            Cause.hasInterrupts(recoveryCause) ? Effect.failCause(recoveryCause) : Effect.void))
+          unregisterTerminalBarrier({ _tag: "TerminalSessionChanged", event: command.event })
+          yield* continuePendingRemovals()
+        })
       }
+      if (command._tag === "Remove") pendingRemovals.delete(command.workflowKey)
       return Effect.void
     }
 
@@ -1188,6 +1558,10 @@ export function makeAppRuntime(
       message: ActorMessage,
       failure: ApplicationOperationError,
     ): Effect.Effect<void> => Effect.gen(function*() {
+      if (message._tag === "Startup") {
+        if (!Deferred.isDoneUnsafe(message.reply)) yield* Deferred.succeed(message.reply, undefined)
+        return
+      }
       if (message._tag === "Intent") {
         if (!Deferred.isDoneUnsafe(message.reply)) yield* Deferred.fail(message.reply, failure)
         return
@@ -1206,15 +1580,22 @@ export function makeAppRuntime(
         ) yield* Deferred.fail(message.command.event.acknowledgment, failure)
         return
       }
-      if (message._tag === "BeginShutdown" || message._tag === "FinishShutdown") return
+      if (
+        message._tag === "BeginShutdown" ||
+        message._tag === "AbortTransitionAcknowledgments" ||
+        message._tag === "FinishShutdown"
+      ) return
       if (
         message._tag === "TerminalCleanupError" || message._tag === "BackgroundFailure" ||
         message._tag === "BranchMutationReconciliation"
       ) return
-      if (
-        message._tag === "TerminalSessionChanged" && message.event.acknowledgment &&
-        !Deferred.isDoneUnsafe(message.event.acknowledgment)
-      ) yield* Deferred.fail(message.event.acknowledgment, failure)
+      if (message._tag === "TerminalSessionChanged") {
+        unregisterTerminalBarrier(message)
+        if (
+          message.event.acknowledgment &&
+          !Deferred.isDoneUnsafe(message.event.acknowledgment)
+        ) yield* Deferred.fail(message.event.acknowledgment, failure)
+      }
       if (message.reply && !Deferred.isDoneUnsafe(message.reply)) {
         yield* Deferred.succeed(message.reply, false)
       }
@@ -1226,6 +1607,7 @@ export function makeAppRuntime(
     ): Effect.Effect<void, never, Scope.Scope> => {
       if (
         Cause.hasInterrupts(cause) || message._tag === "BeginShutdown" ||
+        message._tag === "AbortTransitionAcknowledgments" ||
         message._tag === "FinishShutdown"
       ) return Effect.failCause(cause)
 
@@ -1307,6 +1689,16 @@ export function makeAppRuntime(
           yield* Deferred.fail(active.command.event.acknowledgment, unavailable)
         }
       }
+      for (const workflow of pendingRemovals.values()) {
+        if (!Deferred.isDoneUnsafe(workflow.reply)) {
+          yield* Deferred.fail(workflow.reply, new IntentRejectedError({
+            intent: "Remove",
+            reason: "shutting-down",
+            message: "Application actor is unavailable",
+          }))
+        }
+      }
+      pendingRemovals.clear()
       for (const cursor of owners.values()) {
         for (const buffered of cursor.buffered.splice(0)) {
           yield* failTerminalBarrier(buffered, unavailable)
@@ -1317,7 +1709,9 @@ export function makeAppRuntime(
       }
       unclaimedOwnerEvents.clear()
       for (const pending of yield* Queue.clear(inbox)) {
-        if (pending._tag === "Intent") {
+        if (pending._tag === "Startup") {
+          yield* Deferred.succeed(pending.reply, undefined)
+        } else if (pending._tag === "Intent") {
           yield* Deferred.fail(pending.reply, new IntentRejectedError({
             intent: pending.intent._tag,
             reason: "shutting-down",
@@ -1329,7 +1723,9 @@ export function makeAppRuntime(
           pending._tag !== "CommandCompleted" && pending._tag !== "TerminalCleanupError"
           && pending._tag !== "BackgroundFailure"
           && pending._tag !== "BranchMutationReconciliation"
-          && pending._tag !== "BeginShutdown" && pending._tag !== "FinishShutdown"
+          && pending._tag !== "BeginShutdown"
+          && pending._tag !== "AbortTransitionAcknowledgments"
+          && pending._tag !== "FinishShutdown"
         ) {
           yield* failTerminalBarrier(pending, unavailable)
         }
@@ -1435,25 +1831,29 @@ export function makeAppRuntime(
 
     const terminalRequest = (
       event: TerminalActorEvent,
-    ): Effect.Effect<boolean> => Effect.gen(function*() {
+    ): Effect.Effect<boolean> => Effect.suspend(() => {
       if (!accepting) {
-        yield* failTerminalBarrier(event, transitionRejected("application is shutting down"))
-        return false
+        return failTerminalBarrier(event, transitionRejected("application is shutting down")).pipe(
+          Effect.as(false),
+        )
       }
-      const reply = yield* Deferred.make<boolean>()
-      const offered = yield* Queue.offer(inbox, { ...event, reply })
-      if (!offered) {
-        yield* failTerminalBarrier(event, transitionRejected("application event queue is closed"))
-        return false
+      const reply = Deferred.makeUnsafe<boolean>()
+      const message = { ...event, reply }
+      registerTerminalBarrier(message)
+      if (!Queue.offerUnsafe(inbox, message)) {
+        return failTerminalBarrier(message, transitionRejected("application event queue is closed")).pipe(
+          Effect.as(false),
+        )
       }
-      return yield* Effect.raceFirst(
+      return Effect.raceFirst(
         Deferred.await(reply),
         Deferred.await(actorStopped).pipe(Effect.as(false)),
       )
     })
 
+    type VoidLifecycleControl = Exclude<LifecycleControlMessage, { readonly _tag: "BeginShutdown" }>
     const sendControl = (
-      message: (reply: DeferredType.Deferred<void>) => LifecycleControlMessage,
+      message: (reply: DeferredType.Deferred<void>) => VoidLifecycleControl,
     ): Effect.Effect<boolean> => Effect.gen(function*() {
       const reply = yield* Deferred.make<void>()
       const offered = yield* Queue.offer(controlInbox, message(reply))
@@ -1466,9 +1866,40 @@ export function makeAppRuntime(
 
     const performShutdown = (
       result: DeferredType.Deferred<void, ApplicationShutdownError>,
+      beginReply: DeferredType.Deferred<void>,
+      transitionAcknowledgments: readonly DeferredType.Deferred<void, unknown>[],
     ): Effect.Effect<void> => Effect.gen(function*() {
+      const transitionExit = yield* Effect.exit(
+        Effect.all(
+          transitionAcknowledgments.map((acknowledgment) => Deferred.await(acknowledgment)),
+          { discard: true },
+        ).pipe(Effect.timeoutOrElse({
+          duration: shutdownTransitionTimeoutMs,
+          orElse: () => Effect.fail(new Error(
+            `Timed out after ${shutdownTransitionTimeoutMs}ms while acknowledging session identity`,
+          )),
+        })),
+      )
+      let transitionAbortError: Error | undefined
+      if (Exit.isFailure(transitionExit)) {
+        const reason = errorMessage(Cause.squash(transitionExit.cause))
+        const aborted = yield* sendControl((reply) => ({
+          _tag: "AbortTransitionAcknowledgments",
+          reason,
+          reply,
+        }))
+        if (!aborted) {
+          transitionAbortError = new Error(
+            `${reason}; application actor could not abort pending identity acknowledgments`,
+          )
+        }
+      }
+
       const lifecycleShutdown = Effect.gen(function*() {
-        const began = yield* sendControl((reply) => ({ _tag: "BeginShutdown", reply }))
+        const began = yield* Effect.raceFirst(
+          Deferred.await(beginReply).pipe(Effect.as(true)),
+          Deferred.await(actorStopped).pipe(Effect.as(false)),
+        )
         if (!began) return yield* Effect.fail(new Error("Application actor could not begin shutdown"))
         const navigationExit = yield* Effect.exit(Effect.interruptible(navigation.flush).pipe(
           Effect.timeoutOrElse({
@@ -1496,6 +1927,8 @@ export function makeAppRuntime(
       ], { concurrency: "unbounded" })
       const failures = [lifecycleExit, terminalExit].flatMap((exit) =>
         Exit.isFailure(exit) ? [Cause.squash(exit.cause)] : [])
+      if (Exit.isFailure(transitionExit)) failures.unshift(Cause.squash(transitionExit.cause))
+      if (transitionAbortError) failures.unshift(transitionAbortError)
       const error = failures.length === 0
         ? undefined
         : new ApplicationShutdownError({
@@ -1528,8 +1961,17 @@ export function makeAppRuntime(
       if (shutdownResult) return Deferred.await(shutdownResult)
       accepting = false
       const result = Deferred.makeUnsafe<void, ApplicationShutdownError>()
+      const beginReply = Deferred.makeUnsafe<void>()
+      const transitionAcknowledgments = [...pendingTransitionAcknowledgments.values()]
       shutdownResult = result
-      return Effect.forkDetach(performShutdown(result), {
+      if (!Queue.offerUnsafe(controlInbox, { _tag: "BeginShutdown", reply: beginReply })) {
+        const error = new ApplicationShutdownError({
+          message: "Application shutdown failed: application actor could not begin shutdown",
+        })
+        Deferred.doneUnsafe(result, Effect.fail(error))
+        return Deferred.await(result)
+      }
+      return Effect.forkDetach(performShutdown(result, beginReply, transitionAcknowledgments), {
         startImmediately: true,
         uninterruptible: false,
       }).pipe(Effect.andThen(Deferred.await(result)))
@@ -1549,7 +1991,13 @@ export function makeAppRuntime(
           }))
 
     const offerTerminalCallback = (message: TerminalActorEvent): void => {
-      if (accepting && Queue.offerUnsafe(inbox, message)) return
+      if (accepting) {
+        registerTerminalBarrier(message)
+        if (Queue.offerUnsafe(inbox, message)) return
+        if (message._tag === "TerminalSessionChanged") {
+          unregisterTerminalBarrier(message)
+        }
+      }
       if (message._tag === "TerminalSessionChanged" && message.event.acknowledgment) {
         Deferred.doneUnsafe(
           message.event.acknowledgment,
@@ -1592,13 +2040,10 @@ export function makeAppRuntime(
       shutdown,
     }
 
-    if (projectState.navigation?.view === "terminal" && Exit.isSuccess(snapshotExit)) {
-      yield* Effect.exit(request({
-        _tag: "ResumeSession",
-        sessionId: projectState.navigation.sessionId,
-        reportFailure: false,
-      }))
-    }
+    const startup = yield* Deferred.make<void>()
+    yield* Queue.offer(inbox, { _tag: "Startup", reply: startup })
+    yield* Deferred.await(startup)
+    yield* Effect.yieldNow
 
     yield* Effect.addFinalizer(() => shutdown.pipe(
       Effect.catch((error) => Effect.die(error)),
@@ -1620,6 +2065,7 @@ function commandIntent(command: ActorCommand): ApplicationIntent["_tag"] {
     case "Navigation": return "SelectGraph"
     case "CompletionTimer": return "Refresh"
     case "AcknowledgeTransition": return "OpenEndpoint"
+    case "AcknowledgeStartupAdoptions": return "Refresh"
   }
 }
 
@@ -1665,6 +2111,7 @@ function commandOperation(command: ActorCommand): string {
     case "Stop": return "Stop session"
     case "Remove": return "Remove conversation"
     case "AcknowledgeTransition": return "Acknowledge session identity"
+    case "AcknowledgeStartupAdoptions": return "Restore session identity"
     case "Navigation": return "Save navigation"
     case "CompletionTimer": return "Schedule completion refresh"
   }
@@ -1698,11 +2145,139 @@ function terminalSequence(event: TerminalActorEvent): number {
   return event.event.sequenceId
 }
 
+function isTerminalActorMessage(
+  message: ActorMessage,
+): message is TerminalActorEvent & { readonly reply?: DeferredType.Deferred<boolean> } {
+  return message._tag === "TerminalActivity" || message._tag === "TerminalExit" ||
+    message._tag === "TerminalSessionChanged" || message._tag === "TerminalTransitionError"
+}
+
 function terminalMayBeOpening(state: ApplicationState, event: TerminalActorEvent): boolean {
   const sessionId = event._tag === "TerminalSessionChanged"
     ? event.event.previousSessionId
     : event.event.sessionId
   return state.terminals.get(sessionId)?.phase === "showing"
+}
+
+function removalFallbackSurface(
+  state: ApplicationState,
+  removal: ConversationRemoval,
+): NavigatorSurface {
+  const roots = projectRootsViewModel(state)
+  if (removal.kind === "tree") {
+    return neighboringRootSurface(
+      roots,
+      new Set([removal.rootSessionId, ...removal.memberSessionIds]),
+      removal.rootSessionId,
+    )
+  }
+
+  const forest = selectConversationForest(state)
+  let graph: ConversationGraph | undefined
+  let node: ConversationGraphNode | undefined
+  if (removal.target.kind === "endpoint") {
+    graph = forest.graphBySessionId.get(removal.target.sessionId)
+    const nodeId = graph?.endpointBySessionId.get(removal.target.sessionId)
+    node = nodeId ? graph?.nodes.get(nodeId) : undefined
+  } else {
+    const preferredGraph = state.surface._tag === "Graph"
+      ? forest.graphBySessionId.get(state.surface.familySessionId) ??
+        forest.graphByRootSessionId.get(state.surface.familySessionId)
+      : undefined
+    for (const candidate of [preferredGraph, ...forest.graphs]) {
+      if (!candidate) continue
+      const matched = [...candidate.nodes.values()].find((candidateNode) =>
+        candidateNode.kind === "message" && removal.target.kind === "message" &&
+        removal.target.aliases.some((target) => candidateNode.aliases.some((alias) =>
+          alias.sessionId === target.sessionId && alias.messageId === target.messageId)))
+      if (!matched) continue
+      graph = candidate
+      node = matched
+      break
+    }
+  }
+
+  if (graph && node) {
+    let parentId = node.parentId
+    while (parentId) {
+      const parent = graph.nodes.get(parentId)
+      if (!parent) break
+      if (parent.kind !== "origin") {
+        const target = navigationTargetForGraphNode(parent)
+        if (target) {
+          return { _tag: "Graph", familySessionId: graph.rootSessionId, target }
+        }
+      }
+      parentId = parent.parentId
+    }
+    return neighboringRootSurface(roots, graph.sessionIds, graph.rootSessionId)
+  }
+
+  return state.surface._tag === "Terminal" ? state.surface.returnTo : state.surface
+}
+
+function neighboringRootSurface(
+  roots: ReturnType<typeof projectRootsViewModel>,
+  removedSessionIds: ReadonlySet<string>,
+  anchorSessionId: string,
+): NavigatorSurface {
+  const anchorIndex = Math.max(0, roots.findIndex((root) =>
+    root.sessionId === anchorSessionId || root.memberSessionIds.includes(anchorSessionId)))
+  const remaining = roots.filter((root) =>
+    !removedSessionIds.has(root.sessionId) &&
+    !root.memberSessionIds.some((sessionId) => removedSessionIds.has(sessionId)))
+  const selected = remaining[Math.min(anchorIndex, Math.max(0, remaining.length - 1))]
+  return { _tag: "Roots", selectedSessionId: selected?.sessionId ?? null }
+}
+
+function navigationTargetForGraphNode(
+  node: Exclude<ConversationGraphNode, { readonly kind: "origin" }>,
+): NavigationTarget | undefined {
+  if (node.kind === "endpoint") return { kind: "endpoint", sessionId: node.session.id }
+  const preferred = node.forkTarget ?? node.aliases.at(-1) ?? node.aliases[0]
+  return preferred ? { kind: "message", preferred, aliases: node.aliases } : undefined
+}
+
+function replaceSessionIdInInFlightRemoval(
+  removal: ConversationRemoval,
+  previousSessionId: string,
+  sessionId: string,
+  kind: IdentityTransitionKind,
+  relation?: BranchRelation,
+): ConversationRemoval {
+  const replace = (candidate: string) => candidate === previousSessionId ? sessionId : candidate
+  const messageIds = kind === "native-fork" && relation !== undefined
+    ? new Map(relation.sharedMessages.map((mapping) => [mapping.parentMessageId, mapping.childMessageId]))
+    : undefined
+  const replaceMessageId = (messageId: string) => messageIds?.get(messageId) ?? messageId
+  if (removal.kind === "tree") {
+    return {
+      ...removal,
+      rootSessionId: replace(removal.rootSessionId),
+      memberSessionIds: [...new Set(removal.memberSessionIds.map(replace))],
+    }
+  }
+  if (removal.target.kind === "endpoint") {
+    if (removal.target.sessionId !== previousSessionId) return removal
+    return {
+      ...removal,
+      target: {
+        ...removal.target,
+        sessionId,
+        afterMessageId: removal.target.afterMessageId === null
+          ? null
+          : replaceMessageId(removal.target.afterMessageId),
+      },
+    }
+  }
+  const aliases = new Map<string, MessageRef>()
+  for (const alias of removal.target.aliases) {
+    const replaced = alias.sessionId === previousSessionId
+      ? { sessionId, messageId: replaceMessageId(alias.messageId) }
+      : alias
+    aliases.set(`${replaced.sessionId}\0${replaced.messageId}`, replaced)
+  }
+  return { ...removal, target: { ...removal.target, aliases: [...aliases.values()] } }
 }
 
 function validateStartupAdoption(

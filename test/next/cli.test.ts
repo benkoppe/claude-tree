@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events"
 
 import { expect, test } from "bun:test"
-import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Option } from "effect"
 
 import {
+  composeApplicationLifecycle,
   makeCliProgram,
   makeShutdownSignals,
   makeTerminalEventBridge,
@@ -134,6 +135,41 @@ test("presentation interruption invokes direct runtime shutdown before teardown"
 
   expect(Exit.isFailure(result) && Cause.hasInterruptsOnly(result.cause)).toBeTrue()
   expect(shutdowns).toBe(1)
+})
+
+test("production lifecycle starts presentation before deferred runtime discovery completes", async () => {
+  const discoveryStarted = Deferred.makeUnsafe<void, never>()
+  const releaseDiscovery = Deferred.makeUnsafe<void, never>()
+  const presentationStarted = Deferred.makeUnsafe<void, never>()
+  const shutdownStarted = Deferred.makeUnsafe<void, never>()
+
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const lifecycle = yield* Effect.forkScoped(composeApplicationLifecycle(
+      Effect.gen(function*() {
+        yield* Effect.forkScoped(Effect.gen(function*() {
+          yield* Deferred.succeed(discoveryStarted, undefined)
+          yield* Deferred.await(releaseDiscovery)
+        }))
+        return {
+          shutdown: Deferred.succeed(shutdownStarted, undefined),
+        }
+      }),
+      () => Effect.succeed({
+        run: Deferred.succeed(presentationStarted, undefined),
+        wait: Effect.never,
+      }),
+    ))
+    yield* Deferred.await(discoveryStarted)
+    yield* Deferred.await(presentationStarted)
+    expect(Option.isNone(yield* Deferred.poll(releaseDiscovery))).toBeTrue()
+    const interruption = yield* Effect.forkScoped(Fiber.interrupt(lifecycle))
+    yield* Deferred.await(shutdownStarted)
+    yield* Deferred.succeed(releaseDiscovery, undefined)
+    yield* Fiber.join(interruption)
+    return yield* Fiber.await(lifecycle)
+  })))
+
+  expect(Exit.isFailure(result) && Cause.hasInterruptsOnly(result.cause)).toBeTrue()
 })
 
 test("partial startup failure releases acquired resources exactly once", async () => {

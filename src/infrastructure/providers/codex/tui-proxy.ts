@@ -1,4 +1,8 @@
+import { isAbsolute } from "node:path"
+
 import { Data, Deferred, Effect, FiberSet, PubSub, Scope } from "effect"
+
+import type { IdentityTransitionKind } from "../../../domain/persistence"
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
 const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000
@@ -16,10 +20,12 @@ export type CodexThreadOperation = "start" | "resume" | "fork"
 export interface CodexThreadTransition {
   readonly _tag: "CodexThreadTransition"
   readonly operation: CodexThreadOperation
+  readonly kind: IdentityTransitionKind
   readonly previousThreadId: string
   readonly threadId: string
   readonly title: string
   readonly updatedAt: number
+  readonly cwd: string
   readonly requestedThreadId?: string
   readonly forkPointTurnId?: string
 }
@@ -32,6 +38,10 @@ export interface CodexThreadTransitionFailed {
 }
 
 export type CodexTuiProxyTransition = CodexThreadTransition | CodexThreadTransitionFailed
+
+type ObservedCodexTuiProxyTransition =
+  | Omit<CodexThreadTransition, "kind">
+  | CodexThreadTransitionFailed
 
 export interface CodexTuiProxyTransitionRequest {
   readonly transition: CodexTuiProxyTransition
@@ -48,6 +58,7 @@ export interface CodexTuiProxyOptions {
   readonly upstreamUrl: string
   readonly bearerToken: string
   readonly initialThreadId: string
+  readonly initialThreadIsTemporary?: boolean
   readonly connectTimeoutMs?: number
   readonly cleanupTimeoutMs?: number
   readonly maxPreOpenMessages?: number
@@ -103,6 +114,7 @@ interface ProxyState {
   publishTail: Promise<void>
   pendingPublications: number
   readonly transitionAcknowledgments: Set<Deferred.Deferred<void, CodexTuiProxyError>>
+  awaitingTemporaryAdoption: boolean
   publicationFailure: CodexTuiProxyError | undefined
   cleanupTask: Promise<void> | undefined
 }
@@ -142,6 +154,7 @@ function createProxyState(
       const clients = new Set<Bun.ServerWebSocket<ProxySocketData>>()
       let clientSlots = 0
       let currentThreadId = options.initialThreadId
+      let awaitingTemporaryAdoption = options.initialThreadIsTemporary === true
       const state = {} as ProxyState
       const maxPreOpenMessages = positiveInteger(options.maxPreOpenMessages, DEFAULT_PREOPEN_MESSAGES)
       const maxPreOpenBytes = positiveInteger(options.maxPreOpenBytes, DEFAULT_PREOPEN_BYTES)
@@ -241,7 +254,10 @@ function createProxyState(
                       )) return
                       if (transition._tag === "CodexThreadTransition") {
                         currentThreadId = transition.threadId
-                        for (const client of clients) client.data.currentThreadId = transition.threadId
+                        awaitingTemporaryAdoption = false
+                        for (const client of clients) {
+                          client.data.currentThreadId = transition.threadId
+                        }
                       }
                     }
                     if (!socket.data.closed) socket.send(event.data)
@@ -336,6 +352,7 @@ function createProxyState(
         publishTail: Promise.resolve(),
         pendingPublications: 0,
         transitionAcknowledgments: new Set(),
+        awaitingTemporaryAdoption,
         publicationFailure: undefined,
         cleanupTask: undefined,
       })
@@ -482,7 +499,7 @@ function observeClientMessage(data: ProxySocketData, text: string, limit: number
 function observeServerMessage(
   data: ProxySocketData,
   text: string,
-): CodexTuiProxyTransition | undefined {
+): ObservedCodexTuiProxyTransition | undefined {
   const message = parseRecord(text)
   if (!message || !Object.hasOwn(message, "id") ||
     (typeof message.id !== "number" && typeof message.id !== "string")) return undefined
@@ -499,7 +516,8 @@ function observeServerMessage(
   const thread = message.result.thread
   if (typeof thread.id !== "string" || thread.id.trim().length === 0 ||
     typeof thread.preview !== "string" || typeof thread.updatedAt !== "number" ||
-    !Number.isFinite(thread.updatedAt) || typeof thread.ephemeral !== "boolean" ||
+    !Number.isFinite(thread.updatedAt) || !isCanonicalPathCandidate(thread.cwd) ||
+    typeof thread.ephemeral !== "boolean" ||
     !(thread.parentThreadId === null ||
       (typeof thread.parentThreadId === "string" && thread.parentThreadId.trim().length > 0))) {
     return transitionFailure(request, "tracked switch returned malformed thread data")
@@ -514,6 +532,7 @@ function observeServerMessage(
     threadId: thread.id,
     title: thread.preview,
     updatedAt: thread.updatedAt,
+    cwd: thread.cwd,
     ...(request.requestedThreadId === undefined
       ? {}
       : { requestedThreadId: request.requestedThreadId }),
@@ -537,7 +556,7 @@ function transitionFailure(request: PendingSwitch, detail: string): CodexThreadT
 
 async function publishTransition(
   state: ProxyState,
-  transition: CodexTuiProxyTransition,
+  transition: ObservedCodexTuiProxyTransition,
   capacity: number,
   acknowledgmentTimeoutMs: number,
   socket: Bun.ServerWebSocket<ProxySocketData>,
@@ -550,8 +569,16 @@ async function publishTransition(
   const acknowledgment = Deferred.makeUnsafe<void, CodexTuiProxyError>()
   state.transitionAcknowledgments.add(acknowledgment)
   const publication = state.publishTail.then(async () => {
+    const publishedTransition = transition._tag === "CodexThreadTransition"
+      ? {
+          ...transition,
+          kind: state.awaitingTemporaryAdoption
+            ? "temporary-adoption" as const
+            : "native-fork" as const,
+        }
+      : transition
     const published = await state.runPromise(PubSub.publish(state.transitions, {
-      transition,
+      transition: publishedTransition,
       acknowledgment,
     }))
     if (!published && !state.closed) {
@@ -568,6 +595,9 @@ async function publishTransition(
           message: `Codex TUI transition was not acknowledged within ${acknowledgmentTimeoutMs}ms`,
         })),
       })))
+      if (publishedTransition._tag === "CodexThreadTransition") {
+        state.awaitingTemporaryAdoption = false
+      }
     }
   })
   state.publishTail = publication
@@ -688,6 +718,10 @@ function requireIdentifier(value: string, label: string): void {
       message: `Codex TUI proxy ${label} must be nonempty`,
     })
   }
+}
+
+function isCanonicalPathCandidate(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !value.includes("\0") && isAbsolute(value)
 }
 
 function assertLoopbackWebSocketUrl(value: string): void {

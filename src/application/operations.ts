@@ -17,8 +17,6 @@ import type {
   ValidatedBranch,
 } from "../services/provider"
 import type { TerminalSupervisorApi } from "../services/terminal-supervisor"
-import { RemovalOperationError } from "./protocol"
-
 export type ApplicationMetadataFacet = Pick<
   ProviderStateRepositoryApi,
   | "instanceId"
@@ -40,11 +38,6 @@ export interface IndependentBranch {
   readonly outcome: Exclude<BranchOutcome, ValidatedBranch>
 }
 
-export interface RemovalResult {
-  readonly removal: ConversationRemoval
-  readonly stoppedSessionIds: readonly string[]
-}
-
 export interface ApplicationOperations {
   readonly loadSnapshot: (
     mode: "full" | "incremental",
@@ -62,10 +55,11 @@ export interface ApplicationOperations {
     readonly drafts: ReadonlyMap<string, import("../domain/model").DraftPreview>
   }>
   readonly stop: TerminalSupervisorApi["stopSession"]
-  readonly remove: (
+  readonly commitRemoval: (
     removal: ConversationRemoval,
     affectedSessionIds: readonly string[],
-  ) => Effect.Effect<RemovalResult, unknown>
+    mutationToken: string,
+  ) => Effect.Effect<ConversationRemoval, unknown>
 }
 
 export function makeApplicationOperations(options: {
@@ -133,47 +127,6 @@ export function makeApplicationOperations(options: {
     }
   }))
 
-  const remove: ApplicationOperations["remove"] = (removal, affectedSessionIds) =>
-    Effect.suspend(() => {
-      const mutationToken = crypto.randomUUID()
-      return Effect.gen(function*() {
-        const owned = yield* Effect.suspend(() => options.terminals.ownedSessionIds)
-        const stopped: string[] = []
-        for (const sessionId of affectedSessionIds) {
-          if (!owned.has(sessionId)) continue
-          const stopExit = yield* Effect.exit(Effect.suspend(() =>
-            options.terminals.stopSession(sessionId)))
-          if (Exit.isFailure(stopExit)) {
-            const cause = Cause.squash(stopExit.cause)
-            return yield* Effect.fail(new RemovalOperationError({
-              intent: "Remove",
-              operation: "Remove conversation",
-              message: errorMessage(cause),
-              stoppedSessionIds: stopped,
-              failedSessionId: sessionId,
-              cause,
-            }))
-          }
-          if (stopExit.value) stopped.push(sessionId)
-        }
-        const removalExit = yield* Effect.exit(
-          Effect.suspend(() =>
-            options.metadata.commitRemoval(removal, affectedSessionIds, mutationToken)),
-        )
-        if (Exit.isFailure(removalExit)) {
-          const cause = Cause.squash(removalExit.cause)
-          return yield* Effect.fail(new RemovalOperationError({
-            intent: "Remove",
-            operation: "Remove conversation",
-            message: errorMessage(cause),
-            stoppedSessionIds: stopped,
-            cause,
-          }))
-        }
-        return { removal: removalExit.value, stoppedSessionIds: stopped }
-      })
-    })
-
   return {
     loadSnapshot,
     prepareNew: Effect.suspend(() => options.provider.prepareNewSession),
@@ -185,7 +138,8 @@ export function makeApplicationOperations(options: {
       drafts: options.terminals.draftPreviews,
     })),
     stop: (sessionId) => Effect.suspend(() => options.terminals.stopSession(sessionId)),
-    remove,
+    commitRemoval: (removal, affectedSessionIds, mutationToken) => Effect.suspend(() =>
+      options.metadata.commitRemoval(removal, affectedSessionIds, mutationToken)),
   }
 }
 

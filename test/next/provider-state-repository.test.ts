@@ -433,6 +433,84 @@ describe("ProviderStateRepository terminal ownership", () => {
     expect(committed.adoption.relation).toEqual(forkRelation)
   })
 
+  test("persists temporary adoption followed by repeated native-fork relations and navigation", async () => {
+    const { project, state } = await fixture()
+    const repository = await openProviderState(project, state)
+    await run(repository.updateMetadata(() => ({
+      relations: [],
+      removals: [],
+      navigation: {
+        view: "graph",
+        familySessionId: "temporary",
+        target: {
+          kind: "message",
+          preferred: { sessionId: "temporary", messageId: "source" },
+          aliases: [{ sessionId: "temporary", messageId: "source" }],
+        },
+      },
+    })))
+    let owner = await run(repository.attach(
+      await run(repository.reserve("temporary")),
+      707,
+    ))
+
+    const adopted = await run(repository.commitIdentity({
+      owner,
+      sessionId: "real",
+      kind: "temporary-adoption",
+      mutationToken: "adopt-real",
+    }))
+    await run(repository.ack(adopted.adoption.adoptionToken))
+    owner = adopted.owner
+
+    const firstRelation = relation("fork-one", "real")
+    const firstFork = await run(repository.commitIdentity({
+      owner,
+      sessionId: "fork-one",
+      kind: "native-fork",
+      relation: firstRelation,
+      mutationToken: "fork-one",
+    }))
+    await run(repository.ack(firstFork.adoption.adoptionToken))
+    owner = firstFork.owner
+
+    const secondRelation = {
+      childSessionId: "fork-two",
+      parentSessionId: "fork-one",
+      sourceMessageId: "fork-one-source",
+      sharedMessages: [{
+        parentMessageId: "fork-one-source",
+        childMessageId: "fork-two-source",
+      }],
+      createdAt: timestamp(0),
+    }
+    const secondFork = await run(repository.commitIdentity({
+      owner,
+      sessionId: "fork-two",
+      kind: "native-fork",
+      relation: secondRelation,
+      mutationToken: "fork-two",
+    }))
+    await run(repository.ack(secondFork.adoption.adoptionToken))
+
+    const persisted = await run(repository.load)
+    expect(persisted.relations).toEqual([firstRelation, secondRelation])
+    expect(persisted.navigations).toEqual([{
+      instanceId: repository.instanceId,
+      navigation: {
+        view: "graph",
+        familySessionId: "fork-two",
+        target: {
+          kind: "message",
+          preferred: { sessionId: "fork-two", messageId: "fork-two-source" },
+          aliases: [{ sessionId: "fork-two", messageId: "fork-two-source" }],
+        },
+      },
+    }])
+    expect(persisted.terminalOwners).toEqual([secondFork.owner])
+    expect(persisted.pendingIdentityAdoptions).toEqual([])
+  })
+
   test("exposes and reconciles an orphan only after its PID and group are absent", async () => {
     const { project, state } = await fixture()
     const origin = await openProviderState(

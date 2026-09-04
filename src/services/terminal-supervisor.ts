@@ -100,6 +100,7 @@ export interface TerminalActivityEvent extends SequencedTerminalEvent {
 
 export interface TerminalSessionChangedEvent extends SequencedTerminalEvent {
   readonly previousSessionId: string
+  readonly kind: IdentityTransitionKind
   readonly session: AgentSession
   readonly wasActive: boolean
   readonly adoptionToken: string
@@ -262,7 +263,7 @@ interface TerminalOwner {
   readonly processGroupId: number
   readonly surface: TerminalSurface
   ownership: PersistedTerminalOwner
-  readonly beganTransient: boolean
+  awaitingTemporaryAdoption: boolean
   readonly mutationTokens: MutationTokens
   semanticFiber?: Fiber.Fiber<void, never>
   transitionFiber?: Fiber.Fiber<void, never>
@@ -696,7 +697,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     acquired: AcquiredTerminalLaunch,
     providerScope: Scope.Closeable,
     ownership: PersistedTerminalOwner,
-    beganTransient: boolean,
+    awaitingTemporaryAdoption: boolean,
     mutationTokens: MutationTokens,
   ): Effect.Effect<TerminalOwner, TerminalError | TerminalCleanupError> {
     const launch = acquired.launch
@@ -825,7 +826,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         processGroupId: process.processGroupId,
         surface,
         ownership,
-        beganTransient,
+        awaitingTemporaryAdoption,
         mutationTokens,
         lastQueuedActivity,
         activity: "idle",
@@ -1039,9 +1040,26 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         yield* Deferred.succeed(request.acknowledgment, undefined)
         return undefined
       }
-      const kind: IdentityTransitionKind = owner.beganTransient
+      const kind = transition.kind
+      const expectedKind: IdentityTransitionKind = owner.awaitingTemporaryAdoption
         ? "temporary-adoption"
         : "native-fork"
+      if (kind !== expectedKind) {
+        const error = new TerminalError({
+          operation: "native-session-transition",
+          sessionId: previousSessionId,
+          message: `Provider reported a ${kind} transition while ${expectedKind} was required`,
+        })
+        return yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
+          if (!this.isRunningOwner(owner)) {
+            yield* Deferred.fail(request.acknowledgment, error)
+            return undefined
+          }
+          this.emitTransitionError(owner, sequenceId, error)
+          yield* Deferred.fail(request.acknowledgment, error)
+          return this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true)
+        }.bind(this)))
+      }
       const relationExit = yield* Effect.exit(this.deriveRelation(
         previousSessionId,
         sessionId,
@@ -1136,6 +1154,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         ownerId: owner.ownerId,
         sequenceId,
         previousSessionId,
+        kind,
         session: transition.session,
         wasActive: this.activeOwnerId === owner.ownerId,
         adoptionToken: committed.value.adoption.adoptionToken,
@@ -1267,6 +1286,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         ownerId: owner.ownerId,
         sequenceId: owner.sequence.next++,
         previousSessionId: pending.previousSessionId,
+        kind: pending.kind,
         session: pending.session,
         wasActive: this.activeOwnerId === owner.ownerId,
         adoptionToken,
@@ -2269,6 +2289,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     }
     owner.ownership = ownership
     owner.sessionId = sessionId
+    owner.awaitingTemporaryAdoption = false
     if (entry) this.ledger.set(sessionId, entry)
   }
 

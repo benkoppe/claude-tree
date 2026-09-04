@@ -339,6 +339,60 @@ describe("Effect Claude provider", () => {
     })))
   })
 
+  test("uses cached parent metadata for the initial PreparedTerminal fork title", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    const copied = [copyMessage(parent[0]!, CHILD, "child-1")]
+    let listCalls = 0
+    const provider = providerWith({
+      listSessions: () => {
+        listCalls += 1
+        return [{
+          sessionId: ROOT,
+          customTitle: "Contextual parent",
+          summary: "Parent summary",
+          lastModified: 1,
+        }]
+      },
+      messages: { [ROOT]: parent, [CHILD]: copied },
+      physical: {
+        [ROOT]: parent,
+        [CHILD]: [copiedRecord(copied[0]!, ROOT, parent[0]!.uuid)],
+      },
+    })
+
+    await Effect.runPromise(provider.loadSessionSnapshotFor([]))
+    const outcome = await Effect.runPromise(provider.branchFrom({
+      sessionId: ROOT,
+      messageId: "parent-1",
+    }))
+
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error("expected validated branch")
+    expect(outcome.session.title).toBe("Contextual parent (fork)")
+    expect(listCalls).toBe(1)
+  })
+
+  test("uses a deterministic fork title when parent metadata is unavailable", async () => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    const copied = [copyMessage(parent[0]!, CHILD, "child-1")]
+    const provider = providerWith({
+      messages: { [ROOT]: parent, [CHILD]: copied },
+      physical: {
+        [ROOT]: parent,
+        [CHILD]: [copiedRecord(copied[0]!, ROOT, parent[0]!.uuid)],
+      },
+    })
+
+    const outcome = await Effect.runPromise(provider.branchFrom({
+      sessionId: ROOT,
+      messageId: "parent-1",
+    }))
+
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error("expected validated branch")
+    expect(outcome.session.title).toBe("Conversation (fork)")
+  })
+
   test("forks exactly once across bounded post-create reads", async () => {
     const parent = [
       message(ROOT, "parent-1", "user", "question"),

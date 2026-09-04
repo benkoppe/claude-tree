@@ -523,9 +523,15 @@ describe("Effect Codex provider", () => {
 
   test("acquires fresh sidecar services lazily and adopts the pending ID on thread/start", async () => {
     let acquisitions = 0
+    let initialThreadIsTemporary: boolean | undefined
     let source!: PubSub.PubSub<CodexTuiProxyTransitionRequest>
-    const observedServicesFactory: CodexObservedServicesFactory = () => Effect.gen(function*() {
+    const observedServicesFactory: CodexObservedServicesFactory = (
+      _executable,
+      _initialThreadId,
+      temporary,
+    ) => Effect.gen(function*() {
       acquisitions += 1
+      initialThreadIsTemporary = temporary
       source = yield* PubSub.unbounded<CodexTuiProxyTransitionRequest>()
       return {
         remoteUrl: "ws://127.0.0.1:12345",
@@ -560,22 +566,137 @@ describe("Effect Codex provider", () => {
       yield* publishObservedTransition(source, {
         _tag: "CodexThreadTransition",
         operation: "start",
+        kind: "temporary-adoption",
         previousThreadId: prepared.session.id,
         threadId: CHILD,
         title: "First prompt",
         updatedAt: 21,
+        cwd: "/project",
       })
       return yield* takeAndAcknowledgeTransition(subscription)
     })))
     expect(acquisitions).toBe(1)
+    expect(initialThreadIsTemporary).toBeTrue()
     expect(result).toEqual({
       _tag: "SessionChanged",
+      kind: "temporary-adoption",
       session: {
         id: CHILD,
         title: "First prompt",
         lastModified: 21_000,
         transient: true,
       },
+    })
+  })
+
+  test("treats a temporary terminal's first thread/resume as adoption without native derivation", async () => {
+    let source!: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+    const provider = new CodexProvider("/project", "/usr/bin/codex", {
+      appServerFactory: () => Effect.succeed(fakeClient()),
+      observedServicesFactory: () => Effect.gen(function*() {
+        source = yield* PubSub.unbounded<CodexTuiProxyTransitionRequest>()
+        return {
+          remoteUrl: "ws://127.0.0.1:12346",
+          bearerToken: "secret",
+          transitions: source,
+          close: () => Effect.void,
+        }
+      }),
+      randomUUID: () => "pending-id",
+    })
+    const prepared = await Effect.runPromise(provider.prepareNewSession)
+
+    const transition = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquired = yield* prepared.acquireLaunch
+      const subscription = yield* PubSub.subscribe(acquired.launch.transitions!)
+      yield* publishObservedTransition(source, {
+        _tag: "CodexThreadTransition",
+        operation: "resume",
+        kind: "temporary-adoption",
+        previousThreadId: prepared.session.id,
+        threadId: CHILD,
+        title: "First identity",
+        updatedAt: 22,
+        cwd: "/project",
+        requestedThreadId: CHILD,
+      })
+      return yield* takeAndAcknowledgeTransition(subscription)
+    })))
+
+    expect(transition).toEqual({
+      _tag: "SessionChanged",
+      kind: "temporary-adoption",
+      session: {
+        id: CHILD,
+        title: "First identity",
+        lastModified: 22_000,
+        transient: true,
+      },
+    })
+  })
+
+  test("derives exact requested ancestry for a temporary terminal's first thread/fork", async () => {
+    const parent = thread(ROOT, [turn("parent-turn", "completed", [
+      user("parent-user", [{ type: "text", text: "Question" }]),
+      { id: "parent-agent", type: "agentMessage", text: "Answer" },
+    ])])
+    const child = thread(CHILD, [turn("child-turn", "completed", [
+      user("child-user", [{ type: "text", text: "Question" }]),
+      { id: "child-agent", type: "agentMessage", text: "Answer" },
+    ])])
+    const client = fakeClient({
+      readThread: (id) => Effect.succeed(id === ROOT ? parent : child),
+    })
+    let source!: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+    const provider = new CodexProvider("/project", "/usr/bin/codex", {
+      appServerFactory: () => Effect.succeed(client),
+      observedServicesFactory: () => Effect.gen(function*() {
+        source = yield* PubSub.unbounded<CodexTuiProxyTransitionRequest>()
+        return {
+          remoteUrl: "ws://127.0.0.1:12347",
+          bearerToken: "secret",
+          transitions: source,
+          close: () => Effect.void,
+        }
+      }),
+      randomUUID: () => "pending-id",
+    })
+    const prepared = await Effect.runPromise(provider.prepareNewSession)
+    const transition = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquired = yield* prepared.acquireLaunch
+      const subscription = yield* PubSub.subscribe(acquired.launch.transitions!)
+      yield* publishObservedTransition(source, {
+        _tag: "CodexThreadTransition",
+        operation: "fork",
+        kind: "temporary-adoption",
+        previousThreadId: prepared.session.id,
+        requestedThreadId: ROOT,
+        forkPointTurnId: "parent-turn",
+        threadId: CHILD,
+        title: "First fork",
+        updatedAt: 23,
+        cwd: "/project",
+      })
+      const request = yield* PubSub.take(subscription)
+      const event = request.event
+      if (event._tag === "SessionChanged" && event.derivation) yield* event.derivation
+      yield* Deferred.succeed(request.acknowledgment, undefined)
+      return event
+    })))
+
+    expect(transition._tag).toBe("SessionChanged")
+    if (transition._tag !== "SessionChanged") throw transition.error
+    expect(transition.kind).toBe("temporary-adoption")
+    expect(transition.session.transient).toBeTrue()
+    expect(transition.derivation).toBeDefined()
+    expect(await Effect.runPromise(transition.derivation!)).toEqual({
+      childSessionId: CHILD,
+      parentSessionId: ROOT,
+      sourceMessageId: "parent-agent",
+      sharedMessages: [
+        { parentMessageId: "parent-user", childMessageId: "child-user" },
+        { parentMessageId: "parent-agent", childMessageId: "child-agent" },
+      ],
     })
   })
 
@@ -615,12 +736,14 @@ describe("Effect Codex provider", () => {
       yield* publishObservedTransition(source, {
         _tag: "CodexThreadTransition",
         operation: "fork",
+        kind: "native-fork",
         previousThreadId: ROOT,
         requestedThreadId: ROOT,
         forkPointTurnId: "parent-turn",
         threadId: CHILD,
         title: "Fork",
         updatedAt: 2,
+        cwd: "/project",
       })
       const request = yield* PubSub.take(subscription)
       const event = request.event
@@ -631,6 +754,8 @@ describe("Effect Codex provider", () => {
 
     expect(transition._tag).toBe("SessionChanged")
     if (transition._tag !== "SessionChanged") throw transition.error
+    expect(transition.kind).toBe("native-fork")
+    expect(transition.session.transient).toBeUndefined()
     expect(transition.derivation).toBeDefined()
     expect(await Effect.runPromise(transition.derivation!)).toEqual({
       childSessionId: CHILD,
@@ -728,11 +853,13 @@ describe("Effect Codex provider", () => {
         transition: {
           _tag: "CodexThreadTransition",
           operation: "resume",
+          kind: "native-fork",
           previousThreadId: ROOT,
           requestedThreadId: ROOT,
           threadId: CHILD,
           title: "Child",
           updatedAt: 2,
+          cwd: "/project",
         },
         acknowledgment: sourceAcknowledgment,
       })
@@ -740,6 +867,55 @@ describe("Effect Codex provider", () => {
       expect((yield* Deferred.await(sourceAcknowledgment).pipe(Effect.timeoutOption(10)))._tag).toBe("None")
       yield* Deferred.succeed(request.acknowledgment, undefined)
       yield* Deferred.await(sourceAcknowledgment).pipe(Effect.timeout(1_000))
+    })))
+  })
+
+  test("fails every native transition outside the canonical project before publication", async () => {
+    let source!: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+    const provider = new CodexProvider("/canonical/project", "/usr/bin/codex", {
+      appServerFactory: () => Effect.succeed(fakeClient()),
+      canonicalize: async (path) => path,
+      observedServicesFactory: () => Effect.gen(function*() {
+        source = yield* PubSub.unbounded<CodexTuiProxyTransitionRequest>()
+        return {
+          remoteUrl: "ws://127.0.0.1:13",
+          bearerToken: "token",
+          transitions: source,
+          close: () => Effect.void,
+        }
+      }),
+    })
+    const prepared = await Effect.runPromise(provider.prepareResume({
+      id: ROOT,
+      title: "Root",
+      lastModified: 1,
+    }))
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquired = yield* prepared.acquireLaunch
+      const subscription = yield* PubSub.subscribe(acquired.launch.transitions!)
+      for (const operation of ["start", "resume", "fork"] as const) {
+        yield* publishObservedTransition(source, {
+          _tag: "CodexThreadTransition",
+          operation,
+          kind: operation === "start" ? "temporary-adoption" : "native-fork",
+          previousThreadId: ROOT,
+          threadId: `${operation}-foreign-child`,
+          title: "Foreign",
+          updatedAt: 2,
+          cwd: "/foreign/project",
+          ...(operation === "fork"
+            ? { requestedThreadId: ROOT, forkPointTurnId: "turn" }
+            : {}),
+        })
+        const request = yield* PubSub.take(subscription)
+        expect(request.event._tag).toBe("TransitionFailed")
+        if (request.event._tag === "TransitionFailed") {
+          expect(request.event.error).toBeInstanceOf(ProviderProtocolError)
+          expect(request.event.error.message).toContain("belongs to another project")
+        }
+        yield* Deferred.succeed(request.acknowledgment, undefined)
+      }
     })))
   })
 
@@ -799,11 +975,13 @@ describe("Effect Codex provider", () => {
           transition: {
             _tag: "CodexThreadTransition",
             operation: "resume",
+            kind: "native-fork",
             previousThreadId: ROOT,
             requestedThreadId: ROOT,
             threadId: CHILD,
             title: "Child",
             updatedAt: 2,
+            cwd: "/project",
           },
           acknowledgment: sourceAcknowledgment,
         })
@@ -1389,12 +1567,14 @@ async function nativeForkDerivation(
     yield* publishObservedTransition(source, {
       _tag: "CodexThreadTransition",
       operation: "fork",
+      kind: "native-fork",
       previousThreadId: ROOT,
       requestedThreadId: ROOT,
       forkPointTurnId,
       threadId: CHILD,
       title: "Fork",
       updatedAt: 2,
+      cwd: "/project",
     })
     const request = yield* PubSub.take(subscription)
     yield* Deferred.succeed(request.acknowledgment, undefined)

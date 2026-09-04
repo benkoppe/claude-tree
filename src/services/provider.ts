@@ -18,6 +18,7 @@ import type {
   SessionRemovedError,
   TerminalError,
 } from "../domain/errors"
+import type { IdentityTransitionKind } from "../domain/persistence"
 
 export interface ProviderCapabilities {
   readonly historicalBranching: boolean
@@ -31,6 +32,7 @@ export interface ProviderCapabilities {
 export type TerminalTransitionEvent =
   | {
       readonly _tag: "SessionChanged"
+      readonly kind: IdentityTransitionKind
       readonly session: AgentSession
       readonly derivation?: Effect.Effect<BranchDerivation | undefined, ProviderError | ProviderProtocolError>
     }
