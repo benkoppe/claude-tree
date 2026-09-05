@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { Effect } from "effect"
+import { ClaudeProvider } from "../src/infrastructure/providers/claude/provider"
+import { buildConversationForest } from "../src/domain/conversation-graph"
 
 import {
   forkSession,
@@ -208,9 +211,218 @@ test("the pinned SDK preserves provenance when compaction shortens a fork's acti
   })).toBeTrue()
 })
 
+for (const [preservation, linkedHistory] of ["preservedSegment", "preservedMessages"].flatMap((preservation) =>
+  [false, true].map((linkedHistory) => [preservation, linkedHistory] as const)
+)) {
+  test(`the provider forks and attaches SDK history reordered by ${preservation} (logical history: ${linkedHistory})`, async () => {
+    const store = new InMemorySessionStore()
+    const sessionId = crypto.randomUUID()
+    const projectKey = process.cwd().replaceAll("/", "-")
+    const ids: string[] = Array.from({ length: 8 }, () => crypto.randomUUID())
+    const timestamp = "2026-08-30T12:00:00.000Z"
+    await store.append({ projectKey, sessionId }, [
+      userEntry(sessionId, ids[0]!, null, "old question", timestamp),
+      agentEntry(sessionId, ids[1]!, ids[0]!, "old answer", timestamp),
+      userEntry(sessionId, ids[2]!, ids[1]!, "preserved question", timestamp),
+      agentEntry(sessionId, ids[3]!, ids[2]!, "preserved answer", timestamp),
+      {
+        type: "system", subtype: "compact_boundary", uuid: ids[4]!,
+        sessionId, parentUuid: null, timestamp,
+        ...(linkedHistory ? { logicalParentUuid: ids[3] } : {}),
+        compactMetadata: preservation === "preservedSegment"
+          ? { preservedSegment: { headUuid: ids[2], tailUuid: ids[3], anchorUuid: ids[5] } }
+          : { preservedMessages: { uuids: [ids[2], ids[3]], anchorUuid: ids[5] } },
+      },
+      userEntry(sessionId, ids[5]!, ids[4]!, "compaction summary", timestamp),
+      userEntry(sessionId, ids[6]!, ids[5]!, "continue", timestamp),
+      agentEntry(sessionId, ids[7]!, ids[6]!, "latest answer", timestamp),
+    ])
+    let forkCalls = 0
+    const provider = new ClaudeProvider(process.cwd(), { sdk: {
+      async listSessions() { return [] },
+      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      forkSession: (id, options) => {
+        forkCalls += 1
+        return forkSession(id, { ...options, sessionStore: store })
+      },
+      async importSessionToStore(id, target) {
+        await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
+      },
+    } }, { forkValidationRetryDelaysMs: [] })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId, messageId: ids[7]! }))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    expect(forkCalls).toBe(1)
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(outcome.derivation.sharedMessages.map((pair) => ids.indexOf(pair.parentMessageId))).toEqual(linkedHistory ? [0, 1, 2, 3, 5, 6, 7] : [5, 2, 3, 6, 7])
+    const reads = await Effect.runPromise(provider.readTranscripts([sessionId, outcome.session.id]))
+    const parent = reads.get(sessionId)!
+    const child = reads.get(outcome.session.id)!
+    if (parent._tag !== "Available" || child._tag !== "Available") throw new Error("Missing transcript")
+    const forest = buildConversationForest(
+      [{ id: sessionId, title: "Parent", lastModified: 0 }, outcome.session],
+      new Map([[sessionId, parent.messages], [outcome.session.id, child.messages]]),
+      [{ ...outcome.derivation, createdAt: timestamp }],
+    )
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.graphs[0]!.warnings).toEqual([])
+  })
+}
+
+test("compaction preserves a long logical history across reload, forks, repeated compaction, and rewind", async () => {
+  const store = new InMemorySessionStore()
+  const sessionId = crypto.randomUUID()
+  const projectKey = process.cwd().replaceAll("/", "-")
+  const timestamp = "2026-09-05T12:00:00.000Z"
+  const provider = () => new ClaudeProvider(process.cwd(), { sdk: {
+    async listSessions() { return [] },
+    getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+    forkSession: (id, options) => forkSession(id, { ...options, sessionStore: store }),
+    async importSessionToStore(id, target) {
+      await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
+    },
+  } })
+  const history: string[] = []
+  for (let turn = 0; turn < 80; turn++) {
+    const question = crypto.randomUUID(), answer = crypto.randomUUID()
+    await store.append({ projectKey, sessionId }, [
+      userEntry(sessionId, question, history.at(-1) ?? null, `question ${turn}`, timestamp),
+      agentEntry(sessionId, answer, question, `answer ${turn}`, timestamp),
+    ])
+    history.push(question, answer)
+  }
+  const compact = async (id: string, parent: string) => {
+    const boundary = crypto.randomUUID(), summary = crypto.randomUUID()
+    await store.append({ projectKey, sessionId: id }, [
+      { type: "system", subtype: "compact_boundary", uuid: boundary, parentUuid: null,
+        logicalParentUuid: parent, sessionId: id, timestamp, compactMetadata: {} },
+      { ...userEntry(id, summary, boundary, "compressed context", timestamp), isCompactSummary: true },
+    ])
+    return summary
+  }
+  const read = async (ids: string[]) => new Map([...await Effect.runPromise(provider().readTranscripts(ids))].map(([id, result]) => {
+    if (result._tag !== "Available") throw new Error(JSON.stringify(result))
+    return [id, result.messages] as const
+  }))
+  const summary = await compact(sessionId, history.at(-1)!)
+  expect((await read([sessionId])).get(sessionId)!.filter((message) => message.visible).map((message) => message.id)).toEqual(history)
+  const historicalFork = await Effect.runPromise(provider().branchFrom({ sessionId, messageId: history[79]! }))
+  if (historicalFork._tag !== "ValidatedBranch") throw new Error(historicalFork.reason)
+  expect(historicalFork.derivation.sharedMessages.map((pair) => pair.parentMessageId)).toEqual(history.slice(0, 80))
+  const question = crypto.randomUUID(), answer = crypto.randomUUID()
+  await store.append({ projectKey, sessionId }, [
+    userEntry(sessionId, question, summary, "after compaction", timestamp),
+    agentEntry(sessionId, answer, question, "continued", timestamp),
+  ])
+  const fork = await Effect.runPromise(provider().branchFrom({ sessionId, messageId: answer }))
+  if (fork._tag !== "ValidatedBranch") throw new Error(fork.reason)
+  const childSource = fork.derivation.sharedMessages.at(-1)!.childMessageId
+  const childQuestion = crypto.randomUUID(), childAnswer = crypto.randomUUID()
+  await store.append({ projectKey, sessionId: fork.session.id }, [
+    userEntry(fork.session.id, childQuestion, childSource, "child question", timestamp),
+    agentEntry(fork.session.id, childAnswer, childQuestion, "child answer", timestamp),
+  ])
+  const secondSummary = await compact(fork.session.id, childAnswer)
+  const finalQuestion = crypto.randomUUID()
+  await store.append({ projectKey, sessionId: fork.session.id }, [userEntry(fork.session.id, finalQuestion, secondSummary, "after second compaction", timestamp)])
+  const sessions = [{ id: sessionId, title: "Parent", lastModified: 0 }, fork.session]
+  const relations = [{ ...fork.derivation, createdAt: timestamp }]
+  const forest = buildConversationForest(sessions, await read(sessions.map((session) => session.id)), relations)
+  expect(forest.warnings).toEqual([])
+  expect(forest.graphs).toHaveLength(1)
+  const graph = forest.graphs[0]!
+  const nodeFor = (id: string) => [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.messageId === id))!
+  expect(nodeFor(finalQuestion).parentId).toBe(nodeFor(childAnswer).id)
+  expect(nodeFor(childQuestion).parentId).toBe(nodeFor(answer).id)
+  for (let index = 1; index < history.length; index++) expect(nodeFor(history[index]!).parentId).toBe(nodeFor(history[index - 1]!).id)
+  // Relations saved before history-aware reads only mapped the active context.
+  const legacy = buildConversationForest(sessions, await read(sessions.map((session) => session.id)), [{
+    ...relations[0]!, sharedMessages: relations[0]!.sharedMessages.filter((pair) => new Set<string>([summary, question, answer]).has(pair.parentMessageId)),
+  }])
+  expect(legacy.warnings).toEqual([])
+  expect(legacy.graphs).toHaveLength(1)
+  // An explicit new branch from an earlier parent is a rewind, not compaction.
+  const replacement = crypto.randomUUID()
+  await store.append({ projectKey, sessionId: fork.session.id }, [userEntry(fork.session.id, replacement, childSource, "rewound", timestamp)])
+  const rewound = (await read([fork.session.id])).get(fork.session.id)!
+  expect(rewound.some((message) => message.id === childQuestion || message.id === childAnswer || message.id === finalQuestion)).toBe(false)
+  expect(rewound.at(-1)!.id).toBe(replacement)
+  await compact(fork.session.id, replacement)
+  const compactedRewind = (await read([fork.session.id])).get(fork.session.id)!
+  expect(compactedRewind.filter((message) => message.visible).map((message) => message.id)).toEqual(rewound.filter((message) => message.visible).map((message) => message.id))
+  await compact(fork.session.id, crypto.randomUUID())
+  expect((await Effect.runPromise(provider().readTranscripts([fork.session.id]))).get(fork.session.id)?._tag).toBe("Unavailable")
+})
+
+for (const preserveShared of [false, true]) {
+  test(`compacting an existing fork preserves its attachment (preserved shared history: ${preserveShared})`, async () => {
+    const store = new InMemorySessionStore()
+    const sessionId = crypto.randomUUID()
+    const projectKey = process.cwd().replaceAll("/", "-")
+    const timestamp = "2026-09-05T12:00:00.000Z"
+    const question = crypto.randomUUID(), source = crypto.randomUUID()
+    await store.append({ projectKey, sessionId }, [
+      userEntry(sessionId, question, null, "original question", timestamp),
+      agentEntry(sessionId, source, question, "fork source", timestamp),
+    ])
+    const makeProvider = () => new ClaudeProvider(process.cwd(), { sdk: {
+      async listSessions() { return [] },
+      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      forkSession: (id, options) => forkSession(id, { ...options, sessionStore: store }),
+      async importSessionToStore(id, target) {
+        await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
+      },
+    } })
+    const fork = await Effect.runPromise(makeProvider().branchFrom({ sessionId, messageId: source }))
+    if (fork._tag !== "ValidatedBranch") throw new Error(fork.reason)
+    const childId = fork.session.id
+    const boundary = crypto.randomUUID(), summary = crypto.randomUUID(), continuation = crypto.randomUUID()
+    await store.append({ projectKey, sessionId: childId }, [
+      {
+        type: "system", subtype: "compact_boundary", uuid: boundary, parentUuid: null, sessionId: childId, timestamp,
+        compactMetadata: preserveShared ? { preservedMessages: {
+          anchorUuid: summary, uuids: fork.derivation.sharedMessages.map((pair) => pair.childMessageId),
+        } } : {},
+      },
+      { ...userEntry(childId, summary, boundary, "compressed context", timestamp), isCompactSummary: true },
+      agentEntry(childId, continuation, summary, "continue after compaction", timestamp),
+    ])
+    // A fresh provider must reconstruct the same attachment without cached pre-compaction text.
+    const reads = await Effect.runPromise(makeProvider().readTranscripts([sessionId, childId]))
+    const transcripts = new Map([...reads].map(([id, read]) => {
+      if (read._tag !== "Available") throw new Error(`Unavailable ${id}`)
+      return [id, read.messages] as const
+    }))
+    expect(transcripts.get(childId)?.find((item) => item.id === summary)).toMatchObject({ visible: false, historyBoundary: "compaction" })
+    const forest = buildConversationForest(
+      [{ id: sessionId, title: "Parent", lastModified: 0 }, fork.session], transcripts,
+      [{ ...fork.derivation, createdAt: timestamp }],
+    )
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const graph = forest.graphs[0]!
+    const sourceNode = [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.sessionId === sessionId && alias.messageId === source))!
+    const continued = [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.messageId === continuation))!
+    expect(continued.parentId).toBe(sourceNode.id)
+    const nextFork = await Effect.runPromise(makeProvider().branchFrom({ sessionId: childId, messageId: continuation }))
+    if (nextFork._tag !== "ValidatedBranch") throw new Error(nextFork.reason)
+    const nextReads = await Effect.runPromise(makeProvider().readTranscripts([sessionId, childId, nextFork.session.id]))
+    const nextTranscripts = new Map([...nextReads].map(([id, read]) => {
+      if (read._tag !== "Available") throw new Error(`Unavailable ${id}`)
+      return [id, read.messages] as const
+    }))
+    const nextForest = buildConversationForest(
+      [{ id: sessionId, title: "Parent", lastModified: 0 }, fork.session, nextFork.session], nextTranscripts,
+      [fork.derivation, nextFork.derivation].map((derivation) => ({ ...derivation, createdAt: timestamp })),
+    )
+    expect(nextForest.graphs).toHaveLength(1)
+    expect(nextForest.warnings).toEqual([])
+  })
+}
+
 test("the Claude provider validates SDK-imported source and child records", async () => {
-  const configDir = await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-"))
+  const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-")))
   const projectDir = join(configDir, "project")
+  const projectKey = "sdk-provenance-fixture"
   const sourceSessionId = crypto.randomUUID()
   const userId = crypto.randomUUID()
   const agentId = crypto.randomUUID()
@@ -222,7 +434,6 @@ test("the Claude provider validates SDK-imported source and child records", asyn
 
   try {
     await mkdir(projectDir, { recursive: true })
-    const projectKey = projectDir.replaceAll("/", "-")
     const transcriptDir = join(configDir, "projects", projectKey)
     await mkdir(transcriptDir, { recursive: true })
     await writeFile(
@@ -231,17 +442,25 @@ test("the Claude provider validates SDK-imported source and child records", asyn
     )
 
     const script = `
-      import { ClaudeProvider } from "./src/providers/claude.ts"
-      const provider = new ClaudeProvider(${JSON.stringify(projectDir)}, "/usr/bin/claude")
-      const prepared = await provider.branchFrom({
+      import { Effect } from "effect"
+      import { makeClaudeProvider } from "./src/infrastructure/providers/claude/provider.ts"
+      const provider = makeClaudeProvider(${JSON.stringify(projectDir)}, {
+        resolveExecutable: () => "/usr/bin/claude",
+      })
+      const prepared = await Effect.runPromise(provider.branchFrom({
         sessionId: ${JSON.stringify(sourceSessionId)},
         messageId: ${JSON.stringify(agentId)},
-      })
+      }))
+      if (prepared._tag !== "ValidatedBranch") throw new Error("Unexpected branch outcome")
       console.log(prepared.derivation.sharedMessages.length)
     `
     const subprocess = Bun.spawn([globalThis.process.execPath, "-e", script], {
       cwd: join(import.meta.dir, ".."),
-      env: { ...globalThis.process.env, CLAUDE_CONFIG_DIR: configDir },
+      env: {
+        ...globalThis.process.env,
+        CLAUDE_CONFIG_DIR: configDir,
+        CLAUDE_CODE_PROJECT_DIR_NAME: projectKey,
+      },
       stdout: "pipe",
       stderr: "pipe",
     })
