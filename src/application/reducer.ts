@@ -19,6 +19,7 @@ import { replaceSessionIdInProjectState } from "../services/provider-state-repos
 import {
   selectConversationForest,
   selectFamilyRootSessionId,
+  selectProjectedTranscript,
   selectTranscriptRead,
   selectVisibleEndpointSessionIds,
 } from "./selectors"
@@ -31,6 +32,7 @@ import type {
   NavigatorSurface,
   PendingCompletion,
   RewindAnchor,
+  TerminalState,
 } from "./state"
 
 export const MAX_COMPLETION_REFRESH_ATTEMPTS = 4
@@ -55,6 +57,7 @@ export type StateEvent =
   | { readonly _tag: "TerminalStopping"; readonly sessionId: string }
   | { readonly _tag: "TerminalStopped"; readonly sessionId: string; readonly cleanupIncomplete?: boolean; readonly focusExitedSession?: boolean }
   | { readonly _tag: "CompletionAttemptAdvanced"; readonly sessionId: string; readonly message?: string }
+  | { readonly _tag: "SubmissionDiscoveryAdvanced"; readonly sessionId: string; readonly ownerId: string; readonly revision: number; readonly exhausted?: boolean }
   | { readonly _tag: "SessionIdentityAdopted"; readonly previousSessionId: string; readonly session: AgentSession; readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation }
   | { readonly _tag: "RemovalPersisted"; readonly removal: ConversationRemoval; readonly stoppedSessionIds: readonly string[]; readonly fallback: NavigatorSurface }
   | { readonly _tag: "ModalOpened"; readonly modal: ApplicationModal }
@@ -180,7 +183,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       return terminalActivity(state, event)
     case "TerminalObservationObserved": {
       const terminal = state.terminals.get(event.sessionId)
-      if (!terminal || terminal.ownerId !== event.ownerId) return state
+      if (!terminal || terminal.ownerId !== event.ownerId || terminal.phase !== "running") return state
       const observed = {
         ...state,
         terminals: new Map(state.terminals).set(event.sessionId, { ...terminal, observationReceived: true }),
@@ -194,7 +197,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
     case "TerminalStopping": {
       const terminal = state.terminals.get(event.sessionId)
       return terminal
-        ? { ...state, terminals: new Map(state.terminals).set(event.sessionId, { ...terminal, phase: "stopping" }) }
+        ? { ...state, terminals: new Map(state.terminals).set(event.sessionId, { ...terminal, pendingSubmission: undefined, phase: "stopping" }) }
         : state
     }
     case "TerminalStopped":
@@ -206,6 +209,14 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       )
     case "CompletionAttemptAdvanced":
       return advanceCompletion(state, event.sessionId, event.message)
+    case "SubmissionDiscoveryAdvanced": {
+      const terminal = state.terminals.get(event.sessionId)
+      if (!terminal?.pendingSubmission || terminal.ownerId !== event.ownerId || terminal.historyRevision !== event.revision) return state
+      const { pendingSubmission, ...rest } = terminal
+      return { ...state, terminals: new Map(state.terminals).set(event.sessionId, event.exhausted
+        ? rest
+        : { ...terminal, pendingSubmission: { ...pendingSubmission, attempt: pendingSubmission.attempt + 1 } }) }
+    }
     case "SessionIdentityAdopted":
       return adoptSessionIdentity(
         state,
@@ -231,6 +242,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       return {
         ...state,
         shutdown: "shutting-down",
+        terminals: new Map([...state.terminals].map(([id, terminal]) => [id, { ...terminal, pendingSubmission: undefined }])),
         modal: null,
         pendingCompletions: new Map(),
         replacementCandidates: new Map(),
@@ -305,6 +317,7 @@ function refreshSucceeded(
   const drafts = new Map(state.drafts)
   const pendingCompletions = new Map(state.pendingCompletions)
   const replacementCandidates = new Map(state.replacementCandidates)
+  const terminals = new Map(state.terminals)
   for (const sessionId of replacementCandidates.keys()) {
     if (!sessions.has(sessionId) && !localSessions.has(sessionId)) replacementCandidates.delete(sessionId)
   }
@@ -319,6 +332,7 @@ function refreshSucceeded(
     const reconciled = reconcileTranscript(
       previousRead, incoming, nonIdle, rewindAnchors.get(sessionId),
       pendingCompletions.get(sessionId), replacementCandidates.get(sessionId),
+      terminal?.replacement,
     )
     transcripts.set(sessionId, reconciled.read)
     if (reconciled.candidate) replacementCandidates.set(sessionId, reconciled.candidate)
@@ -327,8 +341,22 @@ function refreshSucceeded(
     if (reconciled.completed) {
       if (pendingCompletions.get(sessionId)?.markUnviewed) unviewedSessionIds.add(sessionId)
       pendingCompletions.delete(sessionId)
+      if (terminal?.replacement) {
+        const { replacement: _, ...settled } = terminal
+        terminals.set(sessionId, settled)
+      }
+    } else if (reconciled.accepted && reconciled.read._tag === "Available") {
+      const completion = pendingCompletions.get(sessionId)
+      if (completion) pendingCompletions.set(sessionId, { ...completion, baseline: reconciled.read.messages })
     }
     if (reconciled.clearAnchor) rewindAnchors.delete(sessionId)
+    const submission = terminal?.pendingSubmission
+    if (submission && reconciled.accepted && reconciled.read._tag === "Available" &&
+      isTranscriptPrefix(submission.baseline, reconciled.read.messages) &&
+      reconciled.read.messages.slice(submission.baseline.length).some((message) => message.visible && message.role === "user")) {
+      const { pendingSubmission: _, ...settled } = terminals.get(sessionId)!
+      terminals.set(sessionId, settled)
+    }
     if (reconciled.clearAnchor || reconciled.completed) {
       const draft = drafts.get(sessionId)
       if (draft?.submitted) drafts.delete(sessionId)
@@ -398,6 +426,7 @@ function refreshSucceeded(
     drafts,
     pendingCompletions,
     replacementCandidates,
+    terminals,
     unviewedSessionIds,
     refresh: { ...without.refresh, initialPending: false, appliedGenerationBySession },
     ...(replacementUnstable
@@ -464,7 +493,10 @@ function terminalActivity(
 ): ApplicationState {
   const existing = state.terminals.get(event.sessionId)
   if (!existing || existing.ownerId !== event.ownerId) return state
-  const terminals = new Map(state.terminals).set(event.sessionId, { ...existing, activity: event.activity })
+  const { pendingSubmission: _, ...idleTerminal } = existing
+  const terminals = new Map(state.terminals).set(event.sessionId, {
+    ...(event.activity === "idle" ? idleTerminal : existing), activity: event.activity,
+  })
   const rewindAnchors = new Map(state.rewindAnchors)
   const drafts = new Map(state.drafts)
   if (event.activity === "working") {
@@ -489,7 +521,6 @@ function terminalActivity(
     return { ...state, terminals, pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId) }
   }
   const version = state.nextCompletionVersion + 1
-  const read = selectTranscriptRead(state, event.sessionId)
   return {
     ...state,
     terminals,
@@ -497,7 +528,7 @@ function terminalActivity(
     pendingCompletions: new Map(state.pendingCompletions).set(event.sessionId, {
       ownerId: event.ownerId,
       version,
-      baseline: read?._tag === "Available" ? read.messages : [],
+      baseline: selectProjectedTranscript(state, event.sessionId),
       markUnviewed: !event.wasVisible,
       attempt: 0,
     }),
@@ -508,6 +539,7 @@ function terminalActivity(
 function observeDraft(state: ApplicationState, sessionId: string, draft?: DraftPreview): ApplicationState {
   const drafts = new Map(state.drafts)
   const rewindAnchors = new Map(state.rewindAnchors)
+  const terminals = new Map(state.terminals)
   if (draft) drafts.set(sessionId, draft)
   else drafts.delete(sessionId)
   if (draft?.rewind) {
@@ -523,6 +555,17 @@ function observeDraft(state: ApplicationState, sessionId: string, draft?: DraftP
     if (restoresSubmission) {
       rewindAnchors.set(sessionId, { ...previousAnchor, targetText, submitted: draft.submitted ?? false })
     } else if (matches.length === 1) {
+      const terminal = terminals.get(sessionId)
+      if (terminal && read?._tag === "Available") {
+        const targetIndex = read.messages.findIndex((message) => message.id === matches[0]!.id)
+        terminals.set(sessionId, { ...terminal, replacement: {
+          prefix: read.messages.slice(0, targetIndex),
+          discardedMessageIds: new Set([
+            ...(terminal.replacement?.discardedMessageIds ?? []),
+            ...read.messages.slice(targetIndex).map((message) => message.id),
+          ]),
+        } })
+      }
       rewindAnchors.set(sessionId, {
         targetMessageId: matches[0]!.id,
         submitted: draft.submitted ?? false,
@@ -538,12 +581,12 @@ function observeDraft(state: ApplicationState, sessionId: string, draft?: DraftP
     }
   }
   return {
-    ...state, drafts, rewindAnchors,
+    ...state, drafts, rewindAnchors, terminals,
     ...(draft?.rewind && !draft.submitted
       ? { pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
           terminals: state.terminals.has(sessionId)
-            ? new Map(state.terminals).set(sessionId, {
-                ...state.terminals.get(sessionId)!, activity: "idle",
+            ? new Map(terminals).set(sessionId, {
+                ...terminals.get(sessionId)!, pendingSubmission: undefined, activity: "idle",
                 historyRevision: (state.terminals.get(sessionId)?.historyRevision ?? 0) + 1,
               })
             : state.terminals,
@@ -559,7 +602,10 @@ function observeSubmission(state: ApplicationState, sessionId: string, text?: st
   return {
     ...state,
     terminals: terminal
-      ? new Map(state.terminals).set(sessionId, { ...terminal, historyRevision: (terminal.historyRevision ?? 0) + 1 })
+      ? new Map(state.terminals).set(sessionId, {
+          ...terminal, historyRevision: (terminal.historyRevision ?? 0) + 1,
+          pendingSubmission: { baseline: selectProjectedTranscript(state, sessionId), attempt: 0 },
+        })
       : state.terminals,
     rewindAnchors: anchor
       ? new Map(state.rewindAnchors).set(sessionId, { ...anchor, submitted: true, submissionText: text })
@@ -749,6 +795,7 @@ function reconcileTranscript(
   anchor: RewindAnchor | undefined,
   completion: PendingCompletion | undefined,
   candidate: { readonly messages: readonly AgentMessage[]; readonly attempts: number } | undefined,
+  replacement: TerminalState["replacement"],
 ): {
   readonly read: TranscriptRead
   readonly accepted: boolean
@@ -758,8 +805,20 @@ function reconcileTranscript(
   readonly unstable?: boolean
 } {
   const retained = completion ? { _tag: "Available" as const, messages: completion.baseline } : previous ?? incoming
+  const targetIndex = previous?._tag === "Available" && anchor
+    ? previous.messages.findIndex((message) => message.id === anchor.targetMessageId) : -1
+  const baseline = targetIndex >= 0 && previous?._tag === "Available"
+    ? previous.messages.slice(0, targetIndex)
+    : retained._tag === "Available" ? retained.messages : []
+  if (incoming._tag === "Available" && (
+    (replacement && (!isTranscriptPrefix(replacement.prefix, incoming.messages) ||
+      incoming.messages.some((message) => replacement.discardedMessageIds.has(message.id)))) ||
+    (!replacement && targetIndex >= 0 && (!isTranscriptPrefix(baseline, incoming.messages) ||
+      (previous?._tag === "Available" && incoming.messages.some((message) =>
+        previous.messages.slice(targetIndex).some((old) => old.id === message.id)))))
+  )) return { read: retained, accepted: false }
   const unexpectedReplacement = incoming._tag === "Available" && previous?._tag === "Available" &&
-    !isTranscriptPrefix(previous.messages, incoming.messages) && !anchor
+    !isTranscriptPrefix(previous.messages, incoming.messages) && !anchor && !replacement
   const replacedCompletedTurn = unexpectedReplacement && completion !== undefined &&
     !isTranscriptPrefix(incoming.messages, previous.messages) && completionTranscriptReady([], incoming.messages)
   let confirmedReplacement = false
@@ -778,10 +837,10 @@ function reconcileTranscript(
     }
   }
   const completed = completion !== undefined && incoming._tag === "Available" &&
-    (confirmedReplacement || completionTranscriptReady(completion.baseline, incoming.messages, anchor))
-  if (completion && !completed) return { read: retained, accepted: false }
-  const read = incoming._tag === "Available" && previous?._tag === "Available" && nonIdle
-    ? { _tag: "Available" as const, messages: stableTranscriptWhileNonIdle(previous.messages, incoming.messages) }
+    (confirmedReplacement || completionTranscriptReady(baseline, incoming.messages))
+  if (completion && !completed && incoming._tag !== "Available") return { read: retained, accepted: false }
+  const read = incoming._tag === "Available" && (nonIdle || (completion && !completed))
+    ? { _tag: "Available" as const, messages: stableTranscriptWhileNonIdle(baseline, incoming.messages) }
     : incoming
   // Invalidate placement from the accepted history only, never a rejected working read.
   const clearAnchor = anchor !== undefined && read._tag === "Available" &&
@@ -792,17 +851,9 @@ function reconcileTranscript(
 function completionTranscriptReady(
   previous: readonly AgentMessage[],
   refreshed: readonly AgentMessage[],
-  rewindAnchor?: RewindAnchor,
 ): boolean {
-  if (sameTranscript(previous, refreshed)) return false
-  if (!rewindAnchor?.submitted && !isTranscriptPrefix(previous, refreshed)) return false
-  if (rewindAnchor?.submitted) {
-    const targetIndex = previous.findIndex((message) => message.id === rewindAnchor.targetMessageId)
-    if (
-      targetIndex >= 0 && refreshed.length <= targetIndex &&
-      refreshed.every((message, index) => samePersistedContent(previous[index], message))
-    ) return false
-  }
+  if (!isTranscriptPrefix(previous, refreshed)) return false
+  if (previous.length === refreshed.length) return false
   const lastVisibleUserIndex = refreshed.findLastIndex((message) => message.role === "user" && message.visible)
   const afterUser = refreshed.slice(lastVisibleUserIndex + 1)
   const signals = refreshed.slice(Math.max(0, lastVisibleUserIndex)).filter((message) => message.turnComplete !== undefined)
@@ -814,15 +865,15 @@ function stableTranscriptWhileNonIdle(
   refreshed: readonly AgentMessage[],
 ): readonly AgentMessage[] {
   if (!isTranscriptPrefix(previous, refreshed)) return previous
-  let lastNewVisibleUserIndex = -1
+  let acceptedLength = previous.length
   for (let index = previous.length; index < refreshed.length; index += 1) {
-    if (refreshed[index]?.role === "user" && refreshed[index]?.visible) lastNewVisibleUserIndex = index
+    if (refreshed[index]?.role === "user" && refreshed[index]?.visible) acceptedLength = index + 1
   }
-  return lastNewVisibleUserIndex < 0 ? previous : refreshed.slice(0, lastNewVisibleUserIndex + 1)
+  return refreshed.slice(0, acceptedLength)
 }
 
 function isTranscriptPrefix(prefix: readonly AgentMessage[], transcript: readonly AgentMessage[]): boolean {
-  return prefix.length <= transcript.length && prefix.every((message, index) => sameMessage(message, transcript[index]))
+  return prefix.length <= transcript.length && prefix.every((message, index) => sameLogicalMessage(message, transcript[index]))
 }
 
 function sameTranscript(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
@@ -830,15 +881,15 @@ function sameTranscript(left: readonly AgentMessage[], right: readonly AgentMess
 }
 
 function sameMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
+  return sameLogicalMessage(left, right) && left.historical === right?.historical
+}
+
+// Context compaction can reclassify a record without replacing its logical history.
+function sameLogicalMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
   return right !== undefined && left.id === right.id && left.role === right.role &&
     left.preview === right.preview && left.ordinal === right.ordinal && left.visible === right.visible &&
     left.displayGroupId === right.displayGroupId && left.turnComplete === right.turnComplete &&
-    left.copyIdentity === right.copyIdentity && left.historyBoundary === right.historyBoundary && left.historical === right.historical
-}
-
-function samePersistedContent(left: AgentMessage | undefined, right: AgentMessage): boolean {
-  return left !== undefined && left.role === right.role && left.preview === right.preview &&
-    (left.copyIdentity === undefined || right.copyIdentity === undefined || left.copyIdentity === right.copyIdentity)
+    left.copyIdentity === right.copyIdentity && left.historyBoundary === right.historyBoundary
 }
 
 function preserveOwnedSessions(

@@ -47,6 +47,16 @@ export interface TerminalState {
   /** Includes empty composer observations so return snapshots cannot resurrect a draft. */
   readonly observationReceived?: boolean
   readonly historyRevision?: number
+  /** Owner-local discovery uses historyRevision to invalidate timers and reads. */
+  readonly pendingSubmission?: {
+    readonly baseline: readonly AgentMessage[]
+    readonly attempt: number
+  } | undefined
+  /** Retained after prefix confirmation to reject lagging pre-rewind snapshots. */
+  readonly replacement?: {
+    readonly prefix: readonly AgentMessage[]
+    readonly discardedMessageIds: ReadonlySet<string>
+  }
   readonly activity: AgentActivity
   readonly phase: "showing" | "running" | "stopping" | "cleanup-incomplete"
 }
@@ -62,6 +72,7 @@ export interface RewindAnchor {
 export interface PendingCompletion {
   readonly ownerId: string
   readonly version: number
+  /** Accepted history through the persisted user, excluding the pending assistant tail. */
   readonly baseline: readonly AgentMessage[]
   readonly markUnviewed: boolean
   readonly attempt: number
@@ -70,7 +81,7 @@ export interface PendingCompletion {
 export interface ActiveRefresh {
   readonly key: string
   readonly generation: number
-  readonly reason: "initial" | "manual" | "terminal-return" | "completion" | "stop" | "ambiguity" | "reconciliation"
+  readonly reason: "initial" | "manual" | "terminal-return" | "completion" | "submission" | "stop" | "ambiguity" | "reconciliation"
   readonly mode: "full" | "incremental"
   readonly sessionIds: ReadonlySet<string>
   readonly historyRevisions?: ReadonlyMap<string, { readonly ownerId?: string; readonly revision: number }>

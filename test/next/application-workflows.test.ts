@@ -1322,6 +1322,220 @@ describe("application actor", () => {
     })))
   })
 
+  for (const rewind of [false, true]) test(`discovers a lagged ${rewind ? "replacement" : "ordinary"} user while working without idle`, async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      if (rewind) {
+        yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft: {
+          text: "replacement", exact: false, rewind: true, rewindTarget: "question",
+        } }))
+        yield* TestClock.adjust(100)
+        yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      }
+      yield* runtime.handleTerminalObservation(observation(2, { _tag: "Submission", text: "replacement" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 3, ROOT, "working", true))
+      yield* TestClock.adjust(100)
+      const lagged = yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      expect(lagged.terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(1)
+      expect(selectProjectedTranscript(lagged, ROOT).map((item) => item.id)).toEqual(rewind ? [] : ["q"])
+      const prefix = rewind ? [] : [message("q", "user", "question", 0)]
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, [
+        ...prefix, message("new-user", "user", "provider-persisted prompt", prefix.length),
+        message("streaming", "agent", "unfinished answer", prefix.length + 1),
+      ]]]))
+      yield* TestClock.adjust(250)
+      const discovered = yield* waitForState(runtime, (state) => !state.terminals.get(ROOT)?.pendingSubmission)
+      expect(selectProjectedTranscript(discovered, ROOT).map((item) => item.id)).toEqual([...prefix.map((item) => item.id), "new-user"])
+      expect(selectSessionStatus(discovered, ROOT)).toBe("working")
+      expect(discovered.pendingCompletions.size).toBe(0)
+      expect(discovered.unviewedSessionIds.size).toBe(0)
+      const reads = fixture.incrementalReads.length
+      yield* TestClock.adjust(5_000)
+      expect(fixture.incrementalReads).toHaveLength(reads)
+      yield* runtime.returnFromTerminal
+      const view = yield* runtime.getViewModel
+      expect(view.surface._tag).toBe("Graph")
+      if (view.surface._tag === "Graph") {
+        const user = view.surface.nodes.find((node) => node._tag === "Message" && node.preview === "provider-persisted prompt")
+        const endpoint = view.surface.nodes.find((node) => node._tag === "Endpoint" && node.session.id === ROOT)
+        expect(user).toBeDefined()
+        expect(endpoint?.parentIds).toEqual([user!.id])
+        expect(endpoint?._tag === "Endpoint" && endpoint.status).toBe("working")
+      }
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("submission discovery exhausts four reads and return does not reset its budget", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working"))
+      for (const [index, delay] of [100, 250, 500, 1_000].entries()) {
+        yield* TestClock.adjust(delay)
+        yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+        if (index === 0) {
+          yield* runtime.returnFromTerminal
+          const returned = yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+          expect(returned.terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(1)
+        }
+      }
+      const exhausted = yield* runtime.getState
+      expect(exhausted.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+      expect(exhausted.modal).toBeNull()
+      expect(selectProjectedTranscript(exhausted, ROOT).map((item) => item.id)).toEqual(["q"])
+      expect(fixture.incrementalReads).toHaveLength(5)
+      yield* TestClock.adjust(10_000)
+      expect(fixture.incrementalReads).toHaveLength(5)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  for (const read of ["manual", "return"] as const) test(`${read} reads satisfy submission discovery and cancel its timer`, async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working"))
+      if (read === "manual") {
+        yield* runtime.refresh()
+        expect((yield* runtime.getState).terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(0)
+      }
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, [
+        message("q", "user", "question", 0), message("new-user", "user", "persisted", 1),
+      ]]]))
+      if (read === "manual") yield* runtime.refresh()
+      else yield* runtime.returnFromTerminal
+      yield* waitForState(runtime, (state) => !state.terminals.get(ROOT)?.pendingSubmission)
+      const reads = fixture.incrementalReads.length
+      yield* TestClock.adjust(5_000)
+      expect(fixture.incrementalReads).toHaveLength(reads)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  for (const cancel of ["undo", "stop", "shutdown", "submission", "idle"] as const) test(`${cancel} cancels the old submission timer`, async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working"))
+      yield* TestClock.adjust(50)
+      if (cancel === "undo") yield* runtime.handleTerminalObservation(observation(3, { _tag: "Draft", draft: {
+        text: "question", exact: false, rewind: true,
+      } }))
+      if (cancel === "stop") {
+        yield* runtime.stopSession(ROOT)
+        yield* runtime.resumeSession(ROOT)
+        expect(yield* runtime.handleTerminalObservation(observation(3, { _tag: "Submission" }))).toBeFalse()
+      }
+      if (cancel === "shutdown") yield* runtime.shutdown
+      if (cancel === "submission") yield* runtime.handleTerminalObservation(observation(3, { _tag: "Submission" }))
+      if (cancel === "idle") yield* runtime.handleTerminalActivity(activity("owner-1", 3, ROOT, "idle"))
+      const reads = fixture.incrementalReads.length
+      yield* TestClock.adjust(50)
+      expect(fixture.incrementalReads).toHaveLength(reads)
+      const state = yield* runtime.getState
+      if (cancel === "submission") {
+        expect(state.terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(0)
+        yield* TestClock.adjust(50)
+        yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+        expect(fixture.incrementalReads).toHaveLength(reads + 1)
+      } else expect(state.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+      if (cancel === "idle") expect(state.pendingCompletions.has(ROOT)).toBeTrue()
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("idle hands user-prefix discovery to completion without exposing an unfinished answer", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working"))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 3, ROOT, "idle"))
+      const users = [message("q", "user", "question", 0), message("new-user", "user", "persisted", 1)]
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, [
+        ...users, { ...message("answer", "agent", "streaming", 2), turnComplete: false },
+      ]]]))
+      yield* TestClock.adjust(100)
+      const pending = yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      expect(pending.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+      expect(pending.pendingCompletions.has(ROOT)).toBeTrue()
+      expect(selectProjectedTranscript(pending, ROOT).map((item) => item.id)).toEqual(["q", "new-user"])
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, [
+        ...users, { ...message("answer", "agent", "finished", 2), turnComplete: true },
+      ]]]))
+      yield* TestClock.adjust(250)
+      const completed = yield* waitForState(runtime, (state) => !state.pendingCompletions.has(ROOT))
+      expect(selectProjectedTranscript(completed, ROOT).map((item) => item.id)).toEqual(["q", "new-user", "answer"])
+      expect(fixture.incrementalReads).toHaveLength(2)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("a superseded in-flight submission read cannot satisfy a newer revision", async () => {
+    const fixture = makeFixture()
+    const started = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    const old = snapshot([session(ROOT, "Root")], new Map([[ROOT, [
+      message("q", "user", "question", 0), message("stale-user", "user", "stale submission", 1),
+    ]]]))
+    const load = fixture.options.provider.loadSessionSnapshotFor
+    let reads = 0
+    const provider: AgentProviderApi = {
+      ...fixture.options.provider,
+      loadSessionSnapshotFor: (ids) => ++reads === 1
+        ? Effect.uninterruptible(Effect.gen(function*() {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+            return old
+          }))
+        : load(ids),
+    }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working"))
+      yield* TestClock.adjust(100)
+      yield* Deferred.await(started)
+      yield* runtime.handleTerminalObservation(observation(3, { _tag: "Submission" }))
+      yield* Deferred.succeed(release, undefined)
+      yield* TestClock.adjust(0)
+      const newer = yield* runtime.getState
+      expect(newer.terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(0)
+      expect(selectProjectedTranscript(newer, ROOT).map((item) => item.id)).toEqual(["q"])
+      yield* TestClock.adjust(100)
+      yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      expect(reads).toBe(2)
+      expect((yield* runtime.getState).terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(1)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("manual refresh cancels and resumes a submission timer without resetting attempts", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission" }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working"))
+      yield* TestClock.adjust(100)
+      yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      yield* TestClock.adjust(50)
+      yield* runtime.refresh()
+      expect((yield* runtime.getState).terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(1)
+      yield* TestClock.adjust(200)
+      expect(fixture.incrementalReads).toHaveLength(1)
+      yield* TestClock.adjust(50)
+      yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      expect(fixture.incrementalReads).toHaveLength(2)
+      expect((yield* runtime.getState).terminals.get(ROOT)?.pendingSubmission?.attempt).toBe(2)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
   test("a completed replacement consumes its submitted draft even when the composer remains unknown on return", async () => {
     const fixture = makeFixture()
     const draft = { text: "replacement", exact: false, rewind: true, rewindTarget: "question" }
