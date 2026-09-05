@@ -677,12 +677,15 @@ function attachChildSession(
     context.rawLogicalNodeIds[transcriptIndex] = logicalNodeId
     context.nodeIdByMessageId.set(childMessage.id, logicalNodeId)
   }
+  const continuationParentId = childSpecificStartIndex < transcript.length
+    ? lastDefined(context.rawLogicalNodeIds) ?? graph.originNodeId
+    : sourceNodeId
   appendSessionMessages(
     graph,
     child.id,
     transcript,
     childSpecificStartIndex,
-    sourceNodeId,
+    continuationParentId,
     exactBranchPointIdsBySession.get(child.id) ?? new Set(),
     displayGroupEndIdsBySession.get(child.id) ?? new Set(),
     context,
