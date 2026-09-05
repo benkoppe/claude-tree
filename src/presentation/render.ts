@@ -10,6 +10,7 @@ import type {
   RootViewModel,
   SurfaceViewModel,
 } from "../application/view-model"
+import type { SessionStatus } from "../application/selectors"
 import { displayWidth, graphemes, truncateToWidth } from "./text"
 import { presentationTheme as theme } from "./theme"
 
@@ -78,6 +79,7 @@ export function renderRoots(
   height: number,
   width: number,
   viewportStart = 0,
+  spinnerFrame = 0,
 ): RenderedRoots {
   const safeWidth = Math.max(1, width)
   const safeHeight = Math.max(1, height)
@@ -105,13 +107,13 @@ export function renderRoots(
     const selected = root.sessionId === selectedSessionId
     const background = selected ? theme.selected : theme.background
     const foreground = selected ? theme.selectedText : theme.text
-    const status = root.status === "idle" ? "○" : "●"
+    const status = statusMarker(root.status, spinnerFrame)
     const counts = `${root.memberSessionIds.length} ${root.memberSessionIds.length === 1 ? "session" : "sessions"}`
     const style = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     canvas.paint(0, row, safeWidth, 1, style)
     canvas.write(1, row, status, {
       ...style,
-      fg: selected ? theme.selectedText : statusColor(root.status),
+      fg: statusColor(root.status),
       attributes: TextAttributes.BOLD,
     })
     const titleX = 4
@@ -224,48 +226,23 @@ function drawNode(
     return
   }
 
-  if (node.status === "blocked") {
-    drawHeading(canvas, node.x + 2, node.y, ICONS.agent, "Agent", contentWidth, {
-      ...heading,
-      fg: selected ? theme.selectedText : theme.primary,
-    }, heading)
-    canvas.write(node.x + 2, node.y + 1, "Needs user", {
-      ...style,
-      fg: selected ? theme.selectedText : theme.danger,
-    })
-    return
-  }
-  if (node.status === "working") {
-    drawHeading(canvas, node.x + 2, node.y, ICONS.agent, "Agent", contentWidth, {
-      ...heading,
-      fg: selected ? theme.selectedText : theme.primary,
-    }, heading)
-    canvas.write(node.x + 2, node.y + 1, BRAILLE_SPINNER_FRAMES[spinnerFrame % BRAILLE_SPINNER_FRAMES.length]!, {
-      ...style,
-      fg: selected ? theme.selectedText : theme.primary,
-    })
-    return
-  }
-
+  const badge = truncateToWidth(`${statusMarker(node.status, spinnerFrame)} ${statusLabel(node.status)}`, contentWidth)
+  const badgeWidth = displayWidth(badge)
+  const titleWidth = Math.max(0, contentWidth - badgeWidth - 1)
+  const agent = node.status === "working" || node.status === "blocked"
   const live = liveSessionIds.has(node.session.id)
   const stoppedFork = !live && node.fork?.empty
-  const label = stoppedFork
+  const label = agent ? "Agent" : stoppedFork
     ? node.fork?.number === undefined ? "Fork" : `Fork ${node.fork.number}`
     : live ? "Draft" : "Session"
-  drawHeading(canvas, node.x + 2, node.y, stoppedFork ? ICONS.branch : ICONS.session, label, contentWidth, {
+  drawHeading(canvas, node.x + 2, node.y, agent ? ICONS.agent : stoppedFork ? ICONS.branch : ICONS.session, label, titleWidth, {
     ...heading,
-    fg: selected ? theme.selectedText : stoppedFork ? theme.accent : live ? theme.info : theme.textMuted,
+    fg: selected ? theme.selectedText : agent ? theme.primary : stoppedFork ? theme.accent : live ? theme.info : theme.textMuted,
   }, heading)
-  if (node.status === "unviewed") {
-    const label = "New updates"
-    const labelX = node.x + 2 + contentWidth - displayWidth(label)
-    if (labelX > node.x + 10) {
-      canvas.write(labelX, node.y, label, {
-        ...heading,
-        fg: selected ? theme.selectedText : theme.warning,
-      })
-    }
-  }
+  canvas.write(node.x + 2 + contentWidth - badgeWidth, node.y, badge, {
+    ...heading, fg: statusColor(node.status),
+  })
+  if (agent) return
   const description = node.draft?.text.replace(/\s+/g, " ").trim() ?? ""
   canvas.write(node.x + 2, node.y + 1, truncateToWidth(description, contentWidth), style)
 }
@@ -292,8 +269,18 @@ function drawHeading(
 export function statusColor(status: RootViewModel["status"]): RGBA {
   if (status === "blocked") return theme.danger
   if (status === "unviewed") return theme.warning
-  if (status === "working") return theme.success
+  if (status === "working") return theme.primary
+  if (status === "live") return theme.success
   return theme.textMuted
+}
+
+export function statusMarker(status: SessionStatus, frame: number): string {
+  return status === "working" ? BRAILLE_SPINNER_FRAMES[frame % BRAILLE_SPINNER_FRAMES.length]!
+    : status === "idle" ? "○" : "●"
+}
+
+export function statusLabel(status: SessionStatus): string {
+  return { idle: "Stopped", live: "Live", unviewed: "New updates", working: "Working", blocked: "Needs user" }[status]
 }
 
 export function chunk(

@@ -4,9 +4,10 @@ import {
   type ConversationForest,
 } from "../domain/conversation-graph"
 import type { AgentMessage, AgentSession, MessageRef, TranscriptRead } from "../domain/model"
+import { SESSION_STATUS_PRIORITY, type SessionStatus } from "../domain/session-status"
 import type { ApplicationState } from "./state"
 
-export type SessionStatus = "blocked" | "unviewed" | "working" | "idle"
+export type { SessionStatus } from "../domain/session-status"
 
 export interface ProjectedApplicationData {
   readonly sessions: ReadonlyMap<string, AgentSession>
@@ -98,10 +99,11 @@ export function selectVisibleEndpointSessionIds(state: ApplicationState): Readon
 
 export function selectSessionStatus(state: ApplicationState, sessionId: string): SessionStatus {
   const terminal = state.terminals.get(sessionId)
-  if (terminal?.activity === "blocked") return "blocked"
+  if (!terminal || terminal.phase === "showing") return "idle"
+  if (terminal.activity === "blocked") return "blocked"
+  if (terminal.activity === "working" || state.pendingCompletions.has(sessionId)) return "working"
   if (state.unviewedSessionIds.has(sessionId)) return "unviewed"
-  if (terminal?.activity === "working" || state.pendingCompletions.has(sessionId)) return "working"
-  return "idle"
+  return "live"
 }
 
 export function selectAggregateStatus(
@@ -111,7 +113,7 @@ export function selectAggregateStatus(
   let selected: SessionStatus = "idle"
   for (const sessionId of sessionIds) {
     const status = selectSessionStatus(state, sessionId)
-    if (STATUS_PRIORITY[status] > STATUS_PRIORITY[selected]) selected = status
+    if (SESSION_STATUS_PRIORITY[status] > SESSION_STATUS_PRIORITY[selected]) selected = status
   }
   return selected
 }
@@ -122,13 +124,6 @@ export function replaceSessionIdInRef(
   sessionId: string,
 ): MessageRef {
   return ref.sessionId === previousSessionId ? { ...ref, sessionId } : ref
-}
-
-const STATUS_PRIORITY: Readonly<Record<SessionStatus, number>> = {
-  idle: 0,
-  working: 1,
-  unviewed: 2,
-  blocked: 3,
 }
 
 function projectRewind(
