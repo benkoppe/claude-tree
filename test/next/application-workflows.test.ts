@@ -1252,6 +1252,30 @@ describe("application actor", () => {
     expect(fixture.incrementalReads).toEqual([[ROOT], [ROOT]])
   })
 
+  test("returning after undoing a send cancels a scheduled completion without restoring the prompt", async () => {
+    const fixture = makeFixture()
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({
+        ...fixture.options,
+        terminals: { ...fixture.options.terminals, draftPreviews: Effect.succeed(new Map([[ROOT, {
+          text: "question", exact: false, rewind: true, rewindTarget: "question",
+        }]])) },
+        completionDelaysMs: [10_000],
+      })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", false))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "idle", false))
+      yield* runtime.returnFromTerminal
+      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
+      return yield* runtime.getState
+    })))
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(selectSessionStatus(state, ROOT)).toBe("live")
+    expect(selectProjectedTranscript(state, ROOT)).toEqual([])
+    expect(state.unviewedSessionIds.size).toBe(0)
+    expect(state.modal).toBeNull()
+  })
+
   test("terminal-return refresh can atomically satisfy a pending completion", async () => {
     const fixture = makeFixture()
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
