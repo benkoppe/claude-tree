@@ -13,6 +13,7 @@ import {
   NullTerminalObserver,
   type AgentActivity,
   type TerminalObserver,
+  type TerminalObservation,
   type TerminalScreen,
 } from "../../src/domain/model"
 import {
@@ -69,6 +70,94 @@ import {
 } from "../../src/services/terminal-supervisor"
 
 const temporaryDirectories: string[] = []
+
+test("drains output, snapshot, and input observations before their activity, draft, and submission", async () => {
+  const fixture = makeFixture()
+  const events: Array<TerminalObservationEvent | TerminalActivityEvent> = []
+  fixture.dependencies.events = {
+    onObservation: (event) => events.push(event),
+    onActivityChanged: (event) => events.push(event),
+  }
+  class Observer implements TerminalObserver {
+    private pending: TerminalObservation[] = []
+    private snapshotObserved = false
+    takeObservations() { const pending = this.pending; this.pending = []; return pending }
+    observeOutput(data: Uint8Array): readonly AgentActivity[] {
+      if (new TextDecoder().decode(data) !== "output") return []
+      this.pending.push({ _tag: "Rewind" })
+      return ["working"]
+    }
+    observeScreen(screen: TerminalScreen) { return screen.lines[0] === "snapshot" ? "idle" as const : undefined }
+    observeDraft(screen: TerminalScreen) {
+      if (screen.lines[0] !== "snapshot") return undefined
+      if (!this.snapshotObserved) this.pending.push({ _tag: "Rewind" })
+      this.snapshotObserved = true
+      return { text: "draft", exact: false }
+    }
+    observeInput() {
+      this.pending.push({ _tag: "Rewind" })
+      return { _tag: "Submission" as const }
+    }
+  }
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const ownerId = yield* supervisor.show(prepared("observations", fixture, { observer: new Observer() }))
+    const process = fixture.processes.processes[0]!
+    process.output(bytes("output"))
+    process.output(bytes("snapshot"))
+    fixture.renderer.surfaces[0]!.input(bytes("\r"))
+    yield* eventually(() => events.length === 7)
+    expect(events.map((event) => "observation" in event ? event.observation._tag : event.activity)).toEqual([
+      "Rewind", "working", "Rewind", "Draft", "idle", "Rewind", "Submission",
+    ])
+    expect(events.every((event) => event.ownerId === ownerId && event.sessionId === "observations")).toBeTrue()
+    expect(events.map((event) => event.sequenceId)).toEqual([1, 2, 3, 4, 5, 6, 7])
+    expect((yield* supervisor.draftPreviews).has("observations")).toBeFalse()
+  }))
+})
+
+for (const boundary of ["frame", "return", "input"] as const) {
+  for (const readable of [true, false]) {
+    test(`production ${boundary} snapshot emits rewind before composer/activity (readable: ${readable})`, async () => {
+      const setup = await createTestRenderer({ width: 50, height: 10, kittyKeyboard: true })
+      const fixture = makeFixture()
+      const events: Array<TerminalObservationEvent | TerminalActivityEvent> = []
+      try {
+        await withSupervisor({ ...fixture.dependencies,
+          renderer: new OpenTuiTerminalRenderer(setup.renderer),
+          events: { onObservation: (event) => events.push(event), onActivityChanged: (event) => events.push(event) },
+        }, (supervisor) => Effect.gen(function*() {
+          const ownerId = yield* supervisor.show(prepared("native", fixture, { observer: new ClaudeTerminalObserver() }))
+          const process = fixture.processes.processes[0]!
+          process.output(bytes("\u001b]0;⠋ Claude Code\u0007\u001b[2J\u001b[HRewind\r\nRestore and fork the conversation to the\r\npoint before…\r\n❯ Restore files from backup\u001b[?25l"))
+          yield* Effect.promise(() => setup.renderOnce())
+          setup.mockInput.pressEnter()
+          expect(events.some((event) => "observation" in event && event.observation._tag === "Rewind")).toBeFalse()
+          process.output(bytes("\u001b[2J\u001b[H" + (readable
+            ? "────────────────────────────────\r\n❯ Restore files from backup\r\n────────────────────────────────"
+            : "Restored transcript; composer not visible") + "\u001b[?25l"))
+          if (boundary === "frame") yield* Effect.promise(() => setup.renderOnce())
+          else if (boundary === "return") yield* supervisor.hideActive
+          else setup.mockInput.pressEnter()
+          yield* eventually(() => events.some((event) => "observation" in event && event.observation._tag === "Rewind"))
+          yield* Effect.promise(() => setup.renderOnce())
+          yield* supervisor.hideActive
+          for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
+          const rewinds = events.filter((event) => "observation" in event && event.observation._tag === "Rewind")
+          expect(rewinds).toHaveLength(1)
+          const following = events.filter((event) => event.sequenceId >= rewinds[0]!.sequenceId)
+          expect(following.map((event) => "observation" in event ? event.observation._tag : event.activity)).toEqual([
+            "Rewind", ...(readable ? ["Draft", "idle"] as const : []), ...(boundary === "input" ? ["Submission"] as const : []),
+          ])
+          expect(events.every((event) => event.ownerId === ownerId && event.sessionId === "native")).toBeTrue()
+          expect(events.map((event) => event.sequenceId)).toEqual([...new Set(events.map((event) => event.sequenceId))].sort((a, b) => a - b))
+          if (!readable) expect((yield* supervisor.draftPreviews).has("native")).toBeFalse()
+        }))
+      } finally {
+        setup.renderer.destroy()
+      }
+    })
+  }
+}
 
 for (const completedCursorVisible of [true, false]) {
 test(`production snapshots precede Escape and sequence hidden-cursor resubmissions (completed cursor visible: ${completedCursorVisible})`, async () => {
@@ -1756,6 +1845,8 @@ class FakeSurface implements TerminalSurface {
   screen(): TerminalScreen {
     return { lines: this.lines, cursor: { x: 0, y: 0, visible: true } }
   }
+
+  input(data: Uint8Array): void { this.callbacks.onData(data, "input") }
 
   focus(): void {
     this.log.push(`focus:${this.id.replace("agent-owner-", "")}`)

@@ -775,9 +775,9 @@ export function makeAppRuntime(
         }
         const previousDraft = state.drafts.get(event.sessionId)
         const draft = event.observation._tag === "Draft" ? event.observation.draft : undefined
-        const newRewind = draft?.rewind && !draft.submitted &&
+        const newRewind = event.observation._tag === "Rewind" || (draft?.rewind && !draft.submitted &&
           (!previousDraft?.rewind || previousDraft.submitted ||
-            (previousDraft.rewindTarget ?? previousDraft.text) !== (draft.rewindTarget ?? draft.text))
+            (previousDraft.rewindTarget ?? previousDraft.text) !== (draft.rewindTarget ?? draft.text)))
         yield* publish({
           _tag: "TerminalObservationObserved",
           sessionId: event.sessionId,

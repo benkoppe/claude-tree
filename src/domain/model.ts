@@ -33,6 +33,8 @@ export interface DraftPreview {
   readonly exact: boolean
   readonly rewind?: boolean
   readonly rewindTarget?: string
+  /** Original complete multiline composer rows, before edits; only row joins may be ambiguous. */
+  readonly rewindTargetLines?: readonly string[]
   readonly submitted?: boolean
 }
 
@@ -53,6 +55,8 @@ export interface TerminalObserver {
   observeScreen(screen: TerminalScreen): AgentActivity | undefined
   /** Undefined is unknown; null is a positively observed empty composer. */
   observeDraft(screen: TerminalScreen): DraftPreview | null | undefined
+  /** Drain semantic occurrences once, before publishing the same snapshot's draft or activity. */
+  takeObservations?(): readonly TerminalObservation[]
 }
 
 export interface TerminalSubmissionObservation {
@@ -61,6 +65,8 @@ export interface TerminalSubmissionObservation {
 }
 
 export type TerminalObservation =
+  /** A confirmed conversation restore, independent of composer readability or session identity. */
+  | { readonly _tag: "Rewind" }
   | { readonly _tag: "Draft"; readonly draft: DraftPreview | null }
   | TerminalSubmissionObservation
 

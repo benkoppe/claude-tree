@@ -47,6 +47,10 @@ export interface TerminalState {
   /** Includes empty composer observations so return snapshots cannot resurrect a draft. */
   readonly observationReceived?: boolean
   readonly historyRevision?: number
+  /** A confirmed occurrence without a resolved provider boundary; never projects history. */
+  readonly unresolvedRewind?: boolean
+  /** Prior submitted boundary is usable only if the restored composer confirms that send. */
+  readonly rewindRestore?: { readonly anchor: RewindAnchor; readonly replacement: NonNullable<TerminalState["replacement"]> }
   /** Owner-local discovery uses historyRevision to invalidate timers and reads. */
   readonly pendingSubmission?: {
     readonly baseline: readonly AgentMessage[]
@@ -56,6 +60,8 @@ export interface TerminalState {
   readonly replacement?: {
     readonly prefix: readonly AgentMessage[]
     readonly discardedMessageIds: ReadonlySet<string>
+    /** Completion releases the prefix constraint, but never discarded-identity evidence. */
+    readonly settled?: boolean
   }
   readonly activity: AgentActivity
   readonly phase: "showing" | "running" | "stopping" | "cleanup-incomplete"
@@ -114,6 +120,7 @@ export interface ApplicationState {
   readonly replacementCandidates: ReadonlyMap<string, {
     readonly messages: readonly AgentMessage[]
     readonly attempts: number
+    readonly userPrefix?: boolean
   }>
   readonly unviewedSessionIds: ReadonlySet<string>
   readonly refresh: {

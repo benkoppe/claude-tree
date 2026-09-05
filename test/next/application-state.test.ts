@@ -571,6 +571,272 @@ describe("application state reducer", () => {
     }, { _tag: "Draft", draft: { text: "later", exact: false, rewind: true } })
   }
 
+  test("an unreadable rewind occurrence invalidates reads without fabricating placement", () => {
+    let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+      ownerId: "owner", activity: "idle", wasVisible: false })
+    const refresh = activeRefresh("before-rewind", 1, "manual", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    const captured = state.refresh.active.get(refresh.key)!
+    expect(observe(state, { _tag: "Rewind" }, "stale")).toBe(state)
+    state = observe(state, { _tag: "Rewind" })
+    expect(state.terminals.get(ROOT)).toMatchObject({ unresolvedRewind: true, activity: "idle", historyRevision: 3 })
+    expect(state.terminals.get(ROOT)?.replacement).toBeUndefined()
+    expect(state.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(state.drafts.size).toBe(0)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    expect(invalidatedRefreshSessionIds(state, captured)).toEqual(new Set([ROOT]))
+    state = observe(state, { _tag: "Draft", draft: null })
+    expect(state.terminals.get(ROOT)?.unresolvedRewind).toBeTrue()
+    state = readReplacement(state, original.slice(0, 2))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    state = readReplacement(state, original.slice(0, 2))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+    expect(state.terminals.get(ROOT)?.unresolvedRewind).toBeFalse()
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  test("explicit re-undo can recover only its matching tracked replacement boundary", () => {
+    let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+    state = observe(state, { _tag: "Rewind" })
+    expect(state.rewindAnchors.size).toBe(0)
+    state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false, rewind: true } })
+    expect(state.rewindAnchors.get(ROOT)?.targetMessageId).toBe("q2")
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+  })
+
+  test("rewind matching joins only evidenced terminal row boundaries and escapes regex syntax", () => {
+    const text = "use veryLongIdentifier [x]+ with care"
+    for (const [preview, rows, matches] of [
+      [text, ["use veryLongIdenti", "  fier [x]+ with  care"], true],
+      [text, undefined, false],
+      ["prefix " + text, ["use veryLongIdenti", "fier [x]+ with care"], false],
+      ["useveryLongIdentifier [x]+ with care", ["use veryLongIdenti", "fier [x]+ with care"], false],
+      ["use veryLongIdentifier xxx with care", ["use veryLongIdenti", "fier [x]+ with care"], false],
+    ] as const) {
+      let state: ApplicationState = { ...loadedState([message("target", "user", preview, 0)]),
+        terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]) }
+      state = observe(state, { _tag: "Rewind" })
+      state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false, rewind: true,
+        rewindTarget: "use veryLongIdenti\nfier [x]+ with care", ...(rows ? { rewindTargetLines: [...rows] } : {}) } })
+      expect(state.rewindAnchors.has(ROOT)).toBe(matches)
+    }
+    let state: ApplicationState = { ...loadedState([message("one", "user", text, 0), message("two", "user", text, 1)]),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]) }
+    state = observe(state, { _tag: "Draft", draft: { text, exact: false, rewind: true,
+      rewindTargetLines: ["use veryLongIdenti", "fier [x]+ with care"] } })
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(state.terminals.get(ROOT)?.unresolvedRewind).toBeTrue()
+  })
+
+  for (const occurrence of [false, true]) {
+    for (const activity of ["working", "blocked", "idle"] as const) {
+      test(`unanchored replacement confirms user prefix independently of assistant streaming (${occurrence}, ${activity})`, () => {
+        let state: ApplicationState = { ...loadedState(original),
+          terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]) }
+        if (occurrence) state = observe(state, { _tag: "Rewind" })
+        state = observe(state, { _tag: "Submission", text: "edited" })
+        state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+          ownerId: "owner", activity, wasVisible: false })
+        const prefix = [...original.slice(0, 2), message("novel", "user", "edited", 2)]
+        for (const attempt of [1, 2]) {
+          state = readReplacement(state, [...prefix, { ...message("answer", "agent", `stream ${attempt}`, 3), turnComplete: false }])
+          expect(selectProjectedTranscript(state, ROOT)).toEqual(attempt === 1 ? original : prefix)
+          expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(attempt === 1 ? 1 : undefined)
+          expect(state.unviewedSessionIds.size).toBe(0)
+        }
+        expect(state.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+        if (activity === "idle") expect(state.pendingCompletions.get(ROOT)?.baseline).toEqual(prefix)
+        for (const stale of [original, original.slice(0, 2), [{ ...original[0]!, preview: "mutated" }, ...prefix.slice(1)]]) {
+          state = readReplacement(state, stale)
+          expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+        }
+        state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+          ownerId: "owner", activity: "idle", wasVisible: false })
+        state = readReplacement(state, [...prefix, { ...message("answer", "agent", "complete", 3), turnComplete: true }])
+        expect(state.pendingCompletions.size).toBe(0)
+        expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
+        state = readReplacement(state, original)
+        expect(selectProjectedTranscript(state, ROOT).at(-1)?.id).toBe("answer")
+      })
+    }
+  }
+
+  test("unresolved occurrence recovers while blocked without a readable submission and preserves forks", () => {
+    const copies = original.map((entry) => ({ ...entry, id: `child-${entry.id}` }))
+    let state = reduceApplicationState(liveRewindState(), { _tag: "PersistedBranchProjected",
+      session: session("child", "Child"), transcript: available(copies),
+      relation: { childSessionId: "child", parentSessionId: ROOT, sourceMessageId: "q2",
+        sharedMessages: original.map((entry, index) => ({ parentMessageId: entry.id, childMessageId: copies[index]!.id })),
+        createdAt: "2026-09-01T00:00:00.000Z" } })
+    state = observe(state, { _tag: "Rewind" })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+      ownerId: "owner", activity: "blocked", wasVisible: false })
+    const prefix = [...original.slice(0, 2), message("new", "user", "edited", 2)]
+    state = readReplacement(readReplacement(state, prefix), prefix)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+    expect(selectProjectedTranscript(state, "child")).toEqual(copies)
+    const graph = projectGraphViewModel(state, ROOT)
+    const edited = graph.nodes.find((node) => node._tag === "Message" && node.preview === "edited")!
+    const copied = graph.nodes.find((node) => node._tag === "Message" && node.preview === "later")!
+    expect(edited.parentIds).toEqual(copied.parentIds)
+  })
+
+  test("unanchored recovery rejects old identities outside the longest common prefix", () => {
+    let state: ApplicationState = { ...loadedState(original),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    state = observe(state, { _tag: "Submission" })
+    const novel = message("new", "user", "edited", 2)
+    for (const invalid of [
+      [{ ...original[0]!, copyIdentity: "mutated" }, original[1]!, novel],
+      [original[1]!, novel],
+      [original[0]!, novel, original[2]!],
+    ]) {
+      state = readReplacement(readReplacement(state, invalid), invalid)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+      expect(state.replacementCandidates.size).toBe(0)
+      expect(state.terminals.get(ROOT)?.pendingSubmission).toBeDefined()
+    }
+    const prefix = [...original.slice(0, 2), novel]
+    state = readReplacement(state, prefix)
+    const refresh = activeRefresh("failed-prefix", state.refresh.generation + 1, "submission", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, { _tag: "RefreshFailed", key: refresh.key, generation: refresh.generation, message: "failed" })
+    state = readReplacement(state, prefix)
+    expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(1)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    state = readReplacement(state, prefix)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+  })
+
+  test("unknown working replacements fail closed and tracked candidates have a bounded budget", () => {
+    let state: ApplicationState = { ...loadedState(original),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    const replacement = [...original.slice(0, 2), message("new", "user", "edited", 2)]
+    state = readReplacement(readReplacement(state, replacement), replacement)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    expect(state.replacementCandidates.size).toBe(0)
+    state = observe(state, { _tag: "Submission" })
+    for (const attempt of [1, 2, 3]) {
+      state = readReplacement(state, [...original.slice(0, 2), message(`new-${attempt}`, "user", "edited", 2)])
+      expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(attempt < 3 ? attempt : undefined)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    }
+    expect(state.modal?._tag).toBe("Error")
+    expect(state.terminals.get(ROOT)?.pendingSubmission).toBeDefined()
+  })
+
+  test("shortening rebases discovery without satisfying it until a novel user persists", () => {
+    let state = observe(liveRewindState(), { _tag: "Rewind" })
+    state = observe(state, { _tag: "Submission" })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+      ownerId: "owner", activity: "working", wasVisible: false })
+    const prefix = original.slice(0, 2)
+    state = readReplacement(readReplacement(state, prefix), prefix)
+    expect(state.terminals.get(ROOT)?.pendingSubmission).toEqual({ baseline: prefix, attempt: 0 })
+    expect(state.unviewedSessionIds.size).toBe(0)
+    state = readReplacement(state, [...prefix, message("new", "user", "edited", 2)])
+    expect(state.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  for (const recovery of ["idle-prefix", "idle-replacement", "working-replacement"] as const) {
+    test(`a completed rewind permits a second missed rewind (${recovery})`, () => {
+      const prefix = original.slice(0, 2)
+      const first = [...prefix, message("first-replacement", "user", "first edit", 2),
+        { ...message("first-answer", "agent", "first complete", 3), turnComplete: true }]
+      let state = observe(liveRewindState(), { _tag: "Submission", text: "first edit" })
+      state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+        ownerId: "owner", activity: "idle", wasVisible: false })
+      state = readReplacement(state, first)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(first)
+      expect(state.terminals.get(ROOT)?.replacement?.settled).toBeTrue()
+      expect(state.pendingCompletions.size).toBe(0)
+      expect(state.rewindAnchors.size).toBe(0)
+      state = reduceApplicationState(state, { _tag: "TerminalShown", sessionId: ROOT, ownerId: "owner",
+        returnTo: { _tag: "Roots", selectedSessionId: ROOT } })
+
+      // Completion releases only the old prefix constraint, not the discarded UUIDs.
+      state = readReplacement(readReplacement(state, original), original)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(first)
+      expect(state.replacementCandidates.size).toBe(0)
+      if (recovery === "idle-prefix") {
+        state = readReplacement(state, prefix)
+        expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(1)
+        expect(selectProjectedTranscript(state, ROOT)).toEqual(first)
+        state = readReplacement(state, prefix)
+        expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+        expect(state.replacementCandidates.size).toBe(0)
+        expect(state.unviewedSessionIds.size).toBe(0)
+        state = readReplacement(readReplacement(state, first), first)
+        expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+      }
+
+      const second = [...prefix, message("second-replacement", "user", "second edit", 2)]
+      if (recovery !== "idle-replacement") {
+        state = observe(state, { _tag: "Submission", text: "second edit" })
+        state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+          ownerId: "owner", activity: "working", wasVisible: false })
+      }
+      for (const attempt of [1, 2]) {
+        state = readReplacement(state, recovery === "idle-replacement" ? second : [...second,
+          { ...message("second-answer", "agent", `stream ${attempt}`, 3), turnComplete: false }])
+        expect(selectProjectedTranscript(state, ROOT)).toEqual(
+          attempt === 1 && recovery !== "idle-prefix" ? first : second)
+        if (attempt === 1 && recovery !== "idle-prefix") expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(1)
+      }
+      expect(state.terminals.get(ROOT)?.pendingSubmission).toBeUndefined()
+      expect(state.replacementCandidates.size).toBe(0)
+      expect(state.rewindAnchors.size).toBe(0)
+      expect(state.unviewedSessionIds.size).toBe(0)
+      expect(state.terminals.get(ROOT)?.replacement?.discardedMessageIds).toEqual(
+        new Set(["q2", "first-replacement", "first-answer"]))
+      state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+        ownerId: "owner", activity: "idle", wasVisible: false })
+      const completed = [...second, { ...message("second-answer", "agent", "second complete", 3), turnComplete: true }]
+      state = readReplacement(state, completed)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(completed)
+      expect(state.terminals.get(ROOT)?.replacement?.settled).toBeTrue()
+      expect(state.pendingCompletions.size).toBe(0)
+      for (const abandoned of [original, first]) {
+        state = readReplacement(readReplacement(state, abandoned), abandoned)
+        expect(selectProjectedTranscript(state, ROOT)).toEqual(completed)
+        expect(state.replacementCandidates.size).toBe(0)
+      }
+      expect(state.modal).toBeNull()
+    })
+  }
+
+  test("unavailable prefix confirmation preserves content but discards its candidate", () => {
+    let state = observe(liveRewindState(), { _tag: "Rewind" })
+    const prefix = original.slice(0, 2)
+    state = readReplacement(state, prefix)
+    const refresh = activeRefresh("unavailable", state.refresh.generation + 1, "manual", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation,
+      snapshot: { sessions: [session(ROOT, "Root")], transcripts: new Map([[ROOT, { _tag: "Unavailable", reason: "busy" }]]) } })
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    expect(state.replacementCandidates.size).toBe(0)
+    state = readReplacement(state, prefix)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(1)
+  })
+
+  test("an obsolete failure cannot erase newer prefix confirmation evidence", () => {
+    let state = observe(liveRewindState(), { _tag: "Rewind" })
+    const refresh = activeRefresh("old-failure", 1, "manual", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = readReplacement(state, original.slice(0, 2))
+    const candidate = state.replacementCandidates.get(ROOT)
+    state = reduceApplicationState(state, { _tag: "RefreshFailed", key: refresh.key, generation: 1, message: "obsolete" })
+    expect(state.replacementCandidates.get(ROOT)).toBe(candidate)
+    expect(state.modal).toBeNull()
+    state = readReplacement(state, original.slice(0, 2))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+  })
+
   for (const confirmedPrefix of [false, true]) {
     for (const activity of ["working", "blocked", "idle"] as const) {
       test(`replacement user precedes the pending endpoint (${activity}, confirmed prefix: ${confirmedPrefix})`, () => {

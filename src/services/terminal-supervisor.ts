@@ -748,6 +748,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
                 this.captureDraft(current)
                 current.inputObserved = true
                 const observation = launch.observer.observeInput?.(data)
+                this.takeObservations(current)
                 if (observation) {
                   delete current.draftPreview
                   delete current.lastDraftKey
@@ -768,7 +769,13 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             this.ignoreCallback(() => {
               const screen = surface.screen()
               const activity = launch.observer.observeScreen(screen)
-              if (current) this.recordDraft(current, launch.observer.observeDraft(screen))
+              const draft = launch.observer.observeDraft(screen)
+              if (current) {
+                this.takeObservations(current)
+                this.recordDraft(current, draft)
+              } else {
+                for (const observation of launch.observer.takeObservations?.() ?? []) offer({ _tag: "Observation", observation })
+              }
               if (activity !== undefined) offerActivities([activity])
             })
           },
@@ -786,7 +793,12 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             onOutput: (data) => {
               const current = owner
               if (current && !this.acceptsTerminalData(current)) return
-              this.ignoreCallback(() => offerActivities(launch.observer.observeOutput(data)))
+              this.ignoreCallback(() => {
+                const activities = launch.observer.observeOutput(data)
+                if (current) this.takeObservations(current)
+                else for (const observation of launch.observer.takeObservations?.() ?? []) offer({ _tag: "Observation", observation })
+                offerActivities(activities)
+              })
               this.ignoreCallback(() => {
                 if (this.activeOwnerId === ownerId) {
                   for (const text of osc52.observe(data)) {
@@ -2231,12 +2243,23 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       const screen = owner.surface.screen()
       const activity = owner.observer.observeScreen(screen)
       const observed = owner.observer.observeDraft(screen)
+      this.takeObservations(owner)
       this.recordDraft(owner, observed)
       if (activity !== undefined) this.offerEvent(owner, { _tag: "Activity", activity })
     } catch {
       // Observer defects must not block process cleanup.
     } finally {
       owner.inputObserved = false
+    }
+  }
+
+  private takeObservations(owner: TerminalOwner): void {
+    for (const observation of owner.observer.takeObservations?.() ?? []) {
+      if (observation._tag === "Rewind") {
+        delete owner.draftPreview
+        delete owner.lastDraftKey
+      }
+      this.offerEvent(owner, { _tag: "Observation", observation })
     }
   }
 

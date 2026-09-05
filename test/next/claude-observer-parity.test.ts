@@ -6,6 +6,249 @@ import {
   observeClaudeActivity,
   observeClaudeDraft,
 } from "../../src/infrastructure/providers/claude/terminal-observer"
+import type { TerminalScreen } from "../../src/domain/model"
+
+const dialogScreen = (lines: readonly string[]): TerminalScreen => ({
+  lines, cursor: { x: 0, y: 0, visible: false },
+})
+const rewindInput = (observer: ClaudeTerminalObserver, input = "\r") => observer.observeInput(new TextEncoder().encode(input))
+
+for (const content of [
+  ["Rewind"],
+  ["Restore and fork the conversation to the", "point before…"],
+  ["Restore the code and/or conversation to the point before…"],
+  ["Confirm you want to restore the conversation"],
+]) {
+  test(`dialog-like composer contents remain drafts and submit normally: ${content.join(" / ")}`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const lines = ["Explain these menu labels:", ...content.map((line) => `  ${line}`)]
+    const screen = {
+      lines: ["────────────────", `❯ ${lines[0]}`, ...lines.slice(1), "────────────────"],
+      cursor: { x: 8, y: lines.length, visible: true },
+    }
+    const text = lines.join("\n")
+    expect(observer.observeScreen(screen)).toBe("idle")
+    expect(observer.observeDraft(screen)).toEqual({ text, exact: false })
+    expect(rewindInput(observer)).toEqual({ _tag: "Submission", text })
+    expect(observer.takeObservations()).toEqual([])
+  })
+}
+
+for (const visible of [true, false]) {
+  test(`a real wrapped dialog with a selection marker is not a composer (cursor visible: ${visible})`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const picker = {
+      lines: ["────────────────", "Rewind", "Restore and fork the conversation to the", "point before…", "❯ target", "────────────────"],
+      cursor: { x: 4, y: 4, visible },
+    }
+    observer.observeScreen(picker)
+    expect(observer.observeDraft(picker)).toBeUndefined()
+    expect(rewindInput(observer)).toBeUndefined()
+    expect(observer.takeObservations()).toEqual([])
+    observer.observeScreen(dialogScreen(["unknown"]))
+    expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+  })
+}
+
+test("a restored hidden-cursor composer containing Rewind is not a lingering dialog heading", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeScreen(dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"]))
+  rewindInput(observer)
+  const restored = dialogScreen(["────────────────", "❯ Explain these menu labels:", "  Rewind", "────────────────"])
+  observer.observeScreen(restored)
+  expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+  expect(observer.observeDraft(restored)).toEqual({
+    text: "Explain these menu labels:\n  Rewind", exact: false, rewind: true,
+    rewindTarget: "Explain these menu labels:\n  Rewind", rewindTargetLines: ["Explain these menu labels:", "  Rewind"],
+  })
+})
+
+test("excluding an input box does not hide a real confirmation elsewhere on the screen", () => {
+  const observer = new ClaudeTerminalObserver()
+  const screen = {
+    lines: ["Confirm you want to restore the conversation", "❯ Restore conversation", "────────────────",
+      "❯ Explain these menu labels:", "  Rewind", "────────────────"],
+    cursor: { x: 4, y: 1, visible: true },
+  }
+  observer.observeScreen(screen)
+  expect(observer.observeDraft(screen)).toBeUndefined()
+  expect(rewindInput(observer)).toBeUndefined()
+  observer.observeScreen(dialogScreen(["unknown"]))
+  expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+})
+
+for (const prompt of ["earlier prompt", "Restore files from backup", "Never mind"]) {
+  test(`wrapped one-stage restore treats ${JSON.stringify(prompt)} as a message, not an action`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const picker = dialogScreen([
+      "│ Rewind │", "│ Restore and fork the conversation to the │", "│ point before… │", `│ ❯ ${prompt} │`,
+    ])
+    observer.observeScreen(picker)
+    expect(observer.observeDraft(picker)).toBeUndefined()
+    expect(rewindInput(observer)).toBeUndefined()
+    expect(observer.takeObservations()).toEqual([])
+    observer.observeScreen(picker)
+    expect(observer.takeObservations()).toEqual([])
+    const restored = dialogScreen(["────────────────", `❯ ${prompt}`, "────────────────"])
+    observer.observeScreen(restored)
+    expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+    expect(observer.observeDraft(restored)).toEqual({ text: prompt, exact: false, rewind: true, rewindTarget: prompt })
+    observer.observeScreen(restored)
+    expect(observer.takeObservations()).toEqual([])
+  })
+}
+
+test("wrapped two-stage restore requires action confirmation and emits once without a readable composer", () => {
+  const observer = new ClaudeTerminalObserver()
+  const picker = dialogScreen([
+    "┃ Rewind ┃", "┃ Restore the code and/or conversation ┃", "┃ to the point before… ┃", "┃ ❯ Restore files from backup ┃",
+  ])
+  const confirmation = dialogScreen([
+    "┃ Rewind ┃", "┃ Confirm you want to ┃", "┃ restore the conversation to the point ┃", "┃ before you sent this message: ┃",
+    "┃ ❯ Restore code and ┃", "┃ conversation ┃", "┃ Never mind ┃",
+  ])
+  const unknown = dialogScreen(["Restored history; composer not visible"])
+  observer.observeScreen(picker)
+  rewindInput(observer)
+  expect(observer.takeObservations()).toEqual([])
+  observer.observeScreen(confirmation)
+  expect(observer.observeDraft(confirmation)).toBeUndefined()
+  expect(observer.takeObservations()).toEqual([])
+  rewindInput(observer)
+  observer.observeScreen(confirmation)
+  observer.observeScreen(dialogScreen(["╭── Rewind ──╮"]))
+  expect(observer.takeObservations()).toEqual([])
+  observer.observeScreen(unknown)
+  expect(observer.observeDraft(unknown)).toBeUndefined()
+  expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+  observer.observeScreen(unknown)
+  expect(observer.takeObservations()).toEqual([])
+  expect(rewindInput(observer, "replacement\r")).toEqual({ _tag: "Submission", text: "replacement" })
+})
+
+test("leaving a two-stage picker without confirming is not a rewind", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeScreen(dialogScreen(["Rewind", "Restore the code and/or conversation to the point before…", "❯ target"]))
+  rewindInput(observer)
+  const restored = dialogScreen(["────────────────", "❯ target", "────────────────"])
+  observer.observeScreen(restored)
+  expect(observer.takeObservations()).toEqual([])
+  expect(observer.observeDraft(restored)).toBeUndefined()
+})
+
+test("confirmation without a readable selected action does not imply a conversation restore", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeScreen(dialogScreen(["Rewind", "Confirm you want to restore the conversation"]))
+  rewindInput(observer)
+  observer.observeScreen(dialogScreen(["unknown"]))
+  expect(observer.takeObservations()).toEqual([])
+})
+
+test("recognizes native instructions wrapped across more than four bordered rows", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeScreen(dialogScreen([
+    "╭── Rewind ──╮", "│ Restore and │", "│ fork the │", "│ conversation │", "│ to the point │", "│ before… │", "│ ❯ prompt │",
+  ]))
+  rewindInput(observer)
+  observer.observeScreen(dialogScreen(["unknown"]))
+  expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+})
+
+for (const action of ["Restore code", "Restore files only", "Never mind", "Summarize from here", "Summarize up to here"]) {
+  test(`${action} cannot emit a rewind on dialog exit`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const confirmation = dialogScreen(["Rewind", "Confirm you want to restore the conversation", `❯ ${action}`])
+    observer.observeScreen(confirmation)
+    rewindInput(observer)
+    observer.observeScreen(confirmation)
+    observer.observeScreen(dialogScreen(["unreadable composer"]))
+    expect(observer.takeObservations()).toEqual([])
+  })
+}
+
+for (const confirmBeforeEscape of [false, true]) {
+  test(`Escape cancels restore observation even after Enter: ${confirmBeforeEscape}`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const confirmation = dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"])
+    observer.observeScreen(confirmation)
+    if (confirmBeforeEscape) rewindInput(observer)
+    rewindInput(observer, "\u001b")
+    observer.observeScreen(confirmation)
+    observer.observeScreen(dialogScreen(["unknown"]))
+    expect(observer.takeObservations()).toEqual([])
+  })
+}
+
+test("repeated restores emit separate occurrences, including an empty restored composer", () => {
+  const observer = new ClaudeTerminalObserver()
+  for (let index = 0; index < 2; index += 1) {
+    observer.observeScreen(dialogScreen(["Restore and fork the conversation to the point before…", "❯ target"]))
+    rewindInput(observer)
+    const empty = dialogScreen(["────────────────", "❯ ", "────────────────"])
+    observer.observeScreen(empty)
+    expect(observer.observeDraft(empty)).toBeNull()
+    expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+    observer.observeScreen(empty)
+    expect(observer.takeObservations()).toEqual([])
+  }
+})
+
+test("cancelling confirmation back to message selection allows a subsequent confirmed restore", () => {
+  const observer = new ClaudeTerminalObserver()
+  const confirmation = dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"])
+  observer.observeScreen(confirmation)
+  rewindInput(observer, "\u001b")
+  observer.observeScreen(dialogScreen(["Restore the code and/or conversation to the point before…", "❯ target"]))
+  rewindInput(observer)
+  observer.observeScreen(confirmation)
+  rewindInput(observer)
+  observer.observeScreen(dialogScreen(["unknown"]))
+  expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+})
+
+test("preserves complete original composer rows through edits without erasing within-row whitespace", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeScreen(dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"]))
+  rewindInput(observer)
+  observer.observeScreen(dialogScreen(["composer not yet visible"]))
+  rewindInput(observer, "\u001b[I")
+  const restored = dialogScreen(["────────────────", "❯ use  veryLongIdenti", "  fier with  care", "────────────────"])
+  observer.observeScreen(restored)
+  const original = observer.observeDraft(restored)
+  expect(original).toEqual({
+    text: "use  veryLongIdenti\n  fier with  care", exact: false, rewind: true,
+    rewindTarget: "use  veryLongIdenti\n  fier with  care", rewindTargetLines: ["use  veryLongIdenti", "  fier with  care"],
+  })
+  const edited = dialogScreen(["────────────────", "❯ edited", "────────────────"])
+  observer.observeScreen(edited)
+  expect(observer.observeDraft(edited)).toEqual({ ...original!, text: "edited" })
+  rewindInput(observer)
+  expect(original?.rewindTargetLines).toEqual(["use  veryLongIdenti", "  fier with  care"])
+  observer.observeScreen(dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"]))
+  rewindInput(observer)
+  observer.observeScreen(edited)
+  expect(observer.observeDraft(edited)?.rewindTargetLines).toBeUndefined()
+  expect(observer.observeDraft(edited)?.rewindTarget).toBe("edited")
+})
+
+for (const rows of [
+  ["❯ clipped start", "  remainder", "────────────────"],
+  ["────────────────", "❯ clipped end", "  remainder"],
+  ["────────────────", "❯ [Pasted text #1 +4 lines]", "  remainder", "────────────────"],
+  ["────────────────", "❯ [Image #1]", "  remainder", "────────────────"],
+  ["────────────────", "❯ truncated…", "  remainder", "────────────────"],
+  ["────────────────", "❯ ↑ 3 more lines", "  remainder", "────────────────"],
+]) {
+  test(`incomplete composer evidence supplies no original row matching: ${JSON.stringify(rows)}`, () => {
+    const observer = new ClaudeTerminalObserver()
+    observer.observeScreen(dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"]))
+    rewindInput(observer)
+    const screen = { ...dialogScreen(rows), cursor: { x: 2, y: 1, visible: true } }
+    observer.observeScreen(screen)
+    expect(observer.observeDraft(screen)?.rewindTargetLines).toBeUndefined()
+    expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+  })
+}
 
 test("observes only a cursor-local Claude composer bounded by its rule", () => {
   expect(
@@ -42,7 +285,7 @@ test("hidden-cursor rewind capture requires a complete idle composer after confi
   expect(observer.observeDraft(restored)).toBeUndefined()
   observer.observeInput(encoder.encode("/rewind\r"))
   expect(observer.observeDraft(restored)).toBeUndefined()
-  observer.observeScreen({ ...restored, lines: ["Confirm you want to restore the conversation"] })
+  observer.observeScreen({ ...restored, lines: ["Confirm you want to restore the conversation", "❯ Restore conversation"] })
   observer.observeInput(encoder.encode("\r"))
   expect(observer.observeDraft({ ...restored, lines: ["❯ historical text", "────────────────"] })).toBeUndefined()
   expect(observer.observeDraft({ ...restored, lines: [...restored.lines, "✻ Cogitating… (12s · esc to interrupt)"] })).toBeUndefined()
@@ -314,7 +557,7 @@ test("submission without observed text does not invent a draft payload", () => {
 test("completed hidden-cursor resubmissions return unknown or empty, never the submitted rewind draft", () => {
   const observer = new ClaudeTerminalObserver()
   const encoder = new TextEncoder()
-  observer.observeScreen({ lines: ["Confirm you want to restore the conversation"], cursor: { x: 0, y: 0, visible: false } })
+  observer.observeScreen({ lines: ["Confirm you want to restore the conversation", "❯ Restore conversation"], cursor: { x: 0, y: 0, visible: false } })
   observer.observeInput(encoder.encode("\r"))
   const restored = { lines: ["────────────────", "❯ restored", "────────────────"], cursor: { x: 0, y: 0, visible: false } }
   observer.observeScreen(restored)
@@ -354,7 +597,7 @@ test("an unchanged pre-Escape composer is not proof of a cancelled send", () => 
 
 test("an empty confirmed composer cannot make a later ordinary edit a rewind", () => {
   const observer = new ClaudeTerminalObserver()
-  observer.observeScreen({ lines: ["Confirm you want to restore the conversation"], cursor: { x: 0, y: 0, visible: false } })
+  observer.observeScreen({ lines: ["Confirm you want to restore the conversation", "❯ Restore conversation"], cursor: { x: 0, y: 0, visible: false } })
   observer.observeInput(new TextEncoder().encode("\r"))
   const screen = { lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
   expect(observer.observeDraft(screen)).toBeNull()
