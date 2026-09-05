@@ -1701,7 +1701,53 @@ describe("application state reducer", () => {
     expect(state.removals).toEqual([])
   })
 
-  test("projects every stopped empty fork as a numbered leaf", () => {
+  test("resolves a collapsed copied-only endpoint to its answer and restores its live draft", () => {
+    const child = "child"
+    const original = [message("hello", "user", "Hello", 0), message("answer", "agent", "answer", 1)]
+    const copies = original.map((entry) => ({ ...entry, id: `copy-${entry.id}` }))
+    const target = { kind: "endpoint" as const, sessionId: child }
+    const state: ApplicationState = {
+      ...loadedState(),
+      surface: { _tag: "Graph", familySessionId: ROOT, target },
+      provider: {
+        sessions: new Map([[ROOT, session(ROOT, "Root")], [child, session(child, "Child")]]),
+        transcripts: new Map([
+          [ROOT, available([message("replacement", "user", "new path", 0)])],
+          [child, available(copies)],
+        ]),
+      },
+      relations: [{ childSessionId: child, parentSessionId: ROOT, sourceMessageId: "answer",
+        sharedMessages: original.map((entry, index) => ({ parentMessageId: entry.id, childMessageId: copies[index]!.id })),
+        createdAt: "2026-09-01T00:00:00.000Z" }],
+    }
+    const graph = projectGraphViewModel(state, ROOT)
+    const answer = graph.nodes.find((node) => node._tag === "Message" && node.preview === "answer")!
+    expect(graph.selectedNodeId).toBe(answer.id)
+    expect(answer.childIds).toEqual([])
+    expect(answer.reachableEndpoints).toMatchObject([
+      { session: { id: child }, visibleNodeId: answer.id, status: "idle", fork: { empty: true } },
+    ])
+    expect(graph.nodes.some((node) => node._tag === "Endpoint")).toBeFalse()
+
+    const live: ApplicationState = {
+      ...state,
+      terminals: new Map([[child, { ownerId: "owner", activity: "idle", phase: "running" }]]),
+      drafts: new Map([[child, { text: "continue", exact: false }]]),
+    }
+    const liveGraph = projectGraphViewModel(live, ROOT, target)
+    const draft = liveGraph.nodes.find((node) => node._tag === "Endpoint")!
+    expect(draft).toMatchObject({
+      _tag: "Endpoint", session: { id: child }, status: "live",
+      draft: { text: "continue" }, parentIds: [answer.id], selected: true,
+    })
+    const stopped = reduceApplicationState(live, { _tag: "TerminalStopped", sessionId: child })
+    expect(stopped.surface).toMatchObject({ _tag: "Graph", target })
+    expect(projectGraphViewModel(stopped, ROOT).selectedNodeId).toBe(answer.id)
+    const returned = reduceApplicationState(live, { _tag: "TerminalReturned", sessionId: child })
+    expect(projectGraphViewModel(returned, ROOT).selectedNodeId).toBe(draft.id)
+  })
+
+  test("projects competing stopped empty forks as numbered leaves", () => {
     const firstChild = "fork-one"
     const secondChild = "fork-two"
     const source = message("source", "user", "fork source", 0)
