@@ -24,6 +24,60 @@ const CHILD = "child:opaque/id"
 const GRANDCHILD = "grandchild:opaque/id"
 
 describe("next conversation graph", () => {
+  test("collapses a stopped copied-only leaf after its parent rewinds or takes a new path", () => {
+    const parent = [message("hello", "user", "Hello", 0), message("answer", "agent", "answer", 1)]
+    const child = parent.map((entry) => ({ ...entry, id: `copy-${entry.id}` }))
+    for (const replacement of [[], [message("new", "user", "new path", 0)]]) {
+      const graph = buildConversationForest(
+        [session(ROOT, 20), session(CHILD, 10)],
+        new Map([[ROOT, replacement], [CHILD, child]]),
+        [relation(CHILD, ROOT, "answer", shared(parent, child, 2))],
+      ).graphs[0]!
+      const answer = nodes(graph).find((node) => node.preview === "answer")!
+      const endpointId = graph.endpointBySessionId.get(CHILD)!
+      expect(graph.nodes.get(endpointId)).toMatchObject({
+        parentId: answer.id, fork: { empty: true },
+      })
+      expect(answer.childIds).toEqual([endpointId])
+      const layout = layoutConversationGraph(graph, 100)
+      expect(layout.nodes.has(endpointId)).toBeFalse()
+      expect(layout.nodes.has(answer.id)).toBeTrue()
+      expect(directionalMove(layout, answer.id, "down")).toBeUndefined()
+      expect(visibleGraphNodeId(graph, endpointId, new Set())).toBe(answer.id)
+      expect(reachableSessionEndpoints(graph, answer.id).map(({ endpoint }) => endpoint.session.id)).toEqual([CHILD])
+      expect(resolveForkTarget(graph, endpointId)).toEqual({ sessionId: CHILD, messageId: "copy-answer" })
+      expect(layoutConversationGraph(graph, 100, new Set([CHILD])).nodes.has(endpointId)).toBeTrue()
+      expect(visibleGraphNodeId(graph, endpointId, new Set([CHILD]))).toBe(endpointId)
+    }
+  })
+
+  test("numbers competing copied-only endpoints and collapses after the last competitor is removed", () => {
+    const parent = [message("hello", "user", "Hello", 0), message("answer", "agent", "answer", 1)]
+    const child = parent.map((entry) => ({ ...entry, id: `copy-${entry.id}` }))
+    const grandchild = parent.map((entry) => ({ ...entry, id: `other-${entry.id}` }))
+    const sessions = [session(ROOT, 30), session(CHILD, 20), session(GRANDCHILD, 10)]
+    const transcripts = new Map([[ROOT, []], [CHILD, child], [GRANDCHILD, grandchild]])
+    const relations = [
+      relation(CHILD, ROOT, "answer", shared(parent, child, 2), 1),
+      relation(GRANDCHILD, ROOT, "answer", shared(parent, grandchild, 2), 2),
+    ]
+    const graph = buildConversationForest(sessions, transcripts, relations).graphs[0]!
+    const layout = layoutConversationGraph(graph, 100)
+    for (const [index, sessionId] of [CHILD, GRANDCHILD].entries()) {
+      const endpointId = graph.endpointBySessionId.get(sessionId)!
+      expect(layout.nodes.has(endpointId)).toBeTrue()
+      expect(graph.nodes.get(endpointId)).toMatchObject({ fork: { empty: true, number: index + 1 } })
+    }
+    const pruned = buildConversationForest(sessions, transcripts, relations,
+      [endpointRemoval(GRANDCHILD, "other-answer")]).graphs[0]!
+    const endpointId = pruned.endpointBySessionId.get(CHILD)!
+    const endpoint = pruned.nodes.get(endpointId)!
+    expect(endpoint).toMatchObject({ fork: { empty: true } })
+    expect(endpoint.kind === "endpoint" ? endpoint.fork?.number : null).toBeUndefined()
+    expect(layoutConversationGraph(pruned, 100).nodes.has(endpointId)).toBeFalse()
+    expect(visibleGraphNodeId(pruned, endpointId, new Set())).toBe(endpoint.parentId!)
+  })
+
   test("rewinding into shared ancestry materializes a separate leaf at the current boundary", () => {
     const parent = [message("p1", "user", "A", 0), message("p2", "agent", "B", 1),
       message("p3", "user", "C", 2), message("p4", "agent", "D", 3)]
@@ -111,6 +165,9 @@ describe("next conversation graph", () => {
       const removed = buildConversationForest(sessions, histories, relations,
         [messageRemoval([{ sessionId: ROOT, messageId: "p3" }])]).graphs[0]!
       expect(removed.endpointBySessionId.has(shortenedId)).toBeTrue()
+      const remainingEndpointId = removed.endpointBySessionId.get(shortenedId)!
+      expect(layoutConversationGraph(removed, 100).nodes.has(remainingEndpointId)).toBeFalse()
+      expect(visibleGraphNodeId(removed, remainingEndpointId, new Set())).toBe(boundary.id)
     }
   })
 

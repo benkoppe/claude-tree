@@ -1115,6 +1115,16 @@ function appendEndpoint(
   return endpointId
 }
 
+export function isMaterializedForkEndpoint(
+  graph: ConversationGraph,
+  node: SessionEndpointNode,
+): boolean {
+  if (!node.fork?.empty) return false
+  const parent = graph.nodes.get(node.parentId ?? "")
+  return parent?.kind !== "message" ||
+    parent.childIds.length !== 1 || parent.childIds[0] !== node.id
+}
+
 function finalizeForkEndpoints(graph: ConversationGraph): void {
   const endpointsBySource = new Map<string, SessionEndpointNode[]>()
   for (const node of graph.nodes.values()) {
@@ -1127,7 +1137,9 @@ function finalizeForkEndpoints(graph: ConversationGraph): void {
         node.fork = { sourceNodeId: parent.id, createdAt: "", empty: true }
       }
     }
-    if (node.kind !== "endpoint" || !node.fork?.empty) continue
+    if (node.kind !== "endpoint") continue
+    if (node.fork) delete node.fork.number
+    if (!isMaterializedForkEndpoint(graph, node)) continue
     const placement = node.parentId ?? graph.originNodeId
     const endpoints = endpointsBySource.get(placement) ?? []
     endpoints.push(node)

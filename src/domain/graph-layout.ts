@@ -3,6 +3,7 @@ import type {
   ConversationGraphNode,
   MessageGraphNodeOrEndpoint,
 } from "./conversation-graph"
+import { isMaterializedForkEndpoint } from "./conversation-graph"
 
 export const GRAPH_NODE_HEIGHT = 2
 export const GRAPH_HORIZONTAL_GAP = 4
@@ -77,7 +78,7 @@ export function visibleGraphNodeId(
     visited.add(currentNodeId)
     const node = graph.nodes.get(currentNodeId)
     if (!node || node.kind === "origin") return undefined
-    if (isPositionedNode(node, visibleEndpointSessionIds)) return node.id
+    if (isPositionedNode(graph, node, visibleEndpointSessionIds)) return node.id
     currentNodeId = node.parentId ?? undefined
   }
   return undefined
@@ -125,7 +126,7 @@ export function layoutConversationGraph(
   const origin = graph.nodes.get(graph.originNodeId)
   for (const rootId of origin?.childIds ?? []) {
     const root = graph.nodes.get(rootId)
-    if (!root || root.kind === "origin" || !isPositionedNode(root, visibleEndpointSessionIds)) {
+    if (!root || root.kind === "origin" || !isPositionedNode(graph, root, visibleEndpointSessionIds)) {
       continue
     }
 
@@ -192,18 +193,19 @@ function visibleChildren(
     .filter((child): child is MessageGraphNodeOrEndpoint =>
       child !== undefined &&
       child.kind !== "origin" &&
-      isPositionedNode(child, visibleEndpointSessionIds)
+      isPositionedNode(graph, child, visibleEndpointSessionIds)
     )
 }
 
 function isPositionedNode(
+  graph: ConversationGraph,
   node: ConversationGraphNode,
   visibleEndpointSessionIds: ReadonlySet<string>,
 ): boolean {
   if (node.kind === "message") return true
   if (node.kind === "origin") return false
   if (visibleEndpointSessionIds.has(node.session.id)) return true
-  return node.fork?.empty === true
+  return isMaterializedForkEndpoint(graph, node)
 }
 
 export function directionalMove(
