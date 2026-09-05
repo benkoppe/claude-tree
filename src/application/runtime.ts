@@ -382,8 +382,8 @@ export function makeAppRuntime(
       }
       const token = nextCommandToken++
       activeCommands.set(key, { token, command })
-      const run = Effect.exit(effect).pipe(
-        Effect.flatMap((exit) => {
+      const run = effect.pipe(
+        Effect.onExit((exit) => {
           const completion: CommandCompletedMessage = {
             _tag: "CommandCompleted",
             key,
@@ -396,6 +396,7 @@ export function makeAppRuntime(
             completion,
           )
         }),
+        Effect.exit,
         Effect.asVoid,
       )
       const fiber = yield* Effect.forkIn(run, commandScope)

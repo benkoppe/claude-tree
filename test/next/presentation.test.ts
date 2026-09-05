@@ -94,6 +94,62 @@ test("forks the newly selected graph node without waiting for publication", asyn
   }
 })
 
+test("a stalled manual refresh does not block navigation or forking", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const initial = branchingGraph("root-1", "Refresh concurrency")
+  const running = await startPresentation(setup.renderer, initial, new Map(), undefined, Effect.succeed(true), {
+    refresh: () => Effect.never,
+  })
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.includes("refresh"))
+    await Effect.runPromise(running.harness.update({ ...initial, refreshing: true }))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressKey("f")
+    await waitFor(() => running.harness.calls.includes("branch:root-1:left-message"))
+  } finally {
+    await running.stop()
+  }
+})
+
+test("an interrupted terminal action does not kill the presentation action queue", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  let attempts = 0
+  const running = await startPresentation(setup.renderer, rootsView(), new Map(), undefined, Effect.succeed(true), {
+    newSession: Effect.suspend(() => ++attempts === 1 ? Effect.interrupt : Effect.succeed(true)),
+  })
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("n")
+    await waitFor(() => attempts === 1)
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("n")
+    await waitFor(() => attempts === 2)
+  } finally {
+    await running.stop()
+  }
+})
+
+test("quit bypasses a stalled foreground terminal action", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const started = Deferred.makeUnsafe<void>()
+  let stopped = false
+  const running = await startPresentation(setup.renderer, rootsView(), new Map(), undefined,
+    Effect.sync(() => { stopped = true; return true }), {
+      newSession: Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+    })
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("n")
+    await Effect.runPromise(Deferred.await(started))
+    setup.mockInput.pressKey("q")
+    await waitFor(() => stopped)
+  } finally {
+    await running.stop()
+  }
+})
+
 test("deletes the newly selected graph node without waiting for publication", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Rapid delete"))
@@ -836,7 +892,7 @@ test("rechecks interaction blocking before content mouse-up", async () => {
     const rendered = await frame(setup, (value) => value.includes("Second conversation"))
     const second = coordinateOf(rendered, "Second conversation")
     await setup.mockMouse.pressDown(second.x, second.y)
-    await Effect.runPromise(running.harness.update({ ...initial, refreshing: true }))
+    await Effect.runPromise(running.harness.update({ ...initial, shuttingDown: true }))
     await setup.mockMouse.release(second.x, second.y)
     await Bun.sleep(20)
     expect(running.harness.calls).not.toContain("select-root:root-2")

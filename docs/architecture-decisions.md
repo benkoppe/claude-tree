@@ -100,6 +100,8 @@ Persist navigation using opaque session IDs and message aliases, never list inde
 
 Each invocation has one application-state actor. User input, terminal callbacks, command completions, refresh results, and shutdown state changes enter its ordered event queue; only the reducer executed by that actor may replace `ApplicationState`. Effects may run concurrently outside the actor, but they return immutable completion events instead of mutating application state directly. Terminal callbacks are serialized before dispatch and carry immutable owner IDs and sequence IDs so stale activity, exit, or identity events can be rejected deterministically.
 
+Command completion delivery is an exit finalizer, including interruption, so a cancelled provider operation cannot strand its caller. Presentation actions run in isolated scoped fibers while retaining foreground ordering. Refresh and quit use a separate background lane: provider reads must not block navigation against the last accepted snapshot, and quitting must not queue behind a stalled fork or terminal launch. Initial loading and foreground mutations still guard conflicting input.
+
 This actor boundary is not a daemon. Provider PTYs and all runtime scopes still belong to the foreground process, and separate invocations have separate actors even though they coordinate durable provider state through the transaction lock.
 
 Live PTYs belong to the foreground `claude-tree` process. Closing the application gracefully terminates its child agent processes and restores the host terminal. Persisted sessions can be resumed on the next launch.

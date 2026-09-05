@@ -10,7 +10,7 @@ import {
   type RGBA as Color,
   type TextChunk,
 } from "@opentui/core"
-import { Cause, Deferred, Effect, Queue, Scope, Stream } from "effect"
+import { Cause, Deferred, Effect, Fiber, Queue, Scope, Stream } from "effect"
 
 import type {
   AppRuntime,
@@ -80,6 +80,7 @@ export interface OpenTuiPresentation {
 interface QueuedAction {
   readonly effect: Effect.Effect<unknown, unknown, never>
   readonly reportFailure: boolean
+  readonly background: boolean
 }
 
 type FooterAction =
@@ -174,36 +175,48 @@ export function makeOpenTuiPresentation(
 ): Effect.Effect<OpenTuiPresentation, never, Scope.Scope> {
   return Effect.gen(function*() {
     const actions = yield* Queue.unbounded<QueuedAction>()
+    const backgroundActions = yield* Queue.unbounded<QueuedAction>()
     const stopped = yield* Deferred.make<void, ApplicationShutdownError>()
     const presentation = new OpenTuiPresentationController(
       renderer,
       appRuntime,
       provider,
       options,
-      (action, reportFailure = true) => Queue.offerUnsafe(actions, { effect: action, reportFailure }),
+      (action, reportFailure = true, background = false) => Queue.offerUnsafe(
+        background ? backgroundActions : actions, { effect: action, reportFailure, background },
+      ),
       stopped,
     )
 
-    yield* Effect.forkScoped(Effect.forever(
-      Queue.take(actions).pipe(
-        Effect.flatMap((action) => Effect.catchCause(action.effect, (cause) => {
-          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-          if (!action.reportFailure || presentation.isStopping) {
-            return Effect.logError("Presentation action failed", cause)
-          }
-          const failure = Cause.squash(cause)
-          if (isReportedApplicationFailure(failure)) {
-            return Effect.logError("Presentation action failed after the application reported it", cause)
-          }
-          const message = `Action failed: ${errorMessage(failure)}`
-          return Effect.suspend(() => appRuntime.openModal({ _tag: "Error", message })).pipe(
-            Effect.catchCause((reportCause) => Cause.hasInterrupts(reportCause)
-              ? Effect.failCause(reportCause)
-              : Effect.logError("Unable to report presentation action failure", reportCause)),
-          )
-        })),
-      ),
-    ))
+    for (const actionQueue of [actions, backgroundActions]) {
+      yield* Effect.forkScoped(Effect.forever(
+        Queue.take(actionQueue).pipe(
+          Effect.flatMap((action) => {
+            const handled = Effect.catchCause(action.effect, (cause) => {
+              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+              if (!action.reportFailure || presentation.isStopping) {
+                return Effect.logError("Presentation action failed", cause)
+              }
+              const failure = Cause.squash(cause)
+              if (isReportedApplicationFailure(failure)) {
+                return Effect.logError("Presentation action failed after the application reported it", cause)
+              }
+              const message = `Action failed: ${errorMessage(failure)}`
+              return Effect.suspend(() => appRuntime.openModal({ _tag: "Error", message })).pipe(
+                Effect.catchCause((reportCause) => Cause.hasInterrupts(reportCause)
+                  ? Effect.failCause(reportCause)
+                  : Effect.logError("Unable to report presentation action failure", reportCause)),
+              )
+            })
+            // Isolate action interruption from the consumer so cancellation cannot
+            // permanently strand all later keyboard and mouse actions.
+            return Effect.forkScoped(handled).pipe(
+              Effect.flatMap((fiber) => action.background ? Effect.void : Fiber.await(fiber).pipe(Effect.asVoid)),
+            )
+          }),
+        ),
+      ))
+    }
     yield* Effect.forkScoped(Effect.forever(
       Stream.runForEach(
         appRuntime.viewModels,
@@ -280,7 +293,7 @@ class OpenTuiPresentationController {
     private readonly appRuntime: AppRuntime,
     private readonly provider: OpenTuiProviderIdentity,
     private readonly options: OpenTuiPresentationOptions,
-    private readonly enqueue: (action: Effect.Effect<unknown, unknown>, reportFailure?: boolean) => void,
+    private readonly enqueue: (action: Effect.Effect<unknown, unknown>, reportFailure?: boolean, background?: boolean) => void,
     private readonly stopped: Deferred.Deferred<void, ApplicationShutdownError>,
   ) {
     this.navigator = new BoxRenderable(renderer, {
@@ -573,9 +586,9 @@ class OpenTuiPresentationController {
     ) return
     key.stopPropagation()
     if (quit) {
-      this.enqueue(this.stop)
+      this.enqueue(this.stop, true, true)
     } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
-      this.runAction(this.appRuntime.refresh())
+      this.refresh()
     } else if (this.interactionBlocked()) {
       return
     } else if (movement !== undefined) {
@@ -599,9 +612,9 @@ class OpenTuiPresentationController {
     if (!recognized) return
     key.stopPropagation()
     if (isExitKey(key)) {
-      this.enqueue(this.stop)
+      this.enqueue(this.stop, true, true)
     } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
-      this.runAction(this.appRuntime.refresh())
+      this.refresh()
     } else if (this.interactionBlocked()) {
       return
     } else if (back) {
@@ -627,7 +640,7 @@ class OpenTuiPresentationController {
 
   private handleLeafPickerKey(key: KeyEvent): void {
     if (isExitKey(key)) {
-      this.enqueue(this.stop)
+      this.enqueue(this.stop, true, true)
       return
     }
     if (isUnmodifiedKey(key, "escape") || isUnmodifiedKey(key, "q")) {
@@ -647,7 +660,7 @@ class OpenTuiPresentationController {
     const modal = this.viewModel?.modal
     if (!modal) return
     if (isExitKey(key)) {
-      this.enqueue(this.stop)
+      this.enqueue(this.stop, true, true)
       return
     }
     if (modal._tag === "About" || modal._tag === "Error") {
@@ -957,7 +970,14 @@ class OpenTuiPresentationController {
   }
 
   private interactionBlocked(): boolean {
-    return this.actionPending || Boolean(this.viewModel?.refreshing || this.viewModel?.shuttingDown)
+    return this.actionPending || Boolean(this.viewModel?.initialLoadPending || this.viewModel?.shuttingDown)
+  }
+
+  private refresh(): void {
+    if (this.stopping) return
+    const action = this.appRuntime.refresh()
+    this.renderSafely("Render refresh request")
+    this.enqueue(action, true, true)
   }
 
   private reconcileModal(modal: ApplicationModal | null): void {
@@ -1436,8 +1456,8 @@ class OpenTuiPresentationController {
     if (action !== "quit" && action !== "about" && this.interactionBlocked()) return
     if (action === "enter-root") this.enterSelectedRoot()
     else if (action === "new") this.runTerminalAction(this.appRuntime.newSession)
-    else if (action === "refresh") this.runAction(this.appRuntime.refresh())
-    else if (action === "quit") this.enqueue(this.stop)
+    else if (action === "refresh") this.refresh()
+    else if (action === "quit") this.enqueue(this.stop, true, true)
     else if (action === "open") this.openSelected()
     else if (action === "fork") this.forkSelected()
     else if (action === "stop") this.showStopConfirmation()
