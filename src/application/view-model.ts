@@ -1,9 +1,10 @@
 import type {
   ConversationGraph,
   MessageGraphNode,
+  ReachableSessionEndpoint,
   SessionEndpointNode,
 } from "../domain/conversation-graph"
-import { reachableSessionEndpoints } from "../domain/conversation-graph"
+import { indexReachableSessionEndpoints } from "../domain/conversation-graph"
 import {
   initialVisibleGraphNodeId,
   layoutConversationGraph,
@@ -154,6 +155,7 @@ export function projectGraphViewModel(
 
   const visibleEndpointSessionIds = selectVisibleEndpointSessionIds(state)
   const layout = layoutConversationGraph(graph, viewportWidth, visibleEndpointSessionIds)
+  const endpointsByNode = indexReachableSessionEndpoints(graph)
   const requestedTarget = selection ?? (state.surface._tag === "Graph" ? state.surface.target : undefined)
   const requestedNodeId = requestedTarget ? resolveSelection(graph, requestedTarget) : undefined
   const selectedNodeId = visibleGraphNodeId(graph, requestedNodeId, visibleEndpointSessionIds) ??
@@ -177,7 +179,7 @@ export function projectGraphViewModel(
         reachableEndpoints: projectReachableEndpoints(
           state,
           graph,
-          node.id,
+          endpointsByNode.get(node.id) ?? [],
           visibleEndpointSessionIds,
         ),
       }
@@ -247,10 +249,10 @@ function endpointViewModel(
 function projectReachableEndpoints(
   state: ApplicationState,
   graph: ConversationGraph,
-  nodeId: string,
+  endpoints: readonly ReachableSessionEndpoint[],
   visibleEndpointSessionIds: ReadonlySet<string>,
 ): readonly ReachableEndpointViewModel[] {
-  return reachableSessionEndpoints(graph, nodeId).map(({ endpoint, distance }) => ({
+  return endpoints.map(({ endpoint, distance }) => ({
     session: endpoint.session,
     status: selectSessionStatus(state, endpoint.session.id),
     draft: state.drafts.get(endpoint.session.id),

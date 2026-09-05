@@ -13,6 +13,9 @@ export interface ProjectedApplicationData {
   readonly transcripts: ReadonlyMap<string, readonly AgentMessage[]>
 }
 
+type ForestInputs = Pick<ApplicationState, "local" | "terminals" | "rewindAnchors" | "relations" | "removals">
+const forestCache = new WeakMap<ApplicationState["provider"], ForestInputs & { readonly forest: ConversationForest }>()
+
 export function selectProjectedData(state: ApplicationState): ProjectedApplicationData {
   const sessions = new Map(state.provider.sessions)
   const reads = new Map(state.provider.transcripts)
@@ -65,13 +68,24 @@ export function selectFamilySessionIds(
 }
 
 export function selectConversationForest(state: ApplicationState): ConversationForest {
+  const cached = forestCache.get(state.provider)
+  if (cached && cached.local === state.local && cached.terminals === state.terminals &&
+    cached.rewindAnchors === state.rewindAnchors && cached.relations === state.relations &&
+    cached.removals === state.removals) return cached.forest
   const data = selectProjectedData(state)
-  return buildConversationForest(
+  const forest = buildConversationForest(
     [...data.sessions.values()],
     data.transcripts,
     state.relations,
     state.removals,
   )
+  // Reducer collections are immutable. Navigation, modal, and refresh bookkeeping
+  // changes can reuse the graph; never mutate a forest returned by this selector.
+  forestCache.set(state.provider, {
+    local: state.local, terminals: state.terminals, rewindAnchors: state.rewindAnchors,
+    relations: state.relations, removals: state.removals, forest,
+  })
+  return forest
 }
 
 export function selectVisibleConversationForest(state: ApplicationState): ConversationForest {
