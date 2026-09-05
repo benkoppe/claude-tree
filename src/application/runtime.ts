@@ -36,6 +36,7 @@ import type {
 } from "../services/provider"
 import type {
   TerminalActivityEvent,
+  TerminalObservationEvent,
   TerminalExitEvent,
   TerminalSessionChangedEvent,
   TerminalSessionTransitionErrorEvent,
@@ -71,6 +72,7 @@ import {
 } from "./reducer"
 import { selectConversationForest, selectProjectedData } from "./selectors"
 import {
+  invalidatedRefreshSessionIds,
   makeInitialApplicationState,
   type ActiveRefresh,
   type ApplicationModal,
@@ -123,6 +125,7 @@ export interface AppRuntime {
   readonly openModal: (modal: ApplicationModal) => ApplicationIntentEffect
   readonly closeModal: ApplicationIntentEffect
   readonly handleTerminalActivity: (event: TerminalActivityEvent) => Effect.Effect<boolean>
+  readonly handleTerminalObservation: (event: TerminalObservationEvent) => Effect.Effect<boolean>
   readonly handleTerminalExit: (event: TerminalExitEvent) => Effect.Effect<boolean>
   readonly handleTerminalSessionChanged: (event: TerminalSessionChangedEvent) => Effect.Effect<boolean>
   readonly handleTerminalTransitionError: (
@@ -480,6 +483,9 @@ export function makeAppRuntime(
       const key = mode === "full" ? "refresh:full"
         : reason === "reconciliation" ? "refresh:reconciliation"
         : `refresh:owner:${ownerId ?? [...sessionIds].join("|")}`
+      if (reason === "reconciliation") {
+        sessionIds = new Set([...(state.refresh.active.get(key)?.sessionIds ?? []), ...sessionIds])
+      }
       if (mode === "full") {
         for (const activeKey of [...activeCommands.keys()]) {
           if (activeKey.startsWith("refresh:") || activeKey.startsWith("completion:")) {
@@ -731,6 +737,27 @@ export function makeAppRuntime(
         })
         if (event.activity === "idle") yield* scheduleCompletion(event.sessionId)
         else yield* supersede(`completion:${ownerId}`, "Terminal activity superseded the completion timer")
+      } else if (message._tag === "TerminalObservation") {
+        const event = message.event
+        if (event.sessionId !== cursor.sessionId) {
+          yield* failTerminalBarrier(message, transitionRejected("observation session does not match its owner"))
+          return
+        }
+        const previousDraft = state.drafts.get(event.sessionId)
+        const draft = event.observation._tag === "Draft" ? event.observation.draft : undefined
+        const newRewind = draft?.rewind && !draft.submitted &&
+          (!previousDraft?.rewind || previousDraft.submitted ||
+            (previousDraft.rewindTarget ?? previousDraft.text) !== (draft.rewindTarget ?? draft.text))
+        yield* publish({
+          _tag: "TerminalObservationObserved",
+          sessionId: event.sessionId,
+          ownerId,
+          observation: event.observation,
+        })
+        if (!state.pendingCompletions.has(event.sessionId)) {
+          yield* supersede(`completion:${ownerId}`, "Terminal observation superseded the completion timer")
+        }
+        if (newRewind) yield* startRefresh("reconciliation", new Set([event.sessionId]))
       } else if (message._tag === "TerminalExit") {
         const event = message.event
         if (event.sessionId !== cursor.sessionId) {
@@ -843,6 +870,8 @@ export function makeAppRuntime(
       const exit = message.exit
 
       if (command._tag === "Refresh") {
+        const refresh = state.refresh.active.get(command.refresh.key)
+        const invalidatedSessionIds = refresh ? invalidatedRefreshSessionIds(state, refresh) : new Set<string>()
         if (Exit.isSuccess(exit)) {
           yield* publish({
             _tag: "RefreshSucceeded",
@@ -901,8 +930,12 @@ export function makeAppRuntime(
           return
         }
         if (command.refresh.reason === "initial" && Exit.isFailure(exit)) return
-        if (Exit.isSuccess(exit) && state.replacementCandidates.size > 0) {
-          yield* startRefresh("reconciliation", new Set(state.replacementCandidates.keys()))
+        const reconciliationSessionIds = new Set([
+          ...(Exit.isSuccess(exit) ? state.replacementCandidates.keys() : []),
+          ...invalidatedSessionIds,
+        ])
+        if (reconciliationSessionIds.size > 0) {
+          yield* startRefresh("reconciliation", reconciliationSessionIds)
         }
         const completionSessionIds = command.refresh.mode === "full"
           ? [...state.pendingCompletions.keys()]
@@ -2020,6 +2053,7 @@ export function makeAppRuntime(
       viewModels: SubscriptionRef.changes(publication),
       terminalEvents: {
         onActivityChanged: (event) => offerTerminalCallback({ _tag: "TerminalActivity", event }),
+        onObservation: (event) => offerTerminalCallback({ _tag: "TerminalObservation", event }),
         onProcessExited: (event) => offerTerminalCallback({ _tag: "TerminalExit", event }),
         onSessionChanged: (event) => offerTerminalCallback({ _tag: "TerminalSessionChanged", event }),
         onSessionTransitionError: (event) => offerTerminalCallback({ _tag: "TerminalTransitionError", event }),
@@ -2042,6 +2076,7 @@ export function makeAppRuntime(
       openModal: (modal) => request({ _tag: "OpenModal", modal }),
       closeModal: request({ _tag: "CloseModal" }),
       handleTerminalActivity: (event) => terminalRequest({ _tag: "TerminalActivity", event }),
+      handleTerminalObservation: (event) => terminalRequest({ _tag: "TerminalObservation", event }),
       handleTerminalExit: (event) => terminalRequest({ _tag: "TerminalExit", event }),
       handleTerminalSessionChanged: (event) => terminalRequest({ _tag: "TerminalSessionChanged", event }),
       handleTerminalTransitionError: (event) => terminalRequest({ _tag: "TerminalTransitionError", event }),
@@ -2089,6 +2124,9 @@ function messageFailureContext(message: ActorMessage): {
   }
   if (message._tag === "TerminalActivity") {
     return { intent: "OpenEndpoint", operation: "Process terminal activity" }
+  }
+  if (message._tag === "TerminalObservation") {
+    return { intent: "OpenEndpoint", operation: "Reconcile terminal observation" }
   }
   if (message._tag === "TerminalExit") {
     return { intent: "StopSession", operation: "Process terminal exit" }
@@ -2156,7 +2194,7 @@ function terminalSequence(event: TerminalActorEvent): number {
 function isTerminalActorMessage(
   message: ActorMessage,
 ): message is TerminalActorEvent & { readonly reply?: DeferredType.Deferred<boolean> } {
-  return message._tag === "TerminalActivity" || message._tag === "TerminalExit" ||
+  return message._tag === "TerminalActivity" || message._tag === "TerminalObservation" || message._tag === "TerminalExit" ||
     message._tag === "TerminalSessionChanged" || message._tag === "TerminalTransitionError"
 }
 

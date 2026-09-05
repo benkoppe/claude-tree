@@ -20,6 +20,7 @@ import type {
   AgentSession,
   BranchDerivation,
   DraftPreview,
+  TerminalObservation,
 } from "../domain/model"
 import type {
   BranchRelation,
@@ -98,6 +99,12 @@ export interface TerminalActivityEvent extends SequencedTerminalEvent {
   readonly wasActive: boolean
 }
 
+export interface TerminalObservationEvent extends SequencedTerminalEvent {
+  readonly sessionId: string
+  readonly wasActive: boolean
+  readonly observation: TerminalObservation
+}
+
 export interface TerminalSessionChangedEvent extends SequencedTerminalEvent {
   readonly previousSessionId: string
   readonly kind: IdentityTransitionKind
@@ -127,6 +134,7 @@ export interface TerminalSessionTransitionErrorEvent extends SequencedTerminalEv
 }
 
 export interface TerminalSupervisorEvents {
+  readonly onObservation?: (event: TerminalObservationEvent) => void
   readonly onProcessExited?: (event: TerminalExitEvent) => void
   readonly onActivityChanged?: (event: TerminalActivityEvent) => void
   readonly onSessionChanged?: (event: TerminalSessionChangedEvent) => void
@@ -272,6 +280,7 @@ interface TerminalOwner {
   exitCode: number | null
   draftPreview?: DraftPreview
   inputObserved: boolean
+  lastDraftKey?: string
   selectionClearPending: boolean
   uiReleased: boolean
   ptyClosed: boolean
@@ -321,6 +330,7 @@ interface PendingReservation {
 }
 
 type SemanticEvent =
+  | { readonly _tag: "Observation"; readonly sequenceId: number; readonly observation: TerminalObservation }
   | { readonly _tag: "Exited"; readonly sequenceId: number; readonly exitCode: number }
   | { readonly _tag: "Activity"; readonly sequenceId: number; readonly activity: AgentActivity }
   | {
@@ -712,10 +722,15 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         event:
           | { readonly _tag: "Exited"; readonly exitCode: number }
           | { readonly _tag: "Activity"; readonly activity: AgentActivity }
+          | { readonly _tag: "Observation"; readonly observation: TerminalObservation }
           | { readonly _tag: "Transition"; readonly request: TerminalTransitionRequest },
       ) => Queue.offerUnsafe(eventQueue, { ...event, sequenceId: sequence.next++ })
       const offerActivities = (activities: readonly AgentActivity[]) => {
         for (const activity of activities) {
+          if (owner) {
+            this.offerEvent(owner, { _tag: "Activity", activity })
+            continue
+          }
           if (activity === lastQueuedActivity) continue
           lastQueuedActivity = activity
           offer({ _tag: "Activity", activity })
@@ -729,10 +744,15 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             if (current && !this.acceptsTerminalData(current)) return
             this.ignoreCallback(() => {
               if (source === "input" && current) {
+                // Observe pending output before Escape can arm cancellation.
+                this.captureDraft(current)
                 current.inputObserved = true
-                launch.observer.observeInput?.(data)
-                const draft = launch.observer.observeDraft(current.surface.screen())
-                if (draft?.rewind) current.draftPreview = draft
+                const observation = launch.observer.observeInput?.(data)
+                if (observation) {
+                  delete current.draftPreview
+                  delete current.lastDraftKey
+                  offer({ _tag: "Observation", observation })
+                }
               }
             })
             this.ignoreCallback(() => process?.write(data))
@@ -746,7 +766,9 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             const current = owner
             if (current && !this.acceptsTerminalData(current)) return
             this.ignoreCallback(() => {
-              const activity = launch.observer.observeScreen(surface.screen())
+              const screen = surface.screen()
+              const activity = launch.observer.observeScreen(screen)
+              if (current) this.recordDraft(current, launch.observer.observeDraft(screen))
               if (activity !== undefined) offerActivities([activity])
             })
           },
@@ -859,6 +881,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     event:
       | { readonly _tag: "Exited"; readonly exitCode: number }
       | { readonly _tag: "Activity"; readonly activity: AgentActivity }
+      | { readonly _tag: "Observation"; readonly observation: TerminalObservation }
       | { readonly _tag: "Transition"; readonly request: TerminalTransitionRequest },
   ): boolean {
     if (event._tag === "Activity") {
@@ -905,7 +928,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     event: SemanticEvent,
     cause: Cause.Cause<unknown>,
   ): Effect.Effect<void> {
-    if (event._tag === "Activity") return Effect.void
+    if (event._tag === "Activity" || event._tag === "Observation") return Effect.void
     if (event._tag === "Transition") {
       return this.containTransitionDefect(owner, event.request, cause)
     }
@@ -980,6 +1003,17 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       entry.ownerId !== owner.ownerId ||
       entry.state !== "running"
     ) return undefined
+
+    if (event._tag === "Observation") {
+      this.ignoreCallback(() => this.events.onObservation?.({
+        ownerId: owner.ownerId,
+        sequenceId: event.sequenceId,
+        sessionId: owner.sessionId,
+        wasActive: this.activeOwnerId === owner.ownerId,
+        observation: event.observation,
+      }))
+      return undefined
+    }
 
     if (event._tag === "Activity") {
       if (owner.activity === event.activity) return undefined
@@ -2193,16 +2227,30 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
   }
 
   private captureDraft(owner: TerminalOwner): void {
-    if (!owner.inputObserved && owner.draftPreview?.exact) return
     try {
-      const observed = owner.observer.observeDraft(owner.surface.screen())
-      if (observed !== undefined) owner.draftPreview = observed
-      else if (owner.inputObserved && !owner.draftPreview?.rewind) delete owner.draftPreview
+      const screen = owner.surface.screen()
+      const activity = owner.observer.observeScreen(screen)
+      const observed = owner.observer.observeDraft(screen)
+      this.recordDraft(owner, observed)
+      if (activity !== undefined) this.offerEvent(owner, { _tag: "Activity", activity })
     } catch {
       // Observer defects must not block process cleanup.
     } finally {
       owner.inputObserved = false
     }
+  }
+
+  private recordDraft(owner: TerminalOwner, draft: DraftPreview | null | undefined): void {
+    if (draft === undefined) return
+    if (draft === null) delete owner.draftPreview
+    else if (owner.inputObserved || !owner.draftPreview?.exact) {
+      // The supervisor keeps only presentation text, never rewind semantics.
+      owner.draftPreview = { text: draft.text, exact: draft.exact }
+    }
+    const key = JSON.stringify(draft)
+    if (key === owner.lastDraftKey) return
+    owner.lastDraftKey = key
+    this.offerEvent(owner, { _tag: "Observation", observation: { _tag: "Draft", draft } })
   }
 
   private releaseOwnerUi(owner: TerminalOwner): readonly TerminalCleanupIssue[] {

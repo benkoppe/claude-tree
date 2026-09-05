@@ -4,6 +4,7 @@ import type { MessageRef, NavigationTarget } from "../domain/model"
 import type { ConversationRemoval } from "../domain/persistence"
 import type {
   TerminalActivityEvent,
+  TerminalObservationEvent,
   TerminalExitEvent,
   TerminalSessionChangedEvent,
   TerminalSessionTransitionErrorEvent,
@@ -77,6 +78,7 @@ export interface IntentEnvelope {
 
 export type TerminalActorEvent =
   | { readonly _tag: "TerminalActivity"; readonly event: TerminalActivityEvent }
+  | { readonly _tag: "TerminalObservation"; readonly event: TerminalObservationEvent }
   | { readonly _tag: "TerminalExit"; readonly event: TerminalExitEvent }
   | { readonly _tag: "TerminalSessionChanged"; readonly event: TerminalSessionChangedEvent }
   | { readonly _tag: "TerminalTransitionError"; readonly event: TerminalSessionTransitionErrorEvent }

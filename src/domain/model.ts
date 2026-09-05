@@ -48,11 +48,21 @@ export interface TerminalScreen {
 }
 
 export interface TerminalObserver {
-  observeInput?(data: Uint8Array): void
+  observeInput?(data: Uint8Array): TerminalSubmissionObservation | void
   observeOutput(data: Uint8Array): readonly AgentActivity[]
   observeScreen(screen: TerminalScreen): AgentActivity | undefined
-  observeDraft(screen: TerminalScreen): DraftPreview | undefined
+  /** Undefined is unknown; null is a positively observed empty composer. */
+  observeDraft(screen: TerminalScreen): DraftPreview | null | undefined
 }
+
+export interface TerminalSubmissionObservation {
+  readonly _tag: "Submission"
+  readonly text?: string
+}
+
+export type TerminalObservation =
+  | { readonly _tag: "Draft"; readonly draft: DraftPreview | null }
+  | TerminalSubmissionObservation
 
 export interface SharedMessage {
   readonly parentMessageId: string

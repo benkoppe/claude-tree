@@ -4,6 +4,7 @@ import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claud
 import {
   available,
   makeInitialApplicationState,
+  invalidatedRefreshSessionIds,
   projectApplicationViewModel,
   reduceApplicationState,
   selectProjectedTranscript,
@@ -19,6 +20,7 @@ import type {
   AgentMessage,
   AgentSession,
   AgentSessionSnapshot,
+  TerminalObservation,
   TranscriptRead,
 } from "../../src/domain/model"
 
@@ -426,7 +428,10 @@ describe("application state reducer", () => {
     const encoder = new TextEncoder()
     const transcript = [message("q1", "user", "first", 0), message("a1", "agent", "answer", 1),
       message("q2", "user", "restore here", 2), message("a2", "agent", "discarded answer", 3)]
-    let state = loadedState(transcript)
+    let state: ApplicationState = {
+      ...loadedState(transcript),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]),
+    }
     observer.observeInput(encoder.encode("/rewind\r"))
     observer.observeScreen({ lines: ["│ Rewind │", "│ Restore and fork the conversation to the point before… │"], cursor: { x: 0, y: 0, visible: false } })
     observer.observeInput(encoder.encode("\r"))
@@ -437,7 +442,7 @@ describe("application state reducer", () => {
     observer.observeScreen(restored)
     const draft = observer.observeDraft(restored)!
     expect(draft.rewind).toBeTrue()
-    state = reduceApplicationState(state, { _tag: "TerminalDraftObserved", sessionId: ROOT, draft })
+    state = observe(state, { _tag: "Draft", draft })
     expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q1", "a1"])
     state = readReplacement(state, transcript)
     expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q1", "a1"])
@@ -471,6 +476,25 @@ describe("application state reducer", () => {
     })
     expect(state.rewindAnchors.has(ROOT)).toBeFalse()
     expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["new"])
+  })
+
+  test("releases provisional placement at prefix confirmation without moving the accepted endpoint", () => {
+    let state = reduceApplicationState(loadedState(original), {
+      _tag: "TerminalDraftObserved", sessionId: ROOT,
+      draft: { text: "later", exact: false, rewind: true, rewindTarget: "later" },
+    })
+    for (let index = 0; index < 3; index += 1) {
+      state = readReplacement(state, original.slice(0, 2))
+      state = reduceApplicationState(state, {
+        _tag: "TerminalDraftObserved", sessionId: ROOT,
+        draft: { text: "later", exact: false, rewind: true, rewindTarget: "later" },
+      })
+      expect(state.rewindAnchors.has(ROOT)).toBeFalse()
+      expect(selectProjectedTranscript(state, ROOT).map((entry) => entry.id)).toEqual(["q", "a"])
+    }
+    state = readReplacement(state, [...original.slice(0, 2), message("new", "user", "replacement", 2)])
+    expect(state.rewindAnchors.has(ROOT)).toBeFalse()
+    expect(selectProjectedTranscript(state, ROOT).at(-1)?.id).toBe("new")
   })
 
   test("accepts a submitted rewind completion without requiring the old baseline prefix", () => {
@@ -534,6 +558,456 @@ describe("application state reducer", () => {
       "replacement-q",
       "replacement-a",
     ])
+  })
+
+  function observe(state: ApplicationState, observation: TerminalObservation, ownerId = "owner"): ApplicationState {
+    return reduceApplicationState(state, { _tag: "TerminalObservationObserved", sessionId: ROOT, ownerId, observation })
+  }
+
+  function liveRewindState(): ApplicationState {
+    return observe({
+      ...loadedState(original),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]),
+    }, { _tag: "Draft", draft: { text: "later", exact: false, rewind: true } })
+  }
+
+  test("owner-checked observations distinguish unknown screens, empty composers, and submissions", () => {
+    let state = liveRewindState()
+    const stale = observe(state, { _tag: "Submission", text: "stale" }, "old-owner")
+    expect(stale).toBe(state)
+    const observer = new ClaudeTerminalObserver()
+    const unknown = observer.observeDraft({ lines: ["unrecognized screen"], cursor: { x: 0, y: 0, visible: false } })
+    expect(unknown).toBeUndefined()
+    // Unknown screens emit no observation; a positively empty composer clears only its preview.
+    state = observe(state, { _tag: "Draft", draft: null })
+    expect(state.drafts.has(ROOT)).toBeFalse()
+    expect(state.rewindAnchors.get(ROOT)?.submitted).toBeFalse()
+    state = observe(state, { _tag: "Submission", text: "edited" })
+    expect(state.rewindAnchors.get(ROOT)).toMatchObject({ submitted: true, submissionText: "edited" })
+    state = observe(state, { _tag: "Submission", text: "" })
+    expect(state.rewindAnchors.get(ROOT)?.submissionText).toBe("")
+    state = observe(state, { _tag: "Submission" })
+    expect(state.rewindAnchors.get(ROOT)?.submissionText).toBeUndefined()
+    expect(state.rewindAnchors.size).toBe(1)
+    state = reduceApplicationState(state, {
+      _tag: "TerminalReturned", sessionId: ROOT,
+      draft: { text: "stale return", exact: false, rewind: true },
+    })
+    expect(state.drafts.has(ROOT)).toBeFalse()
+    expect(state.rewindAnchors.get(ROOT)?.submitted).toBeTrue()
+  })
+
+  test("terminal return cannot replace a newer semantic draft or create rewind evidence", () => {
+    let state = liveRewindState()
+    const draft = state.drafts.get(ROOT)
+    state = reduceApplicationState(state, {
+      _tag: "TerminalReturned", sessionId: ROOT, draft: { text: "stale", exact: false },
+    })
+    expect(state.drafts.get(ROOT)).toBe(draft)
+    const presentationOnly = reduceApplicationState(loadedState(original), {
+      _tag: "TerminalReturned", sessionId: ROOT, draft: { text: "later", exact: false, rewind: true },
+    })
+    expect(presentationOnly.rewindAnchors.size).toBe(0)
+    expect(selectProjectedTranscript(presentationOnly, ROOT)).toEqual(original)
+  })
+
+  test("rejected working replacement snapshots cannot clear provisional placement", () => {
+    let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+    state = reduceApplicationState(state, {
+      _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "working", wasVisible: false,
+    })
+    const replacement = [...original.slice(0, 2), message("edited", "user", "edited", 2)]
+    state = readReplacement(state, replacement)
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(original))
+    expect(state.rewindAnchors.get(ROOT)?.targetMessageId).toBe("q2")
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+    state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false, rewind: true } })
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.terminals.get(ROOT)?.activity).toBe("idle")
+    expect(state.rewindAnchors.get(ROOT)).toMatchObject({ targetMessageId: "q2", submitted: false })
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+  })
+
+  for (const mode of ["full", "incremental"] as const) {
+    test(`a deferred ${mode} read cannot resurrect a replacement after re-undo`, () => {
+      let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+      state = reduceApplicationState(state, {
+        _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false,
+      })
+      const refresh: ActiveRefresh = {
+        ...activeRefresh("deferred", 1, "completion", mode), sessionIds: new Set([ROOT, "other"]),
+        completionVersion: state.pendingCompletions.get(ROOT)!.version,
+      }
+      state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+      const captured = state.refresh.active.get(refresh.key)!
+      expect(captured.historyRevisions?.get(ROOT)).toEqual({ ownerId: "owner", revision: 2 })
+      expect(refresh.historyRevisions).toBeUndefined()
+      expect(invalidatedRefreshSessionIds(state, captured).size).toBe(0)
+      state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false, rewind: true } })
+      expect(state.pendingCompletions.size).toBe(0)
+      expect(invalidatedRefreshSessionIds(state, captured)).toEqual(new Set([ROOT]))
+      const before = state
+      const replacement = [...original.slice(0, 2), message("edited", "user", "edited", 2),
+        { ...message("answer", "agent", "stale answer", 3), turnComplete: true }]
+      state = reduceApplicationState(state, {
+        _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation,
+        snapshot: {
+          sessions: [session(ROOT, "Stale title"), session("other", "Fresh unrelated session")],
+          transcripts: new Map([[ROOT, available(replacement)], ["other", available([])]]),
+        },
+      })
+      expect(state.provider.sessions.get(ROOT)).toBe(before.provider.sessions.get(ROOT))
+      expect(state.provider.transcripts.get(ROOT)).toBe(before.provider.transcripts.get(ROOT))
+      expect(state.rewindAnchors.get(ROOT)).toBe(before.rewindAnchors.get(ROOT))
+      expect(state.drafts.get(ROOT)).toBe(before.drafts.get(ROOT))
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+      expect(state.refresh.appliedGenerationBySession.has(ROOT)).toBeFalse()
+      expect(state.provider.sessions.get("other")?.title).toBe("Fresh unrelated session")
+      expect(state.refresh.appliedGenerationBySession.get("other")).toBe(1)
+      expect(state.pendingCompletions.size).toBe(0)
+      expect(state.unviewedSessionIds.size).toBe(0)
+      expect(state.refresh.active.size).toBe(0)
+      state = readReplacement(state, original.slice(0, 2))
+      expect(state.provider.transcripts.get(ROOT)).toEqual(available(original.slice(0, 2)))
+      expect(state.rewindAnchors.size).toBe(0)
+      expect(state.drafts.get(ROOT)?.text).toBe("edited")
+    })
+  }
+
+  test("only submissions and unsubmitted rewind drafts advance history revisions", () => {
+    let state = liveRewindState()
+    expect(state.terminals.get(ROOT)?.historyRevision).toBe(1)
+    const refresh = activeRefresh("read", 1, "manual", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    const captured = state.refresh.active.get(refresh.key)!
+    for (const draft of [null, { text: "typing", exact: false }, { text: "sent", exact: false, rewind: true, submitted: true }]) {
+      state = observe(state, { _tag: "Draft", draft })
+      expect(state.terminals.get(ROOT)?.historyRevision).toBe(1)
+      expect(invalidatedRefreshSessionIds(state, captured).size).toBe(0)
+    }
+    expect(observe(state, { _tag: "Submission" }, "stale-owner")).toBe(state)
+    state = observe(state, { _tag: "Submission" })
+    expect(state.terminals.get(ROOT)?.historyRevision).toBe(2)
+    expect(invalidatedRefreshSessionIds(state, captured)).toEqual(new Set([ROOT]))
+  })
+
+  test("an old owner read cannot complete a replacement owner's equally numbered revision", () => {
+    let state = observe({
+      ...loadedState(),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]),
+    }, { _tag: "Submission", text: "first send" })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner",
+      activity: "idle", wasVisible: false })
+    const refresh: ActiveRefresh = {
+      ...activeRefresh("old-owner", 1, "completion", "incremental"), sessionIds: new Set([ROOT]),
+      completionVersion: state.pendingCompletions.get(ROOT)!.version,
+    }
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    const captured = state.refresh.active.get(refresh.key)!
+    state = reduceApplicationState(state, { _tag: "TerminalStopped", sessionId: ROOT })
+    state = reduceApplicationState(state, { _tag: "TerminalShown", sessionId: ROOT, ownerId: "replacement-owner",
+      returnTo: { _tag: "Roots", selectedSessionId: ROOT } })
+    state = observe(state, { _tag: "Submission", text: "second send" }, "replacement-owner")
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "replacement-owner",
+      activity: "idle", wasVisible: false })
+    expect(state.terminals.get(ROOT)?.historyRevision).toBe(captured.historyRevisions?.get(ROOT)?.revision)
+    expect(invalidatedRefreshSessionIds(state, captured)).toEqual(new Set([ROOT]))
+    const completion = state.pendingCompletions.get(ROOT)
+    const transcript = state.provider.transcripts.get(ROOT)
+    state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: 1,
+      snapshot: snapshot(session(ROOT, "Old owner title"), [message("q", "user", "question", 0),
+        { ...message("a", "agent", "old answer", 1), turnComplete: true }]) })
+    expect(state.pendingCompletions.get(ROOT)).toBe(completion)
+    expect(state.pendingCompletions.get(ROOT)?.attempt).toBe(0)
+    expect(state.provider.transcripts.get(ROOT)).toBe(transcript)
+    expect(state.provider.sessions.get(ROOT)?.title).toBe("Root")
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  for (const mode of ["full", "incremental"] as const) {
+    test(`a wholly invalidated ${mode} failure only removes its refresh`, () => {
+      for (const completionRead of [false, true]) {
+        let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+        state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner",
+          activity: "idle", wasVisible: false })
+        const refresh: ActiveRefresh = {
+          ...activeRefresh("failed", 1, completionRead ? "completion" : "manual", mode), sessionIds: new Set([ROOT]),
+          ...(completionRead ? { completionVersion: state.pendingCompletions.get(ROOT)!.version } : {}),
+        }
+        state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+        state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false, rewind: true } })
+        state = observe(state, { _tag: "Submission", text: "new edit" })
+        state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner",
+          activity: "idle", wasVisible: false })
+        state = { ...state, replacementCandidates: new Map([[ROOT, { messages: original.slice(0, 2), attempts: 1 }]]) }
+        const before = state
+        state = reduceApplicationState(state, { _tag: "RefreshFailed", key: refresh.key, generation: 1, message: "obsolete read failure" })
+        expect(state.refresh.active.size).toBe(0)
+        expect(state.rewindAnchors).toBe(before.rewindAnchors)
+        expect(state.drafts).toBe(before.drafts)
+        expect(state.replacementCandidates).toBe(before.replacementCandidates)
+        expect(state.pendingCompletions).toBe(before.pendingCompletions)
+        expect(state.provider).toBe(before.provider)
+        expect(state.modal).toBeNull()
+      }
+    })
+  }
+
+  test("a partially invalidated full failure still reports unaffected session errors", () => {
+    for (const completionRead of [false, true]) {
+      let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+      state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner",
+        activity: "idle", wasVisible: false })
+      state = { ...state, provider: { ...state.provider,
+        sessions: new Map(state.provider.sessions).set("other", session("other", "Other")) } }
+      const refresh: ActiveRefresh = {
+        ...activeRefresh("full-failed", 1, completionRead ? "completion" : "manual", "full"),
+        sessionIds: new Set([ROOT]),
+        ...(completionRead ? { completionVersion: state.pendingCompletions.get(ROOT)!.version } : {}),
+      }
+      state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+      expect(state.refresh.active.get(refresh.key)?.historyRevisions?.get("other")).toEqual({ revision: 0 })
+      state = observe(state, { _tag: "Submission", text: "new edit" })
+      state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner",
+        activity: "idle", wasVisible: false })
+      const candidate = { messages: original.slice(0, 2), attempts: 1 }
+      state = { ...state, replacementCandidates: new Map([[ROOT, candidate], ["other", candidate]]) }
+      const before = state
+      state = reduceApplicationState(state, { _tag: "RefreshFailed", key: refresh.key, generation: 1, message: "provider unavailable" })
+      expect(state.refresh.active.size).toBe(0)
+      expect(state.replacementCandidates.get(ROOT)).toBe(candidate)
+      expect(state.replacementCandidates.has("other")).toBeFalse()
+      expect(state.pendingCompletions).toBe(before.pendingCompletions)
+      expect(state.rewindAnchors).toBe(before.rewindAnchors)
+      expect(state.modal).toEqual({ _tag: "Error", message: "provider unavailable" })
+    }
+  })
+
+  test("unaffected completion failures still advance their bounded retry", () => {
+    let state = pendingCompletionState()
+    const refresh: ActiveRefresh = {
+      ...activeRefresh("failed-completion", 1, "completion", "incremental"), sessionIds: new Set([ROOT]),
+      completionVersion: state.pendingCompletions.get(ROOT)!.version,
+    }
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, { _tag: "RefreshFailed", key: refresh.key, generation: 1, message: "read unavailable" })
+    expect(state.pendingCompletions.get(ROOT)?.attempt).toBe(1)
+    expect(state.modal).toBeNull()
+  })
+
+  test("revision invalidation includes removed and newly observed terminals within refresh scope", () => {
+    let state = liveRewindState()
+    const full = activeRefresh("full", 1, "manual", "full")
+    const incremental = { ...activeRefresh("incremental", 2, "manual", "incremental"), sessionIds: new Set([ROOT]) }
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: full })
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: incremental })
+    state = reduceApplicationState(state, { _tag: "TerminalStopped", sessionId: ROOT })
+    state = reduceApplicationState(state, { _tag: "TerminalShown", sessionId: "new", ownerId: "new-owner",
+      returnTo: { _tag: "Roots", selectedSessionId: ROOT } })
+    state = reduceApplicationState(state, { _tag: "TerminalObservationObserved", sessionId: "new", ownerId: "new-owner",
+      observation: { _tag: "Submission" } })
+    expect(invalidatedRefreshSessionIds(state, state.refresh.active.get("full")!)).toEqual(new Set([ROOT, "new"]))
+    expect(invalidatedRefreshSessionIds(state, state.refresh.active.get("incremental")!)).toEqual(new Set([ROOT]))
+  })
+
+  for (const rewind of [false, true]) {
+    test(`completion consumes a submitted preview without an empty composer observation (rewind: ${rewind})`, () => {
+      for (const freshDraft of [false, true]) {
+        let state = rewind ? liveRewindState() : {
+          ...loadedState(original),
+          terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle" as const, phase: "running" as const }]]),
+        }
+        if (!rewind) state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false } })
+        state = observe(state, { _tag: "Submission", text: "edited" })
+        state = reduceApplicationState(state, {
+          _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false,
+        })
+        expect(state.drafts.get(ROOT)?.submitted).toBeTrue()
+        const refresh = activeRefresh("completion", 1, "manual", "full")
+        state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+        const observer = new ClaudeTerminalObserver()
+        expect(observer.observeDraft({ lines: ["unreadable composer"], cursor: { x: 0, y: 0, visible: false } })).toBeUndefined()
+        if (freshDraft) state = observe(state, { _tag: "Draft", draft: { text: "next prompt", exact: false } })
+        const prefix = rewind ? original.slice(0, 2) : original
+        const completed = [...prefix, message("edited", "user", "edited", prefix.length),
+          { ...message("answer", "agent", "new answer", prefix.length + 1), turnComplete: true }]
+        state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: 1,
+          snapshot: snapshot(session(ROOT, "Root"), completed) })
+        expect(state.pendingCompletions.size).toBe(0)
+        expect(state.rewindAnchors.size).toBe(0)
+        expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
+        expect(state.provider.transcripts.get(ROOT)).toEqual(available(completed))
+        expect(state.drafts.get(ROOT)).toEqual(freshDraft ? { text: "next prompt", exact: false } : undefined)
+        state = reduceApplicationState(state, { _tag: "TerminalReturned", sessionId: ROOT,
+          draft: { text: "stale submitted preview", exact: false } })
+        expect(state.drafts.get(ROOT)).toEqual(freshDraft ? { text: "next prompt", exact: false } : undefined)
+      }
+    })
+  }
+
+  test("repeated edited resubmission undo is bounded before any provider refresh", () => {
+    let state = liveRewindState()
+    for (let index = 0; index < 8; index += 1) {
+      const text = `edit ${index}`
+      state = observe(state, { _tag: "Submission", text })
+      state = observe(state, { _tag: "Draft", draft: null })
+      state = reduceApplicationState(state, {
+        _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "working", wasVisible: false,
+      })
+      state = reduceApplicationState(state, {
+        _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false,
+      })
+      expect(state.pendingCompletions.size).toBe(1)
+      state = observe(state, { _tag: "Draft", draft: { text, exact: false, rewind: true } })
+      expect(state.pendingCompletions.size).toBe(0)
+      expect(state.rewindAnchors.size).toBe(1)
+      expect(state.rewindAnchors.get(ROOT)).toMatchObject({ targetMessageId: "q2", submitted: false, submissionText: text })
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+    }
+    state = readReplacement(state, original.slice(0, 2))
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(state.drafts.get(ROOT)?.rewind).toBeUndefined()
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  test("confirmed fork prefix has the same placement live, stopped, and after restart", () => {
+    const child = "child"
+    const copies = original.map((entry) => ({ ...entry, id: `child-${entry.id}` }))
+    let state: ApplicationState = {
+      ...loadedState(original),
+      provider: {
+        sessions: new Map([[ROOT, session(ROOT, "Root")], [child, session(child, "Child")]]),
+        transcripts: new Map([[ROOT, available(original)], [child, available(copies)]]),
+      },
+      relations: [{ childSessionId: child, parentSessionId: ROOT, sourceMessageId: "q2",
+        sharedMessages: original.map((entry, index) => ({ parentMessageId: entry.id, childMessageId: copies[index]!.id })),
+        createdAt: "2026-09-01T00:00:00.000Z" }],
+      terminals: new Map([[child, { ownerId: "owner", activity: "idle", phase: "running" }]]),
+    }
+    state = reduceApplicationState(state, { _tag: "TerminalObservationObserved", sessionId: child, ownerId: "owner",
+      observation: { _tag: "Draft", draft: { text: "later", exact: false, rewind: true } } })
+    function placement(current: ApplicationState): string | null | undefined {
+      const graph = selectConversationForest(current).graphBySessionId.get(child)!
+      return graph.nodes.get(graph.endpointBySessionId.get(child)!)?.parentId
+    }
+    const provisional = placement(state)
+    expect(provisional).toBeDefined()
+    const refresh = { ...activeRefresh("child", 1, "terminal-return", "incremental"), sessionIds: new Set([child]) }
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: 1,
+      snapshot: snapshot(session(child, "Child"), copies.slice(0, 2)) })
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(placement(state)).toBe(provisional)
+    state = reduceApplicationState(state, { _tag: "TerminalObservationObserved", sessionId: child, ownerId: "owner",
+      observation: { _tag: "Submission", text: "new edited prompt" } })
+    state = reduceApplicationState(state, { _tag: "TerminalObservationObserved", sessionId: child, ownerId: "owner",
+      observation: { _tag: "Draft", draft: null } })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: child, ownerId: "owner",
+      activity: "working", wasVisible: false })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: child, ownerId: "owner",
+      activity: "idle", wasVisible: false })
+    expect(state.pendingCompletions.has(child)).toBeTrue()
+    state = reduceApplicationState(state, { _tag: "TerminalObservationObserved", sessionId: child, ownerId: "owner",
+      observation: { _tag: "Draft", draft: { text: "new edited prompt", exact: false, rewind: true } } })
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(selectProjectedTranscript(state, child)).toEqual(copies.slice(0, 2))
+    expect(placement(state)).toBe(provisional)
+    state = reduceApplicationState(state, { _tag: "TerminalStopped", sessionId: child })
+    expect(placement(state)).toBe(provisional)
+    const restarted = { ...makeInitialApplicationState({ relations: state.relations }), provider: state.provider }
+    expect(placement(restarted)).toBe(provisional)
+  })
+
+  test("undo after prefix confirmation anchors only a newly persisted submission", () => {
+    const prefix = original.slice(0, 2)
+    let state = readReplacement(liveRewindState(), prefix)
+    expect(state.rewindAnchors.size).toBe(0)
+    state = observe(state, { _tag: "Submission", text: "new edited prompt" })
+    state = reduceApplicationState(state, {
+      _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "working", wasVisible: false,
+    })
+    const submitted = [...prefix, message("new-q", "user", "new edited prompt", 2)]
+    state = readReplacement(state, submitted)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(submitted)
+    expect(state.rewindAnchors.size).toBe(0)
+    state = observe(state, { _tag: "Draft", draft: { text: "new edited prompt", exact: false, rewind: true } })
+    expect(state.rewindAnchors.get(ROOT)?.targetMessageId).toBe("new-q")
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+    state = readReplacement(state, prefix)
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(prefix))
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  for (const native of [false, true]) {
+    test(`${native ? "native" : "local"} fork distinguishes unread history from explicitly empty history`, () => {
+      const child = session("child", "Child")
+      const relation = {
+        childSessionId: child.id, parentSessionId: ROOT, sourceMessageId: "q2",
+        sharedMessages: original.map((entry) => ({ parentMessageId: entry.id, childMessageId: `child-${entry.id}` })),
+        createdAt: "2026-09-01T00:00:00.000Z",
+      }
+      for (const transcript of [undefined, { _tag: "Missing" }, { _tag: "Unavailable", reason: "unread" }, available([])] as const) {
+        let state = loadedState(original)
+        if (native) {
+          if (transcript !== undefined) state = reduceApplicationState(state, {
+            _tag: "LocalSessionProjected", session: child, transcript,
+          })
+          state = reduceApplicationState(state, {
+            _tag: "SessionIdentityAdopted", previousSessionId: ROOT, session: child, kind: "native-fork", relation,
+          })
+        } else state = reduceApplicationState(state, {
+          _tag: "PersistedBranchProjected", session: child, relation,
+          ...(transcript === undefined ? {} : { transcript }),
+        })
+        expect(state.local.transcripts.get(child.id)).toEqual(transcript)
+        const graph = selectConversationForest(state).graphBySessionId.get(child.id)!
+        const endpoint = graph.nodes.get(graph.endpointBySessionId.get(child.id)!)!
+        const parent = graph.nodes.get(endpoint.parentId!)!
+        if (transcript?._tag === "Available") expect(parent.kind).toBe("origin")
+        else {
+          expect(parent.kind).toBe("message")
+          if (parent.kind !== "message") throw new Error("Expected recorded-source message")
+          expect(parent.aliases).toContainEqual({ sessionId: ROOT, messageId: "q2" })
+        }
+      }
+    })
+  }
+
+  test("local metadata projection preserves existing provider and local transcript evidence", () => {
+    let state = reduceApplicationState(loadedState(original), { _tag: "LocalSessionProjected", session: session(ROOT, "Updated") })
+    expect(state.local.transcripts.has(ROOT)).toBeFalse()
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    state = reduceApplicationState(state, { _tag: "LocalSessionProjected", session: session(ROOT, "Empty"), transcript: available([]) })
+    state = reduceApplicationState(state, { _tag: "LocalSessionProjected", session: session(ROOT, "Updated again") })
+    expect(state.local.transcripts.get(ROOT)).toEqual(available([]))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual([])
+  })
+
+  test("a submitted rewind prefix expires its completion barrier before releasing placement", () => {
+    let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+    state = reduceApplicationState(state, {
+      _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false,
+    })
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const refresh: ActiveRefresh = {
+        ...activeRefresh("completion", state.refresh.generation + 1, "completion", "incremental"),
+        sessionIds: new Set([ROOT]), completionVersion: state.pendingCompletions.get(ROOT)!.version,
+      }
+      state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+      state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation,
+        snapshot: snapshot(session(ROOT, "Root"), original.slice(0, 2)) })
+      expect(state.rewindAnchors.has(ROOT)).toBeTrue()
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+    }
+    expect(state.pendingCompletions.size).toBe(0)
+    state = readReplacement(state, original.slice(0, 2))
+    expect(state.rewindAnchors.size).toBe(0)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original.slice(0, 2))
+    expect(state.unviewedSessionIds.size).toBe(0)
+    expect(state.modal).toBeNull()
   })
 
   test("migrates every ephemeral collection after repository-owned identity adoption", () => {

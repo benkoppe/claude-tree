@@ -5,6 +5,9 @@ import { join } from "node:path"
 
 import { Cause, Deferred, Effect, Exit, Fiber, PubSub, Scope } from "effect"
 import { TestClock } from "effect/testing"
+import { createTestRenderer } from "@opentui/core/testing"
+import { OpenTuiTerminalRenderer } from "../../src/infrastructure/terminal/opentui-terminal-renderer"
+import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 
 import {
   NullTerminalObserver,
@@ -57,6 +60,7 @@ import {
   TerminalCleanupError,
   type TerminalActivityEvent,
   type TerminalExitEvent,
+  type TerminalObservationEvent,
   type TerminalOwnershipRepository,
   type TerminalSessionChangedEvent,
   type TerminalSessionTransitionErrorEvent,
@@ -65,6 +69,74 @@ import {
 } from "../../src/services/terminal-supervisor"
 
 const temporaryDirectories: string[] = []
+
+for (const completedCursorVisible of [true, false]) {
+test(`production snapshots precede Escape and sequence hidden-cursor resubmissions (completed cursor visible: ${completedCursorVisible})`, async () => {
+  const setup = await createTestRenderer({ width: 60, height: 10, kittyKeyboard: true })
+  const fixture = makeFixture()
+  const trace: string[] = []
+  const events: Array<TerminalObservationEvent | TerminalActivityEvent> = []
+  class Observer extends ClaudeTerminalObserver {
+    override observeScreen(screen: TerminalScreen) {
+      trace.push("screen")
+      return super.observeScreen(screen)
+    }
+    override observeInput(data: Uint8Array) {
+      trace.push("input")
+      return super.observeInput(data)
+    }
+  }
+  try {
+    await withSupervisor({ ...fixture.dependencies,
+      renderer: new OpenTuiTerminalRenderer(setup.renderer),
+      events: {
+        onObservation: (event) => events.push(event),
+        onActivityChanged: (event) => events.push(event),
+      },
+    }, (supervisor) => Effect.gen(function*() {
+      const ownerId = yield* supervisor.show(prepared("rewind", fixture, { observer: new Observer() }))
+      const process = fixture.processes.processes[0]!
+      const composer = (text: string) => bytes(`\u001b[2J\u001b[H────────────────────────────────\r\n❯ ${text}\r\n────────────────────────────────\u001b[2;3H\u001b[?25h`)
+      process.output(composer("undo me"))
+      yield* Effect.promise(() => setup.renderOnce())
+      setup.mockInput.pressEnter()
+      process.output(bytes("\u001b]0;⠋ Claude Code\u0007\u001b[2J\u001b[H✻ Cogitating… (12s · esc to interrupt)\u001b[?25l"))
+      trace.length = 0
+      setup.mockInput.pressEscape()
+      expect(trace).toEqual(["screen", "input"])
+      process.output(composer("undo me"))
+      yield* Effect.promise(() => setup.renderOnce())
+      yield* eventually(() => events.some((event) => "observation" in event &&
+        event.observation._tag === "Draft" && event.observation.draft?.rewind === true))
+      expect((yield* supervisor.draftPreviews).get("rewind")).toEqual({ text: "undo me", exact: false })
+      process.output(bytes("\u001b[?25l"))
+      yield* Effect.promise(() => setup.renderOnce())
+      setup.mockInput.pressEnter()
+      yield* eventually(() => events.filter((event) => "observation" in event && event.observation._tag === "Submission").length === 2)
+      const submission = events.findLast((event) => "observation" in event && event.observation._tag === "Submission") as TerminalObservationEvent
+      expect(submission.observation).toEqual({ _tag: "Submission", text: "undo me" })
+      process.output(bytes("\u001b]0;⠋ Claude Code\u0007\u001b]0;✳ Claude Code\u0007"))
+      process.output(composer(""))
+      if (!completedCursorVisible) process.output(bytes("\u001b[?25l"))
+      yield* Effect.promise(() => setup.renderOnce())
+      yield* supervisor.hideActive
+      yield* eventually(() => events.some((event) => "activity" in event && event.activity === "idle" && event.sequenceId > submission.sequenceId))
+      const idleSequence = events.findLast((event) => "activity" in event && event.activity === "idle")!.sequenceId
+      // A later activity event is a queue barrier for all completion snapshots.
+      process.output(bytes("\u001b]0;⠋ Claude Code\u0007"))
+      yield* eventually(() => events.some((event) => "activity" in event && event.activity === "working" && event.sequenceId > idleSequence))
+      const laterDrafts = events.filter((event): event is TerminalObservationEvent =>
+        event.sequenceId > submission.sequenceId && "observation" in event && event.observation._tag === "Draft")
+      expect(laterDrafts.map((event) => event.observation)).toEqual(completedCursorVisible ? [{ _tag: "Draft", draft: null }] : [])
+      expect((yield* supervisor.draftPreviews).has("rewind")).toBeFalse()
+      expect(events.every((event) => event.ownerId === ownerId && event.sessionId === "rewind")).toBeTrue()
+      expect(events.map((event) => event.sequenceId)).toEqual([...new Set(events.map((event) => event.sequenceId))].sort((a, b) => a - b))
+    }))
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+}
 
 afterAll(async () => {
   await Promise.all(temporaryDirectories.map((directory) => rm(directory, {

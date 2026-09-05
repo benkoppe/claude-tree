@@ -86,6 +86,14 @@ export function buildConversationForest(
   const retainedMessagesBySession = collectRetainedMessages(transcripts, relations)
   const exactBranchPointIdsBySession = collectExactBranchPointIds(relations)
   const displayGroupEndIdsBySession = collectDisplayGroupEndIds(relations, removals)
+  for (const [sessionId, transcript] of transcripts) {
+    const lastVisible = transcript.findLast((message) => message.visible)
+    if (!lastVisible) continue
+    const ids = displayGroupEndIdsBySession.get(sessionId) ?? new Set<string>()
+    ids.add(lastVisible.id)
+    displayGroupEndIdsBySession.set(sessionId, ids)
+  }
+  propagateSharedMessageIds(displayGroupEndIdsBySession, relations)
   const recordedChildren = new Set(relations.map((relation) => relation.childSessionId))
   const processedSessions = new Set<string>()
   const graphBySessionId = new Map<string, ConversationGraph>()
@@ -249,6 +257,12 @@ function applyConversationRemovals(
         node.fork &&
         !isAncestorNode(graph, node.fork.sourceNodeId, node.id)
       ) {
+        // A shortened shared prefix is not a detached replay path to remove with its old source.
+        const context = sessionContextByGraph.get(graph)?.get(node.session.id)
+        if (
+          isAncestorNode(graph, node.parentId ?? graph.originNodeId, node.fork.sourceNodeId) &&
+          [...(context?.nodeIdByMessageId.values() ?? [])].includes(node.fork.sourceNodeId)
+        ) continue
         const matches = forkEndpointsBySourceNodeId.get(node.fork.sourceNodeId) ?? []
         matches.push({ graph, nodeId: node.id })
         forkEndpointsBySourceNodeId.set(node.fork.sourceNodeId, matches)
@@ -326,7 +340,7 @@ function applyConversationRemovals(
     const origin = graph.nodes.get(graph.originNodeId)
     graph.rootNodeId = origin?.kind === "origin" ? (origin.childIds[0] ?? "") : ""
     if (graph.nodes.size > 1) {
-      numberEmptyForkEndpoints(graph)
+      finalizeForkEndpoints(graph)
       graphs.push(graph)
     }
   }
@@ -508,16 +522,11 @@ function attachChildSession(
   exactBranchPointIdsBySession: ReadonlyMap<string, ReadonlySet<string>>,
   displayGroupEndIdsBySession: ReadonlyMap<string, ReadonlySet<string>>,
 ): string | null {
-  const sourceIndex = parentContext.transcript.findIndex(
-    (message) => message.id === relation.sourceMessageId,
-  )
   const sharedPrefixLength = relation.sharedMessages.length
   const transcript = transcripts.get(child.id) ?? []
   if (sharedPrefixLength === 0) {
-    const sourceNodeId = parentContext.nodeIdByMessageId.get(relation.sourceMessageId)
-    if (sourceIndex < 0 || !sourceNodeId) {
-      return `Cannot attach ${child.id}: source message ${relation.sourceMessageId} is unavailable`
-    }
+    const sourceNodeId = parentContext.nodeIdByMessageId.get(relation.sourceMessageId) ??
+      messageNodeId(relation.parentSessionId, relation.sourceMessageId)
     const context = createContext(transcript)
     appendSessionMessages(
       graph,
@@ -707,9 +716,12 @@ function attachChildSession(
     context.rawLogicalNodeIds[transcriptIndex] = logicalNodeId
     context.nodeIdByMessageId.set(childMessage.id, logicalNodeId)
   }
-  const continuationParentId = childSpecificStartIndex < transcript.length
-    ? lastDefined(context.rawLogicalNodeIds) ?? (transcript.some((message) => message.historyBoundary === "compaction") ? sourceNodeId : graph.originNodeId)
-    : sourceNodeId
+  // Missing reads retain the prepared fork boundary; an explicit empty read does not.
+  const fallbackParentId = !transcripts.has(child.id) ||
+    transcript.some((message) => message.historyBoundary === "compaction")
+    ? sourceNodeId
+    : graph.originNodeId
+  const continuationParentId = lastDefined(context.rawLogicalNodeIds) ?? fallbackParentId
   appendSessionMessages(
     graph,
     child.id,
@@ -720,15 +732,17 @@ function attachChildSession(
     displayGroupEndIdsBySession.get(child.id) ?? new Set(),
     context,
   )
-  const finalMessageNodeId = childSpecificStartIndex < transcript.length
-    ? lastDefined(context.rawLogicalNodeIds) ?? sourceNodeId
-    : sourceNodeId
+  const finalMessageNodeId = lastDefined(context.rawLogicalNodeIds) ?? continuationParentId
   appendEndpoint(
     graph,
     child,
     finalMessageNodeId,
     forkTargetForLastMessage(child.id, transcript),
-    { sourceNodeId, createdAt: relation.createdAt, empty: finalMessageNodeId === sourceNodeId },
+    {
+      sourceNodeId,
+      createdAt: relation.createdAt,
+      empty: !context.rawLogicalNodeIds.slice(childSpecificStartIndex).some((id) => id !== undefined),
+    },
   )
   contextFor(graph).set(child.id, context)
   return null
@@ -1101,13 +1115,23 @@ function appendEndpoint(
   return endpointId
 }
 
-function numberEmptyForkEndpoints(graph: ConversationGraph): void {
+function finalizeForkEndpoints(graph: ConversationGraph): void {
   const endpointsBySource = new Map<string, SessionEndpointNode[]>()
   for (const node of graph.nodes.values()) {
+    if (node.kind === "endpoint" && !node.fork) {
+      const parent = graph.nodes.get(node.parentId ?? "")
+      if (parent?.childIds.some((id) => {
+        const child = graph.nodes.get(id)
+        return child?.kind === "message" && child.aliases.some((alias) => alias.sessionId === node.session.id)
+      })) {
+        node.fork = { sourceNodeId: parent.id, createdAt: "", empty: true }
+      }
+    }
     if (node.kind !== "endpoint" || !node.fork?.empty) continue
-    const endpoints = endpointsBySource.get(node.fork.sourceNodeId) ?? []
+    const placement = node.parentId ?? graph.originNodeId
+    const endpoints = endpointsBySource.get(placement) ?? []
     endpoints.push(node)
-    endpointsBySource.set(node.fork.sourceNodeId, endpoints)
+    endpointsBySource.set(placement, endpoints)
   }
   for (const endpoints of endpointsBySource.values()) {
     endpoints.sort(

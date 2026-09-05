@@ -750,10 +750,71 @@ test("opens a reachable leaf through the keyboard picker", async () => {
     setup.mockInput.pressEnter()
     const picker = await frame(setup, (value) => value.includes("Open leaf") && value.includes("Left leaf") && value.includes("Right leaf"))
     expect(picker).toContain("2 nodes down")
+    if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+    await Effect.runPromise(running.harness.update({ ...graph, surface: {
+      ...graph.surface, nodes: graph.surface.nodes.map((node) => ({
+        ...node, y: node.y + 1,
+        reachableEndpoints: node.reachableEndpoints.map((endpoint) => ({ ...endpoint, distance: 7 })),
+      })),
+    } }))
+    const refreshed = await frame(setup, (value) => value.includes("Open leaf") && value.includes("7 nodes down"))
+    expect(refreshed).not.toContain("2 nodes down")
     setup.mockInput.pressArrow("down")
     await frame(setup, () => isSelected(setup, "Left leaf"))
     setup.mockInput.pressEnter()
     await waitFor(() => running.harness.calls.includes("open:left"))
+  } finally {
+    await running.stop()
+  }
+})
+
+test("refreshes jump destinations after relocation without losing the selected leaf", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const graph = branchingGraph("root-1", "Relocated leaves")
+  const running = await startPresentation(setup.renderer, graph)
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressKey("g", { shift: true })
+    await frame(setup, (value) => value.includes("Jump to Leaf"))
+    setup.mockInput.pressArrow("down")
+    await frame(setup, () => isSelected(setup, "Left leaf"))
+    if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+    await Effect.runPromise(running.harness.update({ ...graph, surface: {
+      ...graph.surface,
+      nodes: graph.surface.nodes.filter((node) => node.id !== "left-endpoint").map((node) => ({
+        ...node,
+        childIds: node.childIds.filter((id) => id !== "left-endpoint"),
+        reachableEndpoints: [...node.reachableEndpoints].reverse().map((endpoint) => endpoint.session.id === "left"
+          ? { ...endpoint, distance: 5, visibleNodeId: "left-message" }
+          : endpoint),
+      })),
+    } }))
+    await frame(setup, (value) => value.includes("Jump to Leaf") && value.includes("4 nodes down"))
+    expect(isSelected(setup, "Left leaf")).toBeTrue()
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:left-message"))
+  } finally {
+    await running.stop()
+  }
+})
+
+test("closes a leaf picker when its source disappears", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const graph = branchingGraph("root-1", "Removed source")
+  const running = await startPresentation(setup.renderer, graph)
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => value.includes("Open leaf"))
+    if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+    await Effect.runPromise(running.harness.update({ ...graph, surface: {
+      ...graph.surface, selectedNodeId: "left-message",
+      nodes: graph.surface.nodes.filter((node) => node.id !== "source").map((node) => ({
+        ...node, parentIds: node.parentIds.filter((id) => id !== "source"), selected: node.id === "left-message",
+      })),
+    } }))
+    await frame(setup, (value) => !value.includes("Open leaf") && value.includes("left branch"))
+    expect(running.harness.calls.some((call) => call.startsWith("open:"))).toBeFalse()
   } finally {
     await running.stop()
   }
@@ -858,8 +919,7 @@ test("surfaces canonical graph integrity warnings through the runtime", async ()
 
   try {
     const rendered = await frame(setup, (value) => value.includes("Graph integrity warning"))
-    expect(rendered).toContain("source message missing is unavailable".split(" ")[0]!)
-    expect(rendered).toContain("message missing is unavailable")
+    expect(rendered).toContain("history does not end at its recorded source message")
   } finally {
     await running.stop()
   }
@@ -1472,7 +1532,7 @@ function canonicalWarningGraph(): ApplicationViewModel {
       childSessionId: "child",
       parentSessionId: "root",
       sourceMessageId: "missing",
-      sharedMessages: [],
+      sharedMessages: [{ parentMessageId: "question", childMessageId: "copy" }],
       createdAt: "2026-01-01T00:00:00.000Z",
     }],
     "root",

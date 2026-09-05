@@ -3,6 +3,7 @@ import {
   EmbeddedTerminalRenderable,
   type CliRenderer,
   type Selection,
+  type OptimizedBuffer,
 } from "@opentui/core"
 
 import type {
@@ -28,7 +29,7 @@ export class OpenTuiTerminalRenderer implements TerminalRenderer {
   }
 
   createSurface(id: string, callbacks: TerminalSurfaceCallbacks): TerminalSurface {
-    const terminal = new EmbeddedTerminalRenderable(this.renderer, {
+    const terminal = new SnapshotTerminalRenderable(this.renderer, {
       id,
       position: "absolute",
       top: 0,
@@ -84,6 +85,35 @@ export class OpenTuiTerminalRenderer implements TerminalRenderer {
     }
     this.renderer.on(CliRenderEvents.SELECTION, handleSelection)
     return () => this.renderer.off(CliRenderEvents.SELECTION, handleSelection)
+  }
+}
+
+// OpenTUI's screen() reads painted text but a live VT cursor. Compose before
+// sampling so a return-to-navigator between frames cannot mix two VT states.
+class SnapshotTerminalRenderable extends EmbeddedTerminalRenderable {
+  private composing = false
+
+  override screen() {
+    if (this.frameBuffer && !this.composing) {
+      // Snapshot callers observe the returned state explicitly, not reentrantly.
+      const onScreenChange = this.onScreenChange
+      this.onScreenChange = undefined
+      try {
+        this.renderSelf(this.frameBuffer)
+      } finally {
+        this.onScreenChange = onScreenChange
+      }
+    }
+    return super.screen()
+  }
+
+  protected override renderSelf(buffer: OptimizedBuffer): void {
+    this.composing = true
+    try {
+      super.renderSelf(buffer)
+    } finally {
+      this.composing = false
+    }
   }
 }
 

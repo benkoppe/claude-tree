@@ -112,6 +112,8 @@ interface FooterHitRegion {
 type PickerOption = ReachableEndpointViewModel
 
 interface LeafPickerState {
+  readonly familySessionId: string
+  readonly sourceNodeId: string
   readonly title: string
   readonly options: readonly PickerOption[]
   selectedIndex: number
@@ -484,18 +486,33 @@ class OpenTuiPresentationController {
       if (this.graphSignature !== null && signature !== this.graphSignature) {
         this.graphViewportOffset = null
         this.graphNavigationIntent = null
-        this.leafPicker = null
       }
       this.graphSignature = signature
       this.reconcileGraphSelection(viewModel.surface)
       this.reconcileStoppedEndpointPreference(viewModel)
       if (this.leafPicker) {
-        const current = new Map(this.selectedGraphNode()?.reachableEndpoints.map((endpoint) => [endpoint.session.id, endpoint]) ?? [])
-        this.leafPicker = {
-          ...this.leafPicker,
-          options: this.leafPicker.options.map((option) => ({
-            ...option, status: current.get(option.session.id)?.status ?? "idle",
-          })),
+        const picker = this.leafPicker
+        const selected = picker.familySessionId === viewModel.surface.familySessionId
+          ? viewModel.surface.nodes.find((node) => node.id === picker.sourceNodeId)
+          : undefined
+        const selectedSessionId = picker.options[picker.selectedIndex]?.session.id
+        const destinations = new Set<string>()
+        const options: PickerOption[] = []
+        for (const endpoint of selected?.reachableEndpoints ?? []) {
+          if (picker.action === "open") options.push(endpoint)
+          else if (endpoint.visibleNodeId && !destinations.has(endpoint.visibleNodeId)) {
+            destinations.add(endpoint.visibleNodeId)
+            options.push({
+              ...endpoint,
+              distance: Math.max(0, endpoint.distance - (endpoint.visibleNodeId === selected?.id ? 0 : 1)),
+            })
+          }
+        }
+        this.leafPicker = options.length === 0 ? null : {
+          ...picker,
+          options,
+          selectedIndex: Math.max(0, options.findIndex((option) => option.session.id === selectedSessionId)),
+          viewportStart: Math.min(picker.viewportStart, options.length - 1),
         }
       }
       if (viewModel.surface.nodes.length === 0 && previous?.surface._tag === "Graph" && previous.surface.nodes.length > 0) {
@@ -765,6 +782,8 @@ class OpenTuiPresentationController {
       return
     }
     this.leafPicker = {
+      familySessionId: this.graphSurface()!.familySessionId,
+      sourceNodeId: selected.id,
       title: "Jump to Leaf",
       options,
       selectedIndex: 0,
@@ -801,6 +820,8 @@ class OpenTuiPresentationController {
         : -1
       if (preferred && preferredIndex < 0) this.preferredOpenSession = null
       this.leafPicker = {
+        familySessionId: this.graphSurface()!.familySessionId,
+        sourceNodeId: selected.id,
         title: "Open leaf",
         options,
         selectedIndex: preferredIndex >= 0 ? preferredIndex : 0,
