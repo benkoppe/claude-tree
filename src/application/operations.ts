@@ -90,18 +90,6 @@ export function makeApplicationOperations(options: {
         relation,
       ))
 
-  const removeRelation = (relation: BranchRelation): Effect.Effect<void, PersistenceError> =>
-    Effect.suspend(() =>
-      reconcileMutation(
-        options.metadata,
-        Effect.suspend(() => options.metadata.updateMetadata((state) => ({
-          ...state,
-          relations: state.relations.filter((candidate) => !isDeepStrictEqual(candidate, relation)),
-        }))).pipe(Effect.asVoid),
-        (state) => !state.relations.some((candidate) => isDeepStrictEqual(candidate, relation)),
-        undefined,
-      ))
-
   const branch: ApplicationOperations["branch"] = (target) => Effect.suspend(() => Effect.gen(function*() {
     const outcome = yield* Effect.suspend(() => options.provider.branchFrom(target))
     if (outcome._tag === "AmbiguousBranchMutation") return { outcome }

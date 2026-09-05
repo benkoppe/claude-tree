@@ -20,6 +20,44 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
+  test("a late full snapshot cannot overwrite a newer incremental session read", () => {
+    const full = activeRefresh("refresh:full", 1, "manual", "full")
+    const incremental = activeRefresh("refresh:owner:one", 2, "terminal-return", "incremental")
+    let state = reduceApplicationState(loadedState(), { _tag: "RefreshStarted", refresh: full })
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: incremental })
+    const latest = [message("q", "user", "question", 0), message("new", "agent", "new answer", 1)]
+    state = reduceApplicationState(state, {
+      _tag: "RefreshSucceeded", key: incremental.key, generation: 2,
+      snapshot: snapshot(session(ROOT, "New title"), latest),
+    })
+    state = reduceApplicationState(state, {
+      _tag: "RefreshSucceeded", key: full.key, generation: 1,
+      snapshot: snapshot(session(ROOT, "Old title"), [message("q", "user", "question", 0), message("old", "agent", "old answer", 1)]),
+    })
+    expect(state.provider.sessions.get(ROOT)?.title).toBe("New title")
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(latest))
+    expect(state.refresh.active.size).toBe(0)
+  })
+
+  test("a late full snapshot preserves sessions discovered by a newer incremental read", () => {
+    const full = activeRefresh("refresh:full", 1, "manual", "full")
+    const incremental = activeRefresh("refresh:owner:one", 2, "terminal-return", "incremental")
+    let state = reduceApplicationState(loadedState(), { _tag: "RefreshStarted", refresh: full })
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: incremental })
+    const newer = session("new-session", "New session")
+    const messages = [message("new-question", "user", "hello", 0)]
+    state = reduceApplicationState(state, {
+      _tag: "RefreshSucceeded", key: incremental.key, generation: 2,
+      snapshot: snapshot(newer, messages),
+    })
+    state = reduceApplicationState(state, {
+      _tag: "RefreshSucceeded", key: full.key, generation: 1,
+      snapshot: snapshot(session(ROOT, "Root"), []),
+    })
+    expect(state.provider.sessions.get(newer.id)).toEqual(newer)
+    expect(state.provider.transcripts.get(newer.id)).toEqual(available(messages))
+  })
+
   test("accepts only the matching keyed refresh generation", () => {
     const refresh = activeRefresh("refresh:full", 2, "manual", "full")
     let state = reduceApplicationState(loadedState(), { _tag: "RefreshStarted", refresh })
@@ -632,7 +670,7 @@ describe("application state reducer", () => {
           [secondChild, available([secondCopy])],
         ]),
       },
-      refresh: { generation: 0, active: new Map(), initialPending: false },
+      refresh: { generation: 0, active: new Map(), initialPending: false, appliedGenerationBySession: new Map() },
     }
 
     const surface = projectApplicationViewModel(state).surface
@@ -660,7 +698,7 @@ function loadedState(messages: readonly AgentMessage[] = [message("q", "user", "
       sessions: new Map([[ROOT, session(ROOT, "Root")]]),
       transcripts: new Map([[ROOT, available(messages)]]),
     },
-    refresh: { generation: 0, active: new Map(), initialPending: false },
+    refresh: { generation: 0, active: new Map(), initialPending: false, appliedGenerationBySession: new Map() },
   }
 }
 

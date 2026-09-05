@@ -98,6 +98,7 @@ export interface ApplicationState {
     readonly generation: number
     readonly active: ReadonlyMap<string, ActiveRefresh>
     readonly initialPending: boolean
+    readonly appliedGenerationBySession: ReadonlyMap<string, number>
   }
   readonly nextCompletionVersion: number
   readonly shutdown: "running" | "shutting-down" | "stopped" | "cleanup-incomplete"
@@ -124,7 +125,7 @@ export function makeInitialApplicationState(
     rewindAnchors: new Map(),
     pendingCompletions: new Map(),
     unviewedSessionIds: new Set(),
-    refresh: { generation: 0, active: new Map(), initialPending: true },
+    refresh: { generation: 0, active: new Map(), initialPending: true, appliedGenerationBySession: new Map() },
     nextCompletionVersion: 0,
     shutdown: "running",
   }
