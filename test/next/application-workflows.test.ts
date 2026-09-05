@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { forkSession, getSessionMessages, InMemorySessionStore, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
 import {
   Deferred,
   Effect,
@@ -9,6 +10,7 @@ import {
 } from "effect"
 import { TestClock } from "effect/testing"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
+import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
 
 import {
   ApplicationShutdownError,
@@ -34,6 +36,7 @@ import {
   type AgentSession,
   type AgentSessionSnapshot,
   type TerminalObservation,
+  type TerminalScreen,
 } from "../../src/domain/model"
 import type {
   BranchRelation,
@@ -55,6 +58,177 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  for (const { target, streaming } of (["wrapped identifier", "unknown", "unreadable", "duplicate"] as const).flatMap((target) =>
+    (target === "wrapped identifier" ? [false] : [false, true]).map((streaming) => ({ target, streaming })))) {
+    test(`SDK-backed native fork rewind reconciles a ${target} target before the replacement answer (streaming: ${streaming})`, async () => {
+      const waitForState = (runtime: AppRuntime, predicate: (state: ApplicationState) => boolean, description = "SDK workflow state") => Effect.gen(function*() {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          const state = yield* runtime.getState
+          if (predicate(state)) return state
+          // Let SDK promises and Node I/O settle without advancing reconciliation timers.
+          yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+        }
+        return yield* Effect.die(`Timed out waiting for ${description}`)
+      })
+      const fixture = makeFixture()
+      const store = new InMemorySessionStore()
+      const sourceId = crypto.randomUUID()
+      const sourceIds: string[] = Array.from({ length: 6 }, () => crypto.randomUUID())
+      const prompt = "use veryLongIdentifier with care"
+      const texts = ["first question", "first answer", prompt, "discarded answer", target === "duplicate" ? prompt : "last question", "last answer"]
+      const projectKey = process.cwd().replaceAll("/", "-")
+      const sessionIds: string[] = [sourceId]
+      const sdkReads: Array<{ sessionId: string; ids: readonly string[] }> = []
+      const observer = new ClaudeTerminalObserver()
+      const provider = new ClaudeProvider(process.cwd(), {
+        resolveExecutable: () => "/usr/bin/claude",
+        observerFactory: () => observer,
+        sdk: {
+          async listSessions() {
+            return sessionIds.map((sessionId) => ({ sessionId, summary: sessionId, lastModified: 1 }))
+          },
+          async getSessionMessages(sessionId, options) {
+            const messages = await getSessionMessages(sessionId, { ...options, sessionStore: store })
+            sdkReads.push({ sessionId, ids: messages.map((message) => message.uuid) })
+            return messages
+          },
+          async forkSession(sessionId, options) {
+            const result = await forkSession(sessionId, { ...options, sessionStore: store })
+            sessionIds.push(result.sessionId)
+            return result
+          },
+          async importSessionToStore(sessionId, destination) {
+            await destination.append({ projectKey, sessionId }, store.getEntries({ projectKey, sessionId }))
+          },
+        },
+      }, { forkValidationRetryDelaysMs: [] })
+      await store.append({ projectKey, sessionId: sourceId }, sourceIds.map((id, index) =>
+        sdkWorkflowEntry(sourceId, id, sourceIds[index - 1] ?? null, index % 2 ? "assistant" : "user", texts[index]!)))
+
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+        yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+        yield* runtime.branchFrom({ sessionId: sourceId, messageId: sourceIds[5]! })
+        const childId = sessionIds[1]!
+        const branched = yield* runtime.getState
+        const relation = branched.relations.find((item) => item.childSessionId === childId)!
+        expect(relation.sharedMessages.map((pair) => pair.parentMessageId)).toEqual(sourceIds)
+        const copiedIds = relation.sharedMessages.map((pair) => pair.childMessageId)
+        expect(copiedIds.every((id) => !sourceIds.includes(id))).toBeTrue()
+        yield* runtime.returnFromTerminal
+        yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+        yield* runtime.resumeSession(childId)
+        const ownerId = (yield* runtime.getState).terminals.get(childId)!.ownerId!
+        let sequenceId = 0
+        const delivered: TerminalObservation[] = []
+        const deliver = (observation: TerminalObservation) => Effect.gen(function*() {
+          delivered.push(observation)
+          expect(yield* runtime.handleTerminalObservation({ ownerId, sequenceId: ++sequenceId, sessionId: childId, wasActive: true, observation })).toBeTrue()
+        })
+        const drain = () => Effect.forEach(observer.takeObservations(), deliver, { discard: true })
+        const screen = (lines: readonly string[]): TerminalScreen => ({ lines, cursor: { x: 0, y: 0, visible: false } })
+        const picker = screen([
+          "│ Rewind │", "│ Restore and fork the conversation to the │", "│ point before… │",
+          ...(target === "unreadable" ? [] : [`│ ❯ ${target === "unknown" ? "not in provider history" : prompt} │`]),
+        ])
+        observer.observeScreen(picker)
+        yield* drain()
+        expect(observer.observeInput(new TextEncoder().encode("\r"))).toBeUndefined()
+        observer.observeScreen(picker)
+        yield* drain()
+        expect(delivered).toEqual([])
+        const restored = target === "unreadable"
+          ? screen(["Restored history; composer not visible"])
+          : screen(["────────────────────────────────", `❯ ${target === "unknown" ? "not in provider history" : "use veryLongIdenti"}`, ...(target === "unknown" ? [] : ["  fier with care"]), "────────────────────────────────"])
+        const readsBeforeRewind = sdkReads.length
+        observer.observeScreen(restored)
+        yield* drain()
+        expect(delivered).toEqual([{ _tag: "Rewind" }])
+        expect([...(yield* runtime.getState).refresh.active.values()].some((refresh) =>
+          refresh.reason === "reconciliation" && refresh.sessionIds.has(childId))).toBeTrue()
+        const draft = observer.observeDraft(restored)
+        yield* drain()
+        if (draft !== undefined) yield* deliver({ _tag: "Draft", draft })
+        const observed = yield* runtime.getState
+        expect(observed.rewindAnchors.has(childId)).toBe(target === "wrapped identifier")
+        expect(selectProjectedTranscript(observed, childId).map((item) => item.id)).toEqual(target === "wrapped identifier" ? copiedIds.slice(0, 2) : copiedIds)
+        if (target === "wrapped identifier") {
+          yield* runtime.returnFromTerminal
+          const view = yield* runtime.getViewModel
+          expect(view.surface._tag).toBe("Graph")
+          if (view.surface._tag !== "Graph") throw new Error("Expected graph")
+          const boundary = view.surface.nodes.find((node) => node._tag === "Message" && node.preview === "first answer")!
+          const endpoint = view.surface.nodes.find((node) => node._tag === "Endpoint" && node.session.id === childId)
+          expect(endpoint?.parentIds).toEqual([boundary.id])
+        }
+        // Unanchored rewinds must reconcile without a return, idle, or manual refresh.
+        yield* TestClock.adjust(100)
+        yield* waitForState(runtime, (state) => sdkReads.length > readsBeforeRewind && state.refresh.active.size === 0, "rewind reconciliation")
+        if (target !== "wrapped identifier") yield* runtime.returnFromTerminal
+        const returned = yield* runtime.getState
+        expect(selectProjectedTranscript(returned, childId).map((item) => item.id)).toEqual(target === "wrapped identifier" ? copiedIds.slice(0, 2) : copiedIds)
+        expect(selectProjectedTranscript(returned, sourceId).map((item) => item.id)).toEqual(sourceIds)
+        yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+        expect((yield* Effect.promise(() => getSessionMessages(childId, { dir: process.cwd(), sessionStore: store }))).map((item) => item.uuid)).toEqual(copiedIds)
+
+        const replacementId = crypto.randomUUID()
+        const submission = observer.observeInput(new TextEncoder().encode("replacement user only\r"))
+        yield* drain()
+        expect(submission?._tag).toBe("Submission")
+        if (submission) yield* deliver(submission)
+        const transitions = observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ Claude Code\u0007"))
+        expect(transitions).toEqual(["working"])
+        for (const activity of transitions) {
+          expect(yield* runtime.handleTerminalActivity({ ownerId, sequenceId: ++sequenceId, sessionId: childId, wasActive: false, activity })).toBeTrue()
+        }
+        yield* Effect.promise(() => store.append({ projectKey, sessionId: childId }, [
+          sdkWorkflowEntry(childId, replacementId, copiedIds[1]!, "user", "replacement user only"),
+        ]))
+        let tailId = replacementId
+        if (streaming) {
+          const id = crypto.randomUUID()
+          yield* Effect.promise(() => store.append({ projectKey, sessionId: childId }, [
+            sdkWorkflowEntry(childId, id, tailId, "assistant", "streaming first block", null),
+          ]))
+          tailId = id
+        }
+        const discoveryReads = sdkReads.length
+        yield* TestClock.adjust(100)
+        yield* waitForState(runtime, (state) => sdkReads.length > discoveryReads &&
+          (target === "wrapped identifier" ? selectProjectedTranscript(state, childId).at(-1)?.id === replacementId : state.replacementCandidates.has(childId)), "submission discovery")
+        if (target !== "wrapped identifier") {
+          expect((yield* runtime.getState).replacementCandidates.has(childId)).toBeTrue()
+        }
+        if (streaming) {
+          yield* Effect.promise(() => store.append({ projectKey, sessionId: childId }, [
+            sdkWorkflowEntry(childId, crypto.randomUUID(), tailId, "assistant", "streaming second block", null),
+          ]))
+        }
+        yield* TestClock.adjust(100)
+        const accepted = yield* waitForState(runtime, (state) => selectProjectedTranscript(state, childId).at(-1)?.id === replacementId, "replacement acceptance")
+        const replacementReads = sdkReads.slice(discoveryReads).filter((read) => read.sessionId === childId)
+        expect(replacementReads.map((read) => read.ids.slice(0, 3))).toEqual(
+          Array.from({ length: target === "wrapped identifier" ? 1 : 2 }, () => [...copiedIds.slice(0, 2), replacementId]),
+        )
+        expect(replacementReads.map((read) => read.ids.length)).toEqual(streaming ? [4, 5] : target === "wrapped identifier" ? [3] : [3, 3])
+        expect(selectSessionStatus(accepted, childId)).toBe("working")
+        expect(selectProjectedTranscript(accepted, childId).map((item) => item.id)).toEqual([...copiedIds.slice(0, 2), replacementId])
+        expect(selectProjectedTranscript(accepted, sourceId).map((item) => item.id)).toEqual(sourceIds)
+        expect(accepted.pendingCompletions.size).toBe(0)
+        expect(accepted.unviewedSessionIds.size).toBe(0)
+        expect(accepted.modal).toBeNull()
+        const view = yield* runtime.getViewModel
+        expect(view.surface._tag).toBe("Graph")
+        if (view.surface._tag !== "Graph") throw new Error("Expected graph")
+        const user = view.surface.nodes.find((node) => node._tag === "Message" && node.preview === "replacement user only")!
+        const endpoint = view.surface.nodes.find((node) => node._tag === "Endpoint" && node.session.id === childId)
+        expect(endpoint?.parentIds).toEqual([user.id])
+        expect(endpoint?._tag === "Endpoint" && endpoint.status).toBe("working")
+        expect(store.getEntries({ projectKey, sessionId: childId }).filter((entry) => copiedIds.includes(entry.uuid!))).toHaveLength(6)
+      }).pipe(Effect.provide(TestClock.layer()))))
+    })
+  }
+
   test("forks a 10,000-message tree while refresh is stalled and preserves the child after the late snapshot", async () => {
     const fixture = makeFixture()
     const messages = Array.from({ length: 10_000 }, (_, index) => message(`m${index}`, index % 2 ? "agent" : "user", `message ${index}`, index))
@@ -3070,6 +3244,24 @@ function pendingAdoption(
     sessionId,
     createdAt: "2026-09-01T00:00:00.000Z",
     ...(adoptionRelation === undefined ? {} : { relation: adoptionRelation }),
+  }
+}
+
+function sdkWorkflowEntry(
+  sessionId: string,
+  uuid: string,
+  parentUuid: string | null,
+  type: "user" | "assistant",
+  text: string,
+  stopReason: string | null = "end_turn",
+): SessionStoreEntry {
+  return {
+    type, uuid, parentUuid, sessionId, cwd: process.cwd(), timestamp: "2026-09-05T12:00:00.000Z",
+    message: type === "user" ? { role: "user", content: text } : {
+      id: `msg_${uuid}`, type: "message", role: "assistant", model: "test",
+      content: [{ type: "text", text }], stop_reason: stopReason, stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
   }
 }
 

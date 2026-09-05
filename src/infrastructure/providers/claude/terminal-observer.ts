@@ -1,6 +1,7 @@
 import type {
   AgentActivity,
   DraftPreview,
+  TerminalObservation,
   TerminalObserver,
   TerminalScreen,
   TerminalSubmissionObservation,
@@ -8,6 +9,10 @@ import type {
 import { OscSequenceParser } from "../../../osc"
 
 type RewindPhase = "idle" | "armed" | "picker" | "awaitingComposer" | "captured"
+type RewindDialog =
+  | { readonly stage: "selection"; readonly restoreOnSelect: boolean }
+  | { readonly stage: "confirmation"; readonly restoresConversation: boolean | undefined }
+  | { readonly stage: "heading" }
 
 export class ClaudeTerminalObserver implements TerminalObserver {
   private readonly parser = new OscSequenceParser()
@@ -19,6 +24,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   private composerScreen: string | undefined
   private rewindPhase: RewindPhase = "idle"
   private rewindTarget: string | undefined
+  private rewindTargetLines: readonly string[] | undefined
   private ignoredRewindTarget: string | undefined
   private rewindSubmitted = false
   private rewindWorkingSeen = false
@@ -26,18 +32,31 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   private lastSubmittedPrompt: string | undefined
   private cancelledPrompt: string | undefined
   private cancelledScreen: string | undefined
-  private restoreConversation = true
+  private rewindDialog: RewindDialog | undefined
+  private restoreConfirmed = false
+  private observations: TerminalObservation[] = []
   private dismissedDialog = false
+
+  takeObservations(): readonly TerminalObservation[] {
+    const observations = this.observations
+    this.observations = []
+    return observations
+  }
 
   observeInput(bytes: Uint8Array): TerminalSubmissionObservation | void {
     const data = Buffer.from(bytes).toString("utf8")
-    if (this.rewindPhase === "picker") {
+    if (/^(?:\u001b\[[IO])+$/u.test(data)) return
+    if (this.rewindDialog) {
       if (isStandaloneEscape(data)) {
         this.resetRewind()
         this.dismissedDialog = true
-      } else if (hasEnter(data)) {
-        if (this.restoreConversation) this.rewindPhase = "awaitingComposer"
-        else {
+      } else if (hasEnter(data) && !this.dismissedDialog) {
+        const dialog = this.rewindDialog
+        if ((dialog.stage === "selection" && dialog.restoreOnSelect) ||
+          (dialog.stage === "confirmation" && dialog.restoresConversation)) {
+          this.restoreConfirmed = true
+          this.rewindPhase = "awaitingComposer"
+        } else if (dialog.stage === "confirmation" && dialog.restoresConversation === false) {
           this.resetRewind()
           this.dismissedDialog = true
         }
@@ -49,11 +68,8 @@ export class ClaudeTerminalObserver implements TerminalObserver {
       this.resetRewind()
     }
     if (this.rewindPhase === "awaitingComposer") {
-      if (isStandaloneEscape(data) || (hasEnter(data) && !this.restoreConversation)) {
-        this.resetRewind()
-        this.dismissedDialog = true
-      }
-      return
+      // Once the dialog has closed, new input is not restored-composer evidence.
+      this.resetRewind()
     }
 
     const escapeCount = standaloneEscapeCount(data)
@@ -117,31 +133,36 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   observeScreen(screen: TerminalScreen): AgentActivity | undefined {
     this.lastScreen = JSON.stringify([screen.lines, screen.cursor])
     this.captureCancelledPrompt(screen)
-    const rewindMenuVisible = isClaudeRewindPicker(screen)
+    const dialog = readClaudeRewindDialog(screen)
+    const rewindMenuVisible = dialog !== undefined
+    const previousDialog = this.rewindDialog
+    this.rewindDialog = dialog
+    if (dialog && previousDialog && dialog.stage !== "heading" && dialog.stage !== previousDialog.stage) this.dismissedDialog = false
     if (!rewindMenuVisible) this.dismissedDialog = false
     if (!rewindMenuVisible && this.rewindPhase === "picker") this.resetRewind()
     if (rewindMenuVisible && !this.dismissedDialog) {
-      const selected = screen.lines.find((line) => /^\s*[│┃]?\s*❯/u.test(line)) ?? ""
-      this.restoreConversation = !/never mind/iu.test(selected) &&
-        !(/\b(?:restore|rewind)\b.*\b(?:code|files)\b/iu.test(selected) && !/\bconversation\b/iu.test(selected))
+      if (!previousDialog) this.resetRewind()
       if (this.rewindPhase !== "awaitingComposer") this.rewindPhase = "picker"
       this.rewindTarget = undefined
+      this.rewindTargetLines = undefined
       this.ignoredRewindTarget = undefined
       this.cancelledPrompt = undefined
       this.rewindSubmitted = false
       this.rewindWorkingSeen = false
+    }
+    if (!rewindMenuVisible && this.restoreConfirmed) {
+      this.restoreConfirmed = false
+      this.inputBuffer = ""
+      this.composerScreen = undefined
+      this.observations.push({ _tag: "Rewind" })
     }
     if (
       !rewindMenuVisible &&
       this.rewindPhase === "awaitingComposer" &&
       this.rewindTarget === undefined
     ) {
-      const composer = this.readComposer(screen)?.text || undefined
-      if (composer !== undefined && this.canCaptureRewindTarget(composer)) {
-        this.rewindTarget = composer
-        this.ignoredRewindTarget = undefined
-        this.rewindPhase = "captured"
-      }
+      const composer = this.readComposer(screen)
+      if (composer && claudeScreenActivity(screen, composer) === "idle") this.captureRewindTarget(composer)
     }
     const activity = claudeScreenActivity(screen, this.readComposer(screen))
     if (activity === "idle" && !rewindMenuVisible && !this.rewindSubmitted) {
@@ -160,22 +181,13 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   }
 
   observeDraft(screen: TerminalScreen): DraftPreview | null | undefined {
-    if (isClaudeRewindPicker(screen)) return undefined
+    if (readClaudeRewindDialog(screen)) return undefined
     const composer = this.readComposer(screen)
     if (!composer || claudeScreenActivity(screen, composer) !== "idle") return undefined
     const text = composer.text
     if (!this.rewindSubmitted) this.syncComposerInput(screen, text)
     if (text.length === 0 && this.rewindPhase === "awaitingComposer") this.resetRewind()
-    if (
-      text !== undefined &&
-      this.rewindTarget === undefined &&
-      this.rewindPhase === "awaitingComposer" &&
-      this.canCaptureRewindTarget(text)
-    ) {
-      this.rewindTarget = text
-      this.ignoredRewindTarget = undefined
-      this.rewindPhase = "captured"
-    }
+    if (this.rewindPhase === "awaitingComposer") this.captureRewindTarget(composer)
     return text.length === 0
       ? null
       : {
@@ -185,6 +197,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
             ? {
                 rewind: true,
                 ...(this.rewindTarget === undefined ? {} : { rewindTarget: this.rewindTarget }),
+                ...(this.rewindTargetLines === undefined ? {} : { rewindTargetLines: this.rewindTargetLines }),
                 ...(this.rewindSubmitted ? { submitted: true } : {}),
               }
             : {}),
@@ -192,12 +205,13 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   }
 
   private captureCancelledPrompt(screen: TerminalScreen): void {
-    if (this.cancelledPrompt === undefined || isRewindCommand(this.cancelledPrompt) || isClaudeRewindPicker(screen)) return
+    if (this.cancelledPrompt === undefined || isRewindCommand(this.cancelledPrompt) || readClaudeRewindDialog(screen)) return
     if (this.lastScreen === this.cancelledScreen) return
     if (observeClaudeActivity(screen) !== "idle") return
     const composer = observeClaudeDraft(screen)
     if (composer !== this.cancelledPrompt) return
     this.rewindTarget = composer
+    this.rewindTargetLines = observeClaudeComposer(screen)?.lines
     this.rewindPhase = "captured"
     this.rewindSubmitted = false
     this.rewindWorkingSeen = false
@@ -209,7 +223,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     const cursorComposer = observeClaudeComposer(screen)
     if (cursorComposer) return cursorComposer
     if ((this.rewindPhase !== "awaitingComposer" && (this.rewindPhase !== "captured" || this.rewindSubmitted)) ||
-      isClaudeRewindPicker(screen)) return undefined
+      readClaudeRewindDialog(screen)) return undefined
     const bordered = observeBorderedRewindComposer(screen)
     return bordered && claudeScreenActivity(screen, bordered) === "idle" ? bordered : undefined
   }
@@ -219,6 +233,8 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     this.ignoredRewindTarget = ignoreCurrentTarget ? this.rewindTarget : undefined
     this.rewindPhase = ignoreCurrentTarget ? "armed" : "awaitingComposer"
     this.rewindTarget = undefined
+    this.rewindTargetLines = undefined
+    this.restoreConfirmed = false
     this.rewindSubmitted = false
     this.rewindWorkingSeen = false
   }
@@ -226,6 +242,8 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   private resetRewind(): void {
     this.rewindPhase = "idle"
     this.rewindTarget = undefined
+    this.rewindTargetLines = undefined
+    this.restoreConfirmed = false
     this.ignoredRewindTarget = undefined
     this.rewindSubmitted = false
     this.rewindWorkingSeen = false
@@ -274,16 +292,45 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   }
 
   private canCaptureRewindTarget(composer: string): boolean {
-    return composer.length > 0 && !isRewindCommand(composer) && composer !== this.ignoredRewindTarget
+    return composer.length > 0 && !isRewindCommand(composer) && composer !== this.ignoredRewindTarget &&
+      !hasIncompleteComposerText(composer)
+  }
+
+  private captureRewindTarget(composer: ClaudeComposer): void {
+    if (!this.canCaptureRewindTarget(composer.text)) return
+    this.rewindTarget = composer.text
+    this.rewindTargetLines = composer.lines
+    this.ignoredRewindTarget = undefined
+    this.rewindPhase = "captured"
   }
 }
 
-function isClaudeRewindPicker(screen: TerminalScreen): boolean {
-  return screen.lines.map((line) => line.replace(/^[\s│┃]+|[\s│┃]+$/gu, "")).some((line) =>
-    /^\s*Rewind\b.*\b(?:message|conversation)\b/iu.test(line) ||
-    /^\s*Restore (?:the code and\/or conversation|and fork the conversation) to the point before[….]*\s*$/u.test(line) ||
-    /^\s*Confirm you want to restore\b/u.test(line)
-  )
+function readClaudeRewindDialog(screen: TerminalScreen): RewindDialog | undefined {
+  // A picker selection can look cursor-local, but is not a complete input box.
+  const composer = observeBorderedRewindComposer(screen)
+  const composerBottom = composer ? screen.lines.findLastIndex(isHorizontalRule) : -1
+  const lines = screen.lines.map((line, row) => composer && row >= composer.promptRow && row < composerBottom
+    ? ""
+    : line.replace(/^[\s│┃║╭╮╰╯┌┐└┘┏┓┗┛─━═]+|[\s│┃║╭╮╰╯┌┐└┘┏┓┗┛─━═]+$/gu, ""))
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/^(?:Confirm|Restore|Rewind)\b/iu.test(lines[index] ?? "")) continue
+    const text = lines.slice(index).join(" ").replace(/\s+/gu, " ")
+    if (/^Confirm you want to restore\b/u.test(text)) {
+      const selected = lines.findIndex((line, row) => row > index && /^❯/u.test(line))
+      const restoresConversation = selected < 0 ? undefined : lines.slice(selected).some((_, offset) =>
+        /^❯\s*(?:\d+\.\s*)?Restore (?:conversation(?: and code)?|code and conversation)\s*$/iu.test(
+          lines.slice(selected, selected + offset + 1).join(" ").replace(/\s+/gu, " "),
+        ))
+      return { stage: "confirmation", restoresConversation }
+    }
+    if (/^Restore (?:the code and\/or conversation|and fork the conversation) to the point before[….]*(?: |$)/u.test(text)) {
+      return { stage: "selection", restoreOnSelect: text.startsWith("Restore and fork") }
+    }
+    if (/^Rewind\b.*\b(?:message|conversation)\b/iu.test(lines[index] ?? "")) {
+      return { stage: "selection", restoreOnSelect: true }
+    }
+  }
+  return lines.some((line) => line === "Rewind") ? { stage: "heading" } : undefined
 }
 
 function isRewindCommand(input: string): boolean {
@@ -380,6 +427,7 @@ function decodeOscTitle(body: readonly number[]): string | undefined {
 interface ClaudeComposer {
   readonly text: string
   readonly promptRow: number
+  readonly lines?: readonly string[]
 }
 
 function observeBorderedRewindComposer(screen: TerminalScreen): ClaudeComposer | undefined {
@@ -394,7 +442,7 @@ function observeBorderedRewindComposer(screen: TerminalScreen): ClaudeComposer |
   const continuation = screen.lines.slice(promptRow + 1, bottom)
   if (continuation.some((line) => /^\s*❯/u.test(line))) return undefined
   const text = [match[1] ?? "", ...continuation].join("\n").trim()
-  return { text, promptRow }
+  return { text, promptRow, ...completeComposerLines(screen, promptRow, bottom) }
 }
 
 function observeClaudeComposer(
@@ -420,9 +468,21 @@ function observeClaudeComposer(
     return {
       text: [match[1] ?? "", ...screen.lines.slice(promptRow + 1, borderRow)].join("\n").trim(),
       promptRow,
+      ...completeComposerLines(screen, promptRow, borderRow),
     }
   }
   return undefined
+}
+
+function completeComposerLines(screen: TerminalScreen, promptRow: number, bottom: number): Pick<ClaudeComposer, "lines"> {
+  if (!isHorizontalRule(screen.lines[promptRow - 1] ?? "")) return {}
+  const lines = [screen.lines[promptRow]!.replace(/^\s*[❯>]\s?/u, ""), ...screen.lines.slice(promptRow + 1, bottom)]
+  if (lines.length < 2 || lines.some((line) => /^\s*[❯>]/u.test(line)) || hasIncompleteComposerText(lines.join("\n"))) return {}
+  return { lines: Object.freeze(lines) }
+}
+
+function hasIncompleteComposerText(text: string): boolean {
+  return /\[(?:Pasted (?:text|image)|Image|Audio)\s*#\d+|…|\.{3}|(?:↑|↓)\s*\d+\s*(?:more\s+)?lines/iu.test(text)
 }
 
 function isHorizontalRule(line: string): boolean {
