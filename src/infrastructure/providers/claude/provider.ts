@@ -648,18 +648,24 @@ export class ClaudeProvider implements AgentProviderApi {
         ))
       }
       const records = physicalRecords.slice(0, requestedRecordIndex + 1)
-      const physicalIndexById = new Map(records.map((record, index) => [record.id, index]))
+      const physicalIndexById = new Map(physicalRecords.map((record, index) => [record.id, index]))
       let previousIndex = -1
       for (const message of activePrefix) {
         const physicalIndex = physicalIndexById.get(message.id)
-        const physical = physicalIndex === undefined ? undefined : records[physicalIndex]
+        const physical = physicalIndex === undefined ? undefined : physicalRecords[physicalIndex]
         if (
           physicalIndex === undefined ||
-          physicalIndex <= previousIndex ||
           physical === undefined ||
           sourceRole(physical.type) !== message.role ||
           !isDeepStrictEqual(physical.message, message.rawMessage)
         ) {
+          return yield* Effect.fail(this.protocolError(
+            "branchFrom",
+            `Claude's active source transcript does not match its physical records for session ${sessionId}`,
+          ))
+        }
+        if (physicalIndex > requestedRecordIndex) continue
+        if (physicalIndex <= previousIndex) {
           return yield* Effect.fail(this.protocolError(
             "branchFrom",
             `Claude's active source transcript does not match its physical records for session ${sessionId}`,

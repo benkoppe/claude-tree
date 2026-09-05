@@ -339,6 +339,39 @@ describe("Effect Claude provider", () => {
     })))
   })
 
+  test("forks an older boundary when compaction reconstructs a later preserved source record before it", async () => {
+    const physicalParent = [
+      message(ROOT, "parent-1", "user", "question"),
+      message(ROOT, "parent-2", "assistant", "older answer"),
+      message(ROOT, "parent-3", "assistant", "later preserved context"),
+    ]
+    const activeParent = [physicalParent[0]!, physicalParent[2]!, physicalParent[1]!]
+    const copied = physicalParent.slice(0, 2).map((entry, index) =>
+      copyMessage(entry, CHILD, `child-${index + 1}`),
+    )
+    const provider = providerWith({
+      messages: { [ROOT]: activeParent, [CHILD]: copied },
+      physical: {
+        [ROOT]: physicalParent,
+        [CHILD]: copied.map((entry, index) =>
+          copiedRecord(entry, ROOT, physicalParent[index]!.uuid),
+        ),
+      },
+    })
+
+    const outcome = await Effect.runPromise(provider.branchFrom({
+      sessionId: ROOT,
+      messageId: "parent-2",
+    }))
+
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(outcome.derivation.sharedMessages).toEqual([
+      { parentMessageId: "parent-1", childMessageId: "child-1" },
+      { parentMessageId: "parent-2", childMessageId: "child-2" },
+    ])
+  })
+
   test("uses cached parent metadata for the initial PreparedTerminal fork title", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     const copied = [copyMessage(parent[0]!, CHILD, "child-1")]
