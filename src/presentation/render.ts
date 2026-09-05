@@ -113,7 +113,7 @@ export function renderRoots(
     canvas.paint(0, row, safeWidth, 1, style)
     canvas.write(1, row, status, {
       ...style,
-      fg: statusColor(root.status),
+      fg: statusColor(root.status, selected),
       attributes: TextAttributes.BOLD,
     })
     const titleX = 4
@@ -240,7 +240,7 @@ function drawNode(
     fg: selected ? theme.selectedText : agent ? theme.primary : stoppedFork ? theme.accent : live ? theme.info : theme.textMuted,
   }, heading)
   canvas.write(node.x + 2 + contentWidth - badgeWidth, node.y, badge, {
-    ...heading, fg: statusColor(node.status),
+    ...heading, fg: statusColor(node.status, selected),
   })
   if (agent) return
   const description = node.draft?.text.replace(/\s+/g, " ").trim() ?? ""
@@ -266,7 +266,13 @@ function drawHeading(
   }
 }
 
-export function statusColor(status: RootViewModel["status"]): RGBA {
+export function statusColor(status: RootViewModel["status"], selected = false): RGBA {
+  if (selected) {
+    if (status === "blocked") return theme.selectedDanger
+    if (status === "unviewed") return theme.selectedWarning
+    if (status === "live") return theme.selectedSuccess
+    return status === "working" ? theme.selectedText : theme.selectedMuted
+  }
   if (status === "blocked") return theme.danger
   if (status === "unviewed") return theme.warning
   if (status === "working") return theme.primary

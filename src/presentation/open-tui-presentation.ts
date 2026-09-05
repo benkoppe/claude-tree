@@ -1218,7 +1218,7 @@ class OpenTuiPresentationController {
       const suffix = `  ${distance} · ${option.session.id.slice(0, 8)}`
       const titleWidth = Math.max(0, width - displayWidth(marker) - displayWidth(suffix))
       const title = `${truncateToWidth(option.session.title, titleWidth)}${suffix}`
-      const markerColor = statusColor(option.status)
+      const markerColor = statusColor(option.status, selected)
       chunks.push(
         chunk(marker, markerColor, TextAttributes.BOLD, background),
         chunk(
