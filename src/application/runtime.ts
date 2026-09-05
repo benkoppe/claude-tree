@@ -61,7 +61,6 @@ import {
   type ApplicationIntentEffect,
   type ApplicationIntentError,
   type IntentEnvelope,
-  type RefreshReason,
   type StateQueryEnvelope,
   type TerminalActorEvent,
 } from "./protocol"
@@ -184,6 +183,7 @@ type ActorCommand =
   | { readonly _tag: "AcknowledgeStartupAdoptions"; readonly adoptions: readonly PendingIdentityAdoption[] }
   | { readonly _tag: "Navigation"; readonly navigation: NavigationState; readonly reply?: IntentEnvelope["reply"] }
   | { readonly _tag: "CompletionTimer"; readonly sessionId: string; readonly ownerId: string; readonly version: number }
+  | { readonly _tag: "SubmissionTimer"; readonly sessionId: string; readonly ownerId: string; readonly revision: number }
 
 interface ActiveCommand {
   readonly token: number
@@ -470,7 +470,7 @@ export function makeAppRuntime(
     }
 
     const startRefresh = (
-      reason: RefreshReason,
+      reason: ActiveRefresh["reason"],
       sessionIds: ReadonlySet<string>,
       ownerId?: string,
       completionVersion?: number,
@@ -482,13 +482,14 @@ export function makeAppRuntime(
         : "incremental" as const
       const key = mode === "full" ? "refresh:full"
         : reason === "reconciliation" ? "refresh:reconciliation"
+        : reason === "submission" ? `refresh:submission:${ownerId}`
         : `refresh:owner:${ownerId ?? [...sessionIds].join("|")}`
       if (reason === "reconciliation") {
         sessionIds = new Set([...(state.refresh.active.get(key)?.sessionIds ?? []), ...sessionIds])
       }
       if (mode === "full") {
         for (const activeKey of [...activeCommands.keys()]) {
-          if (activeKey.startsWith("refresh:") || activeKey.startsWith("completion:")) {
+          if (activeKey.startsWith("refresh:") || activeKey.startsWith("completion:") || activeKey.startsWith("submission:")) {
             yield* supersede(activeKey)
           }
         }
@@ -553,6 +554,7 @@ export function makeAppRuntime(
           !workflow.stoppedSessionIds.has(candidate))
         if (sessionId !== undefined) {
           workflow.attemptedSessionIds.add(sessionId)
+          yield* publish({ _tag: "TerminalStopping", sessionId })
           yield* launch(key, {
             _tag: "Remove",
             workflowKey: key,
@@ -596,6 +598,34 @@ export function makeAppRuntime(
         Effect.sleep(delay),
       )
     }
+
+    // Any accepted read can satisfy discovery; only discovery timers spend its finite budget.
+    const reconcileSubmissionDiscovery = (): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
+      for (const [key, active] of [...activeCommands]) {
+        const command = active.command
+        if (command._tag !== "SubmissionTimer" && !(command._tag === "Refresh" && command.refresh.reason === "submission")) continue
+        const sessionId = command._tag === "SubmissionTimer" ? command.sessionId : [...command.refresh.sessionIds][0]!
+        const terminal = state.terminals.get(sessionId)
+        const captured = command._tag === "SubmissionTimer" ? command : state.refresh.active.get(key)?.historyRevisions?.get(sessionId)
+        if (!terminal?.pendingSubmission || terminal.phase !== "running" ||
+          terminal.ownerId !== captured?.ownerId || terminal.historyRevision !== captured?.revision) yield* supersede(key)
+      }
+      if (state.shutdown !== "running") return
+      for (const [sessionId, terminal] of state.terminals) {
+        const pending = terminal.pendingSubmission
+        const ownerId = terminal.ownerId
+        if (!pending || !ownerId || terminal.phase !== "running" || owners.get(ownerId)?.sessionId !== sessionId) continue
+        if (activeCommands.has(`submission:${ownerId}`) || [...state.refresh.active.values()].some((refresh) =>
+          refresh.mode === "full" || refresh.sessionIds.has(sessionId))) continue
+        const revision = terminal.historyRevision!
+        const delay = completionDelays[pending.attempt]
+        if (delay === undefined) {
+          yield* publish({ _tag: "SubmissionDiscoveryAdvanced", sessionId, ownerId, revision, exhausted: true })
+        } else {
+          yield* launch(`submission:${ownerId}`, { _tag: "SubmissionTimer", sessionId, ownerId, revision }, Effect.sleep(delay))
+        }
+      }
+    })
 
     const startShow = (
       prepared: PreparedTerminal,
@@ -975,6 +1005,17 @@ export function makeAppRuntime(
           command.ownerId,
           command.version,
         )
+        return
+      }
+
+      if (command._tag === "SubmissionTimer") {
+        const terminal = state.terminals.get(command.sessionId)
+        if (Exit.isFailure(exit) || !terminal?.pendingSubmission || terminal.phase !== "running" ||
+          terminal.ownerId !== command.ownerId || terminal.historyRevision !== command.revision ||
+          owners.get(command.ownerId)?.sessionId !== command.sessionId) return
+        if ([...state.refresh.active.values()].some((refresh) => refresh.mode === "full" || refresh.sessionIds.has(command.sessionId))) return
+        yield* publish({ ...command, _tag: "SubmissionDiscoveryAdvanced" })
+        yield* startRefresh("submission", new Set([command.sessionId]), command.ownerId)
         return
       }
 
@@ -1710,7 +1751,7 @@ export function makeAppRuntime(
     }
 
     processMessageWithBoundary = (message) => Effect.catchCause(
-      Effect.suspend(() => processMessage(message)),
+      Effect.suspend(() => processMessage(message)).pipe(Effect.andThen(reconcileSubmissionDiscovery)),
       (cause) => containMessageDefect(message, cause),
     )
 
@@ -2107,6 +2148,7 @@ function commandIntent(command: ActorCommand): ApplicationIntent["_tag"] {
     case "Remove": return "Remove"
     case "Navigation": return "SelectGraph"
     case "CompletionTimer": return "Refresh"
+    case "SubmissionTimer": return "Refresh"
     case "AcknowledgeTransition": return "OpenEndpoint"
     case "AcknowledgeStartupAdoptions": return "Refresh"
   }
@@ -2160,6 +2202,7 @@ function commandOperation(command: ActorCommand): string {
     case "AcknowledgeStartupAdoptions": return "Restore session identity"
     case "Navigation": return "Save navigation"
     case "CompletionTimer": return "Schedule completion refresh"
+    case "SubmissionTimer": return "Discover submitted user prefix"
   }
 }
 
