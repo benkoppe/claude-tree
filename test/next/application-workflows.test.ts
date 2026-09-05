@@ -53,6 +53,18 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  test("a provider-interrupted fork settles its caller and leaves later actor requests usable", async () => {
+    const fixture = makeFixture()
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider: { ...fixture.options.provider, branchFrom: () => Effect.interrupt } })
+      const fork = yield* Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" }))
+      yield* runtime.openModal({ _tag: "About" })
+      return { fork, state: yield* runtime.getState }
+    })))
+    expect(Exit.isFailure(result.fork)).toBeTrue()
+    expect(result.state.modal).toEqual({ _tag: "About" })
+  })
+
   test("returns a loading runtime and accepts input while initial discovery is deferred", async () => {
     const fixture = makeFixture()
     const discoveryStarted = Deferred.makeUnsafe<void>()
