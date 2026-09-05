@@ -211,8 +211,10 @@ test("the pinned SDK preserves provenance when compaction shortens a fork's acti
   })).toBeTrue()
 })
 
-for (const preservation of ["preservedSegment", "preservedMessages"] as const) {
-  test(`the provider forks and attaches SDK history reordered by ${preservation}`, async () => {
+for (const [preservation, linkedHistory] of ["preservedSegment", "preservedMessages"].flatMap((preservation) =>
+  [false, true].map((linkedHistory) => [preservation, linkedHistory] as const)
+)) {
+  test(`the provider forks and attaches SDK history reordered by ${preservation} (logical history: ${linkedHistory})`, async () => {
     const store = new InMemorySessionStore()
     const sessionId = crypto.randomUUID()
     const projectKey = process.cwd().replaceAll("/", "-")
@@ -226,6 +228,7 @@ for (const preservation of ["preservedSegment", "preservedMessages"] as const) {
       {
         type: "system", subtype: "compact_boundary", uuid: ids[4]!,
         sessionId, parentUuid: null, timestamp,
+        ...(linkedHistory ? { logicalParentUuid: ids[3] } : {}),
         compactMetadata: preservation === "preservedSegment"
           ? { preservedSegment: { headUuid: ids[2], tailUuid: ids[3], anchorUuid: ids[5] } }
           : { preservedMessages: { uuids: [ids[2], ids[3]], anchorUuid: ids[5] } },
@@ -250,7 +253,7 @@ for (const preservation of ["preservedSegment", "preservedMessages"] as const) {
     expect(outcome._tag).toBe("ValidatedBranch")
     expect(forkCalls).toBe(1)
     if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
-    expect(outcome.derivation.sharedMessages.map((pair) => ids.indexOf(pair.parentMessageId))).toEqual([5, 2, 3, 6, 7])
+    expect(outcome.derivation.sharedMessages.map((pair) => ids.indexOf(pair.parentMessageId))).toEqual(linkedHistory ? [0, 1, 2, 3, 5, 6, 7] : [5, 2, 3, 6, 7])
     const reads = await Effect.runPromise(provider.readTranscripts([sessionId, outcome.session.id]))
     const parent = reads.get(sessionId)!
     const child = reads.get(outcome.session.id)!
@@ -264,6 +267,91 @@ for (const preservation of ["preservedSegment", "preservedMessages"] as const) {
     expect(forest.graphs[0]!.warnings).toEqual([])
   })
 }
+
+test("compaction preserves a long logical history across reload, forks, repeated compaction, and rewind", async () => {
+  const store = new InMemorySessionStore()
+  const sessionId = crypto.randomUUID()
+  const projectKey = process.cwd().replaceAll("/", "-")
+  const timestamp = "2026-09-05T12:00:00.000Z"
+  const provider = () => new ClaudeProvider(process.cwd(), { sdk: {
+    async listSessions() { return [] },
+    getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+    forkSession: (id, options) => forkSession(id, { ...options, sessionStore: store }),
+    async importSessionToStore(id, target) {
+      await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
+    },
+  } })
+  const history: string[] = []
+  for (let turn = 0; turn < 80; turn++) {
+    const question = crypto.randomUUID(), answer = crypto.randomUUID()
+    await store.append({ projectKey, sessionId }, [
+      userEntry(sessionId, question, history.at(-1) ?? null, `question ${turn}`, timestamp),
+      agentEntry(sessionId, answer, question, `answer ${turn}`, timestamp),
+    ])
+    history.push(question, answer)
+  }
+  const compact = async (id: string, parent: string) => {
+    const boundary = crypto.randomUUID(), summary = crypto.randomUUID()
+    await store.append({ projectKey, sessionId: id }, [
+      { type: "system", subtype: "compact_boundary", uuid: boundary, parentUuid: null,
+        logicalParentUuid: parent, sessionId: id, timestamp, compactMetadata: {} },
+      { ...userEntry(id, summary, boundary, "compressed context", timestamp), isCompactSummary: true },
+    ])
+    return summary
+  }
+  const read = async (ids: string[]) => new Map([...await Effect.runPromise(provider().readTranscripts(ids))].map(([id, result]) => {
+    if (result._tag !== "Available") throw new Error(JSON.stringify(result))
+    return [id, result.messages] as const
+  }))
+  const summary = await compact(sessionId, history.at(-1)!)
+  expect((await read([sessionId])).get(sessionId)!.filter((message) => message.visible).map((message) => message.id)).toEqual(history)
+  const historicalFork = await Effect.runPromise(provider().branchFrom({ sessionId, messageId: history[79]! }))
+  if (historicalFork._tag !== "ValidatedBranch") throw new Error(historicalFork.reason)
+  expect(historicalFork.derivation.sharedMessages.map((pair) => pair.parentMessageId)).toEqual(history.slice(0, 80))
+  const question = crypto.randomUUID(), answer = crypto.randomUUID()
+  await store.append({ projectKey, sessionId }, [
+    userEntry(sessionId, question, summary, "after compaction", timestamp),
+    agentEntry(sessionId, answer, question, "continued", timestamp),
+  ])
+  const fork = await Effect.runPromise(provider().branchFrom({ sessionId, messageId: answer }))
+  if (fork._tag !== "ValidatedBranch") throw new Error(fork.reason)
+  const childSource = fork.derivation.sharedMessages.at(-1)!.childMessageId
+  const childQuestion = crypto.randomUUID(), childAnswer = crypto.randomUUID()
+  await store.append({ projectKey, sessionId: fork.session.id }, [
+    userEntry(fork.session.id, childQuestion, childSource, "child question", timestamp),
+    agentEntry(fork.session.id, childAnswer, childQuestion, "child answer", timestamp),
+  ])
+  const secondSummary = await compact(fork.session.id, childAnswer)
+  const finalQuestion = crypto.randomUUID()
+  await store.append({ projectKey, sessionId: fork.session.id }, [userEntry(fork.session.id, finalQuestion, secondSummary, "after second compaction", timestamp)])
+  const sessions = [{ id: sessionId, title: "Parent", lastModified: 0 }, fork.session]
+  const relations = [{ ...fork.derivation, createdAt: timestamp }]
+  const forest = buildConversationForest(sessions, await read(sessions.map((session) => session.id)), relations)
+  expect(forest.warnings).toEqual([])
+  expect(forest.graphs).toHaveLength(1)
+  const graph = forest.graphs[0]!
+  const nodeFor = (id: string) => [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.messageId === id))!
+  expect(nodeFor(finalQuestion).parentId).toBe(nodeFor(childAnswer).id)
+  expect(nodeFor(childQuestion).parentId).toBe(nodeFor(answer).id)
+  for (let index = 1; index < history.length; index++) expect(nodeFor(history[index]!).parentId).toBe(nodeFor(history[index - 1]!).id)
+  // Relations saved before history-aware reads only mapped the active context.
+  const legacy = buildConversationForest(sessions, await read(sessions.map((session) => session.id)), [{
+    ...relations[0]!, sharedMessages: relations[0]!.sharedMessages.filter((pair) => new Set<string>([summary, question, answer]).has(pair.parentMessageId)),
+  }])
+  expect(legacy.warnings).toEqual([])
+  expect(legacy.graphs).toHaveLength(1)
+  // An explicit new branch from an earlier parent is a rewind, not compaction.
+  const replacement = crypto.randomUUID()
+  await store.append({ projectKey, sessionId: fork.session.id }, [userEntry(fork.session.id, replacement, childSource, "rewound", timestamp)])
+  const rewound = (await read([fork.session.id])).get(fork.session.id)!
+  expect(rewound.some((message) => message.id === childQuestion || message.id === childAnswer || message.id === finalQuestion)).toBe(false)
+  expect(rewound.at(-1)!.id).toBe(replacement)
+  await compact(fork.session.id, replacement)
+  const compactedRewind = (await read([fork.session.id])).get(fork.session.id)!
+  expect(compactedRewind.filter((message) => message.visible).map((message) => message.id)).toEqual(rewound.filter((message) => message.visible).map((message) => message.id))
+  await compact(fork.session.id, crypto.randomUUID())
+  expect((await Effect.runPromise(provider().readTranscripts([fork.session.id]))).get(fork.session.id)?._tag).toBe("Unavailable")
+})
 
 for (const preserveShared of [false, true]) {
   test(`compacting an existing fork preserves its attachment (preserved shared history: ${preserveShared})`, async () => {
