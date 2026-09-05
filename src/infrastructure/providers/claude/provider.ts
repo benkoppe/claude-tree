@@ -108,6 +108,7 @@ interface ConversationRecord {
 interface SourcePrefix {
   readonly records: readonly ConversationRecord[]
   readonly activeMessageIds: readonly string[]
+  readonly historyMessageIds: readonly string[]
 }
 
 interface OperationDeadline {
@@ -248,7 +249,7 @@ export class ClaudeProvider implements AgentProviderApi {
           Effect.flatMap((messages) => messages === undefined || messages.length === 0
             ? Effect.succeed(messages)
             : this.readSessionEntries(sessionId, "readTranscripts", deadline).pipe(
-              Effect.map((entries) => markCompactionSummaries(messages, entries)),
+              Effect.flatMap((entries) => this.readNavigationHistory(sessionId, messages, entries, "readTranscripts", deadline)),
             )),
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
@@ -289,11 +290,13 @@ export class ClaudeProvider implements AgentProviderApi {
         "branchFrom",
         Math.min(this.operationTimeoutMs, this.forkValidationTimeoutMs),
       )
-      const sourceTranscript = yield* this.requireTranscript(
+      const activeTranscript = yield* this.requireTranscript(
         target.sessionId,
         "branchFrom",
         deadline,
       )
+      const sourceEntries = yield* this.readSessionEntries(target.sessionId, "branchFrom", deadline)
+      const sourceTranscript = yield* this.readNavigationHistory(target.sessionId, activeTranscript, sourceEntries, "branchFrom", deadline)
       const selectedIndex = sourceTranscript.findIndex((message) => message.id === target.messageId)
       const selected = sourceTranscript[selectedIndex]
       if (selected === undefined) {
@@ -345,16 +348,18 @@ export class ClaudeProvider implements AgentProviderApi {
         ))
       }
 
-      const sourceRecords = yield* this.readConversationRecords(
-        target.sessionId,
-        "branchFrom",
-        deadline,
-      )
+      const sourceRecords = yield* this.normalizeRecords(sourceEntries, "branchFrom", target.sessionId)
+      const activeForkIndex = activeTranscript.findIndex((message) => message.id === forkMessage.id)
+      const activePrefix = activeForkIndex >= 0
+        ? activeTranscript.slice(0, activeForkIndex + 1)
+        : yield* this.readStoredTranscript(target.sessionId, sourceEntries.slice(0,
+          sourceEntries.findIndex((entry) => entry.uuid === forkMessage.id) + 1), "branchFrom", deadline)
       const sourcePrefix = yield* this.validateSourcePrefix(
         target.sessionId,
-        sourceTranscript.slice(0, forkIndex + 1),
+        activePrefix,
         sourceRecords,
         forkMessage.id,
+        sourceTranscript,
       )
       const parentTitle = this.sessionTitles.get(target.sessionId) ?? "Conversation"
       mutationSourceMessageId = forkMessage.id
@@ -597,14 +602,14 @@ export class ClaudeProvider implements AgentProviderApi {
         }
         transcript = { _tag: "Available", messages: activeRead.messages }
 
-        const physicalRead = yield* this.readConversationRecords(
+        const physicalRead = yield* this.readSessionEntries(
           childSessionId,
           "validateFork",
           deadline,
         ).pipe(
           Effect.match({
             onFailure: (error) => ({ _tag: "Failure" as const, error }),
-            onSuccess: (records) => ({ _tag: "Success" as const, records }),
+            onSuccess: (entries) => ({ _tag: "Success" as const, entries }),
           }),
         )
         if (physicalRead._tag === "Failure") {
@@ -617,12 +622,14 @@ export class ClaudeProvider implements AgentProviderApi {
           parentSessionId,
           sourcePrefix,
           activeRead.messages,
-          physicalRead.records,
+          yield* this.normalizeRecords(physicalRead.entries, "validateFork", childSessionId),
         )
         if (validation._tag === "Valid") {
           return {
-            _tag: "Valid",
-            transcript,
+            _tag: "Valid" as const,
+            transcript: { _tag: "Available" as const, messages: yield* this.readNavigationHistory(
+              childSessionId, activeRead.messages, physicalRead.entries, "validateFork", deadline,
+            ) },
             sharedMessages: validation.sharedMessages,
           }
         }
@@ -631,11 +638,15 @@ export class ClaudeProvider implements AgentProviderApi {
       }
 
       return {
-        _tag: "Invalid",
+        _tag: "Invalid" as const,
         transcript,
         reason: `Fork ${childSessionId} was created, but ${lastReason}`,
       }
-    })
+    }).pipe(Effect.catch((error) => Effect.succeed({
+      _tag: "Invalid" as const,
+      transcript: { _tag: "Unavailable" as const, reason: error.message },
+      reason: `Fork ${childSessionId} was created, but its history could not be validated: ${error.message}`,
+    })))
   }
 
   private validateSourcePrefix(
@@ -643,6 +654,7 @@ export class ClaudeProvider implements AgentProviderApi {
     activePrefix: readonly ClaudeMessage[],
     physicalRecords: readonly ConversationRecord[],
     requestedMessageId: string,
+    history: readonly ClaudeMessage[],
   ): Effect.Effect<SourcePrefix, ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const requestedRecordIndex = physicalRecords.findIndex((record) => record.id === requestedMessageId)
@@ -679,6 +691,9 @@ export class ClaudeProvider implements AgentProviderApi {
         records,
         activeMessageIds: activePrefix
           .filter((message) => physicalIndexById.get(message.id)! <= requestedRecordIndex)
+          .map((message) => message.id),
+        historyMessageIds: history.slice(0, history.findIndex((message) => message.id === requestedMessageId) + 1)
+          .filter((message) => (physicalIndexById.get(message.id) ?? Infinity) <= requestedRecordIndex)
           .map((message) => message.id),
       }
     })
@@ -752,21 +767,76 @@ export class ClaudeProvider implements AgentProviderApi {
     )
   }
 
-  private readConversationRecords(
+  private normalizeRecords(
+    entries: readonly SessionStoreEntry[],
+    operation: string,
     sessionId: string,
+  ): Effect.Effect<readonly ConversationRecord[], ProviderError | ProviderProtocolError> {
+    return Effect.try({
+      try: () => normalizeConversationRecords(entries),
+      catch: (cause) => this.protocolError(
+        operation,
+        `Claude returned invalid physical transcript records for session ${sessionId}`,
+        cause,
+      ),
+    })
+  }
+
+  private readNavigationHistory(
+    sessionId: string,
+    active: readonly ClaudeMessage[],
+    entries: readonly SessionStoreEntry[],
     operation: string,
     deadline: OperationDeadline,
-  ): Effect.Effect<readonly ConversationRecord[], ProviderError | ProviderProtocolError> {
-    return this.readSessionEntries(sessionId, operation, deadline).pipe(
-      Effect.flatMap((entries) => Effect.try({
-        try: () => normalizeConversationRecords(entries),
-        catch: (cause) => this.protocolError(
-          operation,
-          `Claude returned invalid physical transcript records for session ${sessionId}`,
-          cause,
-        ),
+  ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
+    const linked = entries.some((entry) => isLinkedCompaction(entry))
+    if (!linked) return Effect.succeed(markCompactionSummaries(active, entries))
+    // An in-memory read projection only. The SDK still selects the live path and
+    // handles streamed blocks; no provider transcript is written or synthesized.
+    return Effect.try({
+      try: () => {
+        const indexes = new Map(entries.map((entry, index) => [entry.uuid, index]))
+        return entries.map((entry, index) => {
+          if (!isLinkedCompaction(entry)) return entry
+          const parentIndex = indexes.get(entry.logicalParentUuid as string)
+          if (parentIndex === undefined || parentIndex >= index) throw new Error("Compaction has a missing or cyclic logical parent")
+          return { ...entry, parentUuid: entry.logicalParentUuid, compactMetadata: undefined }
+        })
+      },
+      catch: (cause) => this.protocolError(operation, `Claude has invalid compaction links for session ${sessionId}`, cause),
+    }).pipe(
+      Effect.flatMap((projected) => this.readStoredTranscript(sessionId, projected, operation, deadline)),
+      Effect.flatMap((messages) => Effect.try({
+        try: () => {
+          const activeIds = new Set(active.map((message) => message.id))
+          const normalized = markCompactionSummaries(messages, entries)
+          const historyById = new Map(normalized.map((message) => [message.id, message]))
+          if (active.some((message) => historyById.get(message.id)?.copyIdentity !== message.copyIdentity ||
+            historyById.get(message.id)?.role !== message.role)) {
+            throw new Error("Compaction history does not contain the active context")
+          }
+          return normalized.map((message) => activeIds.has(message.id) ? message : { ...message, historical: true as const })
+        },
+        catch: (cause) => this.protocolError(operation, `Claude compaction history could not be validated for session ${sessionId}`, cause),
       })),
     )
+  }
+
+  private readStoredTranscript(
+    sessionId: string,
+    entries: readonly SessionStoreEntry[],
+    operation: string,
+    deadline: OperationDeadline,
+  ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
+    const sessionStore: SessionStore = {
+      async append() { throw new Error("Navigation history is read-only") },
+      async load(key) { return key.sessionId === sessionId && key.subpath === undefined ? [...entries] : null },
+    }
+    return this.callSdk(operation, () => getSessionMessages(sessionId, { dir: this.projectPath, sessionStore }),
+      this.transcriptReadTimeoutMs, deadline).pipe(Effect.flatMap((messages) => Effect.try({
+        try: () => normalizeTranscript(sessionId, messages),
+        catch: (cause) => this.protocolError(operation, `Claude returned invalid stored history for session ${sessionId}`, cause),
+      })))
   }
 
   private readSessionEntries(
@@ -777,7 +847,9 @@ export class ClaudeProvider implements AgentProviderApi {
     const entries: SessionStoreEntry[] = []
     const store: SessionStore = {
       async append(key, batch) {
-        if (key.sessionId === sessionId && key.subpath === undefined) entries.push(...batch)
+        if (key.sessionId === sessionId && key.subpath === undefined) {
+          for (const entry of batch) entries.push(entry)
+        }
       },
       async load() {
         return null
@@ -1046,6 +1118,10 @@ function normalizeTranscript(
   })
 }
 
+function isLinkedCompaction(entry: SessionStoreEntry): boolean {
+  return entry.type === "system" && entry.subtype === "compact_boundary" && typeof entry.logicalParentUuid === "string"
+}
+
 function markCompactionSummaries(
   messages: readonly ClaudeMessage[],
   entries: readonly SessionStoreEntry[],
@@ -1164,7 +1240,9 @@ function validateFork(
       reason: "its active transcript has not reached the requested source boundary",
     }
   }
-  return { _tag: "Valid", sharedMessages }
+  return { _tag: "Valid", sharedMessages: sourcePrefix.historyMessageIds.map((parentMessageId) => ({
+    parentMessageId, childMessageId: childByParentId.get(parentMessageId)!.id,
+  })) }
 }
 
 export function formatMessage(message: unknown): string {

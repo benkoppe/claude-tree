@@ -629,9 +629,10 @@ function attachChildSession(
   let previousParentSharedIndex = -1
   let parentDiverged = false
   for (const message of parentContext.transcript) {
+    if (message.historyBoundary === "compaction") continue
     const sharedIndex = sharedIndexByParentMessageId.get(message.id)
     if (sharedIndex === undefined) {
-      if (message.historyBoundary === "compaction") continue
+      if (message.historical) continue
       parentDiverged = true
       continue
     }
@@ -647,11 +648,13 @@ function attachChildSession(
   const currentSharedIndexesByTranscriptIndex = new Map<number, number>()
   let childSpecificStartIndex = transcript.length
   let previousSharedIndex = -1
+  const lastCurrentSharedIndex = transcript.findLastIndex((message) => sharedChildIds.has(message.id) && message.historyBoundary !== "compaction")
   for (let transcriptIndex = 0; transcriptIndex < transcript.length; transcriptIndex += 1) {
     const message = transcript[transcriptIndex]!
     const sharedIndex = sharedIndexByChildMessageId.get(message.id)
+    if (message.historyBoundary === "compaction") continue
     if (sharedIndex === undefined) {
-      if (message.historyBoundary === "compaction") continue
+      if (message.historical && transcriptIndex < lastCurrentSharedIndex) continue
       childSpecificStartIndex = Math.min(childSpecificStartIndex, transcriptIndex)
       continue
     }
@@ -705,9 +708,7 @@ function attachChildSession(
     context.nodeIdByMessageId.set(childMessage.id, logicalNodeId)
   }
   const continuationParentId = childSpecificStartIndex < transcript.length
-    ? transcript.some((message) => message.historyBoundary === "compaction")
-      ? sourceNodeId
-      : lastDefined(context.rawLogicalNodeIds) ?? graph.originNodeId
+    ? lastDefined(context.rawLogicalNodeIds) ?? (transcript.some((message) => message.historyBoundary === "compaction") ? sourceNodeId : graph.originNodeId)
     : sourceNodeId
   appendSessionMessages(
     graph,

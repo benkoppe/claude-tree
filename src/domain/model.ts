@@ -19,6 +19,8 @@ export interface AgentMessage {
   readonly copyIdentity?: string
   /** Provider-confirmed context compaction, not a user rewind or new prompt. */
   readonly historyBoundary?: "compaction"
+  /** Provider-confirmed pre-compaction history outside the active context. */
+  readonly historical?: true
 }
 
 export interface MessageRef {
