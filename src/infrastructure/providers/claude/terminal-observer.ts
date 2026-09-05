@@ -35,7 +35,10 @@ export class ClaudeTerminalObserver implements TerminalObserver {
       if (hasEnter(data)) this.rewindPhase = "awaitingComposer"
       return
     }
-    if (this.rewindPhase === "awaitingComposer") return
+    if (this.rewindPhase === "awaitingComposer") {
+      if (isStandaloneEscape(data)) this.resetRewind()
+      return
+    }
 
     const escapeCount = standaloneEscapeCount(data)
     if (escapeCount > 0) {
@@ -84,9 +87,13 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   observeScreen(screen: TerminalScreen): AgentActivity | undefined {
     this.captureCancelledPrompt(screen)
     const rewindMenuVisible = isClaudeRewindPicker(screen)
-    if (rewindMenuVisible && (this.rewindPhase === "armed" || this.rewindPhase === "picker")) {
-      this.rewindPhase = "picker"
+    if (rewindMenuVisible) {
+      if (this.rewindPhase !== "awaitingComposer") this.rewindPhase = "picker"
       this.rewindTarget = undefined
+      this.ignoredRewindTarget = undefined
+      this.cancelledPrompt = undefined
+      this.rewindSubmitted = false
+      this.rewindWorkingSeen = false
     }
     if (
       !rewindMenuVisible &&
@@ -164,6 +171,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     this.ignoredRewindTarget = undefined
     this.rewindSubmitted = false
     this.rewindWorkingSeen = false
+    this.cancelledPrompt = undefined
   }
 
   private observeRewindActivity(activity: AgentActivity | undefined): void {
@@ -202,7 +210,11 @@ export class ClaudeTerminalObserver implements TerminalObserver {
 }
 
 function isClaudeRewindPicker(screen: TerminalScreen): boolean {
-  return screen.lines.some((line) => /^\s*Rewind\b.*\b(?:message|conversation)\b/iu.test(line))
+  return screen.lines.map((line) => line.replace(/^[\s│┃]+|[\s│┃]+$/gu, "")).some((line) =>
+    /^\s*Rewind\b.*\b(?:message|conversation)\b/iu.test(line) ||
+    /^\s*Restore (?:the code and\/or conversation|and fork the conversation) to the point before[….]*\s*$/u.test(line) ||
+    /^\s*Confirm you want to restore\b/u.test(line)
+  )
 }
 
 function isRewindCommand(input: string): boolean {
