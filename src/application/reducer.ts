@@ -717,7 +717,7 @@ function sameMessage(left: AgentMessage, right: AgentMessage | undefined): boole
   return right !== undefined && left.id === right.id && left.role === right.role &&
     left.preview === right.preview && left.ordinal === right.ordinal && left.visible === right.visible &&
     left.displayGroupId === right.displayGroupId && left.turnComplete === right.turnComplete &&
-    left.copyIdentity === right.copyIdentity
+    left.copyIdentity === right.copyIdentity && left.historyBoundary === right.historyBoundary
 }
 
 function samePersistedContent(left: AgentMessage | undefined, right: AgentMessage): boolean {
