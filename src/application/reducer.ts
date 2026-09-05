@@ -32,6 +32,7 @@ import type {
 } from "./state"
 
 export const MAX_COMPLETION_REFRESH_ATTEMPTS = 4
+const MAX_REPLACEMENT_READS = 3
 
 export type StateEvent =
   | { readonly _tag: "RefreshStarted"; readonly refresh: ActiveRefresh; readonly replaceAll?: boolean }
@@ -82,7 +83,11 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
     case "RefreshFailed": {
       const active = state.refresh.active.get(event.key)
       if (!active || active.generation !== event.generation) return state
-      const next = removeRefresh(state, event.key, event.generation)
+      const replacementCandidates = new Map(state.replacementCandidates)
+      for (const sessionId of replacementCandidates.keys()) {
+        if (active.mode === "full" || active.sessionIds.has(sessionId)) replacementCandidates.delete(sessionId)
+      }
+      const next = { ...removeRefresh(state, event.key, event.generation), replacementCandidates }
       if (active.completionVersion !== undefined) {
         return advanceCompletion(next, [...active.sessionIds][0] ?? "", event.message)
       }
@@ -186,6 +191,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
         shutdown: "shutting-down",
         modal: null,
         pendingCompletions: new Map(),
+        replacementCandidates: new Map(),
         refresh: { ...state.refresh, active: new Map() },
       }
     case "ShutdownCompleted":
@@ -254,30 +260,60 @@ function refreshSucceeded(
   const temporarySessionIds = new Set(state.local.temporarySessionIds)
   const rewindAnchors = new Map(state.rewindAnchors)
   const pendingCompletions = new Map(state.pendingCompletions)
+  const replacementCandidates = new Map(state.replacementCandidates)
+  for (const sessionId of replacementCandidates.keys()) {
+    if (!sessions.has(sessionId) && !localSessions.has(sessionId)) replacementCandidates.delete(sessionId)
+  }
+  let replacementUnstable = false
   const unviewedSessionIds = new Set(state.unviewedSessionIds)
 
   for (const [sessionId, incoming] of snapshot.transcripts) {
     if (staleSessionIds.has(sessionId)) continue
-    const completion = pendingCompletions.get(sessionId)
+    let completion = pendingCompletions.get(sessionId)
+    const previousRead = selectTranscriptRead(state, sessionId)
+    const terminal = state.terminals.get(sessionId)
+    const nonIdle = terminal?.activity === "working" || terminal?.activity === "blocked"
+    const unexpectedReplacement = incoming._tag === "Available" && previousRead?._tag === "Available" &&
+      !isTranscriptPrefix(previousRead.messages, incoming.messages) && !rewindAnchors.has(sessionId)
+    const candidate = replacementCandidates.get(sessionId)
+    const replacedCompletedTurn = unexpectedReplacement && completion !== undefined &&
+      !isTranscriptPrefix(incoming.messages, previousRead.messages) &&
+      completionTranscriptReady([], incoming.messages)
+    // Providers expose snapshots, not authoritative revision tokens. Require two
+    // consistent idle reads before replacing history without an observed rewind.
+    // A prefix-only read cannot prove a new turn completed: let its barrier expire first.
+    if (unexpectedReplacement && !nonIdle && (!completion || replacedCompletedTurn)) {
+      const replacementConfirmed = candidate !== undefined && sameTranscript(candidate.messages, incoming.messages)
+      if (!replacementConfirmed) {
+        const attempts = (candidate?.attempts ?? 0) + 1
+        if (attempts >= MAX_REPLACEMENT_READS) {
+          replacementCandidates.delete(sessionId)
+          replacementUnstable = true
+        } else replacementCandidates.set(sessionId, { messages: incoming.messages, attempts })
+        transcripts.set(sessionId, previousRead)
+        continue
+      }
+      if (completion) {
+        if (completion.markUnviewed) unviewedSessionIds.add(sessionId)
+        pendingCompletions.delete(sessionId)
+        completion = undefined
+      }
+    }
+    replacementCandidates.delete(sessionId)
     const completionReady = completion !== undefined && incoming._tag === "Available" &&
       completionTranscriptReady(completion.baseline, incoming.messages, rewindAnchors.get(sessionId))
-    if (completionReady) {
+    if (completionReady && completion) {
       pendingCompletions.delete(sessionId)
       if (completion.markUnviewed) unviewedSessionIds.add(sessionId)
     } else if (completion) {
       transcripts.set(sessionId, { _tag: "Available", messages: completion.baseline })
       continue
     } else if (incoming._tag === "Available") {
-      const previous = selectTranscriptRead(state, sessionId)
-      const terminal = state.terminals.get(sessionId)
-      const anchor = rewindAnchors.get(sessionId)
-      if (previous?._tag === "Available" && (terminal?.activity === "working" || terminal?.activity === "blocked")) {
+      if (previousRead?._tag === "Available" && nonIdle) {
         transcripts.set(sessionId, {
           _tag: "Available",
-          messages: stableTranscriptWhileNonIdle(previous.messages, incoming.messages),
+          messages: stableTranscriptWhileNonIdle(previousRead.messages, incoming.messages),
         })
-      } else if (previous?._tag === "Available" && incoming.messages.length < previous.messages.length && !anchor) {
-        transcripts.set(sessionId, previous)
       }
     }
 
@@ -320,6 +356,7 @@ function refreshSucceeded(
   let completionExhausted = false
   if (active.completionVersion !== undefined) {
     for (const sessionId of active.sessionIds) {
+      if (staleSessionIds.has(sessionId)) continue
       const completion = pendingCompletions.get(sessionId)
       if (!completion || completion.version !== active.completionVersion) continue
       const advanced = advanceCompletionValue(completion)
@@ -327,6 +364,10 @@ function refreshSucceeded(
       else {
         pendingCompletions.delete(sessionId)
         completionExhausted = true
+        const incoming = snapshot.transcripts.get(sessionId)
+        if (incoming?._tag === "Available" && !sameTranscript(completion.baseline, incoming.messages)) {
+          replacementCandidates.set(sessionId, { messages: incoming.messages, attempts: 1 })
+        }
       }
     }
   }
@@ -338,9 +379,12 @@ function refreshSucceeded(
     local: { sessions: localSessions, transcripts: localTranscripts, temporarySessionIds },
     rewindAnchors,
     pendingCompletions,
+    replacementCandidates,
     unviewedSessionIds,
     refresh: { ...without.refresh, initialPending: false, appliedGenerationBySession },
-    ...(completionExhausted
+    ...(replacementUnstable
+      ? { modal: { _tag: "Error", message: "Conversation history kept changing during refresh. Refresh again when the session is idle." } as const }
+      : completionExhausted
       ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
       : {}),
   })
@@ -411,6 +455,7 @@ function terminalActivity(
       terminals,
       rewindAnchors,
       pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId),
+      replacementCandidates: withoutMap(state.replacementCandidates, event.sessionId),
     }
   }
   const version = state.nextCompletionVersion + 1
@@ -475,6 +520,7 @@ function terminalStopped(
     drafts: withoutMap(state.drafts, sessionId),
     rewindAnchors: withoutMap(state.rewindAnchors, sessionId),
     pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+    replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
     unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
   }
   return focusExitedSession || wasVisible
@@ -501,6 +547,7 @@ function rollbackTransient(
     drafts: withoutMap(state.drafts, sessionId),
     rewindAnchors: withoutMap(state.rewindAnchors, sessionId),
     pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+    replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
     unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
   }
 }
@@ -588,6 +635,7 @@ function adoptSessionIdentity(
     rewindAnchors: migrateMapKey(state.rewindAnchors, previousSessionId, sessionId),
     pendingCompletions: migrateMapKey(state.pendingCompletions, previousSessionId, sessionId),
     unviewedSessionIds: migrateSet(state.unviewedSessionIds, previousSessionId, sessionId),
+    replacementCandidates: migrateMapKey(state.replacementCandidates, previousSessionId, sessionId),
     refresh: {
       ...state.refresh,
       active,

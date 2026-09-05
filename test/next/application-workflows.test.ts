@@ -1060,6 +1060,25 @@ describe("application actor", () => {
     expect(fixture.incrementalReads.some((ids) => ids.includes(CHILD))).toBeFalse()
   })
 
+  test("automatically confirms a shortened transcript after one manual refresh", async () => {
+    const fixture = makeFixture()
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.refresh()
+      fixture.snapshot = snapshot([session(ROOT, "Root"), session(CHILD, "Child")], new Map([
+        [ROOT, []], [CHILD, [message("cq", "user", "child question", 0)]],
+      ]))
+      yield* runtime.refresh()
+      expect((yield* runtime.getState).replacementCandidates.has(ROOT)).toBeTrue()
+      yield* TestClock.adjust(100)
+      for (let index = 0; index < 12; index += 1) yield* Effect.yieldNow
+      return yield* runtime.getState
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(state.provider.transcripts.get(ROOT)).toEqual({ _tag: "Available", messages: [] })
+    expect(state.replacementCandidates.size).toBe(0)
+    expect(fixture.incrementalReads).toContainEqual([ROOT])
+  })
+
   test("manual refresh coherently supersedes an in-flight completion refresh", async () => {
     const fixture = makeFixture()
     const incrementalStarted = Deferred.makeUnsafe<void>()

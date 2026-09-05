@@ -89,6 +89,7 @@ const DEFAULT_SHUTDOWN_NAVIGATION_TIMEOUT_MS = 500
 const DEFAULT_SHUTDOWN_TRANSITION_TIMEOUT_MS = 500
 const COMMAND_SCOPE_CLOSE_TIMEOUT_MS = 100
 const RECONCILIATION_FAILURE_BACKOFF_MS = 100
+const TRANSCRIPT_CONFIRMATION_DELAY_MS = 100
 
 export interface AppRuntimeOptions {
   readonly provider: AgentProviderApi
@@ -475,7 +476,9 @@ export function makeAppRuntime(
       const mode = reason === "manual" || reason === "initial" || reason === "ambiguity"
         ? "full" as const
         : "incremental" as const
-      const key = mode === "full" ? "refresh:full" : `refresh:owner:${ownerId ?? [...sessionIds].join("|")}`
+      const key = mode === "full" ? "refresh:full"
+        : reason === "reconciliation" ? "refresh:reconciliation"
+        : `refresh:owner:${ownerId ?? [...sessionIds].join("|")}`
       if (mode === "full") {
         for (const activeKey of [...activeCommands.keys()]) {
           if (activeKey.startsWith("refresh:") || activeKey.startsWith("completion:")) {
@@ -498,7 +501,9 @@ export function makeAppRuntime(
         _tag: "Refresh",
         refresh,
         ...(reply === undefined ? {} : { reply }),
-      }, operations.loadSnapshot(mode, [...sessionIds]))
+      }, reason === "reconciliation"
+        ? Effect.sleep(TRANSCRIPT_CONFIRMATION_DELAY_MS).pipe(Effect.andThen(operations.loadSnapshot(mode, [...sessionIds])))
+        : operations.loadSnapshot(mode, [...sessionIds]))
     })
 
     const continueRemoval = (key: string): Effect.Effect<void, never, Scope.Scope> =>
@@ -895,6 +900,9 @@ export function makeAppRuntime(
           return
         }
         if (command.refresh.reason === "initial" && Exit.isFailure(exit)) return
+        if (Exit.isSuccess(exit) && state.replacementCandidates.size > 0) {
+          yield* startRefresh("reconciliation", new Set(state.replacementCandidates.keys()))
+        }
         const completionSessionIds = command.refresh.mode === "full"
           ? [...state.pendingCompletions.keys()]
           : [...command.refresh.sessionIds]
