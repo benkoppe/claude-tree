@@ -8,6 +8,7 @@ import {
   Stream,
 } from "effect"
 import { TestClock } from "effect/testing"
+import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 
 import {
   ApplicationShutdownError,
@@ -32,6 +33,7 @@ import {
   type AgentMessage,
   type AgentSession,
   type AgentSessionSnapshot,
+  type TerminalObservation,
 } from "../../src/domain/model"
 import type {
   BranchRelation,
@@ -1257,14 +1259,16 @@ describe("application actor", () => {
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({
         ...fixture.options,
-        terminals: { ...fixture.options.terminals, draftPreviews: Effect.succeed(new Map([[ROOT, {
-          text: "question", exact: false, rewind: true, rewindTarget: "question",
-        }]])) },
         completionDelaysMs: [10_000],
       })
       yield* runtime.resumeSession(ROOT)
       yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", false))
       yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "idle", false))
+      expect(yield* runtime.handleTerminalObservation(observation(3, {
+        _tag: "Draft",
+        draft: { text: "question", exact: false, rewind: true, rewindTarget: "question" },
+      }))).toBeTrue()
+      expect((yield* runtime.getState).pendingCompletions.size).toBe(0)
       yield* runtime.returnFromTerminal
       for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
       return yield* runtime.getState
@@ -1273,6 +1277,415 @@ describe("application actor", () => {
     expect(selectSessionStatus(state, ROOT)).toBe("live")
     expect(selectProjectedTranscript(state, ROOT)).toEqual([])
     expect(state.unviewedSessionIds.size).toBe(0)
+    expect(state.modal).toBeNull()
+  })
+
+  test("orders semantic callbacks before terminal return without reading rewind semantics from the cache", async () => {
+    const fixture = makeFixture()
+    const draft = { text: "edited question", exact: false, rewind: true, rewindTarget: "question" }
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      runtime.terminalEvents.onObservation!(observation(1, { _tag: "Draft", draft }))
+      runtime.terminalEvents.onObservation!(observation(2, { _tag: "Submission", text: draft.text }))
+      yield* runtime.returnFromTerminal
+      return yield* runtime.getState
+    })))
+    expect(state.surface).toEqual({
+      _tag: "Graph", familySessionId: ROOT, target: { kind: "endpoint", sessionId: ROOT },
+    })
+    expect(state.drafts.get(ROOT)).toEqual({ ...draft, submitted: true })
+    expect(state.rewindAnchors.get(ROOT)).toMatchObject({
+      targetMessageId: "q", submitted: true, submissionText: draft.text,
+    })
+    expect(selectProjectedTranscript(state, ROOT)).toEqual([])
+    expect(state.modal).toBeNull()
+  })
+
+  test("rejects stale observation sequences and owners without changing the current draft", async () => {
+    const fixture = makeFixture()
+    const draft = { text: "question", exact: false, rewind: true }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      expect(yield* runtime.handleTerminalObservation(observation(2, { _tag: "Draft", draft }))).toBeTrue()
+      expect(yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft: null }))).toBeFalse()
+      expect(yield* runtime.handleTerminalObservation(observation(2, { _tag: "Submission", text: "stale" }))).toBeFalse()
+      expect(yield* runtime.handleTerminalObservation({
+        ...observation(100, { _tag: "Draft", draft: null }), ownerId: "stale-owner",
+      })).toBeFalse()
+      expect((yield* runtime.getState).drafts.get(ROOT)).toEqual(draft)
+      expect((yield* runtime.getState).rewindAnchors.get(ROOT)?.submitted).toBeFalse()
+      expect(yield* runtime.handleTerminalObservation(observation(3, { _tag: "Submission", text: "current" }))).toBeTrue()
+      expect(yield* runtime.handleTerminalActivity(activity("owner-1", 3, ROOT, "working", true))).toBeFalse()
+      expect((yield* runtime.getState).rewindAnchors.get(ROOT)?.submissionText).toBe("current")
+    })))
+  })
+
+  test("a completed replacement consumes its submitted draft even when the composer remains unknown on return", async () => {
+    const fixture = makeFixture()
+    const draft = { text: "replacement", exact: false, rewind: true, rewindTarget: "question" }
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({
+        ...fixture.options,
+        terminals: { ...fixture.options.terminals, draftPreviews: Effect.succeed(new Map([[ROOT, draft]])) },
+        completionDelaysMs: [0],
+      })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft }))
+      yield* runtime.handleTerminalObservation(observation(2, { _tag: "Submission", text: draft.text }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 3, ROOT, "working", true))
+      fixture.snapshot = snapshot([session(ROOT, "Root"), session(CHILD, "Child")], new Map([
+        [ROOT, [message("replacement-q", "user", draft.text, 0), {
+          ...message("replacement-a", "agent", "replacement answer", 1), turnComplete: true,
+        }]],
+        [CHILD, [message("cq", "user", "child question", 0)]],
+      ]))
+      // An unknown composer emits no Draft observation, including no explicit null.
+      yield* runtime.handleTerminalActivity(activity("owner-1", 4, ROOT, "idle", true))
+      yield* TestClock.adjust(0)
+      const completed = yield* waitForState(runtime, (candidate) => !candidate.pendingCompletions.has(ROOT))
+      expect(selectProjectedTranscript(completed, ROOT).map((item) => item.id)).toEqual(["replacement-q", "replacement-a"])
+      expect(completed.rewindAnchors.has(ROOT)).toBeFalse()
+      expect(completed.drafts.has(ROOT)).toBeFalse()
+      // Drain the initial rewind's invalidated read and its fresh reconciliation.
+      yield* TestClock.adjust(100)
+      yield* TestClock.adjust(100)
+      yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+      yield* runtime.returnFromTerminal
+      return yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(state.surface._tag).toBe("Graph")
+    expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["replacement-q", "replacement-a"])
+    expect(state.drafts.has(ROOT)).toBeFalse()
+    expect(state.rewindAnchors.has(ROOT)).toBeFalse()
+    expect(state.unviewedSessionIds.has(ROOT)).toBeFalse()
+    expect(state.modal).toBeNull()
+  })
+
+  test("reundoing an edited replacement retains its boundary while provider history is still cached", async () => {
+    const fixture = makeFixture()
+    const restored = { text: "question", exact: false, rewind: true, rewindTarget: "question" }
+    const edited = { ...restored, text: "edited replacement" }
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, completionDelaysMs: [100] })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft: restored }))
+      yield* runtime.handleTerminalObservation(observation(2, { _tag: "Draft", draft: edited }))
+      yield* runtime.handleTerminalObservation(observation(3, { _tag: "Submission", text: edited.text }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 4, ROOT, "working", true))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 5, ROOT, "idle", true))
+      expect((yield* runtime.getState).pendingCompletions.has(ROOT)).toBeTrue()
+      const reundo = { ...edited, rewindTarget: edited.text }
+      yield* runtime.handleTerminalObservation(observation(6, { _tag: "Draft", draft: reundo }))
+      const undone = yield* runtime.getState
+      expect(undone.provider.transcripts.get(ROOT)).toEqual(fixture.snapshot.transcripts.get(ROOT))
+      expect(undone.drafts.get(ROOT)).toEqual(reundo)
+      expect(undone.rewindAnchors.get(ROOT)).toMatchObject({ targetMessageId: "q", submitted: false })
+      expect(selectProjectedTranscript(undone, ROOT)).toEqual([])
+      yield* TestClock.adjust(100)
+      yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+      expect(fixture.incrementalReads).toEqual([[ROOT]])
+      yield* runtime.returnFromTerminal
+      return yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual([])
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(selectSessionStatus(state, ROOT)).toBe("live")
+    expect(state.modal).toBeNull()
+  })
+
+  test("a completion read started before reundo cannot restore the replacement and triggers fresh prefix reconciliation", async () => {
+    const fixture = makeFixture()
+    const prefix = [message("first-q", "user", "first question", 0), message("first-a", "agent", "first answer", 1)]
+    const original = [...prefix, message("q", "user", "question", 2)]
+    fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, original]]))
+    const draft = { text: "edited replacement", exact: false, rewind: true, rewindTarget: "question" }
+    const reundo = { ...draft, rewindTarget: draft.text }
+    const replacement = snapshot([session(ROOT, "Stale replacement")], new Map([[ROOT, [
+      ...prefix, message("replacement-q", "user", draft.text, 2),
+      { ...message("replacement-a", "agent", "replacement answer", 3), turnComplete: true },
+    ]]]))
+    const completionStarted = Deferred.makeUnsafe<void>()
+    const releaseCompletion = Deferred.makeUnsafe<void>()
+    const provider: AgentProviderApi = {
+      ...fixture.options.provider,
+      loadSessionSnapshotFor: (sessionIds) => Effect.gen(function*() {
+        fixture.incrementalReads.push([...sessionIds])
+        if (fixture.incrementalReads.length === 1) {
+          yield* Deferred.succeed(completionStarted, undefined)
+          yield* Deferred.await(releaseCompletion)
+          return replacement
+        }
+        return fixture.snapshot
+      }),
+    }
+
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider, completionDelaysMs: [0] })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft }))
+      yield* runtime.handleTerminalObservation(observation(2, { _tag: "Submission", text: draft.text }))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 3, ROOT, "working", true))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 4, ROOT, "idle", true))
+      yield* TestClock.adjust(0)
+      yield* Deferred.await(completionStarted)
+      expect((yield* runtime.getState).pendingCompletions.has(ROOT)).toBeTrue()
+
+      yield* runtime.handleTerminalObservation(observation(5, { _tag: "Draft", draft: reundo }))
+      expect(selectProjectedTranscript(yield* runtime.getState, ROOT)).toEqual(prefix)
+      // Let rewind reconciliation finish first, while provider persistence still lags.
+      yield* TestClock.adjust(100)
+      yield* waitForState(runtime, (candidate) => !candidate.refresh.active.has("refresh:reconciliation"))
+      expect(fixture.incrementalReads).toEqual([[ROOT], [ROOT]])
+      expect((yield* runtime.getState).provider.transcripts.get(ROOT)).toEqual({ _tag: "Available", messages: original })
+
+      fixture.snapshot = snapshot([session(ROOT, "Confirmed prefix")], new Map([[ROOT, prefix]]))
+      yield* Deferred.succeed(releaseCompletion, undefined)
+      const rejected = yield* waitForState(runtime, (candidate) =>
+        !candidate.refresh.active.has("refresh:owner:owner-1") && candidate.refresh.active.has("refresh:reconciliation"))
+      expect(rejected.provider.transcripts.get(ROOT)).toEqual({ _tag: "Available", messages: original })
+      expect(rejected.provider.sessions.get(ROOT)?.title).toBe("Root")
+      expect(selectProjectedTranscript(rejected, ROOT)).toEqual(prefix)
+      expect(rejected.rewindAnchors.get(ROOT)).toMatchObject({ targetMessageId: "q", submitted: false })
+      expect(rejected.drafts.get(ROOT)).toEqual(reundo)
+      expect(rejected.pendingCompletions.has(ROOT)).toBeFalse()
+      expect(rejected.unviewedSessionIds.has(ROOT)).toBeFalse()
+
+      yield* TestClock.adjust(100)
+      return yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(fixture.incrementalReads).toEqual([[ROOT], [ROOT], [ROOT]])
+    expect(state.provider.transcripts.get(ROOT)).toEqual({ _tag: "Available", messages: prefix })
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+    expect(state.rewindAnchors.has(ROOT)).toBeFalse()
+    expect(state.drafts.get(ROOT)).toEqual({ text: draft.text, exact: false })
+    expect(state.pendingCompletions.has(ROOT)).toBeFalse()
+    expect(state.unviewedSessionIds.has(ROOT)).toBeFalse()
+    expect(state.modal).toBeNull()
+  })
+
+  test("a failed rewind read invalidated by a same-target edit preserves state and schedules fresh reconciliation", async () => {
+    const fixture = makeFixture()
+    const prefix = [message("first-q", "user", "first question", 0), message("first-a", "agent", "first answer", 1)]
+    const original = [...prefix, message("q", "user", "question", 2)]
+    fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, original]]))
+    const draft = { text: "question", exact: false, rewind: true, rewindTarget: "question" }
+    const edited = { ...draft, text: "edited question" }
+    const readStarted = Deferred.makeUnsafe<void>()
+    const releaseFailure = Deferred.makeUnsafe<void>()
+    const provider: AgentProviderApi = {
+      ...fixture.options.provider,
+      loadSessionSnapshotFor: (sessionIds) => Effect.gen(function*() {
+        fixture.incrementalReads.push([...sessionIds])
+        if (fixture.incrementalReads.length === 1) {
+          yield* Deferred.succeed(readStarted, undefined)
+          yield* Deferred.await(releaseFailure)
+          return yield* Effect.fail(new ProviderError({
+            providerId: "test", operation: "snapshot", message: "obsolete rewind read failed",
+          }))
+        }
+        return fixture.snapshot
+      }),
+    }
+
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft }))
+      yield* TestClock.adjust(100)
+      yield* Deferred.await(readStarted)
+      const reading = yield* runtime.getState
+      const refresh = reading.refresh.active.get("refresh:reconciliation")!
+      expect(refresh.historyRevisions?.get(ROOT)).toEqual({ ownerId: "owner-1", revision: 1 })
+
+      yield* runtime.handleTerminalObservation(observation(2, { _tag: "Draft", draft: edited }))
+      const editing = yield* runtime.getState
+      expect(editing.terminals.get(ROOT)?.historyRevision).toBe(2)
+      expect(editing.refresh.generation).toBe(reading.refresh.generation)
+      expect(editing.refresh.active.get(refresh.key)).toEqual(refresh)
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, prefix]]))
+      yield* Deferred.succeed(releaseFailure, undefined)
+      const rejected = yield* waitForState(runtime, (candidate) =>
+        (candidate.refresh.active.get(refresh.key)?.generation ?? 0) > refresh.generation)
+      expect(rejected.provider).toEqual(editing.provider)
+      expect(rejected.drafts).toEqual(editing.drafts)
+      expect(rejected.rewindAnchors).toEqual(editing.rewindAnchors)
+      expect(rejected.pendingCompletions).toEqual(editing.pendingCompletions)
+      expect(rejected.replacementCandidates).toEqual(editing.replacementCandidates)
+      expect(selectProjectedTranscript(rejected, ROOT)).toEqual(prefix)
+      expect(rejected.modal).toBeNull()
+      expect(fixture.incrementalReads).toEqual([[ROOT]])
+
+      yield* TestClock.adjust(100)
+      return yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(fixture.incrementalReads).toEqual([[ROOT], [ROOT]])
+    expect(state.provider.transcripts.get(ROOT)).toEqual({ _tag: "Available", messages: prefix })
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(prefix)
+    expect(state.rewindAnchors.has(ROOT)).toBeFalse()
+    expect(state.drafts.get(ROOT)).toEqual({ text: edited.text, exact: false })
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.unviewedSessionIds.size).toBe(0)
+    expect(state.modal).toBeNull()
+  })
+
+  test("an old-owner manual read cannot complete a reopened session at the same history revision", async () => {
+    const fixture = makeFixture()
+    const question = message("q", "user", "question", 0)
+    fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, [question]]]))
+    const oldSnapshot = snapshot([session(ROOT, "Old owner answer")], new Map([[ROOT, [
+      question, { ...message("old-a", "agent", "old answer", 1), turnComplete: true },
+    ]]]))
+    const manualStarted = Deferred.makeUnsafe<void>()
+    const releaseManual = Deferred.makeUnsafe<void>()
+    const stopReadStarted = Deferred.makeUnsafe<void>()
+    const releaseStopRead = Deferred.makeUnsafe<void>()
+    const provider: AgentProviderApi = {
+      ...fixture.options.provider,
+      loadSessionSnapshotFor: (sessionIds) => Effect.gen(function*() {
+        fixture.incrementalReads.push([...sessionIds])
+        if (fixture.incrementalReads.length === 1) {
+          yield* Deferred.succeed(stopReadStarted, undefined)
+          // Keep the stop read from advancing the applied generation before the old manual result.
+          yield* Deferred.await(releaseStopRead)
+        }
+        return fixture.snapshot
+      }),
+    }
+
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider, completionDelaysMs: [10_000] })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation(observation(1, { _tag: "Submission", text: question.preview }))
+      fixture.fullSnapshot = () => Effect.gen(function*() {
+        yield* Deferred.succeed(manualStarted, undefined)
+        yield* Deferred.await(releaseManual)
+        return oldSnapshot
+      })
+      const manual = yield* Effect.forkScoped(runtime.refresh())
+      yield* Deferred.await(manualStarted)
+      const reading = yield* runtime.getState
+      expect(reading.refresh.active.get("refresh:full")?.historyRevisions?.get(ROOT)).toEqual({
+        ownerId: "owner-1", revision: 1,
+      })
+
+      yield* runtime.stopSession(ROOT)
+      yield* Deferred.await(stopReadStarted)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalObservation({
+        ...observation(1, { _tag: "Submission", text: question.preview }), ownerId: "owner-2",
+      })
+      yield* runtime.handleTerminalActivity(activity("owner-2", 2, ROOT, "working", true))
+      yield* runtime.handleTerminalActivity(activity("owner-2", 3, ROOT, "idle", true))
+      const reopened = yield* runtime.getState
+      expect(reopened.terminals.get(ROOT)).toMatchObject({ ownerId: "owner-2", historyRevision: 1 })
+      expect(reopened.refresh.appliedGenerationBySession.get(ROOT)).toBe(reading.refresh.appliedGenerationBySession.get(ROOT))
+      expect(reopened.pendingCompletions.get(ROOT)?.ownerId).toBe("owner-2")
+
+      yield* Deferred.succeed(releaseManual, undefined)
+      yield* Fiber.join(manual)
+      const rejected = yield* runtime.getState
+      expect(rejected.pendingCompletions.get(ROOT)).toEqual(reopened.pendingCompletions.get(ROOT))
+      expect(rejected.provider).toEqual(reopened.provider)
+      expect(selectProjectedTranscript(rejected, ROOT)).toEqual([question])
+      expect(rejected.refresh.active.get("refresh:reconciliation")?.sessionIds.has(ROOT)).toBeTrue()
+      expect(rejected.unviewedSessionIds.has(ROOT)).toBeFalse()
+      expect(rejected.modal).toBeNull()
+
+      fixture.snapshot = snapshot([session(ROOT, "New owner answer")], new Map([[ROOT, [
+        question, { ...message("new-a", "agent", "new answer", 1), turnComplete: true },
+      ]]]))
+      yield* TestClock.adjust(100)
+      return yield* waitForState(runtime, (candidate) => !candidate.pendingCompletions.has(ROOT))
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(fixture.incrementalReads).toEqual([[ROOT], [ROOT]])
+    expect(state.terminals.get(ROOT)?.ownerId).toBe("owner-2")
+    expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q", "new-a"])
+    expect(state.provider.sessions.get(ROOT)?.title).toBe("New owner answer")
+    expect(state.unviewedSessionIds.has(ROOT)).toBeFalse()
+    expect(state.modal).toBeNull()
+  })
+
+  test("concurrent unsubmitted rewinds reconcile both sessions after the confirmation delay", async () => {
+    const fixture = makeFixture()
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.resumeSession(CHILD)
+      yield* runtime.handleTerminalObservation({
+        ...observation(1, { _tag: "Draft", draft: { text: "question", exact: false, rewind: true } }),
+        wasActive: false,
+      })
+      yield* runtime.handleTerminalObservation({
+        ...observation(1, { _tag: "Draft", draft: { text: "child question", exact: false, rewind: true } }),
+        ownerId: "owner-2", sessionId: CHILD,
+      })
+      fixture.snapshot = snapshot([session(ROOT, "Root"), session(CHILD, "Child")], new Map([
+        [ROOT, []], [CHILD, []],
+      ]))
+      yield* TestClock.adjust(99)
+      expect(fixture.incrementalReads).toEqual([])
+      yield* TestClock.adjust(1)
+      return yield* waitForState(runtime, (candidate) => candidate.refresh.active.size === 0)
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(fixture.incrementalReads).toHaveLength(1)
+    expect(new Set(fixture.incrementalReads[0])).toEqual(new Set([ROOT, CHILD]))
+    for (const sessionId of [ROOT, CHILD]) {
+      expect(state.provider.transcripts.get(sessionId)).toEqual({ _tag: "Available", messages: [] })
+      expect(selectProjectedTranscript(state, sessionId)).toEqual([])
+      expect(state.rewindAnchors.has(sessionId)).toBeFalse()
+      expect(state.pendingCompletions.has(sessionId)).toBeFalse()
+      expect(state.unviewedSessionIds.has(sessionId)).toBeFalse()
+    }
+    expect(state.modal).toBeNull()
+  })
+
+  for (const empty of [false, true]) {
+    test(`${empty ? "an explicitly empty composer clears" : "an unknown composer preserves"} the draft across return`, async () => {
+      const fixture = makeFixture()
+      const draft = { text: "current draft", exact: false }
+      const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const runtime = yield* makeAppRuntime({
+          ...fixture.options,
+          terminals: { ...fixture.options.terminals, draftPreviews: Effect.succeed(new Map([[ROOT, {
+            text: "question", exact: false, rewind: true, rewindTarget: "question",
+          }]])) },
+        })
+        yield* runtime.resumeSession(ROOT)
+        yield* runtime.handleTerminalObservation(observation(1, { _tag: "Draft", draft }))
+        // Unknown screens emit no observation; null is positive evidence of an empty composer.
+        if (empty) yield* runtime.handleTerminalObservation(observation(2, { _tag: "Draft", draft: null }))
+        yield* runtime.returnFromTerminal
+        return yield* runtime.getState
+      })))
+      expect(state.drafts.get(ROOT)).toEqual(empty ? undefined : draft)
+      expect(state.rewindAnchors.has(ROOT)).toBeFalse()
+      expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q"])
+      expect(state.modal).toBeNull()
+    })
+  }
+
+  test("a completed Claude screen triggers completion refresh without an idle title", async () => {
+    const fixture = makeFixture()
+    const observer = new ClaudeTerminalObserver()
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, completionDelaysMs: [0] })
+      yield* runtime.resumeSession(ROOT)
+      const working = observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ Claude Code\u0007"))[0]!
+      yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, working, false))
+      observer.observeScreen({ lines: ["✻ Cogitating… (12s · esc to interrupt)"], cursor: { x: 0, y: 0, visible: false } })
+      fixture.snapshot = snapshot([session(ROOT, "Root"), session(CHILD, "Child")], new Map([
+        [ROOT, [message("q", "user", "question", 0), { ...message("a", "agent", "answer", 1), turnComplete: true }]],
+        [CHILD, [message("cq", "user", "child question", 0)]],
+      ]))
+      const idle = observer.observeScreen({ lines: ["answer", "❯ ", "────────────────"], cursor: { x: 2, y: 1, visible: true } })
+      expect(idle).toBe("idle")
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, idle!, false))
+      return yield* waitForState(runtime, (candidate) => candidate.pendingCompletions.size === 0 && candidate.unviewedSessionIds.has(ROOT))
+    })))
+    expect(selectSessionStatus(state, ROOT)).toBe("unviewed")
+    expect(selectProjectedTranscript(state, ROOT).map((message) => message.id)).toEqual(["q", "a"])
     expect(state.modal).toBeNull()
   })
 
@@ -2380,6 +2793,10 @@ function activity(
   wasActive = false,
 ) {
   return { ownerId, sequenceId, sessionId, activity: value, wasActive } as const
+}
+
+function observation(sequenceId: number, value: TerminalObservation) {
+  return { ownerId: "owner-1", sequenceId, sessionId: ROOT, wasActive: true, observation: value }
 }
 
 function snapshot(

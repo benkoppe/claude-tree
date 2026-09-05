@@ -34,7 +34,6 @@ export function selectProjectedData(state: ApplicationState): ProjectedApplicati
     }
     if (state.local.sessions.has(sessionId) || state.terminals.has(sessionId)) {
       projectedSessions.set(sessionId, session)
-      transcripts.set(sessionId, [])
     }
   }
   return { sessions: projectedSessions, transcripts }

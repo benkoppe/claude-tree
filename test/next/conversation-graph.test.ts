@@ -24,6 +24,96 @@ const CHILD = "child:opaque/id"
 const GRANDCHILD = "grandchild:opaque/id"
 
 describe("next conversation graph", () => {
+  test("rewinding into shared ancestry materializes a separate leaf at the current boundary", () => {
+    const parent = [message("p1", "user", "A", 0), message("p2", "agent", "B", 1),
+      message("p3", "user", "C", 2), message("p4", "agent", "D", 3)]
+    const child = parent.map((entry, index) => ({ ...entry, id: `c${index}` }))
+    const grandchild = child.map((entry, index) => ({ ...entry, id: `g${index}` }))
+    const relations = [relation(CHILD, ROOT, "p4", shared(parent, child, 4)),
+      relation(GRANDCHILD, CHILD, "c3", shared(child, grandchild, 4))]
+    for (const rewoundId of [ROOT, CHILD, GRANDCHILD]) for (const length of [0, 2]) {
+      const graph = buildConversationForest(
+        [session(ROOT, 20), session(CHILD, 10), session(GRANDCHILD, 5)],
+        new Map([[ROOT, rewoundId === ROOT ? parent.slice(0, length) : parent], [CHILD, rewoundId === CHILD ? child.slice(0, length) : child],
+          [GRANDCHILD, rewoundId === GRANDCHILD ? grandchild.slice(0, length) : grandchild]]),
+        relations,
+      ).graphs[0]!
+      const endpoint = graph.nodes.get(graph.endpointBySessionId.get(rewoundId)!)!
+      const boundary = length === 0 ? graph.originNodeId : nodes(graph).find((node) => node.preview === "B")!.id
+      expect(endpoint.parentId).toBe(boundary)
+      if (rewoundId !== ROOT || length > 0) expect(endpoint).toMatchObject({ fork: { empty: true } })
+      expect(layoutConversationGraph(graph, 100).nodes.has(endpoint.id)).toBeTrue()
+      expect(previews(graph)).toEqual(["A", "B", "C", "D"])
+      if (length !== 0) {
+        const first = nodes(graph).find((node) => node.preview === "A")!
+        expect(reachableSessionEndpoints(graph, first.id).find((entry) => entry.endpoint.session.id === rewoundId)?.distance).toBe(2)
+      }
+    }
+  })
+
+  test("distinguishes authoritative empty history from unread and compacted forks", () => {
+    const parent = [message("p1", "user", "A", 0), message("p2", "agent", "B", 1)]
+    const copied = parent.map((entry, index) => ({ ...entry, id: `c${index}` }))
+    const relations = [relation(CHILD, ROOT, "p2", shared(parent, copied, 2))]
+    const histories: Array<readonly AgentMessage[] | undefined> = [
+      undefined,
+      [],
+      [{ ...message("summary", "agent", "summary", 0, false), historyBoundary: "compaction" }],
+    ]
+    for (const history of histories) {
+      const transcripts = new Map<string, readonly AgentMessage[]>([[ROOT, parent]])
+      if (history !== undefined) transcripts.set(CHILD, history)
+      const graph = buildConversationForest([session(ROOT, 20), session(CHILD, 10)], transcripts, relations).graphs[0]!
+      const endpoint = graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)!
+      const source = nodes(graph).find((node) => node.preview === "B")!
+      expect(endpoint.parentId).toBe(history?.length === 0 ? graph.originNodeId : source.id)
+      expect(endpoint).toMatchObject({ fork: { sourceNodeId: source.id, empty: true } })
+      expect(graph.warnings).toEqual([])
+    }
+  })
+
+  test("keeps zero-prefix replays in their family after the parent loses the source", () => {
+    for (const parent of [[], [message("replacement", "user", "replacement", 0)]]) {
+      for (const child of [[], [message("replay", "user", "replay", 0)]]) {
+        const forest = buildConversationForest(
+          [session(ROOT, 20), session(CHILD, 10)],
+          new Map([[ROOT, parent], [CHILD, child]]),
+          [relation(CHILD, ROOT, "abandoned-user", [])],
+        )
+        expect(forest.graphs).toHaveLength(1)
+        expect(forest.warnings).toEqual([])
+        const graph = forest.graphs[0]!
+        expect(forest.graphBySessionId.get(CHILD)).toBe(graph)
+        const first = child.length ? nodes(graph).find((node) => node.preview === "replay")! :
+          graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)!
+        expect(first.parentId).toBe(graph.originNodeId)
+      }
+    }
+  })
+
+  test("places hidden-tail endpoints before retained grouped continuations on every rebuild", () => {
+    const parent = [message("p1", "user", "A", 0), message("p2", "agent", "B", 1, true, "p2"),
+      message("p3", "agent", "C", 2, true, "p2")]
+    const copied = parent.map((entry, index) => ({ ...entry, id: `c${index}`, ...(entry.displayGroupId ? { displayGroupId: "c1" } : {}) }))
+    const relations = [relation(CHILD, ROOT, "p3", shared(parent, copied, 3))]
+    for (const shortenedId of [ROOT, CHILD]) {
+      const histories = new Map([[ROOT, parent], [CHILD, copied]])
+      histories.set(shortenedId, [...histories.get(shortenedId)!.slice(0, 2), message("hidden", "agent", "hidden", 2, false)])
+      const sessions = [session(ROOT, 20), session(CHILD, 10)]
+      const graph = buildConversationForest(sessions, histories, relations).graphs[0]!
+      const boundary = nodes(graph).find((node) => node.preview === "B")!
+      const endpoint = graph.nodes.get(graph.endpointBySessionId.get(shortenedId)!)!
+      expect(endpoint.parentId).toBe(boundary.id)
+      expect(layoutConversationGraph(graph, 100).nodes.has(endpoint.id)).toBeTrue()
+      expect(nodes(graph).find((node) => node.preview === "C")?.parentId).toBe(boundary.id)
+      const restarted = buildConversationForest(sessions, new Map(histories), [...relations]).graphs[0]!
+      expect([...restarted.nodes]).toEqual([...graph.nodes])
+      const removed = buildConversationForest(sessions, histories, relations,
+        [messageRemoval([{ sessionId: ROOT, messageId: "p3" }])]).graphs[0]!
+      expect(removed.endpointBySessionId.has(shortenedId)).toBeTrue()
+    }
+  })
+
   test("collapses remapped prefixes and retains aliases for exact fork boundaries", () => {
     const parent = [
       message("parent:user", "user", "question", 0),
@@ -100,7 +190,7 @@ describe("next conversation graph", () => {
     }))
     const graph = buildConversationForest(
       [session(ROOT, 20), session(CHILD, 10)],
-      new Map([[ROOT, parent], [CHILD, []]]),
+      new Map([[ROOT, parent]]),
       [relation(CHILD, ROOT, parent[1]!.id, shared(parent, copied, 2))],
     ).graphs[0]!
 

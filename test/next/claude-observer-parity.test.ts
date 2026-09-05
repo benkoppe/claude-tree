@@ -35,6 +35,20 @@ test("recognizes Claude's working and idle terminal titles", () => {
   expect(claudeActivityFromTitle("project shell")).toBeUndefined()
 })
 
+test("hidden-cursor rewind capture requires a complete idle composer after confirmation", () => {
+  const observer = new ClaudeTerminalObserver()
+  const encoder = new TextEncoder()
+  const restored = { lines: ["────────────────", "❯ restored", "────────────────"], cursor: { x: 0, y: 0, visible: false } }
+  expect(observer.observeDraft(restored)).toBeUndefined()
+  observer.observeInput(encoder.encode("/rewind\r"))
+  expect(observer.observeDraft(restored)).toBeUndefined()
+  observer.observeScreen({ ...restored, lines: ["Confirm you want to restore the conversation"] })
+  observer.observeInput(encoder.encode("\r"))
+  expect(observer.observeDraft({ ...restored, lines: ["❯ historical text", "────────────────"] })).toBeUndefined()
+  expect(observer.observeDraft({ ...restored, lines: [...restored.lines, "✻ Cogitating… (12s · esc to interrupt)"] })).toBeUndefined()
+  expect(observer.observeDraft(restored)).toEqual({ text: "restored", exact: false, rewind: true, rewindTarget: "restored" })
+})
+
 test("marks a restored composer as a rewind after Claude's undo command", () => {
   const observer = new ClaudeTerminalObserver()
   observer.observeInput(new TextEncoder().encode("/undo\r"))
@@ -117,6 +131,8 @@ test("replaces a captured rewind target after another double-Escape shortcut", (
   observer.observeScreen(firstRestored)
   observer.observeInput(encoder.encode("\u001b\u001b"))
   expect(observer.observeDraft(firstRestored)?.rewind).toBeUndefined()
+  observer.observeScreen({ ...firstRestored, lines: ["Rewind conversation to a message"] })
+  observer.observeInput(encoder.encode("\r"))
 
   const secondRestored = {
     ...firstRestored,
@@ -215,6 +231,8 @@ test("recognizes rewind commands around terminal control sequences", () => {
   const encoder = new TextEncoder()
   observer.observeInput(encoder.encode("\u001b[I"))
   observer.observeInput(encoder.encode("discarded\u0015/rewind\r"))
+  observer.observeScreen({ lines: ["Rewind conversation to a message"], cursor: { x: 0, y: 0, visible: false } })
+  observer.observeInput(encoder.encode("\r"))
 
   expect(observer.observeDraft({
     lines: ["❯ restored", "────────────────"],
@@ -227,6 +245,9 @@ test("recognizes batched and CSI-u double-Escape rewind shortcuts", () => {
   for (const input of ["\u001b\u001b", "\u001b[27u\u001b[27u"]) {
     const observer = new ClaudeTerminalObserver()
     observer.observeInput(encoder.encode(input))
+    expect(observer.observeDraft({ lines: ["❯ ordinary", "────────────────"], cursor: { x: 2, y: 0, visible: true } })?.rewind).toBeUndefined()
+    observer.observeScreen({ lines: ["Rewind conversation to a message"], cursor: { x: 0, y: 0, visible: false } })
+    observer.observeInput(encoder.encode("\r"))
     expect(observer.observeDraft({
       lines: ["❯ restored", "────────────────"],
       cursor: { x: 10, y: 0, visible: true },
@@ -243,6 +264,103 @@ test("does not mark an ordinary Claude draft as a rewind", () => {
   })).toEqual({ text: "ordinary draft", exact: false })
 })
 
+test("distinguishes an unknown screen from a known empty composer", () => {
+  const observer = new ClaudeTerminalObserver()
+  expect(observer.observeDraft({ lines: ["output"], cursor: { x: 0, y: 0, visible: false } })).toBeUndefined()
+  expect(observer.observeDraft({ lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } })).toBeNull()
+})
+
+for (const choice of ["Restore code", "Restore files only", "Never mind"]) {
+  test(`${choice} and confirmation redraws do not create a conversation rewind`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const confirmation = {
+      lines: ["│ Confirm you want to restore the conversation │", `│ ❯ ${choice} │`],
+      cursor: { x: 0, y: 1, visible: false },
+    }
+    observer.observeScreen(confirmation)
+    observer.observeInput(new TextEncoder().encode("\r"))
+    observer.observeScreen(confirmation)
+    const composer = { lines: ["❯ unchanged", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
+    observer.observeScreen(composer)
+    expect(observer.observeDraft(composer)).toEqual({ text: "unchanged", exact: false })
+  })
+}
+
+test("tracks a bare-Enter restored submission and its next cancelled send", () => {
+  const observer = new ClaudeTerminalObserver()
+  const encoder = new TextEncoder()
+  observer.observeScreen({ lines: ["Confirm you want to restore the conversation", "❯ Restore conversation"], cursor: { x: 0, y: 1, visible: false } })
+  observer.observeInput(encoder.encode("\r"))
+  const restored = { lines: ["❯ restored", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
+  observer.observeScreen(restored)
+  expect(observer.observeInput(encoder.encode("\r"))).toEqual({ _tag: "Submission", text: "restored" })
+  observer.observeScreen({ lines: ["✻ Cogitating… (12s · esc to interrupt)"], cursor: { x: 0, y: 0, visible: false } })
+  observer.observeInput(encoder.encode("\u001b"))
+  observer.observeScreen(restored)
+  expect(observer.observeDraft(restored)).toEqual({ text: "restored", exact: false, rewind: true, rewindTarget: "restored" })
+})
+
+test("paste newlines are not submissions and CSI-u Enter submits the full composer", () => {
+  const observer = new ClaudeTerminalObserver()
+  const encoder = new TextEncoder()
+  expect(observer.observeInput(encoder.encode("\u001b[200~first\nsecond\u001b[201~"))).toBeUndefined()
+  expect(observer.observeInput(encoder.encode("\u001b[13u"))).toEqual({ _tag: "Submission", text: "first\nsecond" })
+})
+
+test("submission without observed text does not invent a draft payload", () => {
+  expect(new ClaudeTerminalObserver().observeInput(new TextEncoder().encode("\r"))).toEqual({ _tag: "Submission" })
+})
+
+test("completed hidden-cursor resubmissions return unknown or empty, never the submitted rewind draft", () => {
+  const observer = new ClaudeTerminalObserver()
+  const encoder = new TextEncoder()
+  observer.observeScreen({ lines: ["Confirm you want to restore the conversation"], cursor: { x: 0, y: 0, visible: false } })
+  observer.observeInput(encoder.encode("\r"))
+  const restored = { lines: ["────────────────", "❯ restored", "────────────────"], cursor: { x: 0, y: 0, visible: false } }
+  observer.observeScreen(restored)
+  expect(observer.observeDraft(restored)?.rewind).toBeTrue()
+  expect(observer.observeInput(encoder.encode("\r"))).toEqual({ _tag: "Submission", text: "restored" })
+  expect(observer.observeDraft(restored)).toBeUndefined()
+  observer.observeOutput(encoder.encode("\u001b]0;⠋ Claude Code\u0007\u001b]0;✳ Claude Code\u0007"))
+  expect(observer.observeDraft(restored)).toBeUndefined()
+  const empty = { ...restored, lines: ["────────────────", "❯ ", "────────────────"] }
+  observer.observeScreen(empty)
+  expect(observer.observeDraft(empty)).toBeUndefined()
+  expect(observer.observeDraft({ ...empty, cursor: { x: 2, y: 1, visible: true } })).toBeNull()
+})
+
+test("repeated pre-input snapshots do not erase unpainted composer edits", () => {
+  const observer = new ClaudeTerminalObserver()
+  const encoder = new TextEncoder()
+  const screen = { lines: ["❯ restored", "────────────────"], cursor: { x: 10, y: 0, visible: true } }
+  observer.observeDraft(screen)
+  observer.observeInput(encoder.encode(" first"))
+  observer.observeDraft(screen)
+  observer.observeInput(encoder.encode(" second"))
+  observer.observeDraft(screen)
+  expect(observer.observeInput(encoder.encode("\r"))).toEqual({ _tag: "Submission", text: "restored first second" })
+})
+
+test("an unchanged pre-Escape composer is not proof of a cancelled send", () => {
+  const observer = new ClaudeTerminalObserver()
+  const encoder = new TextEncoder()
+  const screen = { lines: ["❯ prompt", "────────────────"], cursor: { x: 8, y: 0, visible: true } }
+  observer.observeScreen(screen)
+  observer.observeInput(encoder.encode("\r"))
+  observer.observeInput(encoder.encode("\u001b"))
+  observer.observeScreen(screen)
+  expect(observer.observeDraft(screen)?.rewind).toBeUndefined()
+})
+
+test("an empty confirmed composer cannot make a later ordinary edit a rewind", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeScreen({ lines: ["Confirm you want to restore the conversation"], cursor: { x: 0, y: 0, visible: false } })
+  observer.observeInput(new TextEncoder().encode("\r"))
+  const screen = { lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
+  expect(observer.observeDraft(screen)).toBeNull()
+  expect(observer.observeDraft({ ...screen, lines: ["❯ ordinary", "────────────────"] })?.rewind).toBeUndefined()
+})
+
 test("does not let a stale composer override working title activity", () => {
   const observer = new ClaudeTerminalObserver()
   expect(
@@ -254,6 +372,24 @@ test("does not let a stale composer override working title activity", () => {
       cursor: { x: 2, y: 0, visible: true },
     }),
   ).toBeUndefined()
+})
+
+test("a completed screen clears Working even when Claude never sends an idle title", () => {
+  const observer = new ClaudeTerminalObserver()
+  const stale = { lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
+  observer.observeScreen(stale)
+  observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ Claude Code\u0007"))
+  expect(observer.observeScreen(stale)).toBeUndefined()
+  const completed = { ...stale, lines: ["Finished the requested change.", "❯ ", "────────────────"], cursor: { x: 2, y: 1, visible: true } }
+  expect(observer.observeScreen(completed)).toBe("idle")
+  expect(observer.observeScreen(completed)).toBe("idle")
+})
+
+test("a working footer followed by a composer clears a pinned working title", () => {
+  const observer = new ClaudeTerminalObserver()
+  observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ Claude Code\u0007"))
+  expect(observer.observeScreen({ lines: ["✻ Cogitating… (12s · esc to interrupt)"], cursor: { x: 0, y: 0, visible: false } })).toBe("working")
+  expect(observer.observeScreen({ lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } })).toBe("idle")
 })
 
 test("does not let a stale working footer above the live composer override idle activity", () => {

@@ -219,6 +219,7 @@ export function makeTerminalEventBridge(): TerminalEventBridge {
     events: {
       onProcessExited: (event) => forward((events) => events.onProcessExited?.(event)),
       onActivityChanged: (event) => forward((events) => events.onActivityChanged?.(event)),
+      onObservation: (event) => forward((events) => events.onObservation?.(event)),
       onSessionChanged: (event) => forward((events) => events.onSessionChanged?.(event)),
       onSessionTransitionError: (event) =>
         forward((events) => events.onSessionTransitionError?.(event)),

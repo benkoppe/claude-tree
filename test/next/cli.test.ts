@@ -64,8 +64,13 @@ test("terminal callback bridge preserves events emitted during runtime startup",
     activity: "working",
     wasActive: true,
   })
+  bridge.events.onObservation?.({
+    ownerId: "owner-startup", sequenceId: 2, sessionId: "startup", wasActive: true,
+    observation: { _tag: "Submission", text: "replacement" },
+  })
   bridge.bind({
     onActivityChanged: (event) => observed.push(`${event.sessionId}:${event.activity}`),
+    onObservation: (event) => observed.push(`${event.sessionId}:${event.observation._tag}`),
   })
   bridge.events.onActivityChanged?.({
     ownerId: "owner-running",
@@ -75,7 +80,11 @@ test("terminal callback bridge preserves events emitted during runtime startup",
     wasActive: false,
   } satisfies TerminalActivityEvent)
 
-  expect(observed).toEqual(["startup:working", "running:idle"])
+  bridge.events.onObservation?.({
+    ownerId: "owner-running", sequenceId: 2, sessionId: "running", wasActive: false,
+    observation: { _tag: "Draft", draft: null },
+  })
+  expect(observed).toEqual(["startup:working", "startup:Submission", "running:idle", "running:Draft"])
   expect(() => bridge.bind({})).toThrow("already bound")
 })
 
