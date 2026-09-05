@@ -6,6 +6,7 @@ import {
   projectApplicationViewModel,
   reduceApplicationState,
   selectProjectedTranscript,
+  selectConversationForest,
   selectSessionStatus,
   type ActiveRefresh,
   type ApplicationState,
@@ -20,6 +21,24 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
+  test("reuses the forest for UI-only changes but invalidates every graph input", () => {
+    const state = loadedState()
+    const forest = selectConversationForest(state)
+    const refreshing = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: activeRefresh("refresh:full", 1, "manual", "full") })
+    expect(selectConversationForest(refreshing)).toBe(forest)
+    expect(selectConversationForest({ ...refreshing, modal: { _tag: "About" } })).toBe(forest)
+    for (const changed of [
+      { ...state, provider: { ...state.provider } },
+      { ...state, local: { ...state.local } },
+      { ...state, terminals: new Map(state.terminals) },
+      { ...state, rewindAnchors: new Map(state.rewindAnchors) },
+      { ...state, relations: [...state.relations] },
+      { ...state, removals: [...state.removals] },
+    ]) {
+      const before = selectConversationForest(state)
+      expect(selectConversationForest(changed)).not.toBe(before)
+    }
+  })
   const original = [message("q", "user", "question", 0), message("a", "agent", "answer", 1), message("q2", "user", "later", 2)]
   function readReplacement(state: ApplicationState, messages: readonly AgentMessage[]): ApplicationState {
     const refresh = activeRefresh("refresh:full", state.refresh.generation + 1, "manual", "full")

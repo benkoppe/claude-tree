@@ -53,6 +53,45 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  test("forks a 10,000-message tree while refresh is stalled and preserves the child after the late snapshot", async () => {
+    const fixture = makeFixture()
+    const messages = Array.from({ length: 10_000 }, (_, index) => message(`m${index}`, index % 2 ? "agent" : "user", `message ${index}`, index))
+    fixture.snapshot = snapshot([session(ROOT, "Large tree")], new Map([[ROOT, messages]]))
+    const child = prepared("large-fork", "Large fork")
+    fixture.branchOutcome = {
+      _tag: "ValidatedBranch", ...child,
+      derivation: {
+        parentSessionId: ROOT, childSessionId: child.session.id, sourceMessageId: "m9999",
+        sharedMessages: messages.map((item, index) => ({ parentMessageId: item.id, childMessageId: `copy${index}` })),
+      },
+    }
+    const started = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      fixture.fullSnapshot = () => Effect.gen(function*() {
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+        return fixture.snapshot
+      })
+      const refresh = yield* Effect.forkScoped(runtime.refresh())
+      yield* Deferred.await(started)
+      yield* runtime.branchFrom({ sessionId: ROOT, messageId: "m9999" })
+      const during = yield* runtime.getState
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(refresh)
+      yield* runtime.returnFromTerminal
+      const view = yield* runtime.getViewModel
+      return { during, after: yield* runtime.getState, view }
+    })))
+    expect(result.during.refresh.active.size).toBe(1)
+    expect(result.after.terminals.has(child.session.id)).toBeTrue()
+    expect(result.after.relations).toHaveLength(1)
+    expect(result.view.surface._tag).toBe("Graph")
+    expect(fixture.calls.filter((call) => call === `show:${child.session.id}`)).toHaveLength(1)
+  })
+
   test("a provider-interrupted fork settles its caller and leaves later actor requests usable", async () => {
     const fixture = makeFixture()
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {

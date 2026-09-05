@@ -435,12 +435,37 @@ export function reachableSessionEndpoints(
       queue.push({ nodeId: childId, distance: current.distance + 1 })
     }
   }
-  return endpoints.sort(
-    (left, right) =>
-      left.distance - right.distance ||
-      right.endpoint.session.lastModified - left.endpoint.session.lastModified ||
-      left.endpoint.session.id.localeCompare(right.endpoint.session.id),
-  )
+  return endpoints.sort(compareReachableEndpoints)
+}
+
+/** Index all endpoint ancestry in output-sized work, without scanning each subtree. */
+export function indexReachableSessionEndpoints(
+  graph: ConversationGraph,
+): ReadonlyMap<string, readonly ReachableSessionEndpoint[]> {
+  const index = new Map<string, ReachableSessionEndpoint[]>()
+  for (const endpoint of graph.nodes.values()) {
+    if (endpoint.kind !== "endpoint") continue
+    let node: ConversationGraphNode | undefined = endpoint
+    let distance = 0
+    const visited = new Set<string>()
+    while (node && node.kind !== "origin" && !visited.has(node.id)) {
+      if (distance > 0 && node.kind === "endpoint") break
+      visited.add(node.id)
+      const entries = index.get(node.id) ?? []
+      entries.push({ endpoint, distance })
+      index.set(node.id, entries)
+      distance += 1
+      node = node.parentId === null ? undefined : graph.nodes.get(node.parentId)
+    }
+  }
+  for (const entries of index.values()) entries.sort(compareReachableEndpoints)
+  return index
+}
+
+function compareReachableEndpoints(left: ReachableSessionEndpoint, right: ReachableSessionEndpoint): number {
+  return left.distance - right.distance ||
+    right.endpoint.session.lastModified - left.endpoint.session.lastModified ||
+    left.endpoint.session.id.localeCompare(right.endpoint.session.id)
 }
 
 function appendRootSession(

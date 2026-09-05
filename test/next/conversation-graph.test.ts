@@ -5,6 +5,7 @@ import {
   type ConversationGraph,
   type MessageGraphNode,
   reachableSessionEndpoints,
+  indexReachableSessionEndpoints,
   resolveForkTarget,
 } from "../../src/domain/conversation-graph"
 import {
@@ -178,6 +179,10 @@ describe("next conversation graph", () => {
     ).graphs[0]!
 
     expect(previews(graph)).toEqual(["root", "old path", "retained tail"])
+    const endpointIndex = indexReachableSessionEndpoints(graph)
+    for (const node of graph.nodes.values()) {
+      expect(endpointIndex.get(node.id) ?? []).toEqual(reachableSessionEndpoints(graph, node.id))
+    }
     expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(graph.rootNodeId)
     expect(nodes(graph).find((node) => node.preview === "old path")?.aliases).toContainEqual({
       sessionId: CHILD,
@@ -374,6 +379,8 @@ describe("next conversation graph", () => {
     const layout = layoutConversationGraph(graph, 100)
 
     expect(nodes(graph)).toHaveLength(10_000)
+    const endpointIndex = indexReachableSessionEndpoints(graph)
+    expect(endpointIndex.get(graph.rootNodeId)).toEqual(reachableSessionEndpoints(graph, graph.rootNodeId))
     expect(layout.nodes.size).toBe(10_000)
     expect(layout.nodes.get(graph.rootNodeId)).toMatchObject({ x: 0, y: 0 })
     expect(layout.worldHeight).toBe(39_998)
