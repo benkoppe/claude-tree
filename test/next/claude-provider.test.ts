@@ -1097,6 +1097,37 @@ describe("Claude terminal observer", () => {
     expect(observer.observeDraft(screen)?.rewind).toBeUndefined()
   })
 
+  for (const open of ["/rewind\r", "\u001b\u001b", ""]) {
+    test(`captures the restored prompt after the native two-stage rewind picker (${JSON.stringify(open)})`, () => {
+      const observer = new ClaudeTerminalObserver()
+      const encoder = new TextEncoder()
+      const composer = (text: string) => ({ lines: [`❯ ${text}`, "────────────────"], cursor: { x: 4, y: 0, visible: true } })
+      // A previous cancel/rewind target must not survive a new picker selection.
+      observer.observeInput(encoder.encode("/undo\r"))
+      observer.observeDraft(composer("old target"))
+      observer.observeInput(encoder.encode(open))
+      const picker = { lines: ["Rewind", "Restore the code and/or conversation to the point before…", "❯ earlier prompt"], cursor: { x: 0, y: 2, visible: false } }
+      observer.observeScreen(picker)
+      expect(observer.observeDraft(picker)).toBeUndefined()
+      observer.observeInput(encoder.encode("\r"))
+      const confirmation = { ...picker, lines: ["Rewind", "Confirm you want to restore the conversation to the point before you sent this message:", "❯ Restore conversation", "  Never mind"] }
+      observer.observeScreen(confirmation)
+      expect(observer.observeDraft(confirmation)).toBeUndefined()
+      observer.observeInput(encoder.encode("\r"))
+      // Claude redraws the confirmation while the restore is in flight.
+      observer.observeScreen(confirmation)
+      observer.observeScreen(confirmation)
+      observer.observeScreen(composer("earlier prompt"))
+      expect(observer.observeDraft(composer("earlier prompt"))).toEqual({ text: "earlier prompt", exact: false, rewind: true, rewindTarget: "earlier prompt" })
+      observer.observeScreen(picker)
+      observer.observeInput(encoder.encode("\r"))
+      observer.observeScreen(confirmation)
+      observer.observeInput(encoder.encode("\u001b"))
+      observer.observeScreen(composer("earlier prompt"))
+      expect(observer.observeDraft(composer("earlier prompt"))?.rewind).toBeUndefined()
+    })
+  }
+
   test("prioritizes visible blockers and tracks rewind drafts", () => {
     const observer = new ClaudeTerminalObserver()
     observer.observeInput(new TextEncoder().encode("/undo\r"))

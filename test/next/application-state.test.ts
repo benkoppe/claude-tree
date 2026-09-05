@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 
 import {
   available,
@@ -419,6 +420,28 @@ describe("application state reducer", () => {
       expect(state.pendingCompletions.size).toBe(1)
     })
   }
+
+  test("a native rewind picker projects its selected boundary even while provider reads retain the old tail", () => {
+    const observer = new ClaudeTerminalObserver()
+    const encoder = new TextEncoder()
+    const transcript = [message("q1", "user", "first", 0), message("a1", "agent", "answer", 1),
+      message("q2", "user", "restore here", 2), message("a2", "agent", "discarded answer", 3)]
+    let state = loadedState(transcript)
+    observer.observeInput(encoder.encode("/rewind\r"))
+    observer.observeScreen({ lines: ["│ Rewind │", "│ Restore and fork the conversation to the point before… │"], cursor: { x: 0, y: 0, visible: false } })
+    observer.observeInput(encoder.encode("\r"))
+    observer.observeScreen({ lines: ["│ Confirm you want to restore the conversation │", "│ to the point before you sent this message: │"], cursor: { x: 0, y: 0, visible: false } })
+    observer.observeInput(encoder.encode("\r"))
+    observer.observeScreen({ lines: ["Confirm you want to restore the conversation", "❯ Restore conversation"], cursor: { x: 0, y: 1, visible: false } })
+    const restored = { lines: ["❯ restore here", "────────────────"], cursor: { x: 5, y: 0, visible: true } }
+    observer.observeScreen(restored)
+    const draft = observer.observeDraft(restored)!
+    expect(draft.rewind).toBeTrue()
+    state = reduceApplicationState(state, { _tag: "TerminalDraftObserved", sessionId: ROOT, draft })
+    expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q1", "a1"])
+    state = readReplacement(state, transcript)
+    expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q1", "a1"])
+  })
 
   test("projects rewinds immediately and clears them after provider confirmation", () => {
     const transcript = [
