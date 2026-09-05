@@ -2,6 +2,9 @@ import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { Effect } from "effect"
+import { ClaudeProvider } from "../src/infrastructure/providers/claude/provider"
+import { buildConversationForest } from "../src/domain/conversation-graph"
 
 import {
   forkSession,
@@ -207,6 +210,60 @@ test("the pinned SDK preserves provenance when compaction shortens a fork's acti
     return forkedFrom?.sessionId === sessionId && typeof forkedFrom.messageUuid === "string"
   })).toBeTrue()
 })
+
+for (const preservation of ["preservedSegment", "preservedMessages"] as const) {
+  test(`the provider forks and attaches SDK history reordered by ${preservation}`, async () => {
+    const store = new InMemorySessionStore()
+    const sessionId = crypto.randomUUID()
+    const projectKey = process.cwd().replaceAll("/", "-")
+    const ids: string[] = Array.from({ length: 8 }, () => crypto.randomUUID())
+    const timestamp = "2026-08-30T12:00:00.000Z"
+    await store.append({ projectKey, sessionId }, [
+      userEntry(sessionId, ids[0]!, null, "old question", timestamp),
+      agentEntry(sessionId, ids[1]!, ids[0]!, "old answer", timestamp),
+      userEntry(sessionId, ids[2]!, ids[1]!, "preserved question", timestamp),
+      agentEntry(sessionId, ids[3]!, ids[2]!, "preserved answer", timestamp),
+      {
+        type: "system", subtype: "compact_boundary", uuid: ids[4]!,
+        sessionId, parentUuid: null, timestamp,
+        compactMetadata: preservation === "preservedSegment"
+          ? { preservedSegment: { headUuid: ids[2], tailUuid: ids[3], anchorUuid: ids[5] } }
+          : { preservedMessages: { uuids: [ids[2], ids[3]], anchorUuid: ids[5] } },
+      },
+      userEntry(sessionId, ids[5]!, ids[4]!, "compaction summary", timestamp),
+      userEntry(sessionId, ids[6]!, ids[5]!, "continue", timestamp),
+      agentEntry(sessionId, ids[7]!, ids[6]!, "latest answer", timestamp),
+    ])
+    let forkCalls = 0
+    const provider = new ClaudeProvider(process.cwd(), { sdk: {
+      async listSessions() { return [] },
+      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      forkSession: (id, options) => {
+        forkCalls += 1
+        return forkSession(id, { ...options, sessionStore: store })
+      },
+      async importSessionToStore(id, target) {
+        await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
+      },
+    } }, { forkValidationRetryDelaysMs: [] })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId, messageId: ids[7]! }))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    expect(forkCalls).toBe(1)
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(outcome.derivation.sharedMessages.map((pair) => ids.indexOf(pair.parentMessageId))).toEqual([5, 2, 3, 6, 7])
+    const reads = await Effect.runPromise(provider.readTranscripts([sessionId, outcome.session.id]))
+    const parent = reads.get(sessionId)!
+    const child = reads.get(outcome.session.id)!
+    if (parent._tag !== "Available" || child._tag !== "Available") throw new Error("Missing transcript")
+    const forest = buildConversationForest(
+      [{ id: sessionId, title: "Parent", lastModified: 0 }, outcome.session],
+      new Map([[sessionId, parent.messages], [outcome.session.id, child.messages]]),
+      [{ ...outcome.derivation, createdAt: timestamp }],
+    )
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.graphs[0]!.warnings).toEqual([])
+  })
+}
 
 test("the Claude provider validates SDK-imported source and child records", async () => {
   const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-")))

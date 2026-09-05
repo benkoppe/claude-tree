@@ -372,6 +372,32 @@ describe("Effect Claude provider", () => {
     ])
   })
 
+  test("validates physical records omitted from both compacted active transcripts", async () => {
+    const physicalParent = [
+      message(ROOT, "old", "user", "old history"),
+      message(ROOT, "preserved", "assistant", "preserved answer"),
+      message(ROOT, "summary", "user", "summary"),
+      message(ROOT, "latest", "assistant", "latest answer"),
+    ]
+    const activeParent = [physicalParent[2]!, physicalParent[1]!, physicalParent[3]!]
+    const copied = physicalParent.map((entry, index) => copyMessage(entry, CHILD, `child-${index}`))
+    const provider = providerWith({
+      messages: { [ROOT]: activeParent, [CHILD]: [copied[2]!, copied[3]!] },
+      physical: {
+        [ROOT]: physicalParent,
+        [CHILD]: copied.map((entry, index) => copiedRecord(
+          index === 0 ? { ...entry, message: { content: "tampered hidden history" } } : entry,
+          ROOT,
+          physicalParent[index]!.uuid,
+        )),
+      },
+    })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "latest" }))
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected independent child")
+    expect(outcome.reason).toContain("physical copied prefix does not exactly match")
+  })
+
   test("uses cached parent metadata for the initial PreparedTerminal fork title", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     const copied = [copyMessage(parent[0]!, CHILD, "child-1")]
