@@ -245,6 +245,11 @@ export class ClaudeProvider implements AgentProviderApi {
     return Effect.all(
       unique(sessionIds).map((sessionId) =>
         this.readClaudeTranscript(sessionId, "readTranscripts", deadline).pipe(
+          Effect.flatMap((messages) => messages === undefined || messages.length === 0
+            ? Effect.succeed(messages)
+            : this.readSessionEntries(sessionId, "readTranscripts", deadline).pipe(
+              Effect.map((entries) => markCompactionSummaries(messages, entries)),
+            )),
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
               sessionId,
@@ -752,6 +757,23 @@ export class ClaudeProvider implements AgentProviderApi {
     operation: string,
     deadline: OperationDeadline,
   ): Effect.Effect<readonly ConversationRecord[], ProviderError | ProviderProtocolError> {
+    return this.readSessionEntries(sessionId, operation, deadline).pipe(
+      Effect.flatMap((entries) => Effect.try({
+        try: () => normalizeConversationRecords(entries),
+        catch: (cause) => this.protocolError(
+          operation,
+          `Claude returned invalid physical transcript records for session ${sessionId}`,
+          cause,
+        ),
+      })),
+    )
+  }
+
+  private readSessionEntries(
+    sessionId: string,
+    operation: string,
+    deadline: OperationDeadline,
+  ): Effect.Effect<readonly SessionStoreEntry[], ProviderError | ProviderProtocolError> {
     const entries: SessionStoreEntry[] = []
     const store: SessionStore = {
       async append(key, batch) {
@@ -769,16 +791,7 @@ export class ClaudeProvider implements AgentProviderApi {
       }),
       this.provenanceImportTimeoutMs,
       deadline,
-    ).pipe(
-      Effect.flatMap(() => Effect.try({
-        try: () => normalizeConversationRecords(entries),
-        catch: (cause) => this.protocolError(
-          operation,
-          `Claude returned invalid physical transcript records for session ${sessionId}`,
-          cause,
-        ),
-      })),
-    )
+    ).pipe(Effect.as(entries))
   }
 
   private acquireLaunch(
@@ -1031,6 +1044,19 @@ function normalizeTranscript(
       ...(replayText === undefined ? {} : { replayText }),
     }
   })
+}
+
+function markCompactionSummaries(
+  messages: readonly ClaudeMessage[],
+  entries: readonly SessionStoreEntry[],
+): readonly ClaudeMessage[] {
+  const boundaries = new Set(entries.filter((entry) => entry.type === "system" && entry.subtype === "compact_boundary").map((entry) => entry.uuid))
+  const summaryIds = new Set(entries.filter((entry) => entry.type === "user" &&
+    (entry.isCompactSummary === true || (typeof entry.parentUuid === "string" && boundaries.has(entry.parentUuid))))
+    .map((entry) => entry.uuid))
+  return messages.map((message) => summaryIds.has(message.id)
+    ? { ...message, visible: false, historyBoundary: "compaction" as const }
+    : message)
 }
 
 function normalizeConversationRecords(entries: readonly SessionStoreEntry[]): readonly ConversationRecord[] {

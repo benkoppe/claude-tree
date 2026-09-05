@@ -17,6 +17,8 @@ export interface AgentMessage {
   readonly displayGroupId?: string
   readonly turnComplete?: boolean
   readonly copyIdentity?: string
+  /** Provider-confirmed context compaction, not a user rewind or new prompt. */
+  readonly historyBoundary?: "compaction"
 }
 
 export interface MessageRef {

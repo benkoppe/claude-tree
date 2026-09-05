@@ -265,6 +265,72 @@ for (const preservation of ["preservedSegment", "preservedMessages"] as const) {
   })
 }
 
+for (const preserveShared of [false, true]) {
+  test(`compacting an existing fork preserves its attachment (preserved shared history: ${preserveShared})`, async () => {
+    const store = new InMemorySessionStore()
+    const sessionId = crypto.randomUUID()
+    const projectKey = process.cwd().replaceAll("/", "-")
+    const timestamp = "2026-09-05T12:00:00.000Z"
+    const question = crypto.randomUUID(), source = crypto.randomUUID()
+    await store.append({ projectKey, sessionId }, [
+      userEntry(sessionId, question, null, "original question", timestamp),
+      agentEntry(sessionId, source, question, "fork source", timestamp),
+    ])
+    const makeProvider = () => new ClaudeProvider(process.cwd(), { sdk: {
+      async listSessions() { return [] },
+      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      forkSession: (id, options) => forkSession(id, { ...options, sessionStore: store }),
+      async importSessionToStore(id, target) {
+        await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
+      },
+    } })
+    const fork = await Effect.runPromise(makeProvider().branchFrom({ sessionId, messageId: source }))
+    if (fork._tag !== "ValidatedBranch") throw new Error(fork.reason)
+    const childId = fork.session.id
+    const boundary = crypto.randomUUID(), summary = crypto.randomUUID(), continuation = crypto.randomUUID()
+    await store.append({ projectKey, sessionId: childId }, [
+      {
+        type: "system", subtype: "compact_boundary", uuid: boundary, parentUuid: null, sessionId: childId, timestamp,
+        compactMetadata: preserveShared ? { preservedMessages: {
+          anchorUuid: summary, uuids: fork.derivation.sharedMessages.map((pair) => pair.childMessageId),
+        } } : {},
+      },
+      { ...userEntry(childId, summary, boundary, "compressed context", timestamp), isCompactSummary: true },
+      agentEntry(childId, continuation, summary, "continue after compaction", timestamp),
+    ])
+    // A fresh provider must reconstruct the same attachment without cached pre-compaction text.
+    const reads = await Effect.runPromise(makeProvider().readTranscripts([sessionId, childId]))
+    const transcripts = new Map([...reads].map(([id, read]) => {
+      if (read._tag !== "Available") throw new Error(`Unavailable ${id}`)
+      return [id, read.messages] as const
+    }))
+    expect(transcripts.get(childId)?.find((item) => item.id === summary)).toMatchObject({ visible: false, historyBoundary: "compaction" })
+    const forest = buildConversationForest(
+      [{ id: sessionId, title: "Parent", lastModified: 0 }, fork.session], transcripts,
+      [{ ...fork.derivation, createdAt: timestamp }],
+    )
+    expect(forest.graphs).toHaveLength(1)
+    expect(forest.warnings).toEqual([])
+    const graph = forest.graphs[0]!
+    const sourceNode = [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.sessionId === sessionId && alias.messageId === source))!
+    const continued = [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.messageId === continuation))!
+    expect(continued.parentId).toBe(sourceNode.id)
+    const nextFork = await Effect.runPromise(makeProvider().branchFrom({ sessionId: childId, messageId: continuation }))
+    if (nextFork._tag !== "ValidatedBranch") throw new Error(nextFork.reason)
+    const nextReads = await Effect.runPromise(makeProvider().readTranscripts([sessionId, childId, nextFork.session.id]))
+    const nextTranscripts = new Map([...nextReads].map(([id, read]) => {
+      if (read._tag !== "Available") throw new Error(`Unavailable ${id}`)
+      return [id, read.messages] as const
+    }))
+    const nextForest = buildConversationForest(
+      [{ id: sessionId, title: "Parent", lastModified: 0 }, fork.session, nextFork.session], nextTranscripts,
+      [fork.derivation, nextFork.derivation].map((derivation) => ({ ...derivation, createdAt: timestamp })),
+    )
+    expect(nextForest.graphs).toHaveLength(1)
+    expect(nextForest.warnings).toEqual([])
+  })
+}
+
 test("the Claude provider validates SDK-imported source and child records", async () => {
   const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-sdk-provenance-")))
   const projectDir = join(configDir, "project")
