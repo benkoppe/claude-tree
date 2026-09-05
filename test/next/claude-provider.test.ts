@@ -1075,6 +1075,28 @@ describe("Claude terminal observer", () => {
     ))).toEqual(["working", "idle"])
   })
 
+  test("a cancelled send restored to the composer overrides a stale working title", () => {
+    const observer = new ClaudeTerminalObserver()
+    const encoder = new TextEncoder()
+    observer.observeInput(encoder.encode("undo me\r"))
+    observer.observeOutput(encoder.encode("\u001b]0;⠋ Claude\u0007"))
+    observer.observeInput(encoder.encode("\u001b"))
+    const restored = { lines: ["❯ undo me", "────────────────"], cursor: { x: 9, y: 0, visible: true } }
+    expect(observer.observeScreen(restored)).toBe("idle")
+    expect(observer.observeDraft(restored)).toEqual({ text: "undo me", exact: false, rewind: true, rewindTarget: "undo me" })
+    observer.observeInput(encoder.encode("\r"))
+    expect(observer.observeDraft(restored)?.submitted).toBeTrue()
+  })
+
+  test("Escape alone does not classify a different composer draft as an undone send", () => {
+    const observer = new ClaudeTerminalObserver()
+    const encoder = new TextEncoder()
+    observer.observeInput(encoder.encode("submitted\r"))
+    observer.observeInput(encoder.encode("\u001b"))
+    const screen = { lines: ["❯ unrelated draft", "────────────────"], cursor: { x: 9, y: 0, visible: true } }
+    expect(observer.observeDraft(screen)?.rewind).toBeUndefined()
+  })
+
   test("prioritizes visible blockers and tracks rewind drafts", () => {
     const observer = new ClaudeTerminalObserver()
     observer.observeInput(new TextEncoder().encode("/undo\r"))

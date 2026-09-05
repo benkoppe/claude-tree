@@ -18,6 +18,8 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   private rewindSubmitted = false
   private rewindWorkingSeen = false
   private lastStandaloneEscapeAt = 0
+  private lastSubmittedPrompt: string | undefined
+  private cancelledPrompt: string | undefined
 
   observeInput(bytes: Uint8Array): void {
     const data = Buffer.from(bytes).toString("utf8")
@@ -37,6 +39,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
 
     const escapeCount = standaloneEscapeCount(data)
     if (escapeCount > 0) {
+      this.cancelledPrompt = this.lastSubmittedPrompt
       const now = Date.now()
       if (escapeCount >= 2 || now - this.lastStandaloneEscapeAt <= 500) {
         this.armRewind()
@@ -48,6 +51,10 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     this.lastStandaloneEscapeAt = 0
 
     const submissions = this.observeComposerSubmissions(data)
+    if (submissions.length > 0) {
+      this.lastSubmittedPrompt = submissions.at(-1) || undefined
+      this.cancelledPrompt = undefined
+    }
     if (this.rewindPhase === "captured") {
       if (submissions.some(isRewindCommand)) {
         this.armRewind()
@@ -75,6 +82,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   }
 
   observeScreen(screen: TerminalScreen): AgentActivity | undefined {
+    this.captureCancelledPrompt(screen)
     const rewindMenuVisible = isClaudeRewindPicker(screen)
     if (rewindMenuVisible && (this.rewindPhase === "armed" || this.rewindPhase === "picker")) {
       this.rewindPhase = "picker"
@@ -94,6 +102,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     }
     const activity = observeClaudeActivity(screen)
     if (activity === "blocked" || activity === "working") return activity
+    if (activity === "idle" && this.rewindPhase === "captured" && !this.rewindSubmitted) return "idle"
     if (activity !== undefined && this.titleActivity !== undefined && activity !== this.titleActivity) {
       return undefined
     }
@@ -127,6 +136,18 @@ export class ClaudeTerminalObserver implements TerminalObserver {
               }
             : {}),
         }
+  }
+
+  private captureCancelledPrompt(screen: TerminalScreen): void {
+    if (this.cancelledPrompt === undefined || isRewindCommand(this.cancelledPrompt) || isClaudeRewindPicker(screen)) return
+    if (observeClaudeActivity(screen) !== "idle") return
+    const composer = observeClaudeDraft(screen)
+    if (composer !== this.cancelledPrompt) return
+    this.rewindTarget = composer
+    this.rewindPhase = "captured"
+    this.rewindSubmitted = false
+    this.rewindWorkingSeen = false
+    this.cancelledPrompt = undefined
   }
 
   private armRewind(ignoreCurrentTarget = true): void {

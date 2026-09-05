@@ -122,6 +122,7 @@ describe("application state reducer", () => {
     state = readReplacement(state, shortened)
     expect(state.provider.transcripts.get(ROOT)).toEqual(available(shortened))
     expect(state.unviewedSessionIds.has(ROOT)).toBeFalse()
+    expect(state.modal).toBeNull()
   })
 
   test("replacement confirmation is bounded when history keeps changing", () => {
@@ -392,6 +393,32 @@ describe("application state reducer", () => {
     })
     expect(stale).toBe(state)
   })
+
+  for (const draftFirst of [false, true]) {
+    test(`undoing a send clears the completion wait (draft first: ${draftFirst})`, () => {
+      const transcript = [message("q1", "user", "first", 0), message("a1", "agent", "answer", 1), message("q2", "user", "undo me", 2)]
+      let state: ApplicationState = {
+        ...loadedState(transcript),
+        terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]),
+      }
+      const draft = { _tag: "TerminalDraftObserved" as const, sessionId: ROOT,
+        draft: { text: "undo me", exact: false, rewind: true, rewindTarget: "undo me" } }
+      const idle = { _tag: "TerminalActivityObserved" as const, sessionId: ROOT, ownerId: "owner", activity: "idle" as const, wasVisible: false }
+      for (const event of draftFirst ? [draft, idle] : [idle, draft]) state = reduceApplicationState(state, event)
+      expect(state.pendingCompletions.size).toBe(0)
+      expect(selectSessionStatus(state, ROOT)).toBe("live")
+      expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q1", "a1"])
+      state = readReplacement(state, transcript)
+      expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q1", "a1"])
+      state = readReplacement(state, transcript.slice(0, 2))
+      expect(state.unviewedSessionIds.size).toBe(0)
+      expect(state.modal).toBeNull()
+      // Submitting again starts a new completion cycle, even if the old draft was cached.
+      state = reduceApplicationState(state, { ...idle, activity: "working" })
+      state = reduceApplicationState(state, idle)
+      expect(state.pendingCompletions.size).toBe(1)
+    })
+  }
 
   test("projects rewinds immediately and clears them after provider confirmation", () => {
     const transcript = [

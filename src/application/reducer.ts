@@ -363,8 +363,10 @@ function refreshSucceeded(
       if (advanced) pendingCompletions.set(sessionId, advanced)
       else {
         pendingCompletions.delete(sessionId)
-        completionExhausted = true
         const incoming = snapshot.transcripts.get(sessionId)
+        // Idle can also mean cancelled. A successful read with no completed turn
+        // is not a failed read, and must not manufacture a completion error.
+        completionExhausted ||= incoming?._tag !== "Available"
         if (incoming?._tag === "Available" && !sameTranscript(completion.baseline, incoming.messages)) {
           replacementCandidates.set(sessionId, { messages: incoming.messages, attempts: 1 })
         }
@@ -445,18 +447,26 @@ function terminalActivity(
   if (!existing || existing.ownerId !== event.ownerId) return state
   const terminals = new Map(state.terminals).set(event.sessionId, { ...existing, activity: event.activity })
   const rewindAnchors = new Map(state.rewindAnchors)
+  const drafts = new Map(state.drafts)
   if (event.activity === "working") {
     const anchor = rewindAnchors.get(event.sessionId)
     if (anchor) rewindAnchors.set(event.sessionId, { ...anchor, submitted: true })
+    const draft = drafts.get(event.sessionId)
+    if (draft?.rewind) drafts.set(event.sessionId, { ...draft, submitted: true })
   }
   if (event.activity !== "idle") {
     return {
       ...state,
       terminals,
       rewindAnchors,
+      drafts,
       pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId),
       replacementCandidates: withoutMap(state.replacementCandidates, event.sessionId),
     }
+  }
+  const draft = drafts.get(event.sessionId)
+  if (draft?.rewind && !draft.submitted) {
+    return { ...state, terminals, pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId) }
   }
   const version = state.nextCompletionVersion + 1
   const read = selectTranscriptRead(state, event.sessionId)
@@ -494,7 +504,13 @@ function observeDraft(state: ApplicationState, sessionId: string, draft?: DraftP
       })
     } else rewindAnchors.delete(sessionId)
   }
-  return { ...state, drafts, rewindAnchors }
+  return {
+    ...state, drafts, rewindAnchors,
+    ...(draft?.rewind && !draft.submitted
+      ? { pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+          replacementCandidates: withoutMap(state.replacementCandidates, sessionId) }
+      : {}),
+  }
 }
 
 function terminalStopped(
