@@ -8,6 +8,9 @@ import {
   selectProjectedTranscript,
   selectConversationForest,
   selectSessionStatus,
+  selectAggregateStatus,
+  projectRootsViewModel,
+  projectGraphViewModel,
   type ActiveRefresh,
   type ApplicationState,
 } from "../../src/application"
@@ -21,6 +24,30 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
+  test("standardizes live state and priority across sessions, roots, and trees", () => {
+    for (const activity of ["idle", "working", "blocked"] as const) {
+      const state: ApplicationState = {
+        ...loadedState(), terminals: new Map([[ROOT, { ownerId: "owner", phase: "running", activity }]]),
+        unviewedSessionIds: new Set([ROOT]),
+      }
+      const expected = activity === "idle" ? "unviewed" : activity
+      expect(selectSessionStatus(state, ROOT)).toBe(expected)
+      expect(projectRootsViewModel(state)[0]?.status).toBe(expected)
+      expect(projectGraphViewModel(state, ROOT).status).toBe(expected)
+      expect(selectSessionStatus({ ...state, terminals: new Map() }, ROOT)).toBe("idle")
+      expect(selectSessionStatus({ ...state, unviewedSessionIds: new Set() }, ROOT)).toBe(activity === "idle" ? "live" : activity)
+    }
+    const state: ApplicationState = { ...loadedState(), terminals: new Map([
+      ["live", { ownerId: "1", phase: "running", activity: "idle" }],
+      ["update", { ownerId: "2", phase: "running", activity: "idle" }],
+      ["work", { ownerId: "3", phase: "running", activity: "working" }],
+      ["need", { ownerId: "4", phase: "running", activity: "blocked" }],
+    ]), unviewedSessionIds: new Set(["update"]) }
+    expect(selectAggregateStatus(state, ["live", "update", "work", "need"])).toBe("blocked")
+    expect(selectAggregateStatus(state, ["update", "work", "live"])).toBe("working")
+    expect(selectAggregateStatus(state, ["live", "update"])).toBe("unviewed")
+    expect(selectAggregateStatus(state, ["live", "stopped"])).toBe("live")
+  })
   test("reuses the forest for UI-only changes but invalidates every graph input", () => {
     const state = loadedState()
     const forest = selectConversationForest(state)

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 
-import { Deferred, Effect, Fiber } from "effect"
+import { Deferred, Effect, Fiber, Stream } from "effect"
+import { makeInitialApplicationState, projectApplicationViewModel, type ApplicationViewModel } from "../../src/application"
 import { TestClock } from "effect/testing"
 
 import {
@@ -8,6 +9,7 @@ import {
   makeHerdrCommandExecutor,
   makeLiveHerdrReporter,
   makeTerminalHerdrReporter,
+  reportApplicationToHerdr,
   type HerdrCommandProcess,
 } from "../../src/infrastructure/herdr"
 import {
@@ -22,6 +24,33 @@ const HERDR_ENV = {
   HERDR_BIN_PATH: "/tmp/herdr",
   HERDR_PANE_ID: "pane-7",
 }
+
+test("reports the displayed tree aggregate and switches to terminal-only or roots status", async () => {
+  const base = projectApplicationViewModel(makeInitialApplicationState())
+  const views: ApplicationViewModel[] = ["live", "unviewed", "working", "blocked"].map((status) => ({
+    ...base, surface: { _tag: "Graph", familySessionId: "tree", title: "Tree", nodes: [], selectedNodeId: null,
+      status: status as "live" | "unviewed" | "working" | "blocked", warnings: [], worldWidth: 0, worldHeight: 0 },
+  }))
+  views.push({ ...base, surface: { _tag: "Terminal", sessionId: "other", title: "Other", status: "live", draft: undefined } }, base)
+  const reports: string[] = []
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    yield* reportApplicationToHerdr({ report: (status) => { reports.push(status) }, shutdown: Effect.void }, Stream.fromIterable(views))
+    yield* waitFor(() => reports.length === views.length)
+  })))
+  expect(reports).toEqual(["live", "unviewed", "working", "blocked", "live", "idle"])
+})
+
+test("maps live and new updates to supported Herdr states with explicit messages", async () => {
+  const calls: string[][] = []
+  await runWithReporter((command) => Effect.sync(() => { calls.push([...command]) }), (reporter) => Effect.gen(function*() {
+    reporter.report("live")
+    yield* waitFor(() => calls.length === 1)
+    reporter.report("unviewed")
+    yield* waitFor(() => calls.length === 2)
+  }))
+  expect(calls[0]).toEqual([...reportCommand("idle"), "--message", "Live"])
+  expect(calls[1]).toEqual([...reportCommand("idle"), "--message", "New updates"])
+})
 
 test("is disabled outside a Herdr pane", async () => {
   const reporter = await Effect.runPromise(

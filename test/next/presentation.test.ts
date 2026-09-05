@@ -865,7 +865,7 @@ test("surfaces canonical graph integrity warnings through the runtime", async ()
   }
 })
 
-test("restores live, update, and blocked picker markers", async () => {
+test("uses shared live, update, working, and blocked picker markers", async () => {
   const setup = await createTestRenderer({ width: 90, height: 24 })
   const graph = pickerStatusGraph()
   const running = await startPresentation(setup.renderer, graph)
@@ -875,12 +875,48 @@ test("restores live, update, and blocked picker markers", async () => {
     setup.mockInput.pressEnter()
     await frame(setup, (value) => value.includes("Live leaf") && value.includes("Update leaf") && value.includes("Blocked leaf"))
     const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
-    expect(spans.some((span) => span.text.includes("•") && span.fg.equals(presentationTheme.success))).toBeTrue()
+    expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.success))).toBeTrue()
     expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.warning))).toBeTrue()
     expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.danger))).toBeTrue()
+    expect(spans.some((span) => /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text))).toBeTrue()
+    if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+    await Effect.runPromise(running.harness.update({ ...graph, surface: {
+      ...graph.surface, nodes: graph.surface.nodes.map((node) => ({
+        ...node, ...(node._tag === "Endpoint" ? { status: "live" as const } : {}),
+        reachableEndpoints: node.reachableEndpoints.map((endpoint) => ({ ...endpoint, status: "live" as const })),
+      })),
+    } }))
+    await frame(setup, (value) => value.includes("Open leaf") && !/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
   } finally {
     await running.stop()
   }
+})
+
+test("animates Working on the root list without a refresh", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const initial = rootsView()
+  if (initial.surface._tag !== "Roots") throw new Error("Expected roots")
+  const running = await startPresentation(setup.renderer, { ...initial, surface: {
+    ...initial.surface, roots: initial.surface.roots.map((root) => ({ ...root, status: "working" as const })),
+  } })
+  try {
+    const first = await frame(setup, (value) => /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
+    await frame(setup, (value) => value !== first && /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
+  } finally { await running.stop() }
+})
+
+test("Jump to Leaf uses the same four status indicators", async () => {
+  const setup = await createTestRenderer({ width: 90, height: 24 })
+  const running = await startPresentation(setup.renderer, pickerStatusGraph())
+  try {
+    await frame(setup, (value) => value.includes("picker statuses"))
+    setup.mockInput.pressKey("g", { shift: true })
+    await frame(setup, (value) => value.includes("Jump to Leaf") && value.includes("Working leaf") && /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
+    const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
+    for (const color of [presentationTheme.success, presentationTheme.warning, presentationTheme.danger]) {
+      expect(spans.some((span) => span.text.includes("●") && span.fg.equals(color))).toBeTrue()
+    }
+  } finally { await running.stop() }
 })
 
 test("rechecks interaction blocking before content mouse-up", async () => {
@@ -1491,11 +1527,12 @@ function manyLeafGraph(): ApplicationViewModel {
 }
 
 function pickerStatusGraph(): ApplicationViewModel {
-  const source = messageNode("statuses", "picker statuses", 20, 0, [], ["live", "update", "blocked"], true, "root")
-  const live = { ...endpointNode("live", "live", "Live leaf", 0, 4, [source.id], false), status: "idle" as const }
+  const source = messageNode("statuses", "picker statuses", 20, 0, [], ["live", "update", "blocked", "working"], true, "root")
+  const live = { ...endpointNode("live", "live", "Live leaf", 0, 4, [source.id], false), status: "live" as const }
   const update = { ...endpointNode("update", "update", "Update leaf", 20, 4, [source.id], false), status: "unviewed" as const }
   const blocked = { ...endpointNode("blocked", "blocked", "Blocked leaf", 40, 4, [source.id], false), status: "blocked" as const }
-  const view = graphView("root", "Picker statuses", [source, live, update, blocked])
+  const working = { ...endpointNode("working", "working", "Working leaf", 60, 4, [source.id], false), status: "working" as const }
+  const view = graphView("root", "Picker statuses", [source, live, update, blocked, working])
   return { ...view, liveSessionIds: new Set(["live"]) }
 }
 

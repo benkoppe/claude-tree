@@ -10,7 +10,7 @@ import { setProcessTitle } from "./process-title"
 import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import { makeAppRuntime } from "./application"
 import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
-import { makeLiveHerdrReporter, makeTerminalHerdrReporter } from "./infrastructure/herdr"
+import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
 import { makeClaudeProvider } from "./infrastructure/providers/claude"
 import { createCodexProvider } from "./infrastructure/providers/codex"
 import {
@@ -111,13 +111,14 @@ export function composeProductionApplication(
       processes: new BunPtyProcessFactory(),
       ownership: repository,
       events: bridge.events,
-      herdr: makeTerminalHerdrReporter(herdr),
     })
     yield* composeApplicationLifecycle(
       makeAppRuntime({ provider, metadata: repository, terminals }),
       (appRuntime) => {
         bridge.bind(appRuntime.terminalEvents)
-        return makeOpenTuiPresentation(renderer, appRuntime, provider, { setProcessTitle })
+        return reportApplicationToHerdr(herdr, appRuntime.viewModels).pipe(
+          Effect.andThen(makeOpenTuiPresentation(renderer, appRuntime, provider, { setProcessTitle })),
+        )
       },
     )
   })

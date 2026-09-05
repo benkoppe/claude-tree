@@ -38,6 +38,8 @@ import {
   renderGraph,
   renderRoots,
   statusColor,
+  statusMarker,
+  statusLabel,
   styledText,
   type ViewportOffset,
 } from "./render"
@@ -487,6 +489,15 @@ class OpenTuiPresentationController {
       this.graphSignature = signature
       this.reconcileGraphSelection(viewModel.surface)
       this.reconcileStoppedEndpointPreference(viewModel)
+      if (this.leafPicker) {
+        const current = new Map(this.selectedGraphNode()?.reachableEndpoints.map((endpoint) => [endpoint.session.id, endpoint]) ?? [])
+        this.leafPicker = {
+          ...this.leafPicker,
+          options: this.leafPicker.options.map((option) => ({
+            ...option, status: current.get(option.session.id)?.status ?? "idle",
+          })),
+        }
+      }
       if (viewModel.surface.nodes.length === 0 && previous?.surface._tag === "Graph" && previous.surface.nodes.length > 0) {
         this.enqueue(this.appRuntime.selectRoot(null))
       }
@@ -1059,6 +1070,7 @@ class OpenTuiPresentationController {
           height,
           width,
           this.rootViewportStart,
+          this.spinnerFrame,
         )
         this.rootViewportStart = rendered.startIndex
         this.content.content = rendered.content
@@ -1127,13 +1139,8 @@ class OpenTuiPresentationController {
   private rootStatusChunks(): TextChunk[] {
     const root = this.selectedRoot()
     if (!root) return [chunk("No conversation selected", theme.textMuted)]
-    const label = root.status === "blocked"
-      ? "● Needs user"
-      : root.status === "unviewed"
-        ? "● New updates"
-        : root.status === "working"
-          ? "● Live"
-          : undefined
+    const label = root.status === "idle" ? undefined
+      : `${statusMarker(root.status, this.spinnerFrame)} ${statusLabel(root.status)}`
     return [
       ...(label
         ? [chunk(label, statusColor(root.status), TextAttributes.BOLD), chunk(" · ", theme.textMuted)]
@@ -1204,23 +1211,16 @@ class OpenTuiPresentationController {
       const selected = index === picker.selectedIndex
       const background = selected ? theme.selected : theme.element
       const foreground = selected ? theme.selectedText : theme.text
-      const live = this.viewModel?.liveSessionIds.has(option.session.id) ?? false
-      const marker = option.status === "blocked" || option.status === "unviewed"
-        ? "● "
-        : live ? "• " : "  "
+      const marker = `${statusMarker(option.status, this.spinnerFrame)} `
       const distance = option.distance === 0
         ? "selected leaf"
         : `${option.distance} ${option.distance === 1 ? "node" : "nodes"} down`
       const suffix = `  ${distance} · ${option.session.id.slice(0, 8)}`
       const titleWidth = Math.max(0, width - displayWidth(marker) - displayWidth(suffix))
       const title = `${truncateToWidth(option.session.title, titleWidth)}${suffix}`
-      const markerColor = option.status === "blocked"
-        ? theme.danger
-        : option.status === "unviewed"
-          ? theme.warning
-          : theme.success
+      const markerColor = statusColor(option.status)
       chunks.push(
-        chunk(marker, markerColor, marker.trim() || selected ? TextAttributes.BOLD : TextAttributes.NONE, theme.element),
+        chunk(marker, markerColor, TextAttributes.BOLD, background),
         chunk(
         title.padEnd(width - displayWidth(marker)),
         foreground,
@@ -1264,7 +1264,10 @@ class OpenTuiPresentationController {
     const graphWorking = this.graphSurface()?.nodes.some((node) =>
       node._tag === "Endpoint" && node.status === "working"
     ) ?? false
-    const animate = !this.tooSmall() && Boolean(this.viewModel?.refreshing || graphWorking)
+    const rootsWorking = this.viewModel?.surface._tag === "Roots" &&
+      this.viewModel.surface.roots.some((root) => root.status === "working")
+    const pickerWorking = this.leafPicker?.options.some((option) => option.status === "working")
+    const animate = !this.tooSmall() && Boolean(this.viewModel?.refreshing || graphWorking || rootsWorking || pickerWorking)
     if (!animate) {
       this.stopSpinner()
       return

@@ -1,4 +1,5 @@
-import { Effect, Layer, Scope } from "effect"
+import { Effect, Layer, Scope, Stream } from "effect"
+import type { ApplicationViewModel } from "../../application/view-model"
 
 import {
   HerdrReporter,
@@ -46,6 +47,16 @@ export function makeTerminalHerdrReporter(
     report: reporter.report,
     shutdown: reporter.shutdown,
   }
+}
+
+export function reportApplicationToHerdr(
+  reporter: HerdrReporterApi,
+  viewModels: Stream.Stream<ApplicationViewModel>,
+): Effect.Effect<void, never, Scope.Scope> {
+  return Effect.forkScoped(Stream.runForEach(viewModels, (viewModel) => Effect.sync(() => {
+    const surface = viewModel.surface
+    reporter.report(viewModel.shuttingDown || surface._tag === "Roots" ? "idle" : surface.status)
+  }))).pipe(Effect.asVoid)
 }
 
 export function makeHerdrCommandExecutor(

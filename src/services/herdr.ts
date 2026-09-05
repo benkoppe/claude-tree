@@ -8,7 +8,7 @@ import {
   Scope,
 } from "effect"
 
-import type { AgentActivity } from "../domain/model"
+import type { SessionStatus } from "../domain/session-status"
 
 export const HERDR_SOURCE = "custom:claude-tree-lifecycle"
 export const HERDR_AGENT = "claude-tree"
@@ -21,7 +21,7 @@ export type HerdrCommandExecutor = (
 ) => Effect.Effect<void, unknown>
 
 export interface HerdrReporterApi {
-  readonly report: (activity: AgentActivity) => void
+  readonly report: (activity: SessionStatus) => void
   readonly shutdown: Effect.Effect<void>
 }
 
@@ -62,14 +62,14 @@ function makeEnabledHerdrReporter(
   execute: HerdrCommandExecutor,
 ): Effect.Effect<HerdrReporterApi, never, Scope.Scope> {
   return Effect.gen(function*() {
-    const transitions = yield* Queue.unbounded<AgentActivity>()
-    const reports = yield* Queue.sliding<AgentActivity>(1)
+    const transitions = yield* Queue.unbounded<SessionStatus>()
+    const reports = yield* Queue.sliding<SessionStatus>(1)
     const shutdownRequested = yield* Deferred.make<void>()
     const shutdownComplete = yield* Deferred.make<void>()
-    let currentActivity: AgentActivity | undefined
+    let currentActivity: SessionStatus | undefined
     let stopping = false
 
-    const reportCommand = (activity: AgentActivity): readonly string[] => [
+    const reportCommand = (activity: SessionStatus): readonly string[] => [
       executable,
       "pane",
       "report-agent",
@@ -79,7 +79,8 @@ function makeEnabledHerdrReporter(
       "--agent",
       HERDR_AGENT,
       "--state",
-      activity,
+      activity === "live" || activity === "unviewed" ? "idle" : activity,
+      ...(activity === "live" ? ["--message", "Live"] : activity === "unviewed" ? ["--message", "New updates"] : []),
     ]
     const releaseCommand: readonly string[] = [
       executable,
@@ -99,13 +100,13 @@ function makeEnabledHerdrReporter(
           orElse: () => Effect.void,
         }),
       )
-    const enqueueCurrent = (activity: AgentActivity) =>
+    const enqueueCurrent = (activity: SessionStatus) =>
       Effect.sync(() => {
         if (!stopping && currentActivity === activity) Queue.offerUnsafe(reports, activity)
       })
 
     type TimerResult =
-      | { readonly _tag: "Transition"; readonly activity: AgentActivity }
+      | { readonly _tag: "Transition"; readonly activity: SessionStatus }
       | { readonly _tag: "Elapsed" }
 
     const transitionBefore = (delay: number): Effect.Effect<TimerResult> =>
@@ -118,7 +119,7 @@ function makeEnabledHerdrReporter(
         ),
       )
 
-    const scheduleTransition = (activity: AgentActivity): Effect.Effect<void> =>
+    const scheduleTransition = (activity: SessionStatus): Effect.Effect<void> =>
       Effect.suspend(() =>
         enqueueCurrent(activity).pipe(
           Effect.andThen(transitionBefore(HERDR_REASSERT_DELAYS_MS[0])),
