@@ -12,7 +12,6 @@ import type {
   BranchRelation,
   ConversationRemoval,
   IdentityTransitionKind,
-  InstanceNavigation,
   PendingIdentityAdoption,
   ProjectState,
   ProviderState,

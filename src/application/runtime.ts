@@ -43,12 +43,11 @@ import type {
   TerminalSupervisorApi,
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
-import { makeNavigationWriter, type NavigationWriter } from "./navigation-writer"
+import { makeNavigationWriter } from "./navigation-writer"
 import {
   makeApplicationOperations,
   rollbackPersistedBranch,
   type ApplicationMetadataFacet,
-  type ApplicationOperations,
   type IndependentBranch,
   type PersistedBranch,
 } from "./operations"
