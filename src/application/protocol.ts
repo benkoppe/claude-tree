@@ -8,9 +8,9 @@ import type {
   TerminalSessionChangedEvent,
   TerminalSessionTransitionErrorEvent,
 } from "../services/terminal-supervisor"
-import type { ApplicationModal, ApplicationState } from "./state"
+import type { ActiveRefresh, ApplicationModal, ApplicationState } from "./state"
 
-export type RefreshReason = "initial" | "manual" | "terminal-return" | "completion" | "stop" | "ambiguity"
+export type RefreshReason = ActiveRefresh["reason"]
 
 export type ApplicationIntent =
   | { readonly _tag: "Refresh"; readonly reason: "manual" }

@@ -20,6 +20,96 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
+  const original = [message("q", "user", "question", 0), message("a", "agent", "answer", 1), message("q2", "user", "later", 2)]
+  function readReplacement(state: ApplicationState, messages: readonly AgentMessage[]): ApplicationState {
+    const refresh = activeRefresh("refresh:full", state.refresh.generation + 1, "manual", "full")
+    return reduceApplicationState(reduceApplicationState(state, { _tag: "RefreshStarted", refresh }), {
+      _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation,
+      snapshot: snapshot(session(ROOT, "Root"), messages),
+    })
+  }
+
+  test("confirms external rewinds including rewinds to an empty conversation", () => {
+    for (const shortened of [original.slice(0, 2), []]) {
+      const suspected = readReplacement(loadedState(original), shortened)
+      expect(suspected.provider.transcripts.get(ROOT)).toEqual(available(original))
+      expect(suspected.replacementCandidates.has(ROOT)).toBeTrue()
+      const confirmed = readReplacement(suspected, shortened)
+      expect(confirmed.provider.transcripts.get(ROOT)).toEqual(available(shortened))
+      expect(confirmed.replacementCandidates.size).toBe(0)
+    }
+  })
+
+  test("a transient shortened read does not truncate history", () => {
+    const suspected = readReplacement(loadedState(original), original.slice(0, 1))
+    const recovered = readReplacement(suspected, original)
+    expect(recovered.provider.transcripts.get(ROOT)).toEqual(available(original))
+    expect(recovered.replacementCandidates.size).toBe(0)
+  })
+
+  test("a failed confirmation read requires fresh evidence", () => {
+    const shorter = original.slice(0, 1)
+    let state = readReplacement(loadedState(original), shorter)
+    const refresh = activeRefresh("refresh:full", state.refresh.generation + 1, "manual", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, { _tag: "RefreshFailed", key: refresh.key, generation: refresh.generation, message: "read failed" })
+    expect(state.replacementCandidates.size).toBe(0)
+    state = readReplacement(state, shorter)
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(original))
+  })
+
+  test("a prefix-only rewind reconciles after completion retries without fabricating an update", () => {
+    let state: ApplicationState = { ...loadedState(original), terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false })
+    const shortened = original.slice(0, 2)
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const refresh: ActiveRefresh = {
+        ...activeRefresh("refresh:owner", state.refresh.generation + 1, "completion", "incremental"),
+        sessionIds: new Set([ROOT]), completionVersion: state.pendingCompletions.get(ROOT)!.version,
+      }
+      state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+      state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation, snapshot: snapshot(session(ROOT, "Root"), shortened) })
+      expect(state.provider.transcripts.get(ROOT)).toEqual(available(original))
+    }
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.replacementCandidates.has(ROOT)).toBeTrue()
+    state = readReplacement(state, shortened)
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(shortened))
+    expect(state.unviewedSessionIds.has(ROOT)).toBeFalse()
+  })
+
+  test("replacement confirmation is bounded when history keeps changing", () => {
+    let state = loadedState(original)
+    for (const length of [2, 1, 0]) state = readReplacement(state, original.slice(0, length))
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(original))
+    expect(state.replacementCandidates.size).toBe(0)
+    expect(state.modal).toMatchObject({ _tag: "Error" })
+  })
+
+  test("working activity invalidates a suspected rewind", () => {
+    let state: ApplicationState = {
+      ...readReplacement(loadedState(original), original.slice(0, 1)),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]),
+    }
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "working", wasVisible: false })
+    expect(state.replacementCandidates.size).toBe(0)
+    state = readReplacement(state, original.slice(0, 1))
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(original))
+    expect(state.replacementCandidates.size).toBe(0)
+  })
+
+  test("confirms completed replacement turns when composer rewind detection was missed", () => {
+    let state: ApplicationState = { ...loadedState(original), terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false })
+    const replacement = [original[0]!, { ...message("new", "agent", "replacement answer", 1), turnComplete: true }]
+    state = readReplacement(state, replacement)
+    expect(state.pendingCompletions.has(ROOT)).toBeTrue()
+    state = readReplacement(state, replacement)
+    expect(state.provider.transcripts.get(ROOT)).toEqual(available(replacement))
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
+  })
+
   test("a late full snapshot cannot overwrite a newer incremental session read", () => {
     const full = activeRefresh("refresh:full", 1, "manual", "full")
     const incremental = activeRefresh("refresh:owner:one", 2, "terminal-return", "incremental")

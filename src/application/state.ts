@@ -64,7 +64,7 @@ export interface PendingCompletion {
 export interface ActiveRefresh {
   readonly key: string
   readonly generation: number
-  readonly reason: "initial" | "manual" | "terminal-return" | "completion" | "stop" | "ambiguity"
+  readonly reason: "initial" | "manual" | "terminal-return" | "completion" | "stop" | "ambiguity" | "reconciliation"
   readonly mode: "full" | "incremental"
   readonly sessionIds: ReadonlySet<string>
   readonly completionVersion?: number
@@ -93,6 +93,10 @@ export interface ApplicationState {
   readonly drafts: ReadonlyMap<string, DraftPreview>
   readonly rewindAnchors: ReadonlyMap<string, RewindAnchor>
   readonly pendingCompletions: ReadonlyMap<string, PendingCompletion>
+  readonly replacementCandidates: ReadonlyMap<string, {
+    readonly messages: readonly AgentMessage[]
+    readonly attempts: number
+  }>
   readonly unviewedSessionIds: ReadonlySet<string>
   readonly refresh: {
     readonly generation: number
@@ -124,6 +128,7 @@ export function makeInitialApplicationState(
     drafts: new Map(),
     rewindAnchors: new Map(),
     pendingCompletions: new Map(),
+    replacementCandidates: new Map(),
     unviewedSessionIds: new Set(),
     refresh: { generation: 0, active: new Map(), initialPending: true, appliedGenerationBySession: new Map() },
     nextCompletionVersion: 0,
