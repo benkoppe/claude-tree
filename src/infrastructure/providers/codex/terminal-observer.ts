@@ -4,7 +4,7 @@ import type {
   TerminalObserver,
   TerminalScreen,
 } from "../../../domain/model"
-import { OscSequenceParser } from "./osc"
+import { OscSequenceParser } from "../../../osc"
 
 const ACTIVE_TITLE_STATUSES = new Set(["Starting", "Working", "Thinking", "Waiting"])
 const IDLE_TITLE_STATUSES = new Set(["Ready", "Idle"])
