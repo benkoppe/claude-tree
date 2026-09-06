@@ -154,8 +154,8 @@ const ROOT_CONTROLS: readonly FooterControl[] = [
   { key: "d", description: "delete", action: "remove" },
   { key: "n", description: "new", action: "new" },
   { key: "r", description: "refresh", action: "refresh" },
-  { key: "q", description: "quit", action: "quit" },
   { key: "?", description: "about", action: "about" },
+  { key: "q", description: "quit", action: "quit" },
 ]
 
 const GRAPH_CONTROLS: readonly FooterControl[] = [
@@ -166,9 +166,9 @@ const GRAPH_CONTROLS: readonly FooterControl[] = [
   { key: "f", description: "fork", action: "fork" },
   { key: "d", description: "delete", action: "remove" },
   { key: "x", description: "stop", action: "stop" },
-  { key: "q", description: "roots", action: "roots" },
-  { key: "?", description: "about", action: "about" },
   { key: "r", description: "refresh", action: "refresh" },
+  { key: "?", description: "about", action: "about" },
+  { key: "q", description: "back", action: "roots" },
 ]
 
 export function makeOpenTuiPresentation(
@@ -1255,7 +1255,7 @@ class OpenTuiPresentationController {
 
   private modalActions(modal: ApplicationModal) {
     if (modal._tag === "About" || modal._tag === "Error") {
-      return styledText([chunk("esc close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
+      return styledText([chunk(modal._tag === "About" ? "close" : "esc close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
     }
     const label = modal._tag === "ConfirmStop" ? "Stop" : "Delete"
     return styledText([
