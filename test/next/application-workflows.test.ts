@@ -2077,6 +2077,54 @@ describe("application actor", () => {
     expect(state.modal).toBeNull()
   })
 
+  for (const issue of ["unrecognized-screen", "observer-failed"] as const) {
+    test(`manual refresh explains ${issue} without claiming working history is complete`, async () => {
+      const fixture = makeFixture()
+      let probes = 0
+      const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: {
+          ...fixture.options.terminals,
+          reconcileActivity: Effect.sync(() => {
+            probes += 1
+            return [{ ownerId: "owner-1", sessionId: ROOT, sequenceId: 1, issue }]
+          }),
+        } })
+        yield* runtime.resumeSession(ROOT)
+        yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", false))
+        fixture.snapshot = snapshot([session(ROOT, "Root"), session(CHILD, "Child")], new Map([
+          [ROOT, [message("q", "user", "question", 0), { ...message("a", "agent", "answer", 1), turnComplete: true }]],
+          [CHILD, [message("cq", "user", "updated unrelated question", 0)]],
+        ]))
+        yield* runtime.refresh()
+        return yield* runtime.getState
+      })))
+      expect(probes).toBe(1)
+      expect(state.modal?._tag).toBe("Error")
+      expect(state.modal?._tag === "Error" && state.modal.message).toContain("Activity could not be verified")
+      expect(selectSessionStatus(state, ROOT)).toBe("working")
+      expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q"])
+      expect(state.unviewedSessionIds.has(ROOT)).toBeFalse()
+    })
+  }
+
+  test("a newer activity event suppresses obsolete manual probe diagnostics", async () => {
+    const fixture = makeFixture()
+    let runtime: AppRuntime
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      runtime = yield* makeAppRuntime({ ...fixture.options, terminals: {
+        ...fixture.options.terminals,
+        reconcileActivity: Effect.gen(function*() {
+          yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "working", false))
+          return [{ ownerId: "owner-1", sessionId: ROOT, sequenceId: 1, issue: "observer-failed" as const }]
+        }),
+      } })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", false))
+      yield* runtime.refresh()
+      expect((yield* runtime.getState).modal).toBeNull()
+    })))
+  })
+
   test("terminal-return refresh can atomically satisfy a pending completion", async () => {
     const fixture = makeFixture()
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -3136,6 +3184,7 @@ function makeFixture(): Fixture {
     activitySessionIds: () => Effect.succeed(new Set()),
     draftPreviews: Effect.succeed(new Map()),
     ownershipSnapshot: Effect.succeed([]),
+    reconcileActivity: Effect.succeed([]),
   }
   fixture.options = { provider, metadata, terminals }
   return fixture

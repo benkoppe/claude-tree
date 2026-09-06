@@ -36,6 +36,7 @@ import type {
 } from "../services/provider"
 import type {
   TerminalActivityEvent,
+  TerminalActivityCheck,
   TerminalObservationEvent,
   TerminalExitEvent,
   TerminalSessionChangedEvent,
@@ -139,6 +140,11 @@ type CommandCompletedMessage = {
   readonly token: number
   readonly command: ActorCommand
   readonly exit: Exit.Exit<unknown, unknown>
+}
+
+interface RefreshResult {
+  readonly snapshot: AgentSessionSnapshot
+  readonly activityChecks: readonly TerminalActivityCheck[]
 }
 
 type LifecycleControlMessage =
@@ -509,9 +515,12 @@ export function makeAppRuntime(
         _tag: "Refresh",
         refresh,
         ...(reply === undefined ? {} : { reply }),
-      }, reason === "reconciliation"
-        ? Effect.sleep(TRANSCRIPT_CONFIRMATION_DELAY_MS).pipe(Effect.andThen(operations.loadSnapshot(mode, [...sessionIds])))
-        : operations.loadSnapshot(mode, [...sessionIds]))
+      }, Effect.gen(function*(): Effect.gen.Return<RefreshResult, unknown> {
+        const activityChecks = reason === "manual" ? yield* operations.reconcileActivity : []
+        if (reason === "reconciliation") yield* Effect.sleep(TRANSCRIPT_CONFIRMATION_DELAY_MS)
+        const snapshot = yield* operations.loadSnapshot(mode, [...sessionIds])
+        return { snapshot, activityChecks }
+      }))
     })
 
     const continueRemoval = (key: string): Effect.Effect<void, never, Scope.Scope> =>
@@ -903,12 +912,25 @@ export function makeAppRuntime(
         const refresh = state.refresh.active.get(command.refresh.key)
         const invalidatedSessionIds = refresh ? invalidatedRefreshSessionIds(state, refresh) : new Set<string>()
         if (Exit.isSuccess(exit)) {
+          const previousModal = state.modal
           yield* publish({
             _tag: "RefreshSucceeded",
             key: command.refresh.key,
             generation: command.refresh.generation,
-            snapshot: exit.value as AgentSessionSnapshot,
+            snapshot: (exit.value as RefreshResult).snapshot,
           })
+          const issues = (exit.value as RefreshResult).activityChecks.filter((check) =>
+            check.issue !== undefined && owners.get(check.ownerId)?.sessionId === check.sessionId &&
+            owners.get(check.ownerId)?.lastSequenceId === check.sequenceId &&
+            state.terminals.get(check.sessionId)?.activity === "working")
+          if (issues.length > 0) {
+            const details = issues.map((check) => `${check.sessionId}: ${check.issue === "observer-failed"
+              ? "terminal observation failed" : "terminal screen is not recognized"}`).join("; ")
+            yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: [
+              state.modal !== previousModal && state.modal?._tag === "Error" ? state.modal.message : undefined,
+              `Activity could not be verified (${details}). The last Working signal was retained; refresh did not confirm ongoing work.`,
+            ].filter(Boolean).join("\n") } })
+          }
         } else {
           const cause = Cause.squash(exit.cause)
           yield* publish({

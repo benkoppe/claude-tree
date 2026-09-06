@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 
 import type {
   SDKSessionInfo,
@@ -194,7 +194,9 @@ describe("Effect Claude provider", () => {
 
     const acquired = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
     expect(executableReads).toBe(1)
-    expect(acquired.launch.command).toEqual(["/usr/local/bin/claude", "--session-id", NEW])
+    expect(acquired.launch.command).toEqual(["/usr/local/bin/claude", "--session-id", NEW, "--settings", expect.any(String)])
+    expect(Object.keys(JSON.parse(acquired.launch.command.at(-1)!))).toEqual(["hooks"])
+    expect(acquired.launch.env).toEqual({ CLAUDE_TREE_HOOK_TOKEN: expect.any(String) })
     await Effect.runPromise(acquired.close)
 
     const resumed = await Effect.runPromise(provider.prepareResume({
@@ -207,6 +209,8 @@ describe("Effect Claude provider", () => {
       "/usr/local/bin/claude",
       "--resume",
       ROOT,
+      "--settings",
+      expect.any(String),
     ])
   })
 
@@ -232,8 +236,27 @@ describe("Effect Claude provider", () => {
     expect(first.launch.observer).toBe(observers[0]!)
     expect(second.launch.observer).toBe(observers[1]!)
     expect(first.launch.observer).not.toBe(second.launch.observer)
+    expect(first.launch.env).not.toEqual(second.launch.env)
     await Effect.runPromise(first.close)
     await Effect.runPromise(second.close)
+  })
+
+  test("unavailable optional hook binding leaves the ordinary launch and environment unchanged", async () => {
+    const environment = { ...process.env }
+    const provider = providerWith()
+    const prepared = await Effect.runPromise(provider.prepareResume({ id: ROOT, title: "Root", lastModified: 1 }))
+    const serve = spyOn(Bun, "serve").mockImplementation(() => { throw new Error("bind unavailable") })
+    try {
+      const acquired = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
+      expect(acquired.launch.command).toEqual(["/usr/bin/claude", "--resume", ROOT])
+      expect(acquired.launch.env).toBeUndefined()
+      expect("activityHints" in acquired.launch).toBeFalse()
+      expect(acquired.launch.observer).toBeInstanceOf(ClaudeTerminalObserver)
+      await Effect.runPromise(acquired.close)
+      expect(process.env).toEqual(environment)
+    } finally {
+      serve.mockRestore()
+    }
   })
 
   test("replays user text from the nearest agent with exact prefill", async () => {
@@ -283,6 +306,8 @@ describe("Effect Claude provider", () => {
       "--resume",
       CHILD,
       "--prefill=  replay\nexactly  ",
+      "--settings",
+      expect.any(String),
     ])
     expect(launch.initialDraft).toEqual({ text: "  replay\nexactly  ", exact: true })
   })
@@ -319,6 +344,8 @@ describe("Effect Claude provider", () => {
       "--session-id",
       NEW,
       "--prefill=replay me",
+      "--settings",
+      expect.any(String),
     ])
   })
 

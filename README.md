@@ -46,6 +46,14 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
+## Activity Recovery
+
+Working indicators combine terminal activity observations with a short wait for the provider's completed transcript. Hidden sessions are checked automatically, and `r` in the navigator resamples live terminals as well as refreshing conversation history.
+
+Claude launches include temporary, additive `Stop` and `StopFailure` hooks that request an activity check. They do not change permissions, replace your hooks, or write settings files. If hooks are disabled, restricted, or unavailable, terminal observation remains active. A hook firing is not treated as proof of completion.
+
+If refresh cannot recognize a working terminal's screen or read its transcript, it reports the uncertainty rather than forcing the session idle. Provider UI changes can still require an observer update; include the provider version and refresh error when reporting an activity issue. Conversation text and hook payloads are not logged by this recovery mechanism.
+
 ## Development
 
 The development shell includes Bun and the validated provider CLIs available for the platform:

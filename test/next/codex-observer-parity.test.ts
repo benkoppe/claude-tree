@@ -35,15 +35,69 @@ test("preserves ordered Codex activity transitions in one output chunk", () => {
   expect(observer.observeOutput(output)).toEqual(["working", "idle"])
 })
 
-test("recognizes action-required and explicit Codex title statuses conservatively", () => {
+test("recognizes only structured Codex title activity, not configurable word-only fields", () => {
   expect(codexActivityFromTitle("[ ! ] Action Required | claude-tree-codex")).toBe("blocked")
   expect(codexActivityFromTitle("[ . ] Action Required | claude-tree-codex")).toBe("blocked")
-  expect(codexActivityFromTitle("claude-tree-codex | Working")).toBe("working")
-  expect(codexActivityFromTitle("claude-tree-codex | Thinking")).toBe("working")
-  expect(codexActivityFromTitle("claude-tree-codex | Waiting")).toBe("working")
-  expect(codexActivityFromTitle("claude-tree-codex | Ready")).toBe("idle")
+  expect(codexActivityFromTitle("[ ! ] Action Required")).toBe("blocked")
   expect(codexActivityFromTitle("working-notes")).toBeUndefined()
   expect(codexActivityFromTitle("Thinking about tests")).toBeUndefined()
+  for (const title of ["Working", "Thinking", "Waiting", "Ready", "Idle", "Action Required", "Action Required notes", "Working | project"]) {
+    expect(codexActivityFromTitle(title)).toBeUndefined()
+  }
+  for (const word of ["Starting", "Working", "Thinking", "Waiting", "Ready", "Idle", "Action Required"]) {
+    for (const title of [`project | ${word}`, `${word} | thread`, `project | ${word} | thread`]) {
+      expect(codexActivityFromTitle(title)).toBeUndefined()
+    }
+  }
+  for (const title of ["project ⠋suffix", "prefix⠋ project", "[ ! ] Action Required notes", "project | [ ! ] Action Required"]) {
+    expect(codexActivityFromTitle(title)).toBeUndefined()
+  }
+})
+
+for (const [active, idle] of [
+  ["⠋ project", "project"], // Upstream 0.150.1 default: activity + project-name.
+  ["project ⠹", "project"],
+  ["project ⠸ thread", "project | thread"],
+  ["codex | project ⠼ thread | branch", "codex | project | thread | branch"],
+  ["⠴ | project", "project"],
+  ["project | ⠦ | thread", "project | thread"],
+  ["project | ⠧", "project"],
+  ["⠇ Working", "Working"],
+  ["Thinking ⠏ Ready", "Thinking | Ready"],
+  ["[ ! ] Action Required | project", "project"],
+  ["[ . ] Action Required | project | thread", "project | thread"],
+] as const) {
+  test(`recognizes configured title activity and its exact remaining-title transition: ${active}`, () => {
+    const observer = new CodexTerminalObserver()
+    const activity = active.startsWith("[") ? "blocked" : "working"
+    expect(codexActivityFromTitle(active)).toBe(activity)
+    expect(observer.observeOutput(new TextEncoder().encode(`\u001b]0;${active}\u0007\u001b]0;${idle}\u0007`)))
+      .toEqual([activity, "idle"])
+  })
+}
+
+test("unknown titles cannot complete activity without the recognized project transition", () => {
+  const observer = new CodexTerminalObserver()
+  const output = (title: string) => observer.observeOutput(new TextEncoder().encode(`\u001b]2;${title}\u0007`))
+  expect(output("⠋ | project")).toEqual(["working"])
+  expect(output("unrelated shell")).toEqual([])
+  expect(output("project")).toEqual([])
+  expect(output("project | Working")).toEqual([])
+  expect(output("unrelated shell")).toEqual([])
+  expect(output("⠋")).toEqual(["working"])
+  expect(output("")).toEqual([])
+  expect(output("project ⠋ ⠹")).toEqual(["working"])
+  expect(output("project | ⠹")).toEqual(["working"])
+})
+
+test("live working footers override an idle Codex title and composer", () => {
+  const observer = new CodexTerminalObserver()
+  observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ project\u0007"))
+  expect(observer.observeOutput(new TextEncoder().encode("\u001b]0;project\u0007"))).toEqual(["idle"])
+  expect(observer.observeScreen({
+    lines: ["› prompt", "? for shortcuts", "• Working (12s • esc to interrupt)"],
+    cursor: { x: 8, y: 0, visible: true },
+  })).toBe("working")
 })
 
 test("keeps action-required title activity authoritative over a stale status row", () => {
@@ -131,7 +185,7 @@ test("keeps visible Codex confirmation and trust prompts active", () => {
   const observer = new CodexTerminalObserver()
   expect(
     observer.observeOutput(new TextEncoder().encode("\u001b]0;project | Ready\u0007")),
-  ).toEqual(["idle"])
+  ).toEqual([])
   expect(observer.observeScreen(confirmation)).toBe("blocked")
 
   expect(

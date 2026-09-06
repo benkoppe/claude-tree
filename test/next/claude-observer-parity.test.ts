@@ -63,6 +63,39 @@ test("a restored hidden-cursor composer containing Rewind is not a lingering dia
   })
 })
 
+test("confirmed hidden-cursor restore accepts a custom status line without relaxing ordinary idle evidence", () => {
+  const observer = new ClaudeTerminalObserver()
+  const restored = dialogScreen([
+    "────────────────", "❯ Explain these menu labels:", "  Rewind", "────────────────", "my-project | feature/custom | budget $1.23",
+  ])
+  expect(observer.observeScreen(restored)).toBeUndefined()
+  expect(observer.observeDraft(restored)).toBeUndefined()
+  observer.observeScreen(dialogScreen(["Confirm you want to restore the conversation", "❯ Restore conversation"]))
+  rewindInput(observer)
+  expect(observer.observeDraft(dialogScreen([...restored.lines, "✻ Cogitating… (12s · esc to interrupt)"]))).toBeUndefined()
+  expect(observer.observeDraft(dialogScreen([...restored.lines, "Enter to confirm · Esc to cancel"]))).toBeUndefined()
+  expect(observer.observeScreen(restored)).toBe("idle")
+  expect(observer.takeObservations()).toEqual([{ _tag: "Rewind" }])
+  expect(observer.observeDraft(restored)).toEqual({
+    text: "Explain these menu labels:\n  Rewind", exact: false, rewind: true,
+    rewindTarget: "Explain these menu labels:\n  Rewind", rewindTargetLines: ["Explain these menu labels:", "  Rewind"],
+  })
+})
+
+test("rewind instructions inside a composer with a custom footer are not a dialog", () => {
+  const observer = new ClaudeTerminalObserver()
+  const screen = {
+    lines: ["────────────────", "❯ Explain these instructions:", "  Restore and fork the conversation to the",
+      "  point before…", "────────────────", "my-project | custom statusLine"],
+    cursor: { x: 8, y: 3, visible: true },
+  }
+  const text = "Explain these instructions:\n  Restore and fork the conversation to the\n  point before…"
+  expect(observer.observeScreen(screen)).toBe("idle")
+  expect(observer.observeDraft(screen)).toEqual({ text, exact: false })
+  expect(rewindInput(observer)).toEqual({ _tag: "Submission", text })
+  expect(observer.takeObservations()).toEqual([])
+})
+
 test("excluding an input box does not hide a real confirmation elsewhere on the screen", () => {
   const observer = new ClaudeTerminalObserver()
   const screen = {
@@ -276,6 +309,45 @@ test("recognizes Claude's working and idle terminal titles", () => {
   expect(claudeActivityFromTitle("◐ Claude Code")).toBe("working")
   expect(claudeActivityFromTitle("✳ Claude Code")).toBe("idle")
   expect(claudeActivityFromTitle("project shell")).toBeUndefined()
+})
+
+test("a complete bordered Claude composer proves idle without making a hidden draft readable", () => {
+  const observer = new ClaudeTerminalObserver()
+  const screen = dialogScreen(["────────────────", "❯ draft", "────────────────"])
+  expect(observeClaudeActivity(screen)).toBe("idle")
+  expect(observer.observeScreen(screen)).toBe("idle")
+  expect(observer.observeDraft(screen)).toBeUndefined()
+  expect(observeClaudeActivity(dialogScreen(["❯ draft", "────────────────"]))).toBeUndefined()
+})
+
+for (const lines of [
+  ["Example:", "────────────────", "❯ historical example", "────────────────", "The response continues."],
+  ["```text", "────────────────", "❯ historical example", "────────────────", "```"],
+  ["```text", "────────────────", "❯ historical example", "────────────────"],
+  ["~~~text", "────────────────", "❯ historical example", "────────────────"],
+  ["    ────────────────", "    ❯ indented code", "    ────────────────"],
+]) {
+  test(`historical bordered examples cannot establish hidden-cursor idle: ${JSON.stringify(lines)}`, () => {
+    const observer = new ClaudeTerminalObserver()
+    const screen = dialogScreen(lines)
+    expect(observeClaudeActivity(screen)).toBeUndefined()
+    observer.observeOutput(new TextEncoder().encode("\u001b]0;⠋ Claude Code\u0007"))
+    expect(observer.observeScreen(screen)).toBeUndefined()
+    expect(observer.reconcileScreen(screen, "sample")).toBeUndefined()
+    expect(observer.reconcileScreen(screen, "confirm")).toBeUndefined()
+    const working = dialogScreen([...lines, "✻ Cogitating… (12s · esc to interrupt)"])
+    expect(observer.reconcileScreen(working, "sample")).toBe("working")
+    expect(observer.reconcileScreen(working, "confirm")).toBe("working")
+  })
+}
+
+test("a real bottom composer after a closed code example remains idle with stock hints", () => {
+  const screen = dialogScreen([
+    "```text", "historical code", "```", "────────────────", "❯ ", "────────────────", "  ? for shortcuts", "",
+  ])
+  expect(observeClaudeActivity(screen)).toBe("idle")
+  expect(observeClaudeActivity(dialogScreen([...screen.lines, "✻ Cogitating… (12s · esc to interrupt)"]))).toBe("working")
+  expect(observeClaudeActivity(dialogScreen([...screen.lines, "Enter to confirm · Esc to cancel"]))).toBe("blocked")
 })
 
 test("hidden-cursor rewind capture requires a complete idle composer after confirmation", () => {

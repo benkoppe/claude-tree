@@ -32,6 +32,7 @@ import {
   type TerminalLaunch,
 } from "../../../services/provider"
 import { ClaudeTerminalObserver } from "./terminal-observer"
+import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
 
 export interface ClaudeSdk {
   readonly listSessions: (options: {
@@ -871,9 +872,20 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     draft?: string,
   ): PreparedTerminal["acquireLaunch"] {
-    return this.resolveLaunch(kind, sessionId, draft).pipe(
-      Effect.map((launch) => ({ launch, close: Effect.void })),
-    )
+    return Effect.gen({ self: this }, function*() {
+      const launch = yield* this.resolveLaunch(kind, sessionId, draft)
+      const hooks = yield* makeClaudeLifecycleHooks(sessionId)
+      if (hooks === undefined) return { launch, close: Effect.void }
+      return {
+        launch: {
+          ...launch,
+          command: [...launch.command, "--settings", hooks.settings] as [string, ...string[]],
+          env: hooks.env,
+          activityHints: hooks.activityHints,
+        },
+        close: hooks.close,
+      }
+    })
   }
 
   private resolveLaunch(

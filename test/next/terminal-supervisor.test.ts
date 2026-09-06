@@ -8,10 +8,16 @@ import { TestClock } from "effect/testing"
 import { createTestRenderer } from "@opentui/core/testing"
 import { OpenTuiTerminalRenderer } from "../../src/infrastructure/terminal/opentui-terminal-renderer"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
+import { CodexTerminalObserver } from "../../src/infrastructure/providers/codex/terminal-observer"
+import { makeAppRuntime, type AppRuntime } from "../../src/application/runtime"
+import type { ApplicationMetadataFacet } from "../../src/application/operations"
+import type { ApplicationState } from "../../src/application/state"
 
 import {
   NullTerminalObserver,
   type AgentActivity,
+  type AgentMessage,
+  type AgentSessionSnapshot,
   type TerminalObserver,
   type TerminalObservation,
   type TerminalScreen,
@@ -26,6 +32,7 @@ import {
 import type {
   BranchRelation,
   PendingIdentityAdoption,
+  ProjectState,
   TerminalOwner as PersistedTerminalOwner,
 } from "../../src/domain/persistence"
 import type {
@@ -50,6 +57,7 @@ import {
   type CodexTuiProxyTransitionRequest,
 } from "../../src/infrastructure/providers/codex/tui-proxy"
 import type {
+  AgentProviderApi,
   PreparedTerminal,
   TerminalLaunch,
   TerminalTransitionAcknowledgmentError,
@@ -70,6 +78,434 @@ import {
 } from "../../src/services/terminal-supervisor"
 
 const temporaryDirectories: string[] = []
+
+for (const provider of [
+  { name: "Claude", create: () => new ClaudeTerminalObserver(), title: "⠋ Claude Code",
+    lines: ["────────────────", "❯ ", "────────────────"], row: 1,
+    working: "✻ Cogitating… (12s · esc to interrupt)", blocker: "Enter to confirm · Esc to cancel" },
+  { name: "Codex", create: () => new CodexTerminalObserver(), title: "⠋ | project",
+    lines: ["› ", "", "? for shortcuts"], row: 0,
+    working: "• Working (12s • esc to interrupt)", blocker: "press enter to confirm or esc to cancel" },
+]) {
+  for (const trigger of ["manual", "automatic", "hint"] as const) {
+    test(`${provider.name} ${trigger} recovery drives the real actor from hidden Working to accepted answer and unread updates`, async () => {
+      const fixture = makeFixture()
+      let runtime: AppRuntime | undefined
+      fixture.dependencies.events = {
+        onActivityChanged: (event) => runtime!.terminalEvents.onActivityChanged?.(event),
+        onObservation: (event) => runtime!.terminalEvents.onObservation?.(event),
+        onProcessExited: (event) => runtime!.terminalEvents.onProcessExited?.(event),
+      }
+      await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+        const sessionId = "recovery"
+        const activityHints = yield* PubSub.unbounded<"reconcile">()
+        const observer = provider.create()
+        const idleScreen = { lines: provider.lines, cursor: { x: 2, y: provider.row, visible: true } }
+        let probes = 0
+        const reconcileScreen = observer.reconcileScreen.bind(observer)
+        observer.reconcileScreen = (screen, phase) => { probes += 1; return reconcileScreen(screen, phase) }
+        const question: AgentMessage = { id: "question", role: "user", preview: "Question", ordinal: 0, visible: true }
+        const answer: AgentMessage = {
+          id: "answer", role: "agent", preview: "Completed answer", ordinal: 1, visible: true, turnComplete: true,
+        }
+        let messages = [question]
+        let metadataState: ProjectState = { relations: [], removals: [] }
+        let holdReads = false
+        let reads = 0
+        const releaseCompletion = yield* Deferred.make<void>()
+        const loadSnapshot = Effect.gen(function*() {
+          reads += 1
+          if (holdReads) yield* Deferred.await(releaseCompletion)
+          return {
+            sessions: [session(sessionId)],
+            transcripts: new Map([[sessionId, { _tag: "Available", messages }]]),
+          } satisfies AgentSessionSnapshot
+        })
+        const agentProvider: AgentProviderApi = {
+          id: provider.name.toLowerCase(), displayName: provider.name,
+          capabilities: {
+            historicalBranching: false, exactMessageForks: false, completedTurnForks: false,
+            userMessageReplay: false, temporarySessionIds: false, nativeSessionSwitching: false,
+          },
+          loadSessionSnapshot: loadSnapshot,
+          loadSessionSnapshotFor: () => loadSnapshot,
+          readTranscripts: () => loadSnapshot.pipe(Effect.map((snapshot) => snapshot.transcripts)),
+          prepareResume: () => Effect.succeed(prepared(sessionId, fixture, { observer, activityHints })),
+          prepareNewSession: Effect.die("Unexpected new session"),
+          branchFrom: () => Effect.die("Unexpected branch"),
+        }
+        const metadata: ApplicationMetadataFacet = {
+          instanceId: "recovery-instance",
+          loadMetadata: Effect.sync(() => metadataState),
+          updateMetadata: (transform) => Effect.sync(() => { metadataState = transform(metadataState); return metadataState }),
+          commitRemoval: () => Effect.die("Unexpected removal"),
+          pendingAdoptions: Effect.succeed([]), orphanedAdoptions: Effect.succeed([]),
+          reconcileOrphanedAdoption: () => Effect.void, ack: () => Effect.void,
+        }
+        runtime = yield* makeAppRuntime({ provider: agentProvider, metadata, terminals: supervisor, completionDelaysMs: [0] })
+        const app = runtime
+        yield* app.enterRoot(sessionId)
+        yield* app.resumeSession(sessionId)
+        fixture.renderer.surfaces[0]!.screen = () => idleScreen
+        // Establish the pre-generation screen through the real snapshot boundary.
+        yield* app.returnFromTerminal
+        yield* waitForRuntimeState(app, (state) => state.refresh.active.size === 0)
+        fixture.processes.processes[0]!.output(bytes(`\u001b]0;${provider.title}\u0007`))
+        yield* waitForRuntimeState(app, (state) => state.terminals.get(sessionId)?.activity === "working")
+        messages = [question, answer]
+        // A terminal-return read must withhold even a provider-completed assistant tail while Working.
+        yield* app.resumeSession(sessionId)
+        const readsBeforeReturn = reads
+        yield* app.returnFromTerminal
+        const working = yield* waitForRuntimeState(app, (state) => reads > readsBeforeReturn && state.refresh.active.size === 0)
+        expect(working.provider.transcripts.get(sessionId)).toEqual({ _tag: "Available", messages: [question] })
+        expect(working.terminals.get(sessionId)?.activity).toBe("working")
+        expect(working.unviewedSessionIds.has(sessionId)).toBeFalse()
+        expect(yield* supervisor.activeSessionId).toBeNull()
+        const before = (yield* app.getViewModel).surface
+        expect(before._tag).toBe("Graph")
+        if (before._tag === "Graph") {
+          expect(before.nodes.some((node) => node._tag === "Message" && node.preview === answer.preview)).toBeFalse()
+          expect(before.nodes.find((node) => node._tag === "Endpoint")?.status).toBe("working")
+        }
+        expect(probes).toBe(0)
+        holdReads = true
+        const refresh = trigger === "manual" ? yield* Effect.forkChild(app.refresh()) : undefined
+        if (trigger === "automatic") yield* TestClock.adjust(2_000)
+        if (trigger === "hint") yield* PubSub.publish(activityHints, "reconcile")
+        yield* eventually(() => probes === 1)
+        yield* TestClock.adjust(99)
+        expect(probes).toBe(1)
+        expect((yield* app.getState).terminals.get(sessionId)?.activity).toBe("working")
+        yield* TestClock.adjust(1)
+        const pending = yield* waitForRuntimeState(app, (state) =>
+          state.terminals.get(sessionId)?.activity === "idle" && state.pendingCompletions.has(sessionId))
+        expect(probes).toBe(2)
+        expect(pending.provider.transcripts.get(sessionId)).toEqual({ _tag: "Available", messages: [question] })
+        expect(pending.unviewedSessionIds.has(sessionId)).toBeFalse()
+        yield* Deferred.succeed(releaseCompletion, undefined)
+        if (refresh) yield* Fiber.join(refresh)
+        const completed = yield* waitForRuntimeState(app, (state) =>
+          !state.pendingCompletions.has(sessionId) && state.unviewedSessionIds.has(sessionId) && state.refresh.active.size === 0)
+        expect(completed.terminals.get(sessionId)?.activity).toBe("idle")
+        expect(completed.provider.transcripts.get(sessionId)).toEqual({ _tag: "Available", messages: [question, answer] })
+        expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set())
+        expect(yield* supervisor.activeSessionId).toBeNull()
+        const after = (yield* app.getViewModel).surface
+        expect(after._tag).toBe("Graph")
+        if (after._tag === "Graph") {
+          expect(after.nodes.filter((node) => node._tag === "Message").map((node) => node.preview)).toEqual(["Question", "Completed answer"])
+          expect(after.nodes.find((node) => node._tag === "Endpoint")?.status).toBe("unviewed")
+          expect(after.status).toBe("unviewed")
+        }
+        yield* app.shutdown
+      })))
+    })
+  }
+
+  test(`${provider.name} manual probe confirms unchanged idle without paint or title`, async () => {
+    const fixture = makeFixture()
+    const activities: TerminalActivityEvent[] = []
+    fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event) }
+    await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+      const observer = provider.create()
+      const screen = { lines: provider.lines, cursor: { x: 2, y: provider.row, visible: true } }
+      observer.observeScreen(screen)
+      const ownerId = yield* supervisor.show(prepared("probe", fixture, { observer }))
+      let samples = 0
+      fixture.renderer.surfaces[0]!.screen = () => { samples += 1; return screen }
+      fixture.processes.processes[0]!.output(bytes(`\u001b]0;${provider.title}\u0007`))
+      yield* eventually(() => activities.length === 1)
+      samples = 0
+      const probe = yield* Effect.forkChild(supervisor.reconcileActivity)
+      yield* eventually(() => samples === 1)
+      yield* TestClock.adjust(99)
+      expect(samples).toBe(1)
+      expect(activities.map((event) => event.activity)).toEqual(["working"])
+      yield* TestClock.adjust(1)
+      const checks = yield* Fiber.join(probe)
+      yield* eventually(() => activities.length === 2)
+      expect(samples).toBe(2)
+      expect(checks).toEqual([{ ownerId, sessionId: "probe", sequenceId: activities[1]!.sequenceId, activity: "idle" }])
+      expect(activities.map((event) => event.activity)).toEqual(["working", "idle"])
+      expect(activities[1]!.sequenceId).toBeGreaterThan(activities[0]!.sequenceId)
+      expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set())
+    }))
+  })
+
+  test(`${provider.name} queued probes restart confirmation after newer output`, async () => {
+    const fixture = makeFixture()
+    const activities: TerminalActivityEvent[] = []
+    fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event) }
+    await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+      const observer = provider.create()
+      const screen = { lines: provider.lines, cursor: { x: 2, y: provider.row, visible: true } }
+      observer.observeScreen(screen)
+      yield* supervisor.show(prepared("probe", fixture, { observer }))
+      let samples = 0
+      const reconcile = observer.reconcileScreen.bind(observer)
+      observer.reconcileScreen = (screen, phase) => { samples += 1; return reconcile(screen, phase) }
+      fixture.renderer.surfaces[0]!.screen = () => screen
+      const process = fixture.processes.processes[0]!
+      const working = bytes(`\u001b]0;${provider.title}\u0007`)
+      process.output(working)
+      yield* eventually(() => activities.length === 1)
+      samples = 0
+      const first = yield* Effect.forkChild(supervisor.reconcileActivity)
+      yield* eventually(() => samples === 1)
+      const second = yield* Effect.forkChild(supervisor.reconcileActivity)
+      yield* TestClock.adjust(99)
+      process.output(working)
+      yield* TestClock.adjust(1)
+      expect((yield* Fiber.join(first))[0]?.issue).toBe("unrecognized-screen")
+      yield* eventually(() => samples === 3)
+      expect(activities.map((event) => event.activity)).toEqual(["working"])
+      yield* TestClock.adjust(99)
+      expect(samples).toBe(3)
+      yield* TestClock.adjust(1)
+      expect((yield* Fiber.join(second))[0]?.activity).toBe("idle")
+      yield* eventually(() => activities.length === 2)
+    }))
+  })
+
+  for (const signal of ["working", "blocked", "unknown"] as const) {
+    test(`${provider.name} probe never interprets ${signal} as idle`, async () => {
+      const fixture = makeFixture()
+      const activities: TerminalActivityEvent[] = []
+      fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event) }
+      await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+        const ownerId = yield* supervisor.show(prepared("probe", fixture, { observer: provider.create() }))
+        fixture.processes.processes[0]!.output(bytes(`\u001b]0;${provider.title}\u0007`))
+        yield* eventually(() => activities.length === 1)
+        let samples = 0
+        fixture.renderer.surfaces[0]!.screen = () => {
+          samples += 1
+          return { lines: signal === "unknown" ? ["ordinary output"] :
+            [...provider.lines, signal === "working" ? provider.working : provider.blocker],
+            cursor: { x: 2, y: provider.row, visible: true } }
+        }
+        const probe = yield* Effect.forkChild(supervisor.reconcileActivity)
+        yield* eventually(() => samples === 1)
+        yield* TestClock.adjust(100)
+        const checks = yield* Fiber.join(probe)
+        expect(checks).toEqual([expect.objectContaining({ ownerId, sessionId: "probe",
+          ...(signal === "unknown" ? { issue: "unrecognized-screen" } : { activity: signal }) })])
+        expect(samples).toBe(signal === "unknown" ? 2 : 1)
+        expect(activities.some((event) => event.activity === "idle")).toBeFalse()
+        expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set(["probe"]))
+      }))
+    })
+  }
+}
+
+for (const mode of ["manual", "automatic"] as const) {
+  test(`production hidden ${mode} probe composes pending VT output without capturing an unreadable draft`, async () => {
+    const setup = await createTestRenderer({ width: 50, height: 10 })
+    const fixture = makeFixture()
+    const activities: TerminalActivityEvent[] = []
+    try {
+      await withClockSupervisor({ ...fixture.dependencies,
+        renderer: new OpenTuiTerminalRenderer(setup.renderer),
+        events: { onActivityChanged: (event) => activities.push(event) },
+      }, (supervisor) => Effect.gen(function*() {
+        yield* supervisor.show(prepared("hidden", fixture, { observer: new ClaudeTerminalObserver() }))
+        yield* supervisor.hideActive
+        const process = fixture.processes.processes[0]!
+        process.output(bytes("\u001b]0;⠋ Claude Code\u0007\u001b[2J\u001b[H✻ Cogitating… (12s · esc to interrupt)\u001b[?25l"))
+        yield* eventually(() => activities.length === 1)
+        if (mode === "automatic") {
+          yield* TestClock.adjust(1_999)
+          expect(activities.map((event) => event.activity)).toEqual(["working"])
+        }
+        process.output(bytes("\u001b[2J\u001b[H────────────────────────────────\r\n❯ ordinary unreadable draft\r\n────────────────────────────────\u001b[?25l"))
+        if (mode === "manual") {
+          expect(yield* supervisor.reconcileActivity).toEqual([
+            expect.objectContaining({ sessionId: "hidden", activity: "idle" }),
+          ])
+        } else yield* TestClock.adjust(1)
+        yield* eventually(() => activities.length === 2)
+        expect(activities.map((event) => event.activity)).toEqual(["working", "idle"])
+        expect(yield* supervisor.activeSessionId).toBeNull()
+        expect((yield* supervisor.draftPreviews).has("hidden")).toBeFalse()
+      }))
+    } finally {
+      setup.renderer.destroy()
+    }
+  })
+}
+
+test("automatic unknown probes stay non-idle and stop sampling after disposal", async () => {
+  const fixture = makeFixture()
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(prepared("unknown", fixture, { observer: new OutputObserver() }))
+    fixture.processes.processes[0]!.output(bytes("working"))
+    let samples = 0
+    fixture.renderer.surfaces[0]!.screen = () => {
+      samples += 1
+      return { lines: ["unknown"], cursor: { x: 0, y: 0, visible: false } }
+    }
+    yield* TestClock.adjust(2_000)
+    expect(samples).toBe(1)
+    yield* TestClock.adjust(100)
+    expect(samples).toBe(2)
+    expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set(["unknown"]))
+    yield* supervisor.stopSession("unknown")
+    const disposedSamples = samples
+    yield* TestClock.adjust(10_000)
+    expect(samples).toBe(disposedSamples)
+    expect(yield* supervisor.reconcileActivity).toEqual([])
+  }))
+})
+
+for (const end of ["exit", "replacement"] as const) {
+  test(`${end} between probe samples cannot mutate a disposed owner`, async () => {
+    const fixture = makeFixture()
+    const activities: TerminalActivityEvent[] = []
+    fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event) }
+    await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+      let samples = 0
+      class Observer extends OutputObserver {
+        reconcileScreen() { return ++samples === 1 ? undefined : "idle" as const }
+      }
+      const oldOwner = yield* supervisor.show(prepared("same", fixture, { observer: new Observer() }))
+      fixture.processes.processes[0]!.output(bytes("working"))
+      yield* eventually(() => activities.length === 1)
+      const probe = yield* Effect.forkChild(supervisor.reconcileActivity)
+      yield* eventually(() => samples === 1)
+      if (end === "exit") {
+        fixture.processes.processes[0]!.finish(0)
+        yield* eventually(() => fixture.renderer.surfaces[0]!.released)
+      } else {
+        yield* supervisor.stopSession("same")
+        const newOwner = yield* supervisor.show(prepared("same", fixture, { observer: new OutputObserver() }))
+        expect(newOwner).not.toBe(oldOwner)
+        fixture.processes.processes[1]!.output(bytes("working"))
+        yield* eventually(() => activities.length === 2)
+      }
+      yield* TestClock.adjust(100)
+      expect(yield* Fiber.join(probe)).toEqual([])
+      expect(samples).toBe(1)
+      expect(activities.every((event) => event.activity === "working")).toBeTrue()
+    }))
+  })
+}
+
+test("concurrent probes serialize confirmation and a late hint only samples the new generation", async () => {
+  const fixture = makeFixture()
+  const activities: TerminalActivityEvent[] = []
+  fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event) }
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const activityHints = yield* PubSub.unbounded<"reconcile">()
+    const observer = new ClaudeTerminalObserver()
+    const idle = { lines: ["────────────────", "❯ ", "────────────────"], cursor: { x: 2, y: 1, visible: true } }
+    observer.observeScreen(idle)
+    yield* supervisor.show(prepared("hint", fixture, { observer, activityHints }))
+    let screen = idle
+    let samples = 0
+    fixture.renderer.surfaces[0]!.screen = () => { samples += 1; return screen }
+    const process = fixture.processes.processes[0]!
+    process.output(bytes("\u001b]0;⠋ Claude Code\u0007"))
+    yield* eventually(() => activities.length === 1)
+    samples = 0
+    const first = yield* Effect.forkChild(supervisor.reconcileActivity)
+    yield* eventually(() => samples === 1)
+    const second = yield* Effect.forkChild(supervisor.reconcileActivity)
+    yield* TestClock.adjust(99)
+    expect(samples).toBe(1)
+    yield* TestClock.adjust(1)
+    yield* Fiber.join(first)
+    yield* Fiber.join(second)
+    expect(samples).toBe(3)
+    yield* eventually(() => activities.length === 2)
+    screen = { ...idle, lines: ["✻ Cogitating… (12s · esc to interrupt)"] }
+    process.output(bytes("\u001b]0;⠋ Claude Code\u0007"))
+    yield* eventually(() => activities.length === 3)
+    const beforeHint = samples
+    yield* PubSub.publish(activityHints, "reconcile")
+    yield* eventually(() => samples > beforeHint)
+    yield* TestClock.adjust(100)
+    expect(activities.map((event) => event.activity)).toEqual(["working", "idle", "working"])
+    expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set(["hint"]))
+    yield* supervisor.stopSession("hint")
+    const disposedSamples = samples
+    yield* PubSub.publish(activityHints, "reconcile")
+    yield* TestClock.adjust(3_000)
+    expect(samples).toBe(disposedSamples)
+  }))
+})
+
+test("observer probe exceptions return an owner-scoped diagnostic without forcing idle", async () => {
+  const fixture = makeFixture()
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    let samples = 0
+    class Observer extends OutputObserver {
+      reconcileScreen(): AgentActivity | undefined { samples += 1; throw new Error("broken observer") }
+    }
+    const ownerId = yield* supervisor.show(prepared("broken", fixture, { observer: new Observer() }))
+    fixture.processes.processes[0]!.output(bytes("working"))
+    const checks = yield* supervisor.reconcileActivity
+    expect(checks).toEqual([{ ownerId, sessionId: "broken", sequenceId: 1, issue: "observer-failed" }])
+    expect(samples).toBe(1)
+    yield* TestClock.adjust(2_000)
+    expect(samples).toBe(2)
+    expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set(["broken"]))
+    yield* supervisor.stopSession("broken")
+  }))
+})
+
+test("activity hints published during spawn are retained by the pre-spawn subscription", async () => {
+  const fixture = makeFixture()
+  const activities: TerminalActivityEvent[] = []
+  fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event) }
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const activityHints = yield* PubSub.unbounded<"reconcile">()
+    let samples = 0
+    class Observer extends OutputObserver {
+      reconcileScreen() { samples += 1; return "working" as const }
+    }
+    const spawn = fixture.processes.spawn.bind(fixture.processes)
+    fixture.processes.spawn = (launch, dimensions, callbacks) => {
+      Effect.runSync(PubSub.publish(activityHints, "reconcile"))
+      return spawn(launch, dimensions, callbacks)
+    }
+    yield* supervisor.show(prepared("spawn-hint", fixture, { observer: new Observer(), activityHints }))
+    yield* eventually(() => activities.length === 1)
+    expect(samples).toBe(1)
+    expect(yield* supervisor.nonIdleSessionIds).toEqual(new Set(["spawn-hint"]))
+  }))
+})
+
+test("probes skip an owner while identity adoption awaits application acknowledgment", async () => {
+  const fixture = makeFixture()
+  const changed: TerminalSessionChangedEvent[] = []
+  fixture.dependencies.events = { onSessionChanged: (event) => changed.push(event) }
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const transitions = yield* PubSub.unbounded<TerminalTransitionRequest>()
+    const activityHints = yield* PubSub.unbounded<"reconcile">()
+    let samples = 0
+    class Observer extends OutputObserver {
+      reconcileScreen() { samples += 1; return "working" as const }
+    }
+    const ownerId = yield* supervisor.show(prepared("source", fixture, {
+      observer: new Observer(), transitions, activityHints,
+    }))
+    fixture.processes.processes[0]!.output(bytes("working"))
+    const acknowledgment = yield* publishTransition(transitions, {
+      _tag: "SessionChanged", kind: "native-fork", session: session("adopted"),
+    })
+    yield* eventually(() => changed.length === 1)
+    expect(yield* supervisor.reconcileActivity).toEqual([])
+    yield* PubSub.publish(activityHints, "reconcile")
+    yield* TestClock.adjust(2_000)
+    expect(samples).toBe(0)
+    yield* Deferred.succeed(changed[0]!.acknowledgment!, undefined)
+    yield* Deferred.await(acknowledgment)
+    expect(yield* supervisor.reconcileActivity).toEqual([
+      expect.objectContaining({ ownerId, sessionId: "adopted", activity: "working" }),
+    ])
+    expect(samples).toBe(1)
+  }))
+})
 
 test("drains output, snapshot, and input observations before their activity, draft, and submission", async () => {
   const fixture = makeFixture()
@@ -1454,6 +1890,30 @@ function withSupervisor(
   })))
 }
 
+function withClockSupervisor(
+  dependencies: TerminalSupervisorDependencies,
+  use: (supervisor: TerminalSupervisorApi) => Effect.Effect<void, unknown, TestClock.TestClock>,
+): Promise<void> {
+  return Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor(dependencies)
+    yield* use(supervisor)
+  })).pipe(Effect.provide(TestClock.layer())))
+}
+
+function waitForRuntimeState(
+  runtime: AppRuntime,
+  predicate: (state: ApplicationState) => boolean,
+): Effect.Effect<ApplicationState> {
+  return Effect.gen(function*() {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      const state = yield* runtime.getState
+      if (predicate(state)) return state
+      yield* Effect.yieldNow
+    }
+    return yield* Effect.die("Timed out waiting for application state")
+  })
+}
+
 interface Fixture {
   readonly log: string[]
   readonly renderer: FakeRenderer
@@ -1510,6 +1970,7 @@ function prepared(
   fixture: Fixture,
   options: {
     readonly transitions?: PubSub.PubSub<TerminalTransitionRequest>
+    readonly activityHints?: PubSub.PubSub<"reconcile">
     readonly observer?: TerminalObserver
     readonly transient?: boolean
     readonly command?: TerminalLaunch["command"]
@@ -1529,6 +1990,7 @@ function acquiredLaunch(
   fixture: Fixture,
   options: {
     readonly transitions?: PubSub.PubSub<TerminalTransitionRequest>
+    readonly activityHints?: PubSub.PubSub<"reconcile">
     readonly observer?: TerminalObserver
     readonly command?: TerminalLaunch["command"]
   } = {},
@@ -1539,6 +2001,7 @@ function acquiredLaunch(
     cwd: process.cwd(),
     observer: options.observer ?? new NullTerminalObserver(),
     ...(options.transitions === undefined ? {} : { transitions: options.transitions }),
+    ...(options.activityHints === undefined ? {} : { activityHints: options.activityHints }),
   }
   return {
     launch,
