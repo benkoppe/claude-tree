@@ -10,6 +10,7 @@ import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import { ProviderError, ProviderProtocolError } from "../../src/domain/errors"
+import { buildConversationForest, resolveForkTarget } from "../../src/domain/conversation-graph"
 import {
   ClaudeProvider,
   claudeProviderLayer,
@@ -87,6 +88,63 @@ describe("Effect Claude provider", () => {
     expect(transcript.messages[1]?.turnComplete).toBeFalse()
     expect(transcript.messages[4]?.turnComplete).toBeTrue()
     expect(transcript.messages[4]?.copyIdentity).toBe(JSON.stringify(secondAgent.message))
+  })
+
+  test("hides task notifications while preserving distinct agent responses and raw boundaries", async () => {
+    const notification = "<task-notification>\n<task-id>background-task</task-id>\n<tool-use-id>tool</tool-use-id>\n<output-file>/tmp/task.output</output-file>\n<status>completed</status>\n</task-notification>\nRead the output file to retrieve the result."
+    for (const content of [notification, [{ type: "text", text: notification }]]) {
+      const notice = { ...message(ROOT, "notification", "user", ""), message: { role: "user", content } }
+      const records = [
+        message(ROOT, "user", "user", "question"),
+        message(ROOT, "before", "assistant", "initial response", undefined, "end_turn"),
+        notice,
+        message(ROOT, "after", "assistant", "checking result", undefined, "tool_use"),
+        message(ROOT, "tool-result", "user", "", undefined, undefined, [
+          { type: "tool_result", tool_use_id: "tool", content: "done" },
+        ]),
+        message(ROOT, "final", "assistant", "follow-up response", undefined, "end_turn"),
+      ]
+      const provider = providerWith({ messages: { [ROOT]: records } })
+      const transcript = (await Effect.runPromise(provider.readTranscripts([ROOT]))).get(ROOT)
+      if (transcript?._tag !== "Available") throw new Error("expected transcript")
+      expect(transcript.messages.map(({ id }) => id)).toEqual(records.map(({ uuid }) => uuid))
+      expect(transcript.messages[2]).toMatchObject({
+        id: "notification", role: "user", visible: false, ordinal: 2,
+        copyIdentity: JSON.stringify(notice.message),
+      })
+      expect(transcript.messages[2]).not.toHaveProperty("replayText")
+      expect(transcript.messages[1]?.displayGroupId).toBe("user")
+      expect(transcript.messages[3]?.displayGroupId).toBe("notification")
+      expect(transcript.messages[5]?.displayGroupId).toBe("notification")
+
+      const graph = buildConversationForest(
+        [{ id: ROOT, title: "Root", lastModified: 1 }],
+        new Map([[ROOT, transcript.messages]]),
+        [],
+      ).graphs[0]!
+      const nodes = [...graph.nodes.values()].filter((node) => node.kind === "message")
+      expect(nodes.map(({ role, preview }) => ({ role, preview }))).toEqual([
+        { role: "user", preview: "question" },
+        { role: "agent", preview: "initial response" },
+        { role: "agent", preview: "checking result follow-up response" },
+      ])
+      expect(nodes[2]?.parentId).toBe(nodes[1]?.id)
+      expect(resolveForkTarget(graph, nodes[2]!.id)).toEqual({ sessionId: ROOT, messageId: "final" })
+    }
+  })
+
+  test("keeps user prose mentioning notifications and assistant notification text visible", async () => {
+    const envelope = "<task-notification><task-id>example</task-id></task-notification>"
+    const records = [
+      message(ROOT, "quoted", "user", `Explain this: ${envelope}`),
+      message(ROOT, "incomplete", "user", "<task-notification><task-id>example</task-id>"),
+      message(ROOT, "assistant", "assistant", envelope),
+    ]
+    const provider = providerWith({ messages: { [ROOT]: records } })
+    const transcript = (await Effect.runPromise(provider.readTranscripts([ROOT]))).get(ROOT)
+    if (transcript?._tag !== "Available") throw new Error("expected transcript")
+    expect(transcript.messages.every(({ visible }) => visible)).toBeTrue()
+    expect(transcript.messages[0]).toMatchObject({ replayText: `Explain this: ${envelope}` })
   })
 
   test("loads incremental snapshots with all metadata and deduplicated requested reads", async () => {
