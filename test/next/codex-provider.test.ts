@@ -1405,9 +1405,9 @@ describe("Codex terminal observer", () => {
   test("ports OSC, blockers, working rows, and drafts to TerminalScreen", () => {
     const observer = new CodexTerminalObserver()
     const encoder = new TextEncoder()
-    expect(observer.observeOutput(encoder.encode("\u001b]0;⠋ Working"))).toEqual([])
+    expect(observer.observeOutput(encoder.encode("\u001b]0;⠋ Codex"))).toEqual([])
     expect(observer.observeOutput(encoder.encode(
-      "\u0007\u001b]2;Codex | Ready\u001b\\",
+      "\u0007\u001b]2;Codex\u001b\\",
     ))).toEqual(["working", "idle"])
 
     const composer = {

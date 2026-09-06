@@ -53,6 +53,8 @@ export interface TerminalObserver {
   observeInput?(data: Uint8Array): TerminalSubmissionObservation | void
   observeOutput(data: Uint8Array): readonly AgentActivity[]
   observeScreen(screen: TerminalScreen): AgentActivity | undefined
+  /** Explicit, bounded resampling; normal render frames must not advance recovery confirmation. */
+  reconcileScreen?(screen: TerminalScreen, phase: "sample" | "confirm"): AgentActivity | undefined
   /** Undefined is unknown; null is a positively observed empty composer. */
   observeDraft(screen: TerminalScreen): DraftPreview | null | undefined
   /** Drain semantic occurrences once, before publishing the same snapshot's draft or activity. */

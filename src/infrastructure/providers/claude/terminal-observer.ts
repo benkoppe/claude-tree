@@ -19,6 +19,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   private lastScreen: string | undefined
   private workingTitleScreen: string | undefined
   private awaitingWorkingScreen = false
+  private recoveryScreen: string | undefined
   private inputBuffer = ""
   private pasting = false
   private composerScreen: string | undefined
@@ -46,6 +47,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   observeInput(bytes: Uint8Array): TerminalSubmissionObservation | void {
     const data = Buffer.from(bytes).toString("utf8")
     if (/^(?:\u001b\[[IO])+$/u.test(data)) return
+    this.recoveryScreen = undefined
     if (this.rewindDialog) {
       if (isStandaloneEscape(data)) {
         this.resetRewind()
@@ -113,6 +115,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
   }
 
   observeOutput(bytes: Uint8Array): readonly AgentActivity[] {
+    if (bytes.length > 0) this.recoveryScreen = undefined
     const observed: AgentActivity[] = []
     for (const body of this.parser.observe(bytes)) {
       const title = decodeOscTitle(body)
@@ -132,6 +135,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
 
   observeScreen(screen: TerminalScreen): AgentActivity | undefined {
     this.lastScreen = JSON.stringify([screen.lines, screen.cursor])
+    if (this.recoveryScreen !== this.lastScreen) this.recoveryScreen = undefined
     this.captureCancelledPrompt(screen)
     const dialog = readClaudeRewindDialog(screen)
     const rewindMenuVisible = dialog !== undefined
@@ -164,9 +168,11 @@ export class ClaudeTerminalObserver implements TerminalObserver {
       const composer = this.readComposer(screen)
       if (composer && claudeScreenActivity(screen, composer) === "idle") this.captureRewindTarget(composer)
     }
-    const activity = claudeScreenActivity(screen, this.readComposer(screen))
-    if (activity === "idle" && !rewindMenuVisible && !this.rewindSubmitted) {
-      this.syncComposerInput(screen, this.readComposer(screen)!.text)
+    const composer = this.readComposer(screen)
+    const activity = claudeScreenActivity(screen, composer)
+    if (activity !== "idle") this.recoveryScreen = undefined
+    if (activity === "idle" && composer && !rewindMenuVisible && !this.rewindSubmitted) {
+      this.syncComposerInput(screen, composer.text)
     }
     if (activity === "idle" && this.awaitingWorkingScreen &&
       !(this.rewindPhase === "captured" && !this.rewindSubmitted)) {
@@ -178,6 +184,20 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     if (activity !== undefined) this.awaitingWorkingScreen = false
     this.observeRewindActivity(activity)
     return activity
+  }
+
+  reconcileScreen(screen: TerminalScreen, phase: "sample" | "confirm"): AgentActivity | undefined {
+    if (phase === "sample") this.recoveryScreen = undefined
+    const activity = this.observeScreen(screen)
+    if (activity !== undefined || observeClaudeActivity(screen) !== "idle") return activity
+    if (phase === "confirm" && this.recoveryScreen === this.lastScreen) {
+      this.awaitingWorkingScreen = false
+      this.recoveryScreen = undefined
+      return this.observeScreen(screen)
+    }
+    // Only a new probe's sample can establish its confirmation candidate.
+    if (phase === "sample") this.recoveryScreen = this.lastScreen
+    return undefined
   }
 
   observeDraft(screen: TerminalScreen): DraftPreview | null | undefined {
@@ -224,7 +244,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
     if (cursorComposer) return cursorComposer
     if ((this.rewindPhase !== "awaitingComposer" && (this.rewindPhase !== "captured" || this.rewindSubmitted)) ||
       readClaudeRewindDialog(screen)) return undefined
-    const bordered = observeBorderedRewindComposer(screen)
+    const bordered = observeBorderedComposer(screen)
     return bordered && claudeScreenActivity(screen, bordered) === "idle" ? bordered : undefined
   }
 
@@ -307,7 +327,7 @@ export class ClaudeTerminalObserver implements TerminalObserver {
 
 function readClaudeRewindDialog(screen: TerminalScreen): RewindDialog | undefined {
   // A picker selection can look cursor-local, but is not a complete input box.
-  const composer = observeBorderedRewindComposer(screen)
+  const composer = observeBorderedComposer(screen)
   const composerBottom = composer ? screen.lines.findLastIndex(isHorizontalRule) : -1
   const lines = screen.lines.map((line, row) => composer && row >= composer.promptRow && row < composerBottom
     ? ""
@@ -360,6 +380,7 @@ export function observeClaudeActivity(screen: TerminalScreen): AgentActivity | u
 }
 
 function claudeScreenActivity(screen: TerminalScreen, composer: ClaudeComposer | undefined): AgentActivity | undefined {
+  composer ??= observeBorderedComposer(screen, true)
   const recentRows = screen.lines
     .map((line, row) => ({ line, row }))
     .filter(({ line }) => line.trim().length > 0)
@@ -430,12 +451,27 @@ interface ClaudeComposer {
   readonly lines?: readonly string[]
 }
 
-function observeBorderedRewindComposer(screen: TerminalScreen): ClaudeComposer | undefined {
+function observeBorderedComposer(screen: TerminalScreen, activityOnly = false): ClaudeComposer | undefined {
   const bottom = screen.lines.findLastIndex(isHorizontalRule)
   if (bottom < 2) return undefined
   let top = bottom - 1
   while (top >= 0 && !isHorizontalRule(screen.lines[top] ?? "")) top -= 1
   if (top < 0) return undefined
+  if (activityOnly) {
+    // Ordinary idle evidence must reject historical boxes. Confirmed rewinds
+    // and dialog exclusion retain support for arbitrary custom status lines.
+    if (screen.lines.slice(bottom + 1).some((line) => line.trim() !== "" &&
+      !/^\s*(?:\? for shortcuts|⏵+ .*\(shift\+tab to cycle\))\s*$/u.test(line))) return undefined
+    if (/^\s{2}/u.test(screen.lines[top] ?? "")) return undefined
+    let fence: string | undefined
+    for (const line of screen.lines.slice(0, top)) {
+      const marker = line.match(/^\s*(`{3,}|~{3,})(.*)$/u)
+      if (!marker) continue
+      if (!fence) fence = marker[1]
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = undefined
+    }
+    if (fence) return undefined
+  }
   const promptRow = top + 1
   const match = screen.lines[promptRow]?.match(/^\s*❯\s?(.*)$/u)
   if (!match || promptRow >= bottom) return undefined

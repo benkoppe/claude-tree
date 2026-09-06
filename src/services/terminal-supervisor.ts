@@ -64,6 +64,8 @@ const PROVIDER_CLEANUP_TIMEOUT_MS = 500
 const PERSISTENCE_TIMEOUT_MS = 500
 const TRANSITION_DERIVATION_TIMEOUT_MS = 2_000
 const APPLICATION_ACKNOWLEDGMENT_TIMEOUT_MS = 10_000
+const ACTIVITY_PROBE_INTERVAL_MS = 2_000
+const ACTIVITY_CONFIRMATION_DELAY_MS = 100
 
 export type TerminalOwnerState = "running" | "stopping" | "cleanup-incomplete"
 
@@ -183,6 +185,14 @@ export interface TerminalOwnershipSnapshot {
   readonly exitCode: number | null
 }
 
+export interface TerminalActivityCheck {
+  readonly ownerId: string
+  readonly sessionId: string
+  readonly sequenceId: number
+  readonly activity?: AgentActivity
+  readonly issue?: "unrecognized-screen" | "observer-failed"
+}
+
 export interface TerminalSupervisorApi {
   readonly show: (
     prepared: PreparedTerminal,
@@ -210,6 +220,7 @@ export interface TerminalSupervisorApi {
   readonly activitySessionIds: (activity: AgentActivity) => Effect.Effect<ReadonlySet<string>>
   readonly draftPreviews: Effect.Effect<ReadonlyMap<string, DraftPreview>>
   readonly ownershipSnapshot: Effect.Effect<readonly TerminalOwnershipSnapshot[]>
+  readonly reconcileActivity: Effect.Effect<readonly TerminalActivityCheck[]>
 }
 
 export class TerminalSupervisor extends Context.Service<
@@ -275,6 +286,9 @@ interface TerminalOwner {
   readonly mutationTokens: MutationTokens
   semanticFiber?: Fiber.Fiber<void, never>
   transitionFiber?: Fiber.Fiber<void, never>
+  activityFiber?: Fiber.Fiber<void, never>
+  activityHintFiber?: Fiber.Fiber<void, never>
+  readonly activityProbeGate: Semaphore.Semaphore
   lastQueuedActivity: AgentActivity
   activity: AgentActivity
   exitCode: number | null
@@ -508,6 +522,9 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           const subscription = launch.transitions
             ? yield* Scope.provide(PubSub.subscribe(launch.transitions), providerScope)
             : undefined
+          const activityHints = launch.activityHints
+            ? yield* Scope.provide(PubSub.subscribe(launch.activityHints), providerScope)
+            : undefined
           const ownerExit = yield* Effect.exit(
             this.createOwner(
               ownerId,
@@ -556,6 +573,15 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             this.offerEvent(owner, { _tag: "Exited", exitCode })
           })
           owner.semanticFiber = yield* Effect.forkIn(this.semanticLoop(owner), this.runtimeScope)
+          owner.activityFiber = yield* Effect.forkIn(Effect.forever(
+            Effect.sleep(ACTIVITY_PROBE_INTERVAL_MS).pipe(Effect.andThen(Effect.suspend(() =>
+              owner.lastQueuedActivity === "idle" ? Effect.void : this.probeActivity(owner).pipe(Effect.asVoid)))),
+          ), this.runtimeScope)
+          if (activityHints) {
+            owner.activityHintFiber = yield* Effect.forkIn(Effect.forever(
+              PubSub.take(activityHints).pipe(Effect.andThen(this.probeActivity(owner)), Effect.asVoid),
+            ), this.runtimeScope)
+          }
           if (subscription) {
             owner.transitionFiber = yield* Effect.forkIn(
               this.transitionLoop(owner, subscription),
@@ -697,6 +723,45 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       exitCode: owner.exitCode,
     })),
   )
+
+  readonly reconcileActivity: TerminalSupervisorApi["reconcileActivity"] = Effect.suspend(() =>
+    Effect.forEach([...this.owners.values()], (owner) => this.probeActivity(owner), { concurrency: "unbounded" }).pipe(
+      Effect.map((checks) => checks.filter((check): check is TerminalActivityCheck => check !== undefined)),
+    ))
+
+  private probeActivity(owner: TerminalOwner): Effect.Effect<TerminalActivityCheck | undefined> {
+    return owner.activityProbeGate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
+      if (!this.canProbeActivity(owner)) return undefined
+      const sessionId = owner.sessionId
+      const sample = (phase: "sample" | "confirm"): TerminalActivityCheck => {
+        try {
+          const screen = owner.surface.screen()
+          const activity = owner.observer.reconcileScreen
+            ? owner.observer.reconcileScreen(screen, phase)
+            : owner.observer.observeScreen(screen)
+          const draft = owner.observer.observeDraft(screen)
+          this.takeObservations(owner)
+          this.recordDraft(owner, draft)
+          if (activity !== undefined) this.offerEvent(owner, { _tag: "Activity", activity })
+          return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence.next - 1, ...(activity === undefined
+            ? { issue: "unrecognized-screen" as const } : { activity }) }
+        } catch {
+          return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence.next - 1, issue: "observer-failed" }
+        }
+      }
+      const first = sample("sample")
+      if (first.activity !== undefined || first.issue === "observer-failed") return first
+      yield* Effect.sleep(ACTIVITY_CONFIRMATION_DELAY_MS)
+      if (!this.canProbeActivity(owner) || owner.sessionId !== sessionId) return undefined
+      return sample("confirm")
+    }.bind(this)))
+  }
+
+  private canProbeActivity(owner: TerminalOwner): boolean {
+    return !this.shuttingDown && this.owners.get(owner.ownerId) === owner && !owner.cleanupStarted &&
+      !owner.uiReleased && !owner.pendingIdentity && !owner.pendingAdoptionToken &&
+      owner.exitCode === null && this.ledger.get(owner.sessionId)?.state === "running"
+  }
 
   reportCleanupError(error: TerminalCleanupError): void {
     this.ignoreCallback(() => this.events.onCleanupError?.(error))
@@ -862,6 +927,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         ownership,
         awaitingTemporaryAdoption,
         mutationTokens,
+        activityProbeGate: Semaphore.makeUnsafe(1),
         lastQueuedActivity,
         activity: "idle",
         exitCode: null,
@@ -2383,6 +2449,8 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     owner.cleanupInProgress = false
     owner.semanticFiber?.interruptUnsafe()
     owner.transitionFiber?.interruptUnsafe()
+    owner.activityFiber?.interruptUnsafe()
+    owner.activityHintFiber?.interruptUnsafe()
     this.clearPersistenceOwner(owner.ownerId)
   }
 

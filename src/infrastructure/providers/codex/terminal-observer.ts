@@ -6,9 +6,7 @@ import type {
 } from "../../../domain/model"
 import { OscSequenceParser } from "../../../osc"
 
-const ACTIVE_TITLE_STATUSES = new Set(["Starting", "Working", "Thinking", "Waiting"])
-const IDLE_TITLE_STATUSES = new Set(["Ready", "Idle"])
-const CODEX_SPINNER = /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?:\s|$)/u
+const CODEX_SPINNER = /(?<!\S)[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?!\S)/u
 
 type CodexScreenSignal = "blocker" | "composer" | "status"
 
@@ -20,38 +18,67 @@ interface CodexScreenObservation {
 export class CodexTerminalObserver implements TerminalObserver {
   private readonly parser = new OscSequenceParser()
   private titleActivity: AgentActivity | undefined
-  private sawActiveTitle = false
+  private activeProjectTitle: string | undefined
+  private lastScreen: string | undefined
+  private activeTitleScreen: string | undefined
+  private awaitingActiveScreen = false
+  private recoveryScreen: string | undefined
+
+  observeInput(_bytes: Uint8Array): void {
+    this.recoveryScreen = undefined
+  }
 
   observeOutput(bytes: Uint8Array): readonly AgentActivity[] {
+    if (bytes.length > 0) this.recoveryScreen = undefined
     const observed: AgentActivity[] = []
     for (const body of this.parser.observe(bytes)) {
       const title = decodeOscTitle(body)
       if (title === undefined) continue
 
-      const activity = codexActivityFromTitle(title)
+      const signal = codexTitleSignal(title)
+      const activity = signal?.activity ?? (title === this.activeProjectTitle ? "idle" : undefined)
       if (activity === "working" || activity === "blocked") {
-        this.sawActiveTitle = true
+        this.activeProjectTitle = signal?.remainingTitle
+        if (!this.awaitingActiveScreen) this.activeTitleScreen = this.lastScreen
+        this.awaitingActiveScreen = true
         observed.push(activity)
       } else if (activity === "idle") {
-        this.sawActiveTitle = false
+        this.activeProjectTitle = undefined
+        this.awaitingActiveScreen = false
         observed.push("idle")
-      } else if (this.sawActiveTitle) {
-        this.sawActiveTitle = false
-        observed.push("idle")
-      }
+      } else this.activeProjectTitle = undefined
     }
     if (observed.length > 0) this.titleActivity = observed.at(-1)
     return observed
   }
 
   observeScreen(screen: TerminalScreen): AgentActivity | undefined {
+    this.lastScreen = JSON.stringify([screen.lines, screen.cursor])
+    if (this.recoveryScreen !== this.lastScreen) this.recoveryScreen = undefined
     const observation = observeCodexScreen(screen)
+    if (observation?.activity !== "idle") this.recoveryScreen = undefined
     if (observation === undefined) return undefined
-    if (observation.signal === "blocker") return "blocked"
-    if (this.titleActivity !== undefined && observation.activity !== this.titleActivity) {
-      return undefined
+    if (this.awaitingActiveScreen && observation.signal !== "blocker" &&
+      (observation.activity === "idle" || this.titleActivity === "blocked")) {
+      this.activeTitleScreen ??= this.lastScreen
+      if (this.activeTitleScreen === this.lastScreen) return undefined
     }
+    this.awaitingActiveScreen = false
     return observation.activity
+  }
+
+  reconcileScreen(screen: TerminalScreen, phase: "sample" | "confirm"): AgentActivity | undefined {
+    if (phase === "sample") this.recoveryScreen = undefined
+    const activity = this.observeScreen(screen)
+    if (activity !== undefined || observeCodexActivity(screen) !== "idle") return activity
+    if (phase === "confirm" && this.recoveryScreen === this.lastScreen) {
+      this.awaitingActiveScreen = false
+      this.recoveryScreen = undefined
+      return this.observeScreen(screen)
+    }
+    // Only a new probe's sample can establish its confirmation candidate.
+    if (phase === "sample") this.recoveryScreen = this.lastScreen
+    return undefined
   }
 
   observeDraft(screen: TerminalScreen): DraftPreview | undefined {
@@ -70,13 +97,23 @@ export function observeCodexActivity(screen: TerminalScreen): AgentActivity | un
 }
 
 export function codexActivityFromTitle(title: string): AgentActivity | undefined {
-  if (CODEX_SPINNER.test(title)) return "working"
-  if (/\bAction Required\b/u.test(title)) return "blocked"
+  return codexTitleSignal(title)?.activity
+}
 
-  const segments = title.split(/\s(?:[|·—]|-)\s/u).map((segment) => segment.trim())
-  if (segments.some((segment) => ACTIVE_TITLE_STATUSES.has(segment))) return "working"
-  if (segments.some((segment) => IDLE_TITLE_STATUSES.has(segment))) return "idle"
-  return undefined
+function codexTitleSignal(title: string): { activity: AgentActivity; remainingTitle: string | undefined } | undefined {
+  const blocked = title.match(/^\[ [!.] \] Action Required(?: \| (.+))?$/u)
+  if (blocked) return { activity: "blocked", remainingTitle: blocked[1] }
+  const spinner = CODEX_SPINNER.exec(title)
+  if (!spinner) return undefined
+  // Codex 0.150.1 joins activity with spaces, and all remaining fields with " | ".
+  // Word-only run-state fields are indistinguishable from configured names.
+  const before = title.slice(0, spinner.index).trim().replace(/ \|$|^\|$/u, "").trim()
+  const after = title.slice(spinner.index + spinner[0].length).trim().replace(/^\| |^\|$/u, "").trim()
+  const remainingTitle = [before, after].filter(Boolean).join(" | ")
+  return {
+    activity: "working",
+    remainingTitle: remainingTitle && !CODEX_SPINNER.test(remainingTitle) ? remainingTitle : undefined,
+  }
 }
 
 function decodeOscTitle(body: readonly number[]): string | undefined {
@@ -100,17 +137,16 @@ function observeCodexScreen(screen: TerminalScreen): CodexScreenObservation | un
   if (isCodexTrustPrompt(screen.lines) || isCodexBlocker(afterLastPrompt)) {
     return { activity: "blocked", signal: "blocker" }
   }
-  if (observeCodexComposer(screen) !== undefined) {
-    return { activity: "idle", signal: "composer" }
-  }
-
-  const bottomLines = screen.lines.filter((line) => line.trim().length > 0).slice(-3)
+  const composer = observeCodexComposer(screen)
+  const bottomLines = (composer === undefined ? screen.lines : afterLastPrompt)
+    .filter((line) => line.trim().length > 0).slice(-3)
   if (
     !bottomLines.some((line) => line.includes("■ Conversation interrupted")) &&
     bottomLines.some(isCodexActiveStatusRow)
   ) {
     return { activity: "working", signal: "status" }
   }
+  if (composer !== undefined) return { activity: "idle", signal: "composer" }
   return undefined
 }
 

@@ -43,6 +43,7 @@ export interface ApplicationOperations {
     mode: "full" | "incremental",
     sessionIds: readonly string[],
   ) => Effect.Effect<AgentSessionSnapshot, unknown>
+  readonly reconcileActivity: TerminalSupervisorApi["reconcileActivity"]
   readonly prepareNew: Effect.Effect<PreparedTerminal, unknown>
   readonly prepareResume: AgentProviderApi["prepareResume"]
   readonly branch: (target: Parameters<AgentProviderApi["branchFrom"]>[0]) => Effect.Effect<
@@ -117,6 +118,7 @@ export function makeApplicationOperations(options: {
 
   return {
     loadSnapshot,
+    reconcileActivity: Effect.suspend(() => options.terminals.reconcileActivity),
     prepareNew: Effect.suspend(() => options.provider.prepareNewSession),
     prepareResume: (session) => Effect.suspend(() => options.provider.prepareResume(session)),
     branch,

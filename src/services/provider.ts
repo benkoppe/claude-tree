@@ -59,6 +59,8 @@ export interface TerminalLaunch {
   readonly observer: TerminalObserver
   readonly initialDraft?: DraftPreview
   readonly transitions?: PubSub.PubSub<TerminalTransitionRequest>
+  /** Best-effort wakeups, never proof that a turn completed. */
+  readonly activityHints?: PubSub.PubSub<"reconcile">
 }
 
 export interface AcquiredTerminalLaunch {
