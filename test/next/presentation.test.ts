@@ -937,11 +937,14 @@ test("uses shared live, update, working, and blocked picker markers", async () =
     const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
     expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.success))).toBeTrue()
     expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.warning))).toBeTrue()
-    expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.selectedDanger))).toBeTrue()
+    expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.danger) && span.bg.equals(presentationTheme.element))).toBeTrue()
+    expect(spans.some((span) => span.text.includes("Blocked leaf") && span.bg.equals(presentationTheme.selected))).toBeTrue()
     expect(spans.some((span) => /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text))).toBeTrue()
     for (let index = 0; index < 3; index += 1) setup.mockInput.pressArrow("down")
     await frame(setup, () => setup.captureSpans().lines.flatMap((line) => line.spans).some((span) =>
-      /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text) && span.bg.equals(presentationTheme.selected) && span.fg.equals(presentationTheme.selectedText)))
+      span.text.includes("Working leaf") && span.bg.equals(presentationTheme.selected)))
+    expect(setup.captureSpans().lines.flatMap((line) => line.spans).some((span) =>
+      /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text) && span.bg.equals(presentationTheme.element) && span.fg.equals(presentationTheme.primary))).toBeTrue()
     if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
     await Effect.runPromise(running.harness.update({ ...graph, surface: {
       ...graph.surface, nodes: graph.surface.nodes.map((node) => ({
@@ -976,8 +979,8 @@ test("Jump to Leaf uses the same four status indicators", async () => {
     setup.mockInput.pressKey("g", { shift: true })
     await frame(setup, (value) => value.includes("Jump to Leaf") && value.includes("Working leaf") && /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
     const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
-    for (const color of [presentationTheme.success, presentationTheme.warning, presentationTheme.selectedDanger]) {
-      expect(spans.some((span) => span.text.includes("●") && span.fg.equals(color))).toBeTrue()
+    for (const color of [presentationTheme.success, presentationTheme.warning, presentationTheme.danger]) {
+      expect(spans.some((span) => span.text.includes("●") && span.fg.equals(color) && span.bg.equals(presentationTheme.element))).toBeTrue()
     }
   } finally { await running.stop() }
 })
