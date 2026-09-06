@@ -11,6 +11,7 @@ Root picker:
   Click           select a row; click the selected row to open it
   Enter           open its message graph
   d               delete the selected whole tree from roots
+  x               kill all live terminals in the selected tree after confirmation
   n               start a new conversation
   r               refresh conversations
   ?               open About

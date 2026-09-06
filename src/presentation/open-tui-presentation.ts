@@ -150,9 +150,10 @@ type PendingMouseAction =
 
 const ROOT_CONTROLS: readonly FooterControl[] = [
   { key: "↑↓/jk", description: "select" },
-  { key: "Enter", description: "graph", action: "enter-root" },
-  { key: "d", description: "delete", action: "remove" },
+  { key: "Enter", description: "open", action: "enter-root" },
   { key: "n", description: "new", action: "new" },
+  { key: "d", description: "delete", action: "remove" },
+  { key: "x", description: "kill", action: "stop" },
   { key: "r", description: "refresh", action: "refresh" },
   { key: "?", description: "about", action: "about" },
   { key: "q", description: "quit", action: "quit" },
@@ -161,11 +162,11 @@ const ROOT_CONTROLS: readonly FooterControl[] = [
 const GRAPH_CONTROLS: readonly FooterControl[] = [
   { key: "↑↓/kj", description: "edges" },
   { key: "←→/hl", description: "branches" },
-  { key: "g/G", description: "top/leaf" },
+  { key: "g/G", description: "top/bottom" },
   { key: "Enter", description: "open", action: "open" },
   { key: "f", description: "fork", action: "fork" },
   { key: "d", description: "delete", action: "remove" },
-  { key: "x", description: "stop", action: "stop" },
+  { key: "x", description: "kill", action: "stop" },
   { key: "r", description: "refresh", action: "refresh" },
   { key: "?", description: "about", action: "about" },
   { key: "q", description: "back", action: "roots" },
@@ -610,7 +611,7 @@ class OpenTuiPresentationController {
     const quit = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape") || isExitKey(key)
     if (
       !quit && movement === undefined && !isEnterKey(key) &&
-      !["d", "n", "r"].some((name) => isUnmodifiedKey(key, name))
+      !["d", "x", "n", "r"].some((name) => isUnmodifiedKey(key, name))
     ) return
     key.stopPropagation()
     if (quit) {
@@ -625,6 +626,8 @@ class OpenTuiPresentationController {
       this.enterSelectedRoot()
     } else if (isUnmodifiedKey(key, "d") && !key.repeated) {
       this.showRemovalConfirmation()
+    } else if (isUnmodifiedKey(key, "x") && !key.repeated) {
+      this.showStopConfirmation()
     } else if (isUnmodifiedKey(key, "n") && !key.repeated) {
       this.runTerminalAction(this.appRuntime.newSession)
     }
@@ -852,6 +855,22 @@ class OpenTuiPresentationController {
   }
 
   private showStopConfirmation(): void {
+    if (this.rootsSurface()) {
+      const root = this.selectedRoot()
+      if (!root) return
+      const sessionIds = root.memberSessionIds.filter((id) => this.viewModel?.liveSessionIds.has(id))
+      if (sessionIds.length === 0) {
+        this.showError("This tree has no live terminals")
+        return
+      }
+      this.modalChoice = "confirm"
+      this.enqueue(Effect.suspend(() => this.appRuntime.openModal({
+        _tag: "ConfirmStopTree",
+        rootSessionId: root.sessionId,
+        sessionIds,
+      })))
+      return
+    }
     const selected = this.selectedGraphNode()
     if (selected?._tag !== "Endpoint" || !this.viewModel?.liveSessionIds.has(selected.session.id)) {
       if (selected?._tag === "Endpoint" && selected.fork?.empty) {
@@ -921,7 +940,7 @@ class OpenTuiPresentationController {
 
   private completeConfirmation(choice: "confirm" | "cancel"): void {
     const modal = this.viewModel?.modal
-    if (!modal || (modal._tag !== "ConfirmRemoval" && modal._tag !== "ConfirmStop")) return
+    if (!modal || (modal._tag !== "ConfirmRemoval" && modal._tag !== "ConfirmStop" && modal._tag !== "ConfirmStopTree")) return
     if (choice === "cancel") {
       this.enqueue(this.appRuntime.closeModal)
       return
@@ -935,7 +954,15 @@ class OpenTuiPresentationController {
     const self = this
     this.runAction(Effect.gen(function*() {
       yield* self.appRuntime.closeModal
-      if (modal._tag === "ConfirmStop") {
+      if (modal._tag === "ConfirmStopTree") {
+        if (!self.isStopTreeTargetActionable(modal)) return
+        const sessionIds = modal.sessionIds.filter((id) => self.viewModel?.liveSessionIds.has(id))
+        const results = yield* Effect.forEach(sessionIds, (id) => self.appRuntime.stopSession(id).pipe(Effect.result), {
+          concurrency: "unbounded",
+        })
+        const errors = results.flatMap((result) => result._tag === "Failure" ? [errorMessage(result.failure)] : [])
+        if (errors.length > 0) yield* Effect.fail(new Error(errors.join("\n")))
+      } else if (modal._tag === "ConfirmStop") {
         const actionable = yield* Effect.sync(() => self.isStopTargetActionable(modal.sessionId))
         if (!actionable) return
         yield* self.appRuntime.stopSession(modal.sessionId)
@@ -1028,10 +1055,13 @@ class OpenTuiPresentationController {
       this.stopConfirmationSessionId = null
       this.closingStaleStopModalIdentity = null
     }
+    if (modal?._tag === "ConfirmStopTree" && !this.isStopTreeTargetActionable(modal)) {
+      this.enqueue(this.appRuntime.closeModal)
+    }
     if (identity === this.modalIdentity) return
     this.modalIdentity = identity
     this.pendingMouseAction = null
-    if (modal?._tag === "ConfirmStop") this.modalChoice = "confirm"
+    if (modal?._tag === "ConfirmStop" || modal?._tag === "ConfirmStopTree") this.modalChoice = "confirm"
     if (modal?._tag === "ConfirmRemoval") this.modalChoice = "cancel"
   }
 
@@ -1257,7 +1287,7 @@ class OpenTuiPresentationController {
     if (modal._tag === "About" || modal._tag === "Error") {
       return styledText([chunk(modal._tag === "About" ? "close" : "esc close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
     }
-    const label = modal._tag === "ConfirmStop" ? "Stop" : "Delete"
+    const label = modal._tag === "ConfirmStopTree" ? "Kill" : modal._tag === "ConfirmStop" ? "Stop" : "Delete"
     return styledText([
       chunk(
         "Cancel",
@@ -1520,7 +1550,7 @@ class OpenTuiPresentationController {
     if (this.leafPicker) {
       this.leafPicker = null
       this.render()
-    } else if (this.viewModel?.modal?._tag === "ConfirmRemoval" || this.viewModel?.modal?._tag === "ConfirmStop") {
+    } else if (this.viewModel?.modal?._tag === "ConfirmRemoval" || this.viewModel?.modal?._tag === "ConfirmStop" || this.viewModel?.modal?._tag === "ConfirmStopTree") {
       this.completeConfirmation("cancel")
     } else if (this.viewModel?.modal) {
       this.enqueue(this.appRuntime.closeModal)
@@ -1677,9 +1707,17 @@ class OpenTuiPresentationController {
 
   private visibleModal(): ApplicationModal | null {
     const modal = this.viewModel?.modal ?? null
+    if (modal?._tag === "ConfirmStopTree") return this.isStopTreeTargetActionable(modal) ? modal : null
     if (modal?._tag !== "ConfirmStop") return modal
     if (modal.sessionId !== this.stopConfirmationSessionId) return null
     return this.isStopTargetActionable(modal.sessionId) ? modal : null
+  }
+
+  private isStopTreeTargetActionable(modal: Extract<ApplicationModal, { _tag: "ConfirmStopTree" }>): boolean {
+    const root = this.rootsSurface() ? this.selectedRoot() : undefined
+    return root?.sessionId === modal.rootSessionId &&
+      modal.sessionIds.every((id) => root.memberSessionIds.includes(id)) &&
+      modal.sessionIds.some((id) => this.viewModel?.liveSessionIds.has(id))
   }
 
   private rememberStoppedEndpoint(endpoint: PendingStoppedEndpoint): void {
@@ -1786,6 +1824,12 @@ function modalContent(modal: ApplicationModal): {
     }
   }
   if (modal._tag === "Error") return { title: "Error", body: modal.message }
+  if (modal._tag === "ConfirmStopTree") {
+    return {
+      title: "Kill tree terminals",
+      body: `Kill all ${modal.sessionIds.length} live terminals in this tree?\nWorking Agents will be interrupted and unsent text discarded.\nSaved conversations remain resumable.`,
+    }
+  }
   if (modal._tag === "ConfirmStop") {
     return {
       title: "Stop live session",
