@@ -101,6 +101,8 @@ export function renderRoots(
   const end = Math.min(roots.length, start + safeHeight)
   const canvas = new SparseCanvas()
 
+  const messageCountWidth = roots.reduce((width, root) => Math.max(width, String(root.messageCount).length), 1)
+  const branchCountWidth = roots.reduce((width, root) => Math.max(width, String(root.memberSessionIds.length).length), 1)
   for (let index = start; index < end; index += 1) {
     const root = roots[index]!
     const row = index - start
@@ -108,7 +110,9 @@ export function renderRoots(
     const background = selected ? theme.selected : theme.background
     const foreground = selected ? theme.selectedText : theme.text
     const status = statusMarker(root.status, spinnerFrame)
-    const counts = `${root.memberSessionIds.length} ${root.memberSessionIds.length === 1 ? "session" : "sessions"}`
+    const branchLabel = root.memberSessionIds.length === 1 ? "branch" : "branches"
+    const messageLabel = root.messageCount === 1 ? "message" : "messages"
+    const counts = `${String(root.messageCount).padStart(messageCountWidth)} ${messageLabel.padEnd("messages".length)}  ${String(root.memberSessionIds.length).padStart(branchCountWidth)} ${branchLabel.padEnd("branches".length)}`
     const style = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     canvas.paint(0, row, safeWidth, 1, style)
     canvas.write(1, row, status, {

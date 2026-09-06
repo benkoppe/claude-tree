@@ -29,6 +29,32 @@ test.each([22, 32])("node status badges are right-aligned without overwriting de
   }
 })
 
+test.each([40, 80])("root message and branch counts align numerically at width %i", (width) => {
+  const messageCounts = [0, 1, 123, 12]
+  const roots = [1, 2, 12, 100].map((count, index) => ({
+    sessionId: `root-${count}`,
+    title: "A long conversation title",
+    memberSessionIds: Array.from({ length: count }, (_, index) => `session-${count}-${index}`),
+    messageCount: messageCounts[index]!,
+    lastModified: 0,
+    selected: count === 1,
+    status: "idle" as const,
+  }))
+  const rendered = renderRoots(roots, "root-1", roots.length, width)
+  const rows = rendered.text.split("\n")
+  for (const [index, count] of [1, 2, 12, 100].entries()) {
+    const row = rows[index]!
+    expect(row.trimEnd()).toEndWith(`${count} ${count === 1 ? "branch" : "branches"}`)
+    expect(row.lastIndexOf(`${count} `) + String(count).length).toBe(width - 10)
+    const messageCount = messageCounts[index]!
+    expect(row).toContain(`${messageCount} ${messageCount === 1 ? "message " : "messages"}`)
+    expect(row.indexOf(String(messageCount)) + String(messageCount).length).toBe(width - 24)
+    expect(displayWidth(row)).toBeLessThanOrEqual(width)
+  }
+  const scrolled = renderRoots(roots, "root-100", 1, width)
+  expect(scrolled.text).toBe(rows[3]!)
+})
+
 test("highlighted status colors have readable contrast and root rows use them", () => {
   const luminance = (color: RGBA) => {
     const [r, g, b] = color.toInts().slice(0, 3).map((value) => {
@@ -41,7 +67,7 @@ test("highlighted status colors have readable contrast and root rows use them", 
     const foreground = luminance(statusColor(status, true))
     const background = luminance(theme.selected)
     expect((Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05)).toBeGreaterThanOrEqual(4.5)
-    const rendered = renderRoots([{ sessionId: "root", title: "Root", memberSessionIds: ["root"], lastModified: 0, selected: true, status }], "root", 1, 40)
+    const rendered = renderRoots([{ sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, selected: true, status }], "root", 1, 40)
     const marker = rendered.content.chunks.find((chunk) => chunk.text.includes(statusMarker(status, 0)))
     expect(marker?.fg?.equals(statusColor(status, true))).toBeTrue()
   }
