@@ -55,7 +55,7 @@ test.each([40, 80])("root message and branch counts align numerically at width %
   expect(scrolled.text).toBe(rows[3]!)
 })
 
-test("highlighted status colors have readable contrast and root rows use them", () => {
+test("highlighted status colors have readable contrast but root markers stay unhighlighted", () => {
   const luminance = (color: RGBA) => {
     const [r, g, b] = color.toInts().slice(0, 3).map((value) => {
       const channel = value / 255
@@ -69,6 +69,9 @@ test("highlighted status colors have readable contrast and root rows use them", 
     expect((Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05)).toBeGreaterThanOrEqual(4.5)
     const rendered = renderRoots([{ sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, selected: true, status }], "root", 1, 40)
     const marker = rendered.content.chunks.find((chunk) => chunk.text.includes(statusMarker(status, 0)))
-    expect(marker?.fg?.equals(statusColor(status, true))).toBeTrue()
+    expect(marker?.fg?.equals(statusColor(status, false))).toBeTrue()
+    expect(marker?.bg?.equals(theme.background)).toBeTrue()
+    const title = rendered.content.chunks.find((chunk) => chunk.text.includes("Root"))
+    expect(title?.bg?.equals(theme.selected)).toBeTrue()
   }
 })

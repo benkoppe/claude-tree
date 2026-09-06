@@ -114,10 +114,10 @@ export function renderRoots(
     const messageLabel = root.messageCount === 1 ? "message" : "messages"
     const counts = `${String(root.messageCount).padStart(messageCountWidth)} ${messageLabel.padEnd("messages".length)}  ${String(root.memberSessionIds.length).padStart(branchCountWidth)} ${branchLabel.padEnd("branches".length)}`
     const style = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
-    canvas.paint(0, row, safeWidth, 1, style)
+    canvas.paint(3, row, Math.max(0, safeWidth - 3), 1, style)
     canvas.write(1, row, status, {
-      ...style,
-      fg: statusColor(root.status, selected),
+      ...DEFAULT_STYLE,
+      fg: statusColor(root.status, false),
       attributes: TextAttributes.BOLD,
     })
     const titleX = 4
