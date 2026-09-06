@@ -31,6 +31,11 @@ export type ApplicationModal =
   | { readonly _tag: "About" }
   | { readonly _tag: "Error"; readonly message: string }
   | {
+      readonly _tag: "ConfirmStopTree"
+      readonly rootSessionId: string
+      readonly sessionIds: readonly string[]
+    }
+  | {
       readonly _tag: "ConfirmRemoval"
       readonly requestId: string
       readonly removal: ConversationRemoval

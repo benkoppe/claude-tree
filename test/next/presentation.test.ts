@@ -42,6 +42,7 @@ test("renders roots and preserves directional graph navigation intent", async ()
 
   try {
     await frame(setup, (value) => value.includes("First conversation"))
+    expect(setup.captureCharFrame()).toContain("Enter open n new d delete x kill")
     expect(isSelected(setup, "First conversation")).toBeTrue()
 
     setup.mockInput.pressArrow("down")
@@ -60,6 +61,98 @@ test("renders roots and preserves directional graph navigation intent", async ()
     await frame(setup, () => isSelected(setup, "left branch"))
     setup.mockInput.pressArrow("right")
     await frame(setup, () => isSelected(setup, "right branch"))
+  } finally {
+    await running.stop()
+  }
+})
+
+test("root kill confirms all live tree members, supports cancellation, and leaves other trees alone", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 24 })
+  const initial = rootsView()
+  if (initial.surface._tag !== "Roots") throw new Error("Expected roots")
+  const roots = withLiveSessions({
+    ...initial,
+    surface: {
+      ...initial.surface,
+      roots: initial.surface.roots.map((root) => root.sessionId === "root-2"
+        ? { ...root, memberSessionIds: ["root-2", "child", "inactive"] }
+        : root),
+    },
+  }, ["root-1", "root-2", "child"])
+  const running = await startPresentation(setup.renderer, roots)
+  try {
+    await frame(setup, (value) => value.includes("x kill"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Kill all 2 live terminals"))
+    expect(running.harness.modalUpdates.at(-1)).toEqual({
+      _tag: "ConfirmStopTree", rootSessionId: "root-2", sessionIds: ["root-2", "child"],
+    })
+    expect(running.harness.calls.filter((call) => call.startsWith("stop:"))).toEqual([])
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("Kill tree terminals"))
+    expect(running.harness.calls.filter((call) => call.startsWith("stop:"))).toEqual([])
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Kill tree terminals"))
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("stop:child"))
+    expect(running.harness.calls.filter((call) => call.startsWith("stop:")).sort()).toEqual(["stop:child", "stop:root-2"])
+    expect(running.harness.calls.some((call) => call.startsWith("remove:"))).toBeFalse()
+  } finally {
+    await running.stop()
+  }
+})
+
+test("root kill reports an inactive tree without stopping anything", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const running = await startPresentation(setup.renderer, rootsView())
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("This tree has no live terminals"))
+    expect(running.harness.calls.filter((call) => call.startsWith("stop:"))).toEqual([])
+  } finally {
+    await running.stop()
+  }
+})
+
+test("root kill dismisses a stale confirmation when its terminals exit", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const roots = withLiveSessions(rootsView(), ["root-1"])
+  const running = await startPresentation(setup.renderer, roots)
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Kill tree terminals"))
+    await Effect.runPromise(running.harness.update({
+      ...roots, liveSessionIds: new Set(), modal: running.harness.modalUpdates.at(-1)!,
+    }))
+    await frame(setup, (value) => !value.includes("Kill tree terminals"))
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal).toBeNull()
+    expect(running.harness.calls.filter((call) => call.startsWith("stop:"))).toEqual([])
+  } finally {
+    await running.stop()
+  }
+})
+
+test("root kill attempts every terminal even when one cleanup fails", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 24 })
+  const initial = rootsView()
+  if (initial.surface._tag !== "Roots") throw new Error("Expected roots")
+  const roots = withLiveSessions({
+    ...initial,
+    surface: { ...initial.surface, roots: [{ ...initial.surface.roots[0]!, memberSessionIds: ["root-1", "child"] }] },
+  }, ["root-1", "child"])
+  const running = await startPresentation(setup.renderer, roots, new Map(), undefined, Effect.succeed(true), {
+    stopSession: (id) => id === "root-1" ? Effect.fail(new Error("cleanup failed")) : Effect.succeed(true),
+  })
+  try {
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    setup.mockInput.pressKey("x")
+    await frame(setup, (value) => value.includes("Kill tree terminals"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => value.includes("cleanup failed"))
+    expect(running.harness.calls.filter((call) => call.startsWith("stop:")).sort()).toEqual(["stop:child", "stop:root-1"])
   } finally {
     await running.stop()
   }
@@ -174,6 +267,7 @@ test("stops the newly selected graph endpoint without waiting for publication", 
 
   try {
     await frame(setup, (value) => value.includes("branch source"))
+    expect(setup.captureCharFrame()).toContain("x kill")
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressKey("x")
@@ -853,7 +947,7 @@ test("supports g top and G unique-leaf navigation", async () => {
   const running = await startPresentation(setup.renderer, graph)
 
   try {
-    await frame(setup, (value) => value.includes("g/G top/leaf"))
+    await frame(setup, (value) => value.includes("g/G top/bottom"))
     setup.mockInput.pressArrow("down")
     await frame(setup, () => isSelected(setup, "left branch"))
     setup.mockInput.pressKey("g", { shift: true })
@@ -1045,7 +1139,7 @@ interface RuntimeActionOverrides {
   readonly stopSession?: (
     sessionId: string,
     update: (viewModel: ApplicationViewModel) => Effect.Effect<void>,
-  ) => Effect.Effect<boolean>
+  ) => Effect.Effect<boolean, unknown>
   readonly beforeRefresh?: () => void
   readonly reportedRefreshFailure?: ApplicationOperationError
   readonly refresh?: () => Effect.Effect<unknown, unknown>
