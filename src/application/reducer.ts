@@ -342,10 +342,14 @@ function refreshSucceeded(
     if (!sessions.has(sessionId) && !localSessions.has(sessionId)) replacementCandidates.delete(sessionId)
   }
   const unstableSessionIds = new Set<string>()
+  const unavailableReasons: string[] = []
   const unviewedSessionIds = new Set(state.unviewedSessionIds)
 
   for (const [sessionId, incoming] of snapshot.transcripts) {
     if (staleSessionIds.has(sessionId)) continue
+    if (active.reason === "manual" && incoming._tag === "Unavailable") {
+      unavailableReasons.push(`${sessionId}: ${incoming.reason}`)
+    }
     const previousRead = selectTranscriptRead(state, sessionId)
     const terminal = state.terminals.get(sessionId)
     const nonIdle = terminal?.activity === "working" || terminal?.activity === "blocked"
@@ -385,7 +389,8 @@ function refreshSucceeded(
       terminals.set(sessionId, { ...acceptedTerminal, replacement: {
         ...acceptedTerminal.replacement,
         prefix: stableTranscriptWhileNonIdle(acceptedTerminal.replacement.prefix, reconciled.read.messages),
-        ...(reconciled.completed ? { settled: true } : {}),
+        ...(reconciled.completed || (!nonIdle && !pendingCompletions.has(sessionId) && !acceptedTerminal.pendingSubmission)
+          ? { settled: true } : {}),
       } })
     }
     if (reconciled.clearAnchor || reconciled.completed) {
@@ -437,6 +442,10 @@ function refreshSucceeded(
       if (advanced) pendingCompletions.set(sessionId, advanced)
       else {
         pendingCompletions.delete(sessionId)
+        const terminal = terminals.get(sessionId)
+        if (terminal?.replacement) terminals.set(sessionId, {
+          ...terminal, replacement: { ...terminal.replacement, settled: true },
+        })
         const incoming = snapshot.transcripts.get(sessionId)
         // Idle can also mean cancelled. A successful read with no completed turn
         // is not a failed read, and must not manufacture a completion error.
@@ -460,7 +469,9 @@ function refreshSucceeded(
     terminals,
     unviewedSessionIds,
     refresh: { ...without.refresh, initialPending: false, appliedGenerationBySession },
-    ...(unstableSessionIds.size > 0
+    ...(unavailableReasons.length > 0
+      ? { modal: { _tag: "Error", message: `Conversation refresh failed: ${unavailableReasons.join("; ")}` } as const }
+      : unstableSessionIds.size > 0
       ? { modal: { _tag: "Error", message: "Conversation history kept changing during refresh. Refresh again when the session is idle." } as const }
       : completionExhausted
       ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
@@ -819,9 +830,13 @@ function advanceCompletion(state: ApplicationState, sessionId: string, message?:
   const pendingCompletions = new Map(state.pendingCompletions)
   if (next) pendingCompletions.set(sessionId, next)
   else pendingCompletions.delete(sessionId)
+  const terminal = state.terminals.get(sessionId)
   return {
     ...state,
     pendingCompletions,
+    ...(!next && terminal?.replacement ? { terminals: new Map(state.terminals).set(sessionId, {
+      ...terminal, replacement: { ...terminal.replacement, settled: true },
+    }) } : {}),
     ...(next || message === undefined
       ? {}
       : { modal: { _tag: "Error", message: "Completed response did not become available" } as const }),
@@ -976,14 +991,14 @@ function sameTranscript(left: readonly AgentMessage[], right: readonly AgentMess
 }
 
 function sameMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
-  return sameLogicalMessage(left, right) && left.historical === right?.historical
+  return sameLogicalMessage(left, right) && left.historical === right?.historical && left.turnComplete === right?.turnComplete
 }
 
-// Context compaction can reclassify a record without replacing its logical history.
+// Compaction and turn completion can update metadata without replacing logical history.
 function sameLogicalMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
   return right !== undefined && left.id === right.id && left.role === right.role &&
     left.preview === right.preview && left.ordinal === right.ordinal && left.visible === right.visible &&
-    left.displayGroupId === right.displayGroupId && left.turnComplete === right.turnComplete &&
+    left.displayGroupId === right.displayGroupId &&
     left.copyIdentity === right.copyIdentity && left.historyBoundary === right.historyBoundary
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
+import { normalizeCodexThread } from "../../src/infrastructure/providers/codex/provider"
 
 import {
   available,
@@ -569,6 +570,114 @@ describe("application state reducer", () => {
       ...loadedState(original),
       terminals: new Map([[ROOT, { ownerId: "owner", activity: "idle", phase: "running" }]]),
     }, { _tag: "Draft", draft: { text: "later", exact: false, rewind: true } })
+  }
+
+  test("Codex completion updates an accepted user's metadata without replacing its identity", () => {
+    const turn = (status: "inProgress" | "completed", answer: boolean) => normalizeCodexThread({ turns: [{
+      id: "turn", status, items: [
+        { id: "user", type: "userMessage", content: [{ type: "text", text: "question" }] },
+        ...(answer ? [{ id: "answer", type: "agentMessage", text: "answer", phase: "final_answer" }] : []),
+      ],
+    }] })
+    let state: ApplicationState = { ...loadedState([]),
+      terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    state = observe(state, { _tag: "Submission" })
+    state = readReplacement(state, turn("inProgress", true))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(turn("inProgress", true).slice(0, 1))
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+      ownerId: "owner", activity: "idle", wasVisible: false })
+    state = readReplacement(state, turn("completed", true))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(turn("completed", true))
+    expect(state.pendingCompletions.size).toBe(0)
+    expect(state.replacementCandidates.size).toBe(0)
+    expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
+
+    // A later idle cycle must not reuse this already accepted turn's completion.
+    state = reduceApplicationState(state, { _tag: "TerminalShown", sessionId: ROOT, ownerId: "owner",
+      returnTo: { _tag: "Roots", selectedSessionId: ROOT } })
+    state = observe(state, { _tag: "Submission" })
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+      ownerId: "owner", activity: "idle", wasVisible: false })
+    state = readReplacement(state, turn("completed", true))
+    expect(state.pendingCompletions.has(ROOT)).toBeTrue()
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  test("replacement stability still compares completion metadata exactly", () => {
+    const changed = [message("new", "user", "new question", 0),
+      { ...message("answer", "agent", "answer", 1), turnComplete: false }]
+    let state = readReplacement(loadedState(original), changed)
+    const completed = changed.map((entry) => ({ ...entry, turnComplete: true }))
+    state = readReplacement(state, completed)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    expect(state.replacementCandidates.get(ROOT)?.attempts).toBe(2)
+    state = readReplacement(state, completed)
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(completed)
+  })
+
+  for (const ending of ["cancelled", "exhausted", "failed"] as const) {
+    test(`${ending} replacement releases its prefix constraint but retains discarded identities`, () => {
+      let state = observe(liveRewindState(), { _tag: "Submission", text: "edited" })
+      state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT,
+        ownerId: "owner", activity: "idle", wasVisible: false })
+      const submitted = [...original.slice(0, 2), message("edited", "user", "edited", 2)]
+      state = readReplacement(state, submitted)
+      if (ending === "cancelled") {
+        state = observe(state, { _tag: "Draft", draft: { text: "edited", exact: false, rewind: true } })
+        state = readReplacement(state, original.slice(0, 2))
+      } else {
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const refresh: ActiveRefresh = {
+            ...activeRefresh("completion", state.refresh.generation + 1, "completion", "incremental"),
+            sessionIds: new Set([ROOT]), completionVersion: state.pendingCompletions.get(ROOT)!.version,
+          }
+          state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+          state = reduceApplicationState(state, ending === "failed"
+            ? { _tag: "RefreshFailed", key: refresh.key, generation: refresh.generation, message: "unavailable" }
+            : { _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation,
+                snapshot: snapshot(session(ROOT, "Root"), submitted) })
+        }
+      }
+      expect(state.pendingCompletions.size).toBe(0)
+      expect(state.terminals.get(ROOT)?.replacement?.settled).toBeTrue()
+      const retained = selectProjectedTranscript(state, ROOT)
+      state = readReplacement(readReplacement(state, original), original)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(retained)
+      // A late response is ordinary history, not a newly confirmed completion.
+      const late = [...submitted, { ...message("late", "agent", "late answer", 3), turnComplete: true }]
+      state = readReplacement(state, late)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(ending === "cancelled" ? retained : late)
+      expect(state.unviewedSessionIds.size).toBe(0)
+      state = readReplacement(state, [])
+      expect(selectProjectedTranscript(state, ROOT)).not.toEqual([])
+      state = readReplacement(state, [])
+      expect(selectProjectedTranscript(state, ROOT)).toEqual([])
+      state = readReplacement(readReplacement(state, late), late)
+      expect(selectProjectedTranscript(state, ROOT)).toEqual([])
+      expect(state.unviewedSessionIds.size).toBe(0)
+    })
+  }
+
+  for (const activity of ["working", "blocked"] as const) {
+    for (const stale of [false, true]) {
+      test(`partial manual failure is surfaced while retaining ${activity} history (stale: ${stale})`, () => {
+        let state: ApplicationState = { ...loadedState(original),
+          terminals: new Map([[ROOT, { ownerId: "owner", activity, phase: "running" }]]) }
+        const refresh = activeRefresh("manual", 1, "manual", "full")
+        state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+        if (stale) state = observe(state, { _tag: "Submission" })
+        state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: 1,
+          snapshot: { sessions: [session(ROOT, "Root"), session("other", "Other")],
+            transcripts: new Map<string, TranscriptRead>([
+              [ROOT, { _tag: "Unavailable", reason: "permission denied" }], ["other", available([])],
+            ]) } })
+        expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+        expect(state.provider.transcripts.get("other")).toEqual(available([]))
+        expect(state.modal).toEqual(stale ? null : {
+          _tag: "Error", message: "Conversation refresh failed: root: permission denied",
+        })
+      })
+    }
   }
 
   test("an unreadable rewind occurrence invalidates reads without fabricating placement", () => {
