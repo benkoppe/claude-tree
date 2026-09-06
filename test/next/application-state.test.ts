@@ -1802,6 +1802,7 @@ describe("application state reducer", () => {
     if (surface._tag !== "Graph") throw new Error("Expected graph surface")
     const sourceNode = surface.nodes.find((node) => node._tag === "Message")
     const forks = surface.nodes.filter((node) => node._tag === "Endpoint")
+    expect(projectRootsViewModel(state)[0]?.messageCount).toBe(1)
     expect(sourceNode).toBeDefined()
     expect(forks.map((node) => ({
       sessionId: node._tag === "Endpoint" ? node.session.id : "",

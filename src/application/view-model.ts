@@ -27,6 +27,7 @@ export interface RootViewModel {
   readonly title: string
   readonly lastModified: number
   readonly memberSessionIds: readonly string[]
+  readonly messageCount: number
   readonly status: SessionStatus
   readonly selected: boolean
 }
@@ -131,6 +132,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
         ...memberSessionIds.map((sessionId) => data.sessions.get(sessionId)?.lastModified ?? 0),
       ),
       memberSessionIds,
+      messageCount: [...graph.nodes.values()].filter((node) => node.kind === "message").length,
       status: selectAggregateStatus(state, memberSessionIds),
       selected:
         state.surface._tag === "Roots" &&
