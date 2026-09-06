@@ -9,7 +9,7 @@ Root picker:
   Up/Down or k/j  select a conversation family
   Mouse wheel     select a conversation family
   Click           select a row; click the selected row to open it
-  Enter           open its message graph
+  Enter           open its message tree
   d               delete the selected whole tree from roots
   x               kill all live terminals in the selected tree after confirmation
   n               start a new conversation
@@ -17,17 +17,17 @@ Root picker:
   ?               open About
   q               quit
 
-Message graph:
-  Up/Down or k/j  move along graph edges
+Message tree:
+  Up/Down or k/j  move along tree edges
   Left/Right or h/l move across branches
   g / G           jump to the top / a reachable leaf
   Click           select a card; click the selected card to open it
   Enter           open or resume the session ending at the selected node
   f               fork the selected provider-supported message
-  d               delete the selected node and visual descendants from the graph
+  d               delete the selected node and visual descendants from the tree
   x               kill the selected live endpoint after confirmation
   n               start a new conversation
-  r               refresh the graph
+  r               refresh the tree
   ?               open About
   q or Escape     return to roots
 
@@ -47,6 +47,6 @@ Kill confirmation:
 Footer actions can also be clicked.
 
 Agent terminal:
-  Ctrl+Space      return to the message graph
+  Ctrl+Space      return to the message tree
   d               ordinary provider input
 `

@@ -48,7 +48,7 @@ test("renders roots and preserves directional graph navigation intent", async ()
     setup.mockInput.pressArrow("down")
     await frame(setup, () => isSelected(setup, "Second conversation"))
     setup.mockInput.pressEnter()
-    await frame(setup, (value) => value.includes("Message graph") && value.includes("second question"))
+    await frame(setup, (value) => value.includes("Message tree") && value.includes("second question"))
     expect(isSelected(setup, "second question")).toBeTrue()
 
     await Effect.runPromise(running.harness.update(firstGraph))
@@ -453,7 +453,7 @@ test("contains a throwing terminal title update and renders later updates", asyn
     const failure = await frame(setup, (value) => value.includes("Render update") && value.includes("terminal title defect"))
     expect(failure).toContain("Error")
     setup.mockInput.pressEscape()
-    await frame(setup, (value) => value.includes("Message graph") && !value.includes("terminal title defect"))
+    await frame(setup, (value) => value.includes("Message tree") && !value.includes("terminal title defect"))
     await Effect.runPromise(running.harness.update(linearGraph("root-1", "Recovered render", "later update")))
     await frame(setup, (value) => value.includes("later update"))
   } finally {
@@ -610,7 +610,7 @@ test("keeps graph updates hidden while an endpoint terminal is opening", async (
     await waitFor(() => running.harness.calls.includes("open:root-1"))
     const updated = linearGraph("root-1", "Opening conversation", "draft created during open")
     await Effect.runPromise(running.harness.update(updated))
-    const opening = await frame(setup, (value) => !value.includes("Message graph"))
+    const opening = await frame(setup, (value) => !value.includes("Message tree"))
     expect(opening).not.toContain("draft created during open")
     await Effect.runPromise(Deferred.succeed(release, undefined))
   } finally {
@@ -677,7 +677,7 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
     expect(observed.filter((event) => ["q", "escape", "return"].includes(event.name)).every((event) => !event.stopped)).toBeTrue()
 
     setup.mockInput.pressKey(" ", { ctrl: true })
-    await frame(setup, (value) => value.includes("Message graph"))
+    await frame(setup, (value) => value.includes("Message tree"))
     releaseKittyKey(setup, 32, 5)
     await Bun.sleep(10)
     expect(running.harness.calls).toContain("return-terminal")
@@ -1000,7 +1000,7 @@ test("renders stopped empty forks with stable numbered labels after a live retur
     setup.mockInput.pressEnter()
     await waitFor(() => running.harness.calls.includes("open:fork-one"))
     setup.mockInput.pressKey(" ", { ctrl: true })
-    const returned = await frame(setup, (value) => value.includes("Message graph") && value.includes("Fork 1"))
+    const returned = await frame(setup, (value) => value.includes("Message tree") && value.includes("Fork 1"))
     expect(returned).not.toContain("Draft")
   } finally {
     await running.stop()
@@ -1012,7 +1012,7 @@ test("surfaces canonical graph integrity warnings through the runtime", async ()
   const running = await startPresentation(setup.renderer, canonicalWarningGraph())
 
   try {
-    const rendered = await frame(setup, (value) => value.includes("Graph integrity warning"))
+    const rendered = await frame(setup, (value) => value.includes("Tree integrity warning"))
     expect(rendered).toContain("history does not end at its recorded source message")
   } finally {
     await running.stop()
@@ -1114,7 +1114,7 @@ test("shows minimum dimensions and repairs the navigator after resize", async ()
     expect(minimum).not.toContain("branch source")
 
     setup.resize(80, 24)
-    const restored = await frame(setup, (value) => value.includes("Message graph") && value.includes("branch source"))
+    const restored = await frame(setup, (value) => value.includes("Message tree") && value.includes("branch source"))
     expect(restored).not.toContain("Open leaf")
   } finally {
     await running.stop()
