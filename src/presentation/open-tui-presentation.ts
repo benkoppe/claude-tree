@@ -1074,7 +1074,7 @@ class OpenTuiPresentationController {
     this.shownGraphWarnings.add(identity)
     this.enqueue(this.appRuntime.openModal({
       _tag: "Error",
-      message: `Graph integrity warning: ${warning}`,
+      message: `Tree integrity warning: ${warning}`,
     }))
   }
 
@@ -1173,7 +1173,7 @@ class OpenTuiPresentationController {
       : surface._tag === "Graph"
         ? [
             chunk(truncateToWidth(surface.title, Math.max(1, this.renderer.terminalWidth - 18)), theme.text, TextAttributes.BOLD),
-            chunk("  Message graph", theme.textMuted),
+            chunk("  Message tree", theme.textMuted),
           ]
         : []
     return styledText([...this.identityChunks(), chunk("\n", theme.text), ...secondLine])
@@ -1662,7 +1662,7 @@ class OpenTuiPresentationController {
       this.graphNavigationIntent = null
       this.graphViewportOffset = null
     }
-    this.renderSafely("Render graph selection")
+    this.renderSafely("Render tree selection")
   }
 
   private reconcileGraphSelection(
