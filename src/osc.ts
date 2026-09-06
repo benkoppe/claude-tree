@@ -1,5 +1,7 @@
 const ESCAPE = 0x1b
 const BELL = 0x07
+const CANCEL = 0x18
+const SUBSTITUTE = 0x1a
 const OSC_MARKER = 0x5d
 const STRING_TERMINATOR = 0x5c
 const MAX_OSC_BODY_BYTES = 256 * 1024
@@ -14,6 +16,10 @@ export class OscSequenceParser {
     const sequences: number[][] = []
 
     for (const byte of bytes) {
+      if (byte === CANCEL || byte === SUBSTITUTE) {
+        this.reset()
+        continue
+      }
       if (this.state === "ground") {
         if (byte === ESCAPE) this.state = "escape"
       } else if (this.state === "escape") {
@@ -29,6 +35,9 @@ export class OscSequenceParser {
         }
       } else if (byte === STRING_TERMINATOR) {
         this.finish(sequences)
+      } else if (byte === OSC_MARKER) {
+        // A new OSC introducer abandons an unterminated sequence.
+        this.startOsc()
       } else if (byte === ESCAPE) {
         // tmux passthrough doubles the inner escape, including the one in ST.
         this.state = "osc-escape"
