@@ -1093,9 +1093,14 @@ function normalizeTranscript(
     }
 
     const localCommandArtifact = isLocalCommandArtifact(normalizedSource)
-    const visible = !localCommandArtifact && isVisibleMessage(normalizedSource)
-    if (sourceType === "user" && visible) assistantDisplayGroupId = candidate.uuid
-    const replayText = sourceType === "user" && !localCommandArtifact
+    const taskNotification = sourceType === "user" &&
+      /^\s*<task-notification>\s*<task-id>[^<]+<\/task-id>[\s\S]*?<\/task-notification>/.test(
+        extractUserPromptText(candidate.message) ?? "",
+      )
+    const visible = !localCommandArtifact && !taskNotification && isVisibleMessage(normalizedSource)
+    // Notifications start a new response without representing a human submission.
+    if (sourceType === "user" && (visible || taskNotification)) assistantDisplayGroupId = candidate.uuid
+    const replayText = sourceType === "user" && !localCommandArtifact && !taskNotification
       ? extractUserPromptText(candidate.message)
       : undefined
     const turnComplete = assistantTurnComplete(normalizedSource)
