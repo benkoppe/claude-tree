@@ -17,6 +17,7 @@ import type {
 } from "../../../domain/model"
 import {
   AgentProvider,
+  SESSION_SNAPSHOT_BATCH_SIZE,
   type AgentProviderApi,
   type AmbiguousBranchMutation,
   type BranchOutcome,
@@ -190,14 +191,7 @@ export class CodexProvider implements AgentProviderApi {
     this.maxSnapshotSessions = positiveInteger(options.maxSnapshotSessions, SNAPSHOT_SESSION_LIMIT)
     this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
 
-    this.loadSessionSnapshot = this.withServer((server) => Effect.gen({ self: this }, function*() {
-      const sessions = yield* this.listSessionsFrom(server)
-      const transcripts = yield* this.readTranscriptsFrom(
-        server,
-        sessions.map((session) => session.id),
-      )
-      return { sessions, transcripts }
-    }), "loadSessionSnapshot", true)
+    this.loadSessionSnapshot = this.loadSessionSnapshotProgressively(() => Effect.void)
 
     this.prepareNewSession = Effect.gen({ self: this }, function*() {
       const sessionId = yield* Effect.try({
@@ -233,12 +227,22 @@ export class CodexProvider implements AgentProviderApi {
     )
   }
 
+  loadSessionSnapshotProgressively(publish: (snapshot: AgentSessionSnapshot) => Effect.Effect<void>) {
+    return this.withServer((server) => Effect.gen({ self: this }, function*() {
+      const sessions = yield* this.listSessionsFrom(server)
+      yield* publish({ sessions, transcripts: new Map() })
+      const transcripts = yield* this.readTranscriptsFrom(server, sessions.map((session) => session.id), undefined,
+        (transcripts) => publish({ sessions: [], transcripts }))
+      return { sessions, transcripts }
+    }), "loadSessionSnapshot", true)
+  }
+
   loadSessionSnapshotFor(
     sessionIds: readonly string[],
   ): Effect.Effect<AgentSessionSnapshot, ProviderError | ProviderProtocolError> {
     return this.withServer((server) => Effect.gen({ self: this }, function*() {
-      const sessions = yield* this.listSessionsFrom(server)
-      const transcripts = yield* this.readTranscriptsFrom(server, sessionIds)
+      const sessions: AgentSession[] = []
+      const transcripts = yield* this.readTranscriptsFrom(server, sessionIds, sessions)
       return { sessions, transcripts }
     }), "loadSessionSnapshotFor", true)
   }
@@ -336,6 +340,7 @@ export class CodexProvider implements AgentProviderApi {
         return {
           _tag: "ValidatedBranch" as const,
           session,
+          transcript,
           acquireLaunch: this.acquireObservedLaunch("resume", session.id),
           derivation: {
             childSessionId: session.id,
@@ -535,6 +540,8 @@ export class CodexProvider implements AgentProviderApi {
   private readTranscriptsFrom(
     server: CodexAppServerClient,
     sessionIds: readonly string[],
+    sessions?: AgentSession[],
+    publish?: (transcripts: ReadonlyMap<string, TranscriptRead>) => Effect.Effect<void>,
   ): Effect.Effect<ReadonlyMap<string, TranscriptRead>, ProviderProtocolError> {
     if (sessionIds.length > this.maxSnapshotSessions) {
       return Effect.fail(this.protocolError(
@@ -542,9 +549,18 @@ export class CodexProvider implements AgentProviderApi {
         `Codex transcript read exceeded ${this.maxSnapshotSessions} sessions`,
       ))
     }
+    const pending = new Map<string, TranscriptRead>()
     return Effect.all(
-      sessionIds.map((sessionId) => this.readTranscriptOutcome(server, sessionId).pipe(
+      [...new Set(sessionIds)].map((sessionId) => this.readTranscriptOutcome(server, sessionId, sessions).pipe(
         Effect.map((transcript): readonly [string, TranscriptRead] => [sessionId, transcript]),
+        Effect.tap(([id, read]) => Effect.suspend(() => {
+          if (!publish) return Effect.void
+          pending.set(id, read)
+          if (pending.size < SESSION_SNAPSHOT_BATCH_SIZE) return Effect.void
+          const batch = new Map(pending)
+          pending.clear()
+          return publish(batch)
+        })),
       )),
       { concurrency: this.readConcurrency },
     ).pipe(Effect.map((entries) => new Map(entries)))
@@ -553,8 +569,15 @@ export class CodexProvider implements AgentProviderApi {
   private readTranscriptOutcome(
     server: CodexAppServerClient,
     sessionId: string,
+    sessions?: AgentSession[],
   ): Effect.Effect<TranscriptRead> {
     return this.readThreadWithOverloadRetry(server, sessionId).pipe(
+      Effect.tap((thread) => Effect.gen({ self: this }, function*() {
+        if (!(yield* this.threadBelongsToProject(thread))) return yield* Effect.fail(this.protocolError(
+          "readTranscripts", `Codex session ${sessionId} belongs to another project`,
+        ))
+        if (sessions) sessions.push(yield* this.sessionFromThread(thread, "readTranscripts"))
+      })),
       Effect.flatMap((thread) => this.normalizeThread(thread, "readTranscripts")),
       Effect.match({
         onFailure: (cause): TranscriptRead => {

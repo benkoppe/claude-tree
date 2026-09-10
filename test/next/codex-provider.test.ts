@@ -77,7 +77,7 @@ describe("Effect Codex provider", () => {
     }))
 
     const snapshot = await Effect.runPromise(provider.loadSessionSnapshot)
-    expect(canonicalized).toEqual(["/project-link", "/project", "/project"])
+    expect(canonicalized).toEqual(["/project-link", "/project", "/project", "/project", "/project"])
     expect(snapshot.sessions).toEqual([
       { id: ROOT, title: "Root name", lastModified: 12_000 },
       { id: CHILD, title: "Child", lastModified: 1_000 },
@@ -133,7 +133,7 @@ describe("Effect Codex provider", () => {
 
     expect(snapshot.sessions.map((session) => session.id)).toEqual([ROOT, "canonical"])
     expect(client.readCalls).toEqual([ROOT, "canonical"])
-    expect(canonicalized).toEqual(["/project-link", "/project-link", "/foreign"])
+    expect(canonicalized).toEqual(["/project-link", "/project-link", "/foreign", "/project", "/project"])
   })
 
   test("bounds thread-list pages, session count, and the overall metadata deadline", async () => {
@@ -206,16 +206,13 @@ describe("Effect Codex provider", () => {
 
   test("loads incremental metadata without reading unrelated transcripts", async () => {
     const client = fakeClient({
-      listThreads: () => Effect.succeed({
-        data: [thread(ROOT), thread(CHILD), thread("unrelated")],
-        nextCursor: null,
-      }),
+      listThreads: () => Effect.die("Targeted reads must not discover unrelated sessions"),
     })
     const provider = providerWith(client)
 
     const snapshot = await Effect.runPromise(provider.loadSessionSnapshotFor([CHILD]))
 
-    expect(snapshot.sessions.map((session) => session.id)).toEqual([ROOT, CHILD, "unrelated"])
+    expect(snapshot.sessions.map((session) => session.id)).toEqual([CHILD])
     expect(client.readCalls).toEqual([CHILD])
     expect([...snapshot.transcripts.keys()]).toEqual([CHILD])
   })

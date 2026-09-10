@@ -15,12 +15,13 @@ export type RefreshReason = ActiveRefresh["reason"]
 
 export type ApplicationIntent =
   | { readonly _tag: "Refresh"; readonly reason: "manual" }
-  | { readonly _tag: "SelectRoot"; readonly sessionId: string | null }
+  | { readonly _tag: "SelectRoot"; readonly sessionId: string | null; readonly selectionId?: string }
   | { readonly _tag: "EnterRoot"; readonly sessionId: string }
   | {
       readonly _tag: "SelectGraph"
       readonly familySessionId: string
       readonly target: NavigationTarget
+      readonly selectionId?: string
     }
   | { readonly _tag: "NewSession" }
   | { readonly _tag: "ResumeSession"; readonly sessionId: string; readonly reportFailure: boolean }

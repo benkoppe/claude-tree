@@ -1,11 +1,11 @@
 import {
-  buildConversationForest,
   visibleConversationForest,
   type ConversationForest,
 } from "../domain/conversation-graph"
 import type { AgentMessage, AgentSession, MessageRef, TranscriptRead } from "../domain/model"
 import { SESSION_STATUS_PRIORITY, type SessionStatus } from "../domain/session-status"
 import type { ApplicationState } from "./state"
+import { projectForest } from "./forest-projection"
 
 export type { SessionStatus } from "../domain/session-status"
 
@@ -16,8 +16,22 @@ export interface ProjectedApplicationData {
 
 type ForestInputs = Pick<ApplicationState, "local" | "terminals" | "rewindAnchors" | "relations" | "removals">
 const forestCache = new WeakMap<ApplicationState["provider"], ForestInputs & { readonly forest: ConversationForest }>()
+const projectedCache = new WeakMap<ApplicationState["provider"], {
+  readonly local: ApplicationState["local"]
+  readonly rewindAnchors: ApplicationState["rewindAnchors"]
+  readonly terminals: ApplicationState["terminals"]
+  readonly data: ProjectedApplicationData
+}>()
+const visibleForestCache = new WeakMap<ConversationForest, { visible: ReadonlySet<string>; forest: ConversationForest }>()
+
+function sameKeys(left: ReadonlyMap<string, unknown>, right: ReadonlyMap<string, unknown>): boolean {
+  return left === right || (left.size === right.size && [...left.keys()].every((key) => right.has(key)))
+}
 
 export function selectProjectedData(state: ApplicationState): ProjectedApplicationData {
+  const cached = projectedCache.get(state.provider)
+  if (cached && cached.local === state.local && cached.rewindAnchors === state.rewindAnchors &&
+    sameKeys(cached.terminals, state.terminals)) return cached.data
   const sessions = new Map(state.provider.sessions)
   const reads = new Map(state.provider.transcripts)
   for (const [sessionId, session] of state.local.sessions) sessions.set(sessionId, session)
@@ -36,7 +50,9 @@ export function selectProjectedData(state: ApplicationState): ProjectedApplicati
       projectedSessions.set(sessionId, session)
     }
   }
-  return { sessions: projectedSessions, transcripts }
+  const data = { sessions: projectedSessions, transcripts }
+  projectedCache.set(state.provider, { local: state.local, rewindAnchors: state.rewindAnchors, terminals: state.terminals, data })
+  return data
 }
 
 export function selectTranscriptRead(
@@ -69,12 +85,12 @@ export function selectFamilySessionIds(
 
 export function selectConversationForest(state: ApplicationState): ConversationForest {
   const cached = forestCache.get(state.provider)
-  if (cached && cached.local === state.local && cached.terminals === state.terminals &&
+  if (cached && cached.local === state.local && sameKeys(cached.terminals, state.terminals) &&
     cached.rewindAnchors === state.rewindAnchors && cached.relations === state.relations &&
     cached.removals === state.removals) return cached.forest
   const data = selectProjectedData(state)
-  const forest = buildConversationForest(
-    [...data.sessions.values()],
+  const forest = projectForest(
+    data.sessions,
     data.transcripts,
     state.relations,
     state.removals,
@@ -89,7 +105,13 @@ export function selectConversationForest(state: ApplicationState): ConversationF
 }
 
 export function selectVisibleConversationForest(state: ApplicationState): ConversationForest {
-  return visibleConversationForest(selectConversationForest(state), selectVisibleEndpointSessionIds(state))
+  const forest = selectConversationForest(state)
+  const visible = selectVisibleEndpointSessionIds(state)
+  const cached = visibleForestCache.get(forest)
+  if (cached && cached.visible.size === visible.size && [...visible].every((id) => cached.visible.has(id))) return cached.forest
+  const projected = visibleConversationForest(forest, visible)
+  visibleForestCache.set(forest, { visible, forest: projected })
+  return projected
 }
 
 export function selectVisibleEndpointSessionIds(state: ApplicationState): ReadonlySet<string> {

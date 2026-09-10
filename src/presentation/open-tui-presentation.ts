@@ -10,7 +10,7 @@ import {
   type RGBA as Color,
   type TextChunk,
 } from "@opentui/core"
-import { Cause, Deferred, Effect, Fiber, Queue, Scope, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Queue, Scope, Stream } from "effect"
 
 import type {
   AppRuntime,
@@ -56,6 +56,7 @@ const SEPARATOR_HEIGHT = 1
 const CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
+const HISTORY_LOADING_MESSAGE = "This tree's history is still loading. Open it to prioritize loading."
 
 export interface OpenTuiProviderIdentity {
   readonly id: string
@@ -122,6 +123,7 @@ interface LeafPickerState {
 }
 
 interface PendingGraphSelection {
+  readonly selectionId: string
   readonly familySessionId: string
   readonly nodeId: string
   completed: boolean
@@ -263,6 +265,10 @@ class OpenTuiPresentationController {
 
   private viewModel: ApplicationViewModel | undefined
   private selectedRootSessionId: string | null = null
+  private pendingRootSelection: { sessionId: string; selectionId: string; completed: boolean } | undefined
+  private nextSelectionId = 1
+  private latestSelection: Effect.Effect<unknown, unknown> | undefined
+  private selectionQueued = false
   private rootViewportStart = 0
   private graphViewportOffset: ViewportOffset | null = null
   private graphNavigationIntent: GraphNavigationIntent | null = null
@@ -278,6 +284,7 @@ class OpenTuiPresentationController {
   private stopping = false
   private spinnerFrame = 0
   private spinnerTimer: ReturnType<typeof setTimeout> | undefined
+  private renderTimer: ReturnType<typeof setTimeout> | undefined
   private currentTitle: string | undefined
   private nextRemovalRequest = 1
   private readonly consumedKeyReleases = new Set<string>()
@@ -476,12 +483,19 @@ class OpenTuiPresentationController {
       const roots = viewModel.surface.roots
       const selectedByRuntime = roots.find((root) => root.selected)?.sessionId
       const localSurvives = roots.some((root) => root.sessionId === this.selectedRootSessionId)
-      this.selectedRootSessionId = selectedByRuntime ?? (localSurvives ? this.selectedRootSessionId : roots[0]?.sessionId ?? null)
+      if (!localSurvives || (this.pendingRootSelection?.completed &&
+        this.selectionAcknowledged(this.pendingRootSelection.selectionId) &&
+        selectedByRuntime === this.pendingRootSelection.sessionId)) this.pendingRootSelection = undefined
+      if (!this.pendingRootSelection) {
+        this.selectedRootSessionId = selectedByRuntime ?? (localSurvives ? this.selectedRootSessionId : roots[0]?.sessionId ?? null)
+      }
       this.graphSignature = null
       this.graphViewportOffset = null
       this.graphNavigationIntent = null
     } else if (viewModel.surface._tag === "Graph") {
-      const signature = viewModel.surface.nodes
+      this.pendingRootSelection = undefined
+      const signature = viewModel.surface.unselectedNodes === (previous?.surface._tag === "Graph" ? previous.surface.unselectedNodes : undefined) &&
+        viewModel.surface.unselectedNodes !== undefined ? this.graphSignature! : viewModel.surface.nodes
         .map((node) => `${node.id}:${node.x}:${node.y}:${node.parentIds.join(",")}:${node.childIds.join(",")}`)
         .join("|")
       if (this.graphSignature !== null && signature !== this.graphSignature) {
@@ -520,6 +534,7 @@ class OpenTuiPresentationController {
         this.enqueue(this.appRuntime.selectRoot(null))
       }
     } else {
+      this.pendingRootSelection = undefined
       this.pendingGraphSelections.length = 0
       this.preferredOpenSession = null
       this.pendingStoppedEndpoint = null
@@ -720,9 +735,48 @@ class OpenTuiPresentationController {
     const index = clamp(current + delta, 0, surface.roots.length - 1)
     const root = surface.roots[index]!
     if (root.sessionId === this.selectedRootSessionId) return
-    this.selectedRootSessionId = root.sessionId
-    this.enqueue(this.appRuntime.selectRoot(root.sessionId))
+    this.queueRootSelection(root.sessionId)
     this.render()
+  }
+
+  private enqueueSelection(effect: Effect.Effect<unknown, unknown>): void {
+    this.latestSelection = effect
+    if (this.selectionQueued) return
+    this.selectionQueued = true
+    const self = this
+    this.enqueue(Effect.gen(function*() {
+      let failure: Cause.Cause<unknown> | undefined
+      while (self.latestSelection) {
+        const next = self.latestSelection
+        self.latestSelection = undefined
+        const exit = yield* Effect.exit(next)
+        if (Exit.isFailure(exit)) failure = exit.cause
+      }
+      if (failure) return yield* Effect.failCause(failure)
+    }).pipe(Effect.ensuring(Effect.sync(() => { self.selectionQueued = false }))))
+  }
+
+  private queueRootSelection(sessionId: string): void {
+    this.selectedRootSessionId = sessionId
+    const pending = { sessionId, selectionId: `selection-${this.nextSelectionId++}`, completed: false }
+    this.pendingRootSelection = pending
+    this.enqueueSelection(this.appRuntime.selectRoot(sessionId, pending.selectionId).pipe(Effect.onExit((exit) => Effect.sync(() => {
+      pending.completed = true
+      if (Exit.isFailure(exit) && this.pendingRootSelection === pending) {
+        this.pendingRootSelection = undefined
+        this.selectedRootSessionId = this.rootsSurface()?.roots.find((root) => root.selected)?.sessionId ?? null
+        this.render()
+      }
+      if (this.pendingRootSelection === pending &&
+        this.selectionAcknowledged(pending.selectionId) &&
+        this.rootsSurface()?.roots.some((root) => root.selected && root.sessionId === sessionId)) {
+        this.pendingRootSelection = undefined
+      }
+    }))))
+  }
+
+  private selectionAcknowledged(selectionId: string): boolean {
+    return this.viewModel?.selectionId === selectionId
   }
 
   private enterSelectedRoot(): void {
@@ -746,7 +800,7 @@ class OpenTuiPresentationController {
     const selected = this.selectedGraphNode()
     if (!graph || !selected) return
     const move = directionalMove(
-      navigationLayout(graph.nodes),
+      navigationLayout(graph.unselectedNodes ?? graph.nodes),
       selected.id,
       direction,
       this.graphNavigationIntent ?? undefined,
@@ -763,7 +817,7 @@ class OpenTuiPresentationController {
     const graph = this.graphSurface()
     const selected = this.selectedGraphNode()
     if (!graph || !selected) return
-    const nodeId = topVisibleGraphNodeId(navigationLayout(graph.nodes), selected.id)
+    const nodeId = topVisibleGraphNodeId(navigationLayout(graph.unselectedNodes ?? graph.nodes), selected.id)
     if (nodeId && nodeId !== selected.id) this.selectGraphNode(nodeId)
   }
 
@@ -858,6 +912,10 @@ class OpenTuiPresentationController {
     if (this.rootsSurface()) {
       const root = this.selectedRoot()
       if (!root) return
+      if (root.historyPending) {
+        this.showError(HISTORY_LOADING_MESSAGE)
+        return
+      }
       const sessionIds = root.memberSessionIds.filter((id) => this.viewModel?.liveSessionIds.has(id))
       if (sessionIds.length === 0) {
         this.showError("This tree has no live terminals")
@@ -896,6 +954,10 @@ class OpenTuiPresentationController {
     if (roots) {
       const root = this.selectedRoot()
       if (!root) return
+      if (root.historyPending) {
+        this.showError(HISTORY_LOADING_MESSAGE)
+        return
+      }
       const removal: ConversationRemoval = {
         kind: "tree",
         rootSessionId: root.sessionId,
@@ -1079,6 +1141,15 @@ class OpenTuiPresentationController {
   }
 
   private render(): void {
+    if (this.stopping || this.renderTimer) return
+    this.renderTimer = setTimeout(() => {
+      this.renderTimer = undefined
+      try { this.renderFrame() }
+      catch (cause) { this.reportRenderFailure("Render frame", cause) }
+    }, 0)
+  }
+
+  private renderFrame(): void {
     if (!this.started || this.renderer.isDestroyed || !this.viewModel) return
     this.updateTitle()
     const surface = this.viewModel.surface
@@ -1413,8 +1484,7 @@ class OpenTuiPresentationController {
     if (action.kind === "root") {
       if (action.sessionId === this.selectedRootSessionId) this.enterSelectedRoot()
       else {
-        this.selectedRootSessionId = action.sessionId
-        this.enqueue(this.appRuntime.selectRoot(action.sessionId))
+        this.queueRootSelection(action.sessionId)
         this.render()
       }
     } else {
@@ -1633,14 +1703,14 @@ class OpenTuiPresentationController {
   }
 
   private queueGraphSelection(familySessionId: string, node: GraphNodeViewModel): void {
-    const pending: PendingGraphSelection = { familySessionId, nodeId: node.id, completed: false }
-    this.pendingGraphSelections.push(pending)
+    const pending: PendingGraphSelection = { familySessionId, nodeId: node.id, selectionId: `selection-${this.nextSelectionId++}`, completed: false }
+    this.pendingGraphSelections.splice(0, this.pendingGraphSelections.length, pending)
     this.preferredOpenSession = null
     this.pendingStoppedEndpoint = null
     this.graphViewportOffset = null
-    this.enqueue(Effect.suspend(() => {
+    this.enqueueSelection(Effect.suspend(() => {
       if (!this.pendingGraphSelections.includes(pending)) return Effect.void
-      return Effect.matchCauseEffect(this.appRuntime.selectGraph(familySessionId, node.target), {
+      return Effect.matchCauseEffect(this.appRuntime.selectGraph(familySessionId, node.target, pending.selectionId), {
         onFailure: (cause) => Effect.sync(() => this.settleGraphSelection(pending, false)).pipe(
           Effect.andThen(Effect.failCause(cause)),
         ),
@@ -1679,6 +1749,7 @@ class OpenTuiPresentationController {
     if (!selectedNodeId) return
     const acknowledgedIndex = this.pendingGraphSelections.findIndex((pending, index) =>
       pending.nodeId === selectedNodeId &&
+      this.selectionAcknowledged(pending.selectionId) &&
       this.pendingGraphSelections.slice(0, index + 1).every((candidate) => candidate.completed)
     )
     if (acknowledgedIndex >= 0) this.pendingGraphSelections.splice(0, acknowledgedIndex + 1)
@@ -1692,7 +1763,6 @@ class OpenTuiPresentationController {
     return {
       ...graph,
       selectedNodeId: pending.nodeId,
-      nodes: graph.nodes.map((node) => ({ ...node, selected: node.id === pending.nodeId })),
     }
   }
 
@@ -1794,6 +1864,8 @@ class OpenTuiPresentationController {
   private readonly guardedOnDialogActionsMouseUp = this.guardCallback("Handle dialog input", this.onDialogActionsMouseUp)
 
   private teardown(): void {
+    if (this.renderTimer) clearTimeout(this.renderTimer)
+    this.renderTimer = undefined
     this.stopSpinner()
     if (this.started) {
       this.renderer.keyInput.off("keypress", this.guardedOnKeyPress)
@@ -1890,8 +1962,12 @@ function renderControls(
   return { chunks, hitRegions }
 }
 
+const navigationLayouts = new WeakMap<readonly GraphNodeViewModel[], ConversationGraphLayout>()
+
 function navigationLayout(nodes: readonly GraphNodeViewModel[]): ConversationGraphLayout {
-  return {
+  const cached = navigationLayouts.get(nodes)
+  if (cached) return cached
+  const layout = {
     nodes: new Map(nodes.map((node) => [node.id, {
       node: navigationNode(node),
       x: node.x,
@@ -1900,9 +1976,11 @@ function navigationLayout(nodes: readonly GraphNodeViewModel[]): ConversationGra
       height: node.height,
     }])),
     nodeWidth: nodes[0]?.width ?? 1,
-    worldWidth: Math.max(0, ...nodes.map((node) => node.x + node.width)),
-    worldHeight: Math.max(0, ...nodes.map((node) => node.y + node.height)),
+    worldWidth: nodes.reduce((maximum, node) => Math.max(maximum, node.x + node.width), 0),
+    worldHeight: nodes.reduce((maximum, node) => Math.max(maximum, node.y + node.height), 0),
   }
+  navigationLayouts.set(nodes, layout)
+  return layout
 }
 
 function navigationNode(node: GraphNodeViewModel): MessageGraphNodeOrEndpoint {

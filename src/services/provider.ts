@@ -20,6 +20,8 @@ import type {
 } from "../domain/errors"
 import type { IdentityTransitionKind } from "../domain/persistence"
 
+export const SESSION_SNAPSHOT_BATCH_SIZE = 16
+
 export interface ProviderCapabilities {
   readonly historicalBranching: boolean
   readonly exactMessageForks: boolean
@@ -80,6 +82,7 @@ export interface PreparedTerminal {
 export interface ValidatedBranch extends PreparedTerminal {
   readonly _tag: "ValidatedBranch"
   readonly derivation: BranchDerivation
+  readonly transcript?: TranscriptRead
 }
 
 export interface CreatedIndependentSession {
@@ -145,6 +148,10 @@ export interface AgentProviderApi {
     AgentSessionSnapshot,
     ProviderError | ProviderProtocolError
   >
+  /** Initial-load progress. Catalogue first, then disjoint transcript batches. */
+  readonly loadSessionSnapshotProgressively?: (
+    publish: (snapshot: AgentSessionSnapshot) => Effect.Effect<void>,
+  ) => Effect.Effect<AgentSessionSnapshot, ProviderError | ProviderProtocolError>
   readonly loadSessionSnapshotFor: (
     sessionIds: readonly string[],
   ) => Effect.Effect<AgentSessionSnapshot, ProviderError | ProviderProtocolError>

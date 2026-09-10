@@ -206,6 +206,43 @@ test("a stalled manual refresh does not block navigation or forking", async () =
   }
 })
 
+test("root key repeats coalesce and stale publications cannot rewind the local cursor", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const initial = rootsView()
+  if (initial.surface._tag !== "Roots") throw new Error("Expected roots")
+  const base = initial.surface.roots[0]!
+  const roots = Array.from({ length: 200 }, (_, index) => ({ ...base,
+    sessionId: `root-${index}`, title: `Conversation ${index}`, selected: index === 0,
+  }))
+  const view: ApplicationViewModel = { ...initial, surface: { _tag: "Roots", roots } }
+  const release = Deferred.makeUnsafe<void>()
+  let attempts = 0
+  const running = await startPresentation(setup.renderer, view, new Map(), undefined, Effect.succeed(true), {
+    selectRoot: (_id, publish) => ++attempts === 1
+      ? Deferred.await(release).pipe(Effect.andThen(Effect.suspend(publish)))
+      : publish(),
+  })
+  try {
+    await frame(setup, (value) => value.includes("Conversation 0"))
+    setup.mockInput.pressArrow("down")
+    await waitFor(() => attempts === 1)
+    for (let index = 0; index < 100; index++) setup.mockInput.pressArrow("down")
+    await running.harness.update({ ...view, surface: { _tag: "Roots", roots: roots.map((root) => ({
+      ...root, selected: root.sessionId === "root-1",
+    })) } }).pipe(Effect.runPromise)
+    await frame(setup, () => isSelected(setup, "Conversation 101"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    await Effect.runPromise(Deferred.succeed(release, undefined))
+    await waitFor(() => running.harness.calls.includes("enter-root:root-102"))
+    expect(running.harness.calls.filter((call) => call.startsWith("select-root:"))).toEqual([
+      "select-root:root-1", "select-root:root-102",
+    ])
+  } finally {
+    await running.stop()
+  }
+})
+
 test("an interrupted terminal action does not kill the presentation action queue", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   let attempts = 0
@@ -378,8 +415,8 @@ test("executes a captured rapid selection after its predecessor rejects", async 
   try {
     await frame(setup, (value) => value.includes("branch source"))
     setup.mockInput.pressArrow("down")
-    setup.mockInput.pressArrow("right")
     await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:left-message"))
+    setup.mockInput.pressArrow("right")
     expect(running.harness.calls).not.toContain("select-graph:message:root-1:right-message")
 
     await Effect.runPromise(Deferred.fail(rejectFirst, new Error("first selection rejected")))
@@ -450,7 +487,7 @@ test("contains a throwing terminal title update and renders later updates", asyn
   try {
     await frame(setup, (value) => value.includes("First conversation"))
     await Effect.runPromise(running.harness.update(linearGraph("root-1", "Broken render", "broken update")))
-    const failure = await frame(setup, (value) => value.includes("Render update") && value.includes("terminal title defect"))
+    const failure = await frame(setup, (value) => value.includes("Render frame") && value.includes("terminal title defect"))
     expect(failure).toContain("Error")
     setup.mockInput.pressEscape()
     await frame(setup, (value) => value.includes("Message tree") && !value.includes("terminal title defect"))
@@ -981,7 +1018,7 @@ test("scrolls a long leaf picker with the mouse wheel", async () => {
       await setup.renderOnce()
     }
     await setup.renderOnce()
-    rendered = setup.captureCharFrame()
+    rendered = await frame(setup, (value) => !value.includes("Leaf 1 "))
     expect(rendered).not.toContain("Leaf 1 ")
     setup.mockInput.pressEnter()
     await waitFor(() => running.harness.calls.some((call) => call.startsWith("open:leaf-") && call !== "open:leaf-1"))
@@ -1129,6 +1166,7 @@ interface RuntimeHarness {
 }
 
 interface RuntimeActionOverrides {
+  readonly selectRoot?: (sessionId: string | null, publishSelection: () => Effect.Effect<boolean>) => Effect.Effect<unknown, unknown>
   readonly newSession?: Effect.Effect<boolean>
   readonly openEndpoint?: (sessionId: string) => Effect.Effect<boolean>
   readonly selectGraph?: (
@@ -1223,13 +1261,15 @@ function makeHarness(
               Effect.andThen(Effect.fail(failure)),
             )
       },
-      selectRoot: (sessionId: string | null) => {
+      selectRoot: (sessionId: string | null, selectionId?: string) => Effect.suspend(() => {
         calls.push(`select-root:${sessionId ?? "none"}`)
+        const publishSelection = () => {
         if (current.surface._tag !== "Roots") {
           const roots = rootsView()
           if (roots.surface._tag !== "Roots") return Effect.succeed(false)
           return update({
             ...roots,
+            selectionId: selectionId ?? null,
             surface: {
               ...roots.surface,
               roots: roots.surface.roots.map((root) => ({
@@ -1242,6 +1282,7 @@ function makeHarness(
         const surface = current.surface
         return update({
           ...current,
+          selectionId: selectionId ?? null,
           surface: {
             ...surface,
             roots: surface.roots.map((root) => ({
@@ -1250,13 +1291,15 @@ function makeHarness(
             })),
           },
         }).pipe(Effect.as(true))
-      },
+        }
+        return actionOverrides.selectRoot?.(sessionId, publishSelection) ?? publishSelection()
+      }),
       enterRoot: (sessionId: string) => {
         calls.push(`enter-root:${sessionId}`)
         const graph = graphs.get(sessionId)
         return graph ? update(graph).pipe(Effect.as(true)) : Effect.succeed(false)
       },
-      selectGraph: (familySessionId: string, target: NavigationTarget) => {
+      selectGraph: (familySessionId: string, target: NavigationTarget, selectionId?: string) => {
         calls.push(`select-graph:${targetKey(target)}`)
         const publishSelection = () => {
           if (current.surface._tag !== "Graph") return Effect.void
@@ -1270,7 +1313,7 @@ function makeHarness(
               targetKey(node.target) === targetKey(target)
             )?.id ?? null,
           }
-          return update({ ...current, surface })
+          return update({ ...current, surface, selectionId: selectionId ?? null })
         }
         const override = actionOverrides.selectGraph?.(familySessionId, target, publishSelection)
         if (override) return override
@@ -1504,6 +1547,7 @@ function endpointNode(
 
 function baseView(): Omit<ApplicationViewModel, "surface"> {
   return {
+    selectionId: null,
     modal: null,
     refreshing: false,
     initialLoadPending: false,

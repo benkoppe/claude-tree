@@ -32,6 +32,7 @@ export type ApplicationMetadataFacet = Pick<
 export interface PersistedBranch {
   readonly prepared: PreparedTerminal
   readonly relation: BranchRelation
+  readonly transcript?: import("../domain/model").TranscriptRead
 }
 
 export interface IndependentBranch {
@@ -99,7 +100,8 @@ export function makeApplicationOperations(options: {
     const now = yield* Clock.currentTimeMillis
     const relation = { ...outcome.derivation, createdAt: new Date(now).toISOString() }
     const persisted = yield* Effect.exit(saveRelation(relation))
-    if (Exit.isSuccess(persisted)) return { prepared: outcome, relation: persisted.value }
+    if (Exit.isSuccess(persisted)) return { prepared: outcome, relation: persisted.value,
+      ...(outcome.transcript === undefined ? {} : { transcript: outcome.transcript }) }
 
     const snapshot = yield* Effect.exit(Effect.suspend(() =>
       options.provider.loadSessionSnapshotFor([outcome.session.id])))

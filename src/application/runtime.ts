@@ -46,6 +46,7 @@ import type {
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
 import { makeNavigationWriter } from "./navigation-writer"
+import { groupSessionFamilies } from "./forest-projection"
 import {
   makeApplicationOperations,
   rollbackPersistedBranch,
@@ -108,9 +109,9 @@ export interface AppRuntime {
   readonly viewModels: Stream.Stream<ApplicationViewModel>
   readonly terminalEvents: TerminalSupervisorEvents
   readonly refresh: () => ApplicationIntentEffect
-  readonly selectRoot: (sessionId: string | null) => ApplicationIntentEffect
+  readonly selectRoot: (sessionId: string | null, selectionId?: string) => ApplicationIntentEffect
   readonly enterRoot: (sessionId: string) => ApplicationIntentEffect
-  readonly selectGraph: (familySessionId: string, target: NavigationTarget) => ApplicationIntentEffect
+  readonly selectGraph: (familySessionId: string, target: NavigationTarget, selectionId?: string) => ApplicationIntentEffect
   readonly newSession: ApplicationIntentEffect
   readonly resumeSession: (sessionId: string) => ApplicationIntentEffect
   readonly openEndpoint: (sessionId: string) => ApplicationIntentEffect
@@ -153,6 +154,7 @@ type LifecycleControlMessage =
   | { readonly _tag: "FinishShutdown"; readonly error?: ApplicationShutdownError; readonly reply: DeferredType.Deferred<void> }
 
 type ActorMessage =
+  | Extract<StateEvent, { readonly _tag: "RefreshProgress" }>
   | { readonly _tag: "Startup"; readonly reply: DeferredType.Deferred<void> }
   | IntentEnvelope
   | StateQueryEnvelope
@@ -166,7 +168,7 @@ type ActorMessage =
 type ActorControlMessage = LifecycleControlMessage | CommandCompletedMessage
 
 type ActorCommand =
-  | { readonly _tag: "Refresh"; readonly refresh: ActiveRefresh; readonly reply?: IntentEnvelope["reply"] }
+  | { readonly _tag: "Refresh"; readonly refresh: ActiveRefresh; readonly reply?: IntentEnvelope["reply"]; readonly enterRoot?: { readonly sessionId: string; readonly requestGeneration: number } }
   | { readonly _tag: "PrepareNew"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Branch"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
@@ -246,7 +248,8 @@ export function makeAppRuntime(
       }),
     ))
     const operations = makeApplicationOperations(options)
-    const navigation = yield* makeNavigationWriter(options.metadata)
+    const navigation = yield* makeNavigationWriter(options.metadata, (cause) =>
+      Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }))
     const preparedTerminals = new Map<string, PreparedTerminal>()
     const owners = new Map<string, OwnerCursor>()
     const unclaimedOwnerEvents = new Map<string, OwnerCursor["buffered"]>()
@@ -265,6 +268,7 @@ export function makeAppRuntime(
     let startupNavigationEligible = true
     let startupRecoveryPending = true
     let navigationGeneration = 0
+    let navigatorRequestGeneration = 0
     let shutdownResult: DeferredType.Deferred<void, ApplicationShutdownError> | undefined
     let identityGeneration = 0
     const identityTransitions: Array<{
@@ -467,6 +471,8 @@ export function makeAppRuntime(
       reply?: IntentEnvelope["reply"],
     ): Effect.Effect<void, never, Scope.Scope> => {
       const navigationState = navigationForSurface(surface)
+      if (!reply) return navigation.schedule(navigationState).pipe(Effect.catch((cause) =>
+        Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }).pipe(Effect.asVoid)))
       const key = `navigation:${nextCommandToken}`
       return launch(key, {
         _tag: "Navigation",
@@ -486,6 +492,9 @@ export function makeAppRuntime(
       const mode = reason === "manual" || reason === "initial" || reason === "ambiguity"
         ? "full" as const
         : "incremental" as const
+      if (mode === "incremental" && !reply && [...state.refresh.active.values()].some((active) =>
+        active.mode === "incremental" && [...sessionIds].every((id) => active.sessionIds.has(id)) &&
+        invalidatedRefreshSessionIds(state, active).size === 0)) return
       const key = mode === "full" ? "refresh:full"
         : reason === "reconciliation" ? "refresh:reconciliation"
         : reason === "submission" ? `refresh:submission:${ownerId}`
@@ -518,7 +527,11 @@ export function makeAppRuntime(
       }, Effect.gen(function*(): Effect.gen.Return<RefreshResult, unknown> {
         const activityChecks = reason === "manual" ? yield* operations.reconcileActivity : []
         if (reason === "reconciliation") yield* Effect.sleep(TRANSCRIPT_CONFIRMATION_DELAY_MS)
-        const snapshot = yield* operations.loadSnapshot(mode, [...sessionIds])
+        const snapshot = yield* reason === "initial" && options.provider.loadSessionSnapshotProgressively
+          ? options.provider.loadSessionSnapshotProgressively((snapshot) => Queue.offer(inbox, {
+            _tag: "RefreshProgress", key, generation, snapshot,
+          }).pipe(Effect.asVoid))
+          : operations.loadSnapshot(mode, [...sessionIds])
         return { snapshot, activityChecks }
       }))
     })
@@ -1001,6 +1014,25 @@ export function makeAppRuntime(
           ) yield* scheduleCompletion(sessionId)
         }
         if (command.reply) {
+          if (command.enterRoot) {
+            if (Exit.isFailure(exit)) {
+              yield* failReply(command.reply, "EnterRoot", "Load conversation", Cause.squash(exit.cause), false)
+            } else if (command.enterRoot.requestGeneration !== navigatorRequestGeneration || state.surface._tag === "Terminal") {
+              yield* reject(command.reply, "EnterRoot", "superseded", "A newer navigation superseded this conversation load")
+            } else {
+              const graph = projectGraphViewModel(state, command.enterRoot.sessionId)
+              const node = graph.nodes.find((node) => node.selected)
+              if (!node) {
+                yield* reject(command.reply, "EnterRoot", "invalid", "Conversation history is unavailable")
+              } else {
+                const surface = { _tag: "Graph" as const, familySessionId: graph.familySessionId, target: node.target }
+                yield* publish({ _tag: "Navigated", surface })
+                yield* startNavigation(surface)
+                yield* Deferred.succeed(command.reply, undefined)
+              }
+            }
+            return
+          }
           if (Exit.isSuccess(exit)) yield* Deferred.succeed(command.reply, undefined)
           else yield* failReply(
             command.reply,
@@ -1091,6 +1123,7 @@ export function makeAppRuntime(
             _tag: "PersistedBranchProjected",
             session: outcome.prepared.session,
             relation: outcome.relation,
+            ...(outcome.transcript === undefined ? {} : { transcript: outcome.transcript }),
           })
           yield* startShow(
             outcome.prepared,
@@ -1366,18 +1399,34 @@ export function makeAppRuntime(
           intent._tag === "SelectGraph" || intent._tag === "NewSession" ||
           intent._tag === "ResumeSession" || intent._tag === "OpenEndpoint" ||
           intent._tag === "BranchFrom" || intent._tag === "ReturnFromTerminal"
-        ) startupNavigationEligible = false
+        ) {
+          startupNavigationEligible = false
+          navigatorRequestGeneration += 1
+        }
         switch (intent._tag) {
           case "Refresh":
             yield* startRefresh("manual", new Set(), undefined, undefined, envelope.reply)
             return
           case "SelectRoot": {
             const surface = { _tag: "Roots" as const, selectedSessionId: intent.sessionId }
-            yield* publish({ _tag: "Navigated", surface })
-            yield* startNavigation(surface, envelope.reply)
+            yield* publish({ _tag: "Navigated", surface, ...(intent.selectionId === undefined ? {} : { selectionId: intent.selectionId }) })
+            yield* startNavigation(surface)
+            yield* Deferred.succeed(envelope.reply, undefined)
             return
           }
           case "EnterRoot": {
+            const family = [...groupSessionFamilies(state.provider.sessions, state.relations).values()]
+              .find((group) => group.sessions.some((session) => session.id === intent.sessionId))
+            if (family?.sessions.some((session) => !state.provider.transcripts.has(session.id))) {
+              const refresh: ActiveRefresh = { key: "refresh:navigation", generation: state.refresh.generation + 1,
+                reason: "terminal-return", mode: "incremental", sessionIds: new Set(family.sessions.map((session) => session.id)) }
+              yield* supersede(refresh.key)
+              yield* publish({ _tag: "RefreshStarted", refresh })
+              yield* launch(refresh.key, { _tag: "Refresh", refresh, reply: envelope.reply,
+                enterRoot: { sessionId: intent.sessionId, requestGeneration: navigatorRequestGeneration } },
+                operations.loadSnapshot("incremental", [...refresh.sessionIds]).pipe(Effect.map((snapshot): RefreshResult => ({ snapshot, activityChecks: [] }))), false)
+              return
+            }
             const graph = projectGraphViewModel(state, intent.sessionId)
             const selected = graph.nodes.find((node) => node.selected)
             if (!selected) {
@@ -1390,7 +1439,8 @@ export function makeAppRuntime(
               target: selected.target,
             }
             yield* publish({ _tag: "Navigated", surface })
-            yield* startNavigation(surface, envelope.reply)
+            yield* startNavigation(surface)
+            yield* Deferred.succeed(envelope.reply, undefined)
             return
           }
           case "SelectGraph": {
@@ -1399,8 +1449,9 @@ export function makeAppRuntime(
               familySessionId: intent.familySessionId,
               target: intent.target,
             }
-            yield* publish({ _tag: "Navigated", surface })
-            yield* startNavigation(surface, envelope.reply)
+            yield* publish({ _tag: "Navigated", surface, ...(intent.selectionId === undefined ? {} : { selectionId: intent.selectionId }) })
+            yield* startNavigation(surface)
+            yield* Deferred.succeed(envelope.reply, undefined)
             return
           }
           case "NewSession": {
@@ -1527,6 +1578,7 @@ export function makeAppRuntime(
       })
 
     const processMessage = (message: ActorMessage): Effect.Effect<void, never, Scope.Scope> => {
+      if (message._tag === "RefreshProgress") return publish(message)
       if (message._tag === "Startup") {
         return Effect.gen(function*() {
           if (accepting && state.shutdown === "running") {
@@ -1691,7 +1743,7 @@ export function makeAppRuntime(
       ) return
       if (
         message._tag === "TerminalCleanupError" || message._tag === "BackgroundFailure" ||
-        message._tag === "BranchMutationReconciliation"
+        message._tag === "BranchMutationReconciliation" || message._tag === "RefreshProgress"
       ) return
       if (message._tag === "TerminalSessionChanged") {
         unregisterTerminalBarrier(message)
@@ -1827,6 +1879,7 @@ export function makeAppRuntime(
           pending._tag !== "CommandCompleted" && pending._tag !== "TerminalCleanupError"
           && pending._tag !== "BackgroundFailure"
           && pending._tag !== "BranchMutationReconciliation"
+          && pending._tag !== "RefreshProgress"
           && pending._tag !== "BeginShutdown"
           && pending._tag !== "AbortTransitionAcknowledgments"
           && pending._tag !== "FinishShutdown"
@@ -2125,9 +2178,9 @@ export function makeAppRuntime(
         },
       },
       refresh: () => request({ _tag: "Refresh", reason: "manual" }),
-      selectRoot: (sessionId) => request({ _tag: "SelectRoot", sessionId }),
+      selectRoot: (sessionId, selectionId) => request({ _tag: "SelectRoot", sessionId, ...(selectionId === undefined ? {} : { selectionId }) }),
       enterRoot: (sessionId) => request({ _tag: "EnterRoot", sessionId }),
-      selectGraph: (familySessionId, target) => request({ _tag: "SelectGraph", familySessionId, target }),
+      selectGraph: (familySessionId, target, selectionId) => request({ _tag: "SelectGraph", familySessionId, target, ...(selectionId === undefined ? {} : { selectionId }) }),
       newSession: request({ _tag: "NewSession" }),
       resumeSession: (sessionId) => request({ _tag: "ResumeSession", sessionId, reportFailure: true }),
       openEndpoint: (sessionId) => request({ _tag: "OpenEndpoint", sessionId }),
@@ -2160,7 +2213,7 @@ export function makeAppRuntime(
 
 function commandIntent(command: ActorCommand): ApplicationIntent["_tag"] {
   switch (command._tag) {
-    case "Refresh": return "Refresh"
+    case "Refresh": return command.enterRoot ? "EnterRoot" : "Refresh"
     case "PrepareNew": return "NewSession"
     case "PrepareResume": return "ResumeSession"
     case "Branch": return "BranchFrom"
@@ -2212,7 +2265,7 @@ function messageFailureContext(message: ActorMessage): {
 
 function commandOperation(command: ActorCommand): string {
   switch (command._tag) {
-    case "Refresh": return "Refresh conversations"
+    case "Refresh": return command.enterRoot ? "Load conversation" : "Refresh conversations"
     case "PrepareNew": return "Create session"
     case "PrepareResume": return "Resume session"
     case "Branch": return "Create branch"
