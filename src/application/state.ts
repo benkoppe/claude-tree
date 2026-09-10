@@ -98,6 +98,7 @@ export interface ActiveRefresh {
   readonly historyRevisions?: ReadonlyMap<string, { readonly ownerId?: string; readonly revision: number }>
   readonly completionVersion?: number
   readonly ambiguityReason?: string
+  readonly progressSessionIds?: ReadonlySet<string>
 }
 
 export interface ProviderSnapshotState {
@@ -112,6 +113,7 @@ export interface LocalOverlayState {
 }
 
 export interface ApplicationState {
+  readonly selectionId: string | null
   readonly provider: ProviderSnapshotState
   readonly local: LocalOverlayState
   readonly relations: readonly BranchRelation[]
@@ -148,6 +150,7 @@ export function makeInitialApplicationState(
   initial: InitialApplicationState = {},
 ): ApplicationState {
   return {
+    selectionId: null,
     provider: { sessions: new Map(), transcripts: new Map() },
     local: { sessions: new Map(), transcripts: new Map(), temporarySessionIds: new Set() },
     relations: initial.relations ?? [],

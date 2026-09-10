@@ -58,10 +58,11 @@ describe("application state reducer", () => {
     const refreshing = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: activeRefresh("refresh:full", 1, "manual", "full") })
     expect(selectConversationForest(refreshing)).toBe(forest)
     expect(selectConversationForest({ ...refreshing, modal: { _tag: "About" } })).toBe(forest)
+    expect(selectConversationForest({ ...state, terminals: new Map(state.terminals) })).toBe(forest)
     for (const changed of [
       { ...state, provider: { ...state.provider } },
       { ...state, local: { ...state.local } },
-      { ...state, terminals: new Map(state.terminals) },
+      { ...state, terminals: new Map([[ROOT, { phase: "running" as const, activity: "working" as const }]]) },
       { ...state, rewindAnchors: new Map(state.rewindAnchors) },
       { ...state, relations: [...state.relations] },
       { ...state, removals: [...state.removals] },

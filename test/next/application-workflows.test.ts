@@ -84,11 +84,14 @@ describe("application actor", () => {
         resolveExecutable: () => "/usr/bin/claude",
         observerFactory: () => observer,
         sdk: {
+          async getSessionInfo(sessionId) {
+            return sessionIds.includes(sessionId) ? { sessionId, summary: sessionId, lastModified: 1 } : undefined
+          },
           async listSessions() {
             return sessionIds.map((sessionId) => ({ sessionId, summary: sessionId, lastModified: 1 }))
           },
           async getSessionMessages(sessionId, options) {
-            const messages = await getSessionMessages(sessionId, { ...options, sessionStore: store })
+            const messages = await getSessionMessages(sessionId, { ...options, sessionStore: options.sessionStore ?? store })
             sdkReads.push({ sessionId, ids: messages.map((message) => message.uuid) })
             return messages
           },
@@ -266,6 +269,86 @@ describe("application actor", () => {
     expect(result.after.relations).toHaveLength(1)
     expect(result.view.surface._tag).toBe("Graph")
     expect(fixture.calls.filter((call) => call === `show:${child.session.id}`)).toHaveLength(1)
+  })
+
+  test("cursor acceptance and terminal display do not wait for navigation persistence", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const metadata = { ...fixture.options.metadata, updateMetadata: (transform: Parameters<ApplicationMetadataFacet["updateMetadata"]>[0]) =>
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)),
+          Effect.andThen(fixture.options.metadata.updateMetadata(transform))) }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.selectRoot(ROOT)
+      yield* Deferred.await(started)
+      for (let index = 0; index < 100; index++) yield* runtime.selectRoot(index % 2 ? ROOT : CHILD)
+      yield* runtime.enterRoot(ROOT)
+      const opening = yield* Effect.forkChild(runtime.openEndpoint(ROOT))
+      yield* waitForState(runtime, (state) => state.surface._tag === "Terminal")
+      expect(fixture.calls).toContain(`show:${ROOT}`)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(opening)
+    })))
+  })
+
+  test("the catalogue is usable during hydration and entering a root reads only its family", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const listed = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const provider = { ...fixture.options.provider,
+        loadSessionSnapshotProgressively: (publish: (value: AgentSessionSnapshot) => Effect.Effect<void>) => Effect.gen(function*() {
+          yield* publish({ sessions: fixture.snapshot.sessions, transcripts: new Map() })
+          yield* Deferred.succeed(listed, undefined)
+          yield* Deferred.await(release)
+          return fixture.snapshot
+        }),
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* Deferred.await(listed)
+      yield* waitForState(runtime, (state) => state.provider.sessions.size === 2)
+      const catalogue = yield* runtime.getViewModel
+      expect(catalogue.initialLoadPending).toBeFalse()
+      expect(catalogue.refreshing).toBeTrue()
+      expect(catalogue.surface._tag).toBe("Roots")
+      if (catalogue.surface._tag !== "Roots") throw new Error("Expected roots")
+      expect(catalogue.surface.roots).toHaveLength(2)
+      expect(catalogue.surface.roots.every((root) => root.historyPending)).toBeTrue()
+      yield* runtime.selectRoot(ROOT)
+      yield* runtime.enterRoot(ROOT)
+      expect(fixture.incrementalReads).toEqual([[ROOT]])
+      expect((yield* runtime.getState).surface._tag).toBe("Graph")
+      expect((yield* runtime.getState).refresh.initialPending).toBeTrue()
+      yield* Deferred.succeed(release, undefined)
+      const completed = yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      expect(completed.surface._tag).toBe("Graph")
+    })))
+  })
+
+  test("a late family load cannot take focus from a newer navigation", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const release = yield* Deferred.make<void>()
+      const provider = { ...fixture.options.provider,
+        loadSessionSnapshotProgressively: (publish: (value: AgentSessionSnapshot) => Effect.Effect<void>) =>
+          publish({ sessions: fixture.snapshot.sessions, transcripts: new Map() }).pipe(Effect.andThen(Effect.never)),
+        loadSessionSnapshotFor: (ids: readonly string[]) => Deferred.await(release).pipe(
+          Effect.andThen(fixture.options.provider.loadSessionSnapshotFor(ids))),
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* waitForState(runtime, (state) => state.provider.sessions.size === 2)
+      const entering = yield* Effect.forkChild(Effect.flip(runtime.enterRoot(ROOT)))
+      yield* waitForState(runtime, (state) => state.refresh.active.has("refresh:navigation"))
+      yield* runtime.selectRoot(CHILD, "newer-selection")
+      yield* Deferred.succeed(release, undefined)
+      const error = yield* Fiber.join(entering)
+      expect(error).toBeInstanceOf(IntentRejectedError)
+      const state = yield* runtime.getState
+      expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      expect(state.selectionId).toBe("newer-selection")
+    })))
   })
 
   test("a provider-interrupted fork settles its caller and leaves later actor requests usable", async () => {

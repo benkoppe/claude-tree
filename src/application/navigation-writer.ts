@@ -14,6 +14,7 @@ export interface NavigationMetadataFacet {
 }
 
 export interface NavigationWriter {
+  readonly schedule: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly write: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly flush: Effect.Effect<void, PersistenceError>
   readonly close: Effect.Effect<void>
@@ -29,6 +30,7 @@ const DRAIN_SCOPE_CLOSE_TIMEOUT_MS = 100
 
 export function makeNavigationWriter(
   repository: NavigationMetadataFacet,
+  reportFailure: (error: PersistenceError) => Effect.Effect<unknown> = () => Effect.void,
 ): Effect.Effect<NavigationWriter, never, Scope.Scope> {
   return Effect.gen(function*() {
     const drainScope = yield* Scope.make("sequential")
@@ -97,6 +99,7 @@ export function makeNavigationWriter(
         if (Exit.isSuccess(exit)) lastFailure = undefined
         else lastFailure = Cause.squash(exit.cause) as PersistenceError
         for (const waiter of pending.waiters) yield* Deferred.done(waiter, exit)
+        if (lastFailure && pending.waiters.length === 0) yield* reportFailure(lastFailure)
       }
     }).pipe(
       Effect.onExit((exit) => Exit.isFailure(exit) && draining
@@ -104,7 +107,7 @@ export function makeNavigationWriter(
         : Effect.void),
     )
 
-    const write = (navigation: NavigationState): Effect.Effect<void, PersistenceError> =>
+    const enqueue = (navigation: NavigationState, waiter?: Deferred.Deferred<void, PersistenceError>): Effect.Effect<void, PersistenceError> =>
       Effect.gen(function*() {
         if (closed) {
           return yield* Effect.fail(new PersistenceError({
@@ -113,23 +116,30 @@ export function makeNavigationWriter(
             message: "Cannot save navigation after the navigation writer has closed",
           }))
         }
-        const waiter = yield* Deferred.make<void, PersistenceError>()
         const json = JSON.stringify(navigation)
-        if (queued === undefined && current?.json === json) current.waiters.push(waiter)
-        else if (queued?.json === json) queued.waiters.push(waiter)
+        if (queued === undefined && current?.json === json) {
+          if (waiter) current.waiters.push(waiter)
+        } else if (queued?.json === json) {
+          if (waiter) queued.waiters.push(waiter)
+        }
         else {
           queued = {
             navigation,
             json,
-            waiters: [...(queued?.waiters ?? []), waiter],
+            waiters: [...(queued?.waiters ?? []), ...(waiter ? [waiter] : [])],
           }
         }
         if (!draining) {
           draining = true
           yield* Effect.forkIn(drain, drainScope)
         }
-        return yield* Deferred.await(waiter)
       })
+
+    const write = (navigation: NavigationState) => Effect.gen(function*() {
+      const waiter = yield* Deferred.make<void, PersistenceError>()
+      yield* enqueue(navigation, waiter)
+      yield* Deferred.await(waiter)
+    })
 
     const flush = Effect.gen(function*() {
       if (!draining && queued === undefined) {
@@ -140,6 +150,6 @@ export function makeNavigationWriter(
       yield* Deferred.await(waiter)
     })
 
-    return { write, flush, close }
+    return { write, schedule: (navigation) => enqueue(navigation), flush, close }
   })
 }

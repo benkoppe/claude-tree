@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util"
+
 import type {
   AgentMessage,
   AgentSession,
@@ -39,6 +41,7 @@ export const MAX_COMPLETION_REFRESH_ATTEMPTS = 4
 const MAX_REPLACEMENT_READS = 3
 
 export type StateEvent =
+  | { readonly _tag: "RefreshProgress"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
   | { readonly _tag: "RefreshStarted"; readonly refresh: ActiveRefresh; readonly replaceAll?: boolean }
   | { readonly _tag: "RefreshSucceeded"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
   | { readonly _tag: "RefreshFailed"; readonly key: string; readonly generation: number; readonly message: string }
@@ -46,7 +49,7 @@ export type StateEvent =
   | { readonly _tag: "LocalSessionProjected"; readonly session: AgentSession; readonly transcript?: TranscriptRead; readonly temporary?: boolean }
   | { readonly _tag: "PersistedBranchProjected"; readonly session: AgentSession; readonly relation: BranchRelation; readonly transcript?: TranscriptRead }
   | { readonly _tag: "TransientSessionRolledBack"; readonly sessionId: string; readonly restoreTo: NavigatorSurface }
-  | { readonly _tag: "Navigated"; readonly surface: ApplicationSurface }
+  | { readonly _tag: "Navigated"; readonly surface: ApplicationSurface; readonly selectionId?: string }
   | { readonly _tag: "TerminalShowStarted"; readonly sessionId: string }
   | { readonly _tag: "TerminalShown"; readonly sessionId: string; readonly ownerId: string; readonly returnTo: NavigatorSurface }
   | { readonly _tag: "TerminalShowFailed"; readonly sessionId: string; readonly restoreTo: NavigatorSurface; readonly message?: string }
@@ -71,6 +74,18 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
   if (state.shutdown === "shutting-down" && !isShutdownEvent(event)) return state
 
   switch (event._tag) {
+    case "RefreshProgress": {
+      const refresh = state.refresh.active.get(event.key)
+      if (!refresh || refresh.generation !== event.generation) return state
+      const progressive = { ...state, refresh: { ...state.refresh, active: new Map(state.refresh.active).set(event.key, {
+        ...refresh, mode: "incremental" as const, sessionIds: new Set(event.snapshot.transcripts.keys()),
+      }) } }
+      const next = refreshSucceeded(progressive, event.key, event.generation, event.snapshot, true)
+      return { ...next, refresh: { ...next.refresh, initialPending: state.refresh.initialPending,
+        active: new Map(next.refresh.active).set(event.key, { ...refresh, progressSessionIds: new Set([
+          ...(refresh.progressSessionIds ?? []), ...event.snapshot.transcripts.keys(),
+        ]) }) } }
+    }
     case "RefreshStarted": {
       const active = event.replaceAll ? new Map<string, ActiveRefresh>() : new Map(state.refresh.active)
       const sessionIds = event.refresh.mode === "full"
@@ -158,7 +173,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
     case "TransientSessionRolledBack":
       return rollbackTransient(state, event.sessionId, event.restoreTo)
     case "Navigated":
-      return { ...state, surface: event.surface }
+      return { ...state, surface: event.surface, selectionId: event.selectionId ?? null }
     case "TerminalShowStarted":
       return {
         ...state,
@@ -304,6 +319,7 @@ function refreshSucceeded(
   key: string,
   generation: number,
   snapshot: AgentSessionSnapshot,
+  progress = false,
 ): ApplicationState {
   const active = state.refresh.active.get(key)
   if (!active || active.generation !== generation) return state
@@ -316,6 +332,7 @@ function refreshSucceeded(
     : new Map([...state.provider.transcripts, ...snapshot.transcripts])
   const appliedGenerationBySession = new Map(state.refresh.appliedGenerationBySession)
   const staleSessionIds = new Set(invalidatedRefreshSessionIds(state, active))
+  if (active.mode === "full") for (const id of active.progressSessionIds ?? []) staleSessionIds.add(id)
   for (const [sessionId, appliedGeneration] of appliedGenerationBySession) {
     if (appliedGeneration > generation) staleSessionIds.add(sessionId)
   }
@@ -458,17 +475,35 @@ function refreshSucceeded(
   }
 
   const without = removeRefresh(state, key, generation)
+  for (const [id, session] of sessions) {
+    const previous = state.provider.sessions.get(id)
+    if (previous && isDeepStrictEqual(previous, session)) sessions.set(id, previous)
+  }
+  for (const [id, read] of transcripts) {
+    const previous = state.provider.transcripts.get(id)
+    if (previous?._tag === "Available" && read._tag === "Available" && sameTranscript(previous.messages, read.messages)) {
+      transcripts.set(id, previous)
+    }
+  }
+  const providerSessions = reuseMap(state.provider.sessions, sessions)
+  const providerTranscripts = reuseMap(state.provider.transcripts, transcripts)
+  const retainedLocalSessions = reuseMap(state.local.sessions, localSessions)
+  const retainedLocalTranscripts = reuseMap(state.local.transcripts, localTranscripts)
+  const retainedTemporaryIds = reuseSet(state.local.temporarySessionIds, temporarySessionIds)
   return repairNavigatorSurface({
     ...without,
-    provider: { sessions, transcripts },
-    local: { sessions: localSessions, transcripts: localTranscripts, temporarySessionIds },
-    rewindAnchors,
-    drafts,
-    pendingCompletions,
+    provider: providerSessions === state.provider.sessions && providerTranscripts === state.provider.transcripts
+      ? state.provider : { sessions: providerSessions, transcripts: providerTranscripts },
+    local: retainedLocalSessions === state.local.sessions && retainedLocalTranscripts === state.local.transcripts && retainedTemporaryIds === state.local.temporarySessionIds
+      ? state.local : { sessions: retainedLocalSessions, transcripts: retainedLocalTranscripts, temporarySessionIds: retainedTemporaryIds },
+    rewindAnchors: reuseMap(state.rewindAnchors, rewindAnchors),
+    drafts: reuseMap(state.drafts, drafts),
+    pendingCompletions: reuseMap(state.pendingCompletions, pendingCompletions),
     replacementCandidates,
-    terminals,
-    unviewedSessionIds,
-    refresh: { ...without.refresh, initialPending: false, appliedGenerationBySession },
+    terminals: reuseMap(state.terminals, terminals),
+    unviewedSessionIds: reuseSet(state.unviewedSessionIds, unviewedSessionIds),
+    refresh: { ...without.refresh, initialPending: state.refresh.initialPending &&
+      (progress || [...without.refresh.active.values()].some((refresh) => refresh.reason === "initial")), appliedGenerationBySession },
     ...(unavailableReasons.length > 0
       ? { modal: { _tag: "Error", message: `Conversation refresh failed: ${unavailableReasons.join("; ")}` } as const }
       : unstableSessionIds.size > 0
@@ -477,6 +512,15 @@ function refreshSucceeded(
       ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
       : {}),
   })
+}
+
+function reuseMap<K, V>(previous: ReadonlyMap<K, V>, next: ReadonlyMap<K, V>): ReadonlyMap<K, V> {
+  return previous.size === next.size && [...next].every(([key, value]) => previous.has(key) && previous.get(key) === value)
+    ? previous : next
+}
+
+function reuseSet<A>(previous: ReadonlySet<A>, next: ReadonlySet<A>): ReadonlySet<A> {
+  return previous.size === next.size && [...next].every((value) => previous.has(value)) ? previous : next
 }
 
 function projectLocalSession(
@@ -1135,6 +1179,10 @@ function repairNavigatorSurface(
   const requested = preferred ?? state.surface as NavigatorSurface
   const forest = selectConversationForest(state)
   if (requested._tag === "Roots") {
+    if (state.refresh.initialPending && requested.selectedSessionId !== null &&
+      state.provider.sessions.has(requested.selectedSessionId) && !state.provider.transcripts.has(requested.selectedSessionId)) {
+      return { ...state, surface: requested }
+    }
     const selected = requested.selectedSessionId === null
       ? undefined
       : forest.graphBySessionId.get(requested.selectedSessionId) ??

@@ -147,9 +147,10 @@ describe("Effect Claude provider", () => {
     expect(transcript.messages[0]).toMatchObject({ replayText: `Explain this: ${envelope}` })
   })
 
-  test("loads incremental snapshots with all metadata and deduplicated requested reads", async () => {
+  test("loads only requested metadata and deduplicated transcripts", async () => {
     const reads: string[] = []
     const provider = providerWith({
+      listSessions: () => { throw new Error("Targeted reads must not discover unrelated sessions") },
       messages: {
         [ROOT]: () => {
           reads.push(ROOT)
@@ -163,7 +164,7 @@ describe("Effect Claude provider", () => {
     })
 
     const snapshot = await Effect.runPromise(provider.loadSessionSnapshotFor([CHILD, CHILD]))
-    expect(snapshot.sessions.map((session) => session.id)).toEqual([ROOT, CHILD])
+    expect(snapshot.sessions.map((session) => session.id)).toEqual([CHILD])
     expect([...snapshot.transcripts.keys()]).toEqual([CHILD])
     expect(reads).toEqual([CHILD])
 
@@ -503,7 +504,7 @@ describe("Effect Claude provider", () => {
       },
     })
 
-    await Effect.runPromise(provider.loadSessionSnapshotFor([]))
+    await Effect.runPromise(provider.loadSessionSnapshot)
     const outcome = await Effect.runPromise(provider.branchFrom({
       sessionId: ROOT,
       messageId: "parent-1",
@@ -862,7 +863,7 @@ describe("Effect Claude provider", () => {
     expect(error.operation).toBe("listSessions")
   })
 
-  test("uses one absolute deadline across session listing and transcript reads", async () => {
+  test("starts each full-snapshot transcript budget after discovery rather than expiring queued reads", async () => {
     let resolveList: ((sessions: readonly SDKSessionInfo[]) => void) | undefined
     let rootReads = 0
     const provider = providerWith({
@@ -893,6 +894,8 @@ describe("Effect Claude provider", () => {
         yield* Effect.yieldNow
         expect(rootReads).toBe(1)
         yield* TestClock.adjust(4)
+        expect(fiber.pollUnsafe()).toBeUndefined()
+        yield* TestClock.adjust(6)
         return yield* Fiber.join(fiber)
       }),
       TestClock.layer(),
@@ -900,7 +903,7 @@ describe("Effect Claude provider", () => {
 
     expect(snapshot.transcripts.get(ROOT)).toEqual({
       _tag: "Unavailable",
-      reason: "Claude loadSessionSnapshot timed out after 10ms",
+      reason: "Claude readTranscripts timed out after 10ms",
     })
   })
 
@@ -1299,6 +1302,9 @@ function fakeSdk(
   sessions: readonly SDKSessionInfo[] = [],
 ): ClaudeSdk {
   return {
+    async getSessionInfo(sessionId) {
+      return sessions.find((session) => session.sessionId === sessionId)
+    },
     async listSessions() {
       return options.listSessions?.() ?? sessions
     },

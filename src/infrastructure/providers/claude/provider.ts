@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from "node:util"
 import {
   forkSession,
   getSessionMessages,
+  getSessionInfo,
   importSessionToStore,
   listSessions,
   type SDKSessionInfo,
@@ -24,6 +25,7 @@ import type {
 } from "../../../domain/model"
 import {
   AgentProvider,
+  SESSION_SNAPSHOT_BATCH_SIZE,
   type AgentProviderApi,
   type AmbiguousBranchMutation,
   type BranchOutcome,
@@ -35,6 +37,7 @@ import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
 
 export interface ClaudeSdk {
+  readonly getSessionInfo: (sessionId: string, options: { readonly dir: string }) => Promise<SDKSessionInfo | undefined>
   readonly listSessions: (options: {
     readonly dir: string
     readonly includeWorktrees: boolean
@@ -42,7 +45,7 @@ export interface ClaudeSdk {
   }) => Promise<readonly SDKSessionInfo[]>
   readonly getSessionMessages: (
     sessionId: string,
-    options: { readonly dir: string },
+    options: { readonly dir: string; readonly sessionStore?: SessionStore },
   ) => Promise<readonly SessionMessage[] | null | undefined>
   readonly forkSession: (
     sessionId: string,
@@ -74,6 +77,7 @@ export interface ClaudeProviderOptions {
 }
 
 const defaultSdk: ClaudeSdk = {
+  getSessionInfo,
   listSessions,
   getSessionMessages,
   forkSession,
@@ -207,17 +211,24 @@ export class ClaudeProvider implements AgentProviderApi {
     this.provenanceImportTimeoutMs =
       options.provenanceImportTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
 
-    this.loadSessionSnapshot = Effect.gen({ self: this }, function*() {
+    this.loadSessionSnapshot = this.loadSessionSnapshotProgressively(() => Effect.void)
+
+    this.prepareNewSession = this.prepareTransientSession()
+  }
+
+  loadSessionSnapshotProgressively(publish: (snapshot: AgentSessionSnapshot) => Effect.Effect<void>) {
+    return Effect.gen({ self: this }, function*() {
       const deadline = yield* this.makeDeadline("loadSessionSnapshot", this.operationTimeoutMs)
       const sessions = yield* this.listSessionSummaries(deadline)
+      yield* publish({ sessions, transcripts: new Map() })
       const transcripts = yield* this.readTranscriptsWithin(
         sessions.map((session) => session.id),
         deadline,
+        (transcripts) => publish({ sessions: [], transcripts }),
       )
       return { sessions, transcripts }
     })
 
-    this.prepareNewSession = this.prepareTransientSession()
   }
 
   readTranscripts(
@@ -234,7 +245,18 @@ export class ClaudeProvider implements AgentProviderApi {
   ): Effect.Effect<AgentSessionSnapshot, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const deadline = yield* this.makeDeadline("loadSessionSnapshotFor", this.operationTimeoutMs)
-      const sessions = yield* this.listSessionSummaries(deadline)
+      const summaries = yield* Effect.forEach(unique(sessionIds), (id) => this.callSdk(
+        "getSessionInfo", () => this.sdk.getSessionInfo(id, { dir: this.projectPath }), this.listSessionsTimeoutMs, deadline,
+      ).pipe(Effect.flatMap((info) => Effect.try({
+        try: () => {
+          if (info === undefined) return undefined
+          if (info.sessionId !== id) throw new Error("Session metadata belongs to another session")
+          return toSessionSummary(info)
+        },
+        catch: (cause) => this.protocolError("getSessionInfo", "Claude returned invalid session metadata", cause),
+      }))), { concurrency: TRANSCRIPT_READ_CONCURRENCY })
+      const sessions = summaries.filter((session): session is AgentSession => session !== undefined)
+      this.sessionTitles = new Map([...this.sessionTitles, ...sessions.map((session) => [session.id, session.title] as const)])
       const transcripts = yield* this.readTranscriptsWithin(sessionIds, deadline)
       return { sessions, transcripts }
     })
@@ -243,15 +265,18 @@ export class ClaudeProvider implements AgentProviderApi {
   private readTranscriptsWithin(
     sessionIds: readonly string[],
     deadline: OperationDeadline,
+    publish?: (transcripts: ReadonlyMap<string, TranscriptRead>) => Effect.Effect<void>,
   ): Effect.Effect<ReadonlyMap<string, TranscriptRead>> {
+    const pending = new Map<string, TranscriptRead>()
     return Effect.all(
       unique(sessionIds).map((sessionId) =>
-        this.readClaudeTranscript(sessionId, "readTranscripts", deadline).pipe(
-          Effect.flatMap((messages) => messages === undefined || messages.length === 0
-            ? Effect.succeed(messages)
-            : this.readSessionEntries(sessionId, "readTranscripts", deadline).pipe(
-              Effect.flatMap((entries) => this.readNavigationHistory(sessionId, messages, entries, "readTranscripts", deadline)),
-            )),
+        Effect.gen({ self: this }, function*() {
+          const readDeadline = publish ? yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs) : deadline
+          const entries = yield* this.readSessionEntries(sessionId, "readTranscripts", readDeadline)
+          const messages = yield* this.readClaudeTranscript(sessionId, "readTranscripts", readDeadline, entries)
+          return messages === undefined || messages.length === 0 ? messages
+            : yield* this.readNavigationHistory(sessionId, messages, entries, "readTranscripts", readDeadline)
+        }).pipe(
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
               sessionId,
@@ -264,6 +289,14 @@ export class ClaudeProvider implements AgentProviderApi {
                 : { _tag: "Available", messages },
             ],
           }),
+          Effect.tap(([id, read]) => Effect.suspend(() => {
+            if (!publish) return Effect.void
+            pending.set(id, read)
+            if (pending.size < SESSION_SNAPSHOT_BATCH_SIZE) return Effect.void
+            const batch = new Map(pending)
+            pending.clear()
+            return publish(batch)
+          })),
         ),
       ),
       { concurrency: TRANSCRIPT_READ_CONCURRENCY },
@@ -291,12 +324,13 @@ export class ClaudeProvider implements AgentProviderApi {
         "branchFrom",
         Math.min(this.operationTimeoutMs, this.forkValidationTimeoutMs),
       )
+      const sourceEntries = yield* this.readSessionEntries(target.sessionId, "branchFrom", deadline)
       const activeTranscript = yield* this.requireTranscript(
         target.sessionId,
         "branchFrom",
         deadline,
+        sourceEntries,
       )
-      const sourceEntries = yield* this.readSessionEntries(target.sessionId, "branchFrom", deadline)
       const sourceTranscript = yield* this.readNavigationHistory(target.sessionId, activeTranscript, sourceEntries, "branchFrom", deadline)
       const selectedIndex = sourceTranscript.findIndex((message) => message.id === target.messageId)
       const selected = sourceTranscript[selectedIndex]
@@ -546,6 +580,7 @@ export class ClaudeProvider implements AgentProviderApi {
       return {
         _tag: "ValidatedBranch",
         session,
+        transcript: validation.transcript,
         acquireLaunch,
         derivation: {
           childSessionId: session.id,
@@ -735,8 +770,9 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
+    entries?: readonly SessionStoreEntry[],
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
-    return this.readClaudeTranscript(sessionId, operation, deadline).pipe(
+    return this.readClaudeTranscript(sessionId, operation, deadline, entries).pipe(
       Effect.flatMap((messages) => messages === undefined
         ? Effect.fail(this.providerError(operation, `Claude session ${sessionId} was not found`))
         : Effect.succeed(messages)),
@@ -747,10 +783,13 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
+    entries?: readonly SessionStoreEntry[],
   ): Effect.Effect<readonly ClaudeMessage[] | undefined, ProviderError | ProviderProtocolError> {
     return this.callSdk(
       operation,
-      () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath }),
+      () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath,
+        ...(entries === undefined ? {} : { sessionStore: this.snapshotStore(sessionId, entries) }),
+      }),
       this.transcriptReadTimeoutMs,
       deadline,
     ).pipe(
@@ -829,15 +868,19 @@ export class ClaudeProvider implements AgentProviderApi {
     operation: string,
     deadline: OperationDeadline,
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
-    const sessionStore: SessionStore = {
-      async append() { throw new Error("Navigation history is read-only") },
-      async load(key) { return key.sessionId === sessionId && key.subpath === undefined ? [...entries] : null },
-    }
+    const sessionStore = this.snapshotStore(sessionId, entries)
     return this.callSdk(operation, () => getSessionMessages(sessionId, { dir: this.projectPath, sessionStore }),
       this.transcriptReadTimeoutMs, deadline).pipe(Effect.flatMap((messages) => Effect.try({
         try: () => normalizeTranscript(sessionId, messages),
         catch: (cause) => this.protocolError(operation, `Claude returned invalid stored history for session ${sessionId}`, cause),
       })))
+  }
+
+  private snapshotStore(sessionId: string, entries: readonly SessionStoreEntry[]): SessionStore {
+    return {
+      async append() { throw new Error("Navigation history is read-only") },
+      async load(key) { return key.sessionId === sessionId && key.subpath === undefined ? [...entries] : null },
+    }
   }
 
   private readSessionEntries(

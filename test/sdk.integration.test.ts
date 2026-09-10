@@ -240,7 +240,8 @@ for (const [preservation, linkedHistory] of ["preservedSegment", "preservedMessa
     let forkCalls = 0
     const provider = new ClaudeProvider(process.cwd(), { sdk: {
       async listSessions() { return [] },
-      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      async getSessionInfo() { return undefined },
+      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: options.sessionStore ?? store }),
       forkSession: (id, options) => {
         forkCalls += 1
         return forkSession(id, { ...options, sessionStore: store })
@@ -275,7 +276,8 @@ test("compaction preserves a long logical history across reload, forks, repeated
   const timestamp = "2026-09-05T12:00:00.000Z"
   const provider = () => new ClaudeProvider(process.cwd(), { sdk: {
     async listSessions() { return [] },
-    getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+    async getSessionInfo() { return undefined },
+    getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: options.sessionStore ?? store }),
     forkSession: (id, options) => forkSession(id, { ...options, sessionStore: store }),
     async importSessionToStore(id, target) {
       await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
@@ -366,7 +368,8 @@ for (const preserveShared of [false, true]) {
     ])
     const makeProvider = () => new ClaudeProvider(process.cwd(), { sdk: {
       async listSessions() { return [] },
-      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      async getSessionInfo() { return undefined },
+      getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: options.sessionStore ?? store }),
       forkSession: (id, options) => forkSession(id, { ...options, sessionStore: store }),
       async importSessionToStore(id, target) {
         await target.append({ projectKey, sessionId: id }, store.getEntries({ projectKey, sessionId: id }))
