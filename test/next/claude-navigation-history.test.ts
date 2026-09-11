@@ -242,3 +242,182 @@ test("SDK-created forks preserve forward compaction links and validated shared h
   expect(read?._tag).toBe("Available")
   expect(forks()).toBe(1)
 })
+
+test.each(["messages", "segment"])("re-emitted preserved %s restore history and the postcompaction continuation together", async (kind) => {
+  const f = fixture()
+  const compact = { ...f.compact, compactMetadata: kind === "messages"
+    ? { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } }
+    : { preservedSegment: { headUuid: f.ids[1], tailUuid: f.ids[1], anchorUuid: f.ids[3] } } }
+  const entries = [f.question, f.answer, compact, f.summary,
+    { ...f.answer, parentUuid: f.ids[3] }, { ...f.current, parentUuid: f.ids[1] }, f.response]
+  const before = JSON.stringify(entries)
+  const { provider } = await providerFor(f.sessionId, entries)
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.map((message) => message.id)).toEqual([f.ids[0]!, f.ids[1]!, f.ids[3]!, f.ids[4]!, f.ids[5]!])
+  expect(read.messages.filter((message) => message.visible).map((message) => message.preview)).toEqual([
+    "old question", "old answer", "current question", "current answer",
+  ])
+  expect(read.messages.find((message) => message.id === f.ids[0])?.historical).toBeTrue()
+  expect(read.messages.find((message) => message.id === f.ids[1])?.historical).toBeUndefined()
+  expect(JSON.stringify(entries)).toBe(before)
+})
+
+test("SDK-only preservation rewiring still requires reconnecting a persisted continuation", async () => {
+  const f = fixture()
+  const compact = { ...f.compact, compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } } }
+  const { provider } = await providerFor(f.sessionId, [f.question, f.answer, compact, f.summary,
+    { ...f.current, parentUuid: f.ids[1] }, f.response])
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.map((message) => message.id)).toEqual([f.ids[0]!, f.ids[1]!, f.ids[3]!, f.ids[4]!, f.ids[5]!])
+})
+
+test("missing or contradictory original preserved ancestry fails with an evidence error", () => {
+  for (const original of [[], [record("answer", "one"), record("answer", "two")]]) {
+    const compact = { ...boundary("compact", "answer"), compactMetadata: {
+      preservedMessages: { uuids: ["answer"], anchorUuid: "summary" },
+    } }
+    expect(() => projectNavigationHistory([...original, compact, record("summary", "compact"),
+      record("answer", "summary"), record("current", "answer")], ["summary", "answer", "current", "compact"]))
+      .toThrow(original.length ? "multiple conflicting historical parents" : "no evidenced historical parents")
+  }
+})
+
+test("changed payloads cannot supply historical ancestry for a preserved UUID", async () => {
+  const f = fixture()
+  const compact = { ...f.compact, compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } } }
+  const changed = { ...f.entry(f.ids[1]!, f.ids[3]!, "assistant", "different answer") }
+  const { provider, forks } = await providerFor(f.sessionId, [f.question, f.answer, compact, f.summary, changed,
+    { ...f.current, parentUuid: f.ids[1] }, f.response])
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  expect(read?._tag).toBe("Unavailable")
+  const error = await Effect.runPromise(Effect.flip(provider.branchFrom({ sessionId: f.sessionId, messageId: f.ids[5]! })))
+  expect(error.message).toContain("no evidenced historical parents")
+  expect(forks()).toBe(0)
+})
+
+test.each([false, true])("preservation survives SDK forks and forks of forks (re-emitted records: %s)", async (repeated) => {
+  const f = fixture()
+  const compact = { ...f.compact, compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } } }
+  const entries = [f.question, f.answer, compact, f.summary,
+    ...(repeated ? [{ ...f.answer, parentUuid: f.ids[3] }] : []),
+    { ...f.current, parentUuid: f.ids[1] }, f.response]
+  const { provider, forks } = await providerFor(f.sessionId, entries)
+  let sessionId: string = f.sessionId
+  let targetId: string = f.ids[5]!
+  for (let depth = 0; depth < 2; depth++) {
+    const source = (await Effect.runPromise(provider.readTranscripts([sessionId]))).get(sessionId)
+    if (source?._tag !== "Available") throw new Error(JSON.stringify(source))
+    const branch = await Effect.runPromise(provider.branchFrom({ sessionId, messageId: targetId }))
+    if (branch._tag !== "ValidatedBranch") throw new Error(`repeated=${repeated}, depth=${depth}: ${branch.reason}`)
+    expect(branch.derivation.sharedMessages.map((pair) => pair.parentMessageId)).toEqual(source.messages.map((message) => message.id))
+    const read = (await Effect.runPromise(provider.readTranscripts([branch.session.id]))).get(branch.session.id)
+    if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+    expect(read.messages.filter((message) => message.visible).map((message) => message.preview)).toEqual([
+      "old question", "old answer", "current question", "current answer",
+    ])
+    sessionId = branch.session.id
+    targetId = branch.derivation.sharedMessages.at(-1)!.childMessageId
+  }
+  const historical = await Effect.runPromise(provider.branchFrom({ sessionId: f.sessionId, messageId: f.ids[1]! }))
+  if (historical._tag !== "ValidatedBranch") throw new Error(historical.reason)
+  expect(historical.derivation.sharedMessages.map((pair) => pair.parentMessageId)).toEqual([f.ids[0]!, f.ids[1]!])
+  expect(forks()).toBe(3)
+})
+
+test("preservation repairs do not resurrect a discarded path after rewind", async () => {
+  const f = fixture()
+  const compact = { ...f.compact, compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } } }
+  const { provider } = await providerFor(f.sessionId, [f.question, f.answer, compact, f.summary,
+    { ...f.answer, parentUuid: f.ids[3] }, { ...f.current, parentUuid: null }, f.response])
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.map((message) => message.id)).toEqual([f.ids[4]!, f.ids[5]!])
+})
+
+test("older compactions cannot reapply context rewiring to a repeatedly preserved message", async () => {
+  const f = fixture()
+  const entries: SessionStoreEntry[] = [f.question, f.answer]
+  for (let index = 0; index < 30; index++) {
+    const compactId = crypto.randomUUID(), summaryId = crypto.randomUUID()
+    entries.push({ ...boundary(compactId, f.ids[1]!), sessionId: f.sessionId,
+      compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: summaryId } } },
+      { ...f.entry(summaryId, compactId, "user", "summary"), isCompactSummary: true },
+      { ...f.answer, parentUuid: summaryId })
+  }
+  entries.push({ ...f.current, parentUuid: f.ids[1] }, f.response)
+  const { provider } = await providerFor(f.sessionId, entries)
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.filter((message) => message.visible).map((message) => message.id)).toEqual([
+    f.ids[0]!, f.ids[1]!, f.ids[4]!, f.ids[5]!,
+  ])
+  expect(read.messages.filter((message) => message.historyBoundary === "compaction")).toHaveLength(1)
+})
+
+test("successive preserved turns retain evidenced historical continuations and both compaction anchors", async () => {
+  const f = fixture()
+  const secondBoundary = crypto.randomUUID(), secondSummary = crypto.randomUUID()
+  const lastQuestion = crypto.randomUUID(), lastAnswer = crypto.randomUUID()
+  const entries = [f.question, f.answer,
+    { ...f.compact, compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } } }, f.summary,
+    { ...f.answer, parentUuid: f.ids[3] }, f.current, { ...f.current, parentUuid: f.ids[1] }, f.response,
+    { ...boundary(secondBoundary, f.ids[5]!), sessionId: f.sessionId,
+      compactMetadata: { preservedSegment: { headUuid: f.ids[5], tailUuid: f.ids[5], anchorUuid: secondSummary } } },
+    { ...f.entry(secondSummary, secondBoundary, "user", "second summary"), isCompactSummary: true },
+    { ...f.response, parentUuid: secondSummary },
+    f.entry(lastQuestion, f.ids[5]!, "user", "last question"), f.entry(lastAnswer, lastQuestion, "assistant", "last answer")]
+  const { provider } = await providerFor(f.sessionId, entries)
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.map((message) => message.id)).toEqual([
+    f.ids[0]!, f.ids[1]!, f.ids[3]!, f.ids[4]!, f.ids[5]!, secondSummary, lastQuestion, lastAnswer,
+  ])
+})
+
+test("preservation metadata never excuses a genuine ordinary-parent cycle", () => {
+  const compact = { ...boundary("compact", "answer"), compactMetadata: {
+    preservedMessages: { uuids: ["answer"], anchorUuid: "summary" },
+  } }
+  expect(() => projectNavigationHistory([record("question", "question"), record("answer", "question"),
+    compact, record("summary", "compact"), record("current", "answer")], ["summary", "answer", "current", "compact"]))
+    .toThrow("cyclic navigation ancestry")
+})
+
+test.each([false, true])("a context-only preserved record keeps its selected placement (re-emitted: %s)", async (reemitted) => {
+  const f = fixture()
+  const origin = f.entry(f.ids[6]!, null, "assistant", "independent source")
+  const compact = { ...f.compact, logicalParentUuid: origin.uuid, compactMetadata: {
+    preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] },
+  } }
+  const { provider } = await providerFor(f.sessionId, [f.question, origin, compact, f.summary,
+    { ...f.answer, parentUuid: reemitted ? f.ids[3] : f.ids[0] }, { ...f.current, parentUuid: f.ids[1] }, f.response])
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.filter((message) => message.visible).map((message) => message.preview)).toEqual([
+    "independent source", "old answer", "current question", "current answer",
+  ])
+})
+
+test.each(["answer", "user"])("a rewind into a preserved %s prefix does not resurrect its later messages", async (target) => {
+  const f = fixture()
+  const replacement = crypto.randomUUID(), response = crypto.randomUUID()
+  const cutoff = target === "answer" ? f.ids[1]! : f.ids[4]!
+  const question = { ...f.current, parentUuid: f.ids[1] }
+  const compact = { ...f.compact, logicalParentUuid: f.ids[5], compactMetadata: {
+    preservedMessages: { uuids: [f.ids[1], f.ids[4], f.ids[5]], anchorUuid: f.ids[3] },
+  } }
+  const entries = [f.question, f.answer, question, f.response, compact, f.summary,
+    { ...f.answer, parentUuid: f.ids[3] }, question, f.response,
+    f.entry(replacement, cutoff, "user", "replacement"), f.entry(response, replacement, "assistant", "replacement response")]
+  const { provider } = await providerFor(f.sessionId, entries)
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.messages.filter((message) => message.visible).map((message) => message.id)).toEqual([
+    f.ids[0]!, f.ids[1]!, ...(target === "user" ? [f.ids[4]!] : []), replacement, response,
+  ])
+  const branch = await Effect.runPromise(provider.branchFrom({ sessionId: f.sessionId, messageId: response }))
+  if (branch._tag !== "ValidatedBranch") throw new Error(branch.reason)
+  expect(branch.derivation.sharedMessages.some((pair) => pair.parentMessageId === f.ids[5])).toBeFalse()
+})

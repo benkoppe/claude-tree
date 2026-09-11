@@ -568,6 +568,72 @@ test("filesystem import preserves compacted roots and real SDK forks without rep
   }
 })
 
+test("filesystem preservation cycles recover across SDK forks without depending on the original parent file", async () => {
+  const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-preserved-versions-")))
+  const projectDir = join(configDir, "project")
+  const projectKey = "preserved-versions-fixture"
+  const sessionId = crypto.randomUUID()
+  const ids = Array.from({ length: 6 }, () => crypto.randomUUID())
+  const timestamp = "2026-09-11T12:00:00.000Z"
+  const answer = agentEntry(sessionId, ids[1]!, ids[0]!, "old answer", timestamp)
+  const entries: SessionStoreEntry[] = [
+    userEntry(sessionId, ids[0]!, null, "old question", timestamp), answer,
+    { type: "file-history-snapshot", snapshot: "x".repeat(6 * 1024 * 1024) },
+    { type: "system", subtype: "compact_boundary", uuid: ids[2]!, sessionId, parentUuid: null,
+      logicalParentUuid: ids[1], compactMetadata: { preservedMessages: { uuids: [ids[1]], anchorUuid: ids[3] } } },
+    { ...userEntry(sessionId, ids[3]!, ids[2]!, "summary", timestamp), isCompactSummary: true },
+    { ...answer, parentUuid: ids[3] },
+    userEntry(sessionId, ids[4]!, ids[1]!, "current question", timestamp),
+    agentEntry(sessionId, ids[5]!, ids[4]!, "current answer", timestamp),
+  ]
+  try {
+    await mkdir(projectDir, { recursive: true })
+    const transcriptDir = join(configDir, "projects", projectKey)
+    await mkdir(transcriptDir, { recursive: true })
+    const transcriptPath = join(transcriptDir, `${sessionId}.jsonl`)
+    await writeFile(transcriptPath, entries.map((entry) => JSON.stringify({ ...entry, cwd: projectDir })).join("\n") + "\n")
+    const script = `
+      import { Effect } from "effect"
+      import { unlink } from "node:fs/promises"
+      import { makeClaudeProvider } from "./src/infrastructure/providers/claude/provider.ts"
+      const makeProvider = () => makeClaudeProvider(${JSON.stringify(projectDir)}, { resolveExecutable: () => "/usr/bin/claude" })
+      const read = async id => {
+        const result = (await Effect.runPromise(makeProvider().readTranscripts([id]))).get(id)
+        if (result?._tag !== "Available") throw new Error(JSON.stringify(result))
+        return result.messages.filter(message => message.visible).map(message => message.preview)
+      }
+      const fork = async (id, messageId) => {
+        const result = await Effect.runPromise(makeProvider().branchFrom({ sessionId: id, messageId }))
+        if (result._tag !== "ValidatedBranch") throw new Error(JSON.stringify(result))
+        return result
+      }
+      const original = await read(${JSON.stringify(sessionId)})
+      const child = await fork(${JSON.stringify(sessionId)}, ${JSON.stringify(ids[5])})
+      const grandchild = await fork(child.session.id, child.derivation.sharedMessages.at(-1).childMessageId)
+      await unlink(${JSON.stringify(transcriptPath)})
+      const descendant = await read(grandchild.session.id)
+      const historical = await fork(child.session.id, child.derivation.sharedMessages.find(pair => pair.parentMessageId === ${JSON.stringify(ids[1])}).childMessageId)
+      console.log(JSON.stringify({ original, descendant, historical: await read(historical.session.id), copied: historical.derivation.sharedMessages.length }))
+    `
+    const subprocess = Bun.spawn([process.execPath, "-e", script], {
+      cwd: join(import.meta.dir, ".."), env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
+      stdout: "pipe", stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      subprocess.exited, Bun.readableStreamToText(subprocess.stdout), Bun.readableStreamToText(subprocess.stderr),
+    ])
+    expect(stderr).toBe("")
+    expect(exitCode).toBe(0)
+    const result = JSON.parse(stdout)
+    expect(result.original).toEqual(["old question", "old answer", "current question", "current answer"])
+    expect(result.descendant).toEqual(result.original)
+    expect(result.historical).toEqual(["old question", "old answer"])
+    expect(result.copied).toBe(2)
+  } finally {
+    await rm(configDir, { recursive: true, force: true })
+  }
+})
+
 function userEntry(
   sessionId: string,
   uuid: string,

@@ -35,7 +35,7 @@ import {
 } from "../../../services/provider"
 import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
-import { projectNavigationHistory } from "./navigation-history"
+import { NavigationHistoryError, projectNavigationHistory } from "./navigation-history"
 
 export interface ClaudeSdk {
   readonly getSessionInfo: (sessionId: string, options: { readonly dir: string }) => Promise<SDKSessionInfo | undefined>
@@ -397,10 +397,16 @@ export class ClaudeProvider implements AgentProviderApi {
 
       const sourceRecords = yield* this.normalizeRecords(sourceEntries, "branchFrom", target.sessionId)
       const activeForkIndex = activeTranscript.findIndex((message) => message.id === forkMessage.id)
-      const activePrefix = activeForkIndex >= 0
+      const sourceIndex = sourceEntries.findIndex((entry) => entry.uuid === forkMessage.id && (entry.type === "user" || entry.type === "assistant"))
+      const entryIndexes = new Map(sourceEntries.flatMap((entry, index) =>
+        typeof entry.uuid === "string" && (entry.type === "user" || entry.type === "assistant" || entry.type === "system")
+          ? [[entry.uuid, index] as const] : []))
+      const contextBeyondBoundary = (activeContext.systemAnchorId !== undefined &&
+        (entryIndexes.get(activeContext.systemAnchorId) ?? -1) > sourceIndex) ||
+        activeTranscript.slice(0, activeForkIndex + 1).some((message) => (entryIndexes.get(message.id) ?? -1) > sourceIndex)
+      const activePrefix = activeForkIndex >= 0 && !contextBeyondBoundary
         ? activeTranscript.slice(0, activeForkIndex + 1)
-        : yield* this.readStoredTranscript(target.sessionId, sourceEntries.slice(0,
-          sourceEntries.findIndex((entry) => entry.uuid === forkMessage.id) + 1), "branchFrom", deadline)
+        : yield* this.readStoredTranscript(target.sessionId, sourceEntries.slice(0, sourceIndex + 1), "branchFrom", deadline)
       const sourcePrefix = yield* this.validateSourcePrefix(
         target.sessionId,
         activePrefix,
@@ -713,10 +719,14 @@ export class ClaudeProvider implements AgentProviderApi {
         ))
       }
       const records = physicalRecords.slice(0, requestedRecordIndex + 1)
-      const physicalIndexById = new Map(physicalRecords.map((record, index) => [record.id, index]))
+      const physicalIndexById = new Map(records.map((record, index) => [record.id, index]))
+      const historyPrefix = history.slice(0, history.findIndex((message) => message.id === requestedMessageId) + 1)
+      const historyIds = new Set(historyPrefix.map((message) => message.id))
       for (const message of activePrefix) {
+        if (!historyIds.has(message.id)) return yield* Effect.fail(this.protocolError("branchFrom",
+          `Selected fork prefix contains record ${message.id} outside the validated navigation history`))
         const physicalIndex = physicalIndexById.get(message.id)
-        const physical = physicalIndex === undefined ? undefined : physicalRecords[physicalIndex]
+        const physical = physicalIndex === undefined ? undefined : records[physicalIndex]
         if (
           physicalIndex === undefined ||
           physical === undefined ||
@@ -740,7 +750,7 @@ export class ClaudeProvider implements AgentProviderApi {
         activeMessageIds: activePrefix
           .filter((message) => physicalIndexById.get(message.id)! <= requestedRecordIndex)
           .map((message) => message.id),
-        historyMessageIds: history.slice(0, history.findIndex((message) => message.id === requestedMessageId) + 1)
+        historyMessageIds: historyPrefix
           .filter((message) => (physicalIndexById.get(message.id) ?? Infinity) <= requestedRecordIndex)
           .map((message) => message.id),
       }
@@ -849,13 +859,9 @@ export class ClaudeProvider implements AgentProviderApi {
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const active = context.messages
-      const projection = yield* Effect.try({
-        try: () => projectNavigationHistory(entries, [
-          ...active.map((message) => message.id), ...(context.systemAnchorId ? [context.systemAnchorId] : []),
-        ]),
-        catch: (cause) => this.protocolError(operation,
-          `Claude has invalid navigation ancestry for session ${sessionId}: ${errorMessage(cause)}`, cause),
-      })
+      const projection = yield* this.projectNavigationHistoryWithProvenance(sessionId, entries, [
+        ...active.map((message) => message.id), ...(context.systemAnchorId ? [context.systemAnchorId] : []),
+      ], operation, deadline)
       if (!projection.changed) return markCompactionSummaries(active, projection.sourceRecords)
       const messages = yield* this.readStoredTranscript(sessionId, projection.records, operation, deadline, context.systemAnchorId)
       return yield* Effect.try({
@@ -872,6 +878,40 @@ export class ClaudeProvider implements AgentProviderApi {
         },
         catch: (cause) => this.protocolError(operation, `Claude compaction history could not be validated for session ${sessionId}: ${errorMessage(cause)}`, cause),
       })
+    })
+  }
+
+  private projectNavigationHistoryWithProvenance(
+    sessionId: string,
+    entries: readonly SessionStoreEntry[],
+    selectedIds: readonly string[],
+    operation: string,
+    deadline: OperationDeadline,
+  ): Effect.Effect<ReturnType<typeof projectNavigationHistory>, ProviderError | ProviderProtocolError> {
+    return Effect.gen({ self: this }, function*() {
+      const ancestors = new Map<string, readonly SessionStoreEntry[]>([[sessionId, entries]])
+      while (true) {
+        const attempt = yield* Effect.try({
+          try: () => projectNavigationHistory(entries, selectedIds, ancestors),
+          catch: (cause) => cause,
+        }).pipe(Effect.match({
+          onSuccess: (projection) => ({ _tag: "Projected" as const, projection }),
+          onFailure: (cause) => ({ _tag: "Failed" as const, cause }),
+        }))
+        if (attempt._tag === "Projected") return attempt.projection
+        const cause = attempt.cause
+        if (cause instanceof NavigationHistoryError && cause.kind === "missing-preservation-source" &&
+          cause.sourceSessionId && !ancestors.has(cause.sourceSessionId)) {
+          const source = yield* this.readSessionEntries(cause.sourceSessionId, operation, deadline).pipe(
+            Effect.mapError((error) => this.protocolError(operation,
+              `Compaction preservation for session ${sessionId} requires source session ${cause.sourceSessionId}: ${error.message}`, error)),
+          )
+          ancestors.set(cause.sourceSessionId, source)
+          continue
+        }
+        return yield* Effect.fail(this.protocolError(operation,
+          `Claude has invalid navigation ancestry for session ${sessionId}: ${errorMessage(cause)}`, cause))
+      }
     })
   }
 
@@ -1215,13 +1255,17 @@ function markCompactionSummaries(
 
 function normalizeConversationRecords(entries: readonly SessionStoreEntry[]): readonly ConversationRecord[] {
   const records: ConversationRecord[] = []
-  const seenIds = new Set<string>()
+  const identities = new Map<string, SessionStoreEntry>()
   for (const entry of entries) {
     if (entry.type !== "user" && entry.type !== "assistant") continue
-    if (typeof entry.uuid !== "string" || entry.uuid.length === 0 || seenIds.has(entry.uuid)) {
-      throw new Error("Physical conversation records do not have unique message IDs")
+    if (typeof entry.uuid !== "string" || entry.uuid.length === 0) {
+      throw new Error("Physical conversation record has no message ID")
     }
-    seenIds.add(entry.uuid)
+    const previous = identities.get(entry.uuid)
+    if (previous && (previous.type !== entry.type || !isDeepStrictEqual(previous.message, entry.message))) {
+      throw new Error(`Physical conversation record ${entry.uuid} has contradictory repeated payloads`)
+    }
+    identities.set(entry.uuid, entry)
     const provenance = entry.forkedFrom
     let forkedFrom: ConversationRecord["forkedFrom"]
     if (provenance !== undefined) {
@@ -1267,6 +1311,7 @@ function validateFork(
   }
 
   const childByParentId = new Map<string, ConversationRecord>()
+  const parentByChildId = new Map<string, string>()
   for (const [index, parent] of sourcePrefix.records.entries()) {
     const child = physicalChild[index]
     if (child === undefined) {
@@ -1283,24 +1328,27 @@ function validateFork(
         reason: "its physical copied prefix does not exactly match the source role, payload, and provenance",
       }
     }
+    if (childByParentId.has(parent.id) && childByParentId.get(parent.id)!.id !== child.id) {
+      return { _tag: "Invalid", reason: "a repeated source record maps to contradictory child identities" }
+    }
+    if (parentByChildId.has(child.id) && parentByChildId.get(child.id) !== parent.id) {
+      return { _tag: "Invalid", reason: "distinct source records map to the same child identity" }
+    }
     childByParentId.set(parent.id, child)
+    parentByChildId.set(child.id, parent.id)
   }
 
   // Physical copy order proves integrity; SDK reconstruction defines graph order.
-  const sharedMessages = sourcePrefix.activeMessageIds.map((parentMessageId) => ({
-    parentMessageId,
-    childMessageId: childByParentId.get(parentMessageId)!.id,
+  let orders = [sourcePrefix.activeMessageIds, sourcePrefix.historyMessageIds].map((ids) => ({
+    indexes: new Map(ids.map((id, index) => [childByParentId.get(id)!.id, index])),
+    length: ids.length,
+    previous: -1,
   }))
-  const logicalIndexByChildId = new Map(sharedMessages.map((pair, index) => [pair.childMessageId, index]))
   const physicalByChildId = new Map(physicalChild.map((record) => [record.id, record]))
 
-  let previousParentIndex = -1
   for (const child of activeChild) {
-    const parentIndex = logicalIndexByChildId.get(child.id)
     const physical = physicalByChildId.get(child.id)
     if (
-      parentIndex === undefined ||
-      parentIndex <= previousParentIndex ||
       physical === undefined ||
       sourceRole(physical.type) !== child.role ||
       !isDeepStrictEqual(physical.message, child.rawMessage)
@@ -1310,9 +1358,17 @@ function validateFork(
         reason: "its active transcript is not an ordered subsequence of the source conversation",
       }
     }
-    previousParentIndex = parentIndex
+    // A fork can omit context-only compaction rewiring. Accept one complete
+    // evidenced ordering, never a hybrid of context and navigation order.
+    orders = orders.filter((order) => {
+      const index = order.indexes.get(child.id)
+      if (index === undefined || index <= order.previous) return false
+      order.previous = index
+      return true
+    })
+    if (orders.length === 0) return { _tag: "Invalid", reason: "its active transcript is not an ordered subsequence of the source conversation" }
   }
-  if (previousParentIndex !== sharedMessages.length - 1) {
+  if (!orders.some((order) => order.previous === order.length - 1)) {
     return {
       _tag: "Short",
       reason: "its active transcript has not reached the requested source boundary",
