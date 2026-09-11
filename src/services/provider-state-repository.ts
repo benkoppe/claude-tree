@@ -149,6 +149,8 @@ export interface ProviderStateRepositoryOptions {
   readonly providerId: string
   readonly stateHome?: string
   readonly instanceId?: string
+  /** Attach to an already initialized invocation without recreating lost state. */
+  readonly requireExisting?: boolean
 }
 
 interface CommitIdentityBase {
@@ -193,6 +195,7 @@ export interface ProviderStateRepositoryApi {
   readonly instanceId: string
   readonly load: Effect.Effect<ProviderState, PersistenceError>
   readonly loadMetadata: Effect.Effect<ProjectState, PersistenceError>
+  readonly saveNavigation: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly updateMetadata: (
     transform: (state: ProjectState) => ProjectState,
   ) => Effect.Effect<ProjectState, PersistenceError>
@@ -268,6 +271,7 @@ export function makeProviderStateRepository(
       Effect.gen(function*() {
         const value = yield* readJsonIfPresent(platform, paths.statePath)
         if (value === undefined) {
+          if (options.requireExisting) return yield* Effect.fail(new Error("Provider state is missing"))
           yield* writeJsonAtomically(platform, paths.statePath, persistedState(emptyProviderState()))
           return
         }
@@ -365,6 +369,17 @@ function providerStateApi(
         const next = replaceMetadataForInstance(state, instanceId, nextMetadata)
         return [next, projectStateForInstance(canonicalizeAndValidate(next), instanceId)] as const
       }))
+
+  const saveNavigation: ProviderStateRepositoryApi["saveNavigation"] = (navigation) =>
+    persistenceTransaction("save navigation", (state) => syncAttempt(() => [
+      replaceMetadataForInstance(state, instanceId, { ...projectStateForInstance(state, instanceId), navigation }),
+      undefined,
+    ] as const)).pipe(
+      Effect.catch((error) => readState("reconcile navigation save").pipe(
+        Effect.flatMap((state) => jsonEqual(projectStateForInstance(state, instanceId).navigation, navigation)
+          ? Effect.void : Effect.fail(error)),
+      )),
+    )
 
   const commitRemoval: ProviderStateRepositoryApi["commitRemoval"] = (
     removal,
@@ -484,6 +499,7 @@ function providerStateApi(
     load,
     loadMetadata: load.pipe(Effect.map((state) => projectStateForInstance(state, instanceId))),
     updateMetadata,
+    saveNavigation,
     commitRemoval,
     reserve,
     attach: (owner, processGroupId, options) => {

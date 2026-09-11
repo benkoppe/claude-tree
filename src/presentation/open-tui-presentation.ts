@@ -22,6 +22,7 @@ import type {
   ReachableEndpointViewModel,
   RootViewModel,
 } from "../application"
+import { indexRootViews } from "../application/view-model"
 import {
   directionalMove,
   topVisibleGraphNodeId,
@@ -286,7 +287,7 @@ class OpenTuiPresentationController {
   private stopping = false
   private spinnerFrame = 0
   private spinnerTimer: ReturnType<typeof setTimeout> | undefined
-  private renderTimer: ReturnType<typeof setTimeout> | undefined
+  private renderDirty = false
   private currentTitle: string | undefined
   private nextRemovalRequest = 1
   private readonly consumedKeyReleases = new Set<string>()
@@ -470,21 +471,23 @@ class OpenTuiPresentationController {
     this.renderer.keyInput.on("keypress", this.guardedOnKeyPress)
     this.renderer.keyInput.on("keyrelease", this.guardedOnKeyRelease)
     this.renderer.on(CliRenderEvents.RESIZE, this.guardedOnResize)
+    this.renderer.setFrameCallback(this.prepareFrame)
+    this.renderDirty = true
     this.renderer.start()
-    this.renderSafely("Initial render")
   }
 
   applyViewModel(viewModel: ApplicationViewModel): void {
     if (this.stopping) return
     const previous = this.viewModel
+    const previousRootSelection = this.selectedRootSessionId
     this.viewModel = viewModel
     if (viewModel.surface._tag === "Roots") {
       this.pendingGraphSelections.length = 0
       this.preferredOpenSession = null
       this.pendingStoppedEndpoint = null
       const roots = viewModel.surface.roots
-      const selectedByRuntime = roots.find((root) => root.selected)?.sessionId
-      const localSurvives = roots.some((root) => root.sessionId === this.selectedRootSessionId)
+      const selectedByRuntime = viewModel.surface.selectedSessionId ?? undefined
+      const localSurvives = this.selectedRootSessionId !== null && indexRootViews(roots).bySessionId.has(this.selectedRootSessionId)
       if (!localSurvives || (this.pendingRootSelection?.completed &&
         this.selectionAcknowledged(this.pendingRootSelection.selectionId) &&
         selectedByRuntime === this.pendingRootSelection.sessionId)) this.pendingRootSelection = undefined
@@ -543,7 +546,11 @@ class OpenTuiPresentationController {
     }
     this.reconcileModal(viewModel.modal)
     this.surfaceGraphWarning()
-    if (this.started) this.render()
+    const unchangedRoots = previous?.surface._tag === "Roots" && viewModel.surface._tag === "Roots" &&
+      previous.surface.roots === viewModel.surface.roots && previousRootSelection === this.selectedRootSessionId &&
+      previous.modal === viewModel.modal && previous.refreshing === viewModel.refreshing &&
+      previous.initialLoadPending === viewModel.initialLoadPending && previous.shuttingDown === viewModel.shuttingDown
+    if (this.started && !unchangedRoots) this.render()
     this.renderFailurePending = false
   }
 
@@ -735,7 +742,7 @@ class OpenTuiPresentationController {
   private moveRoot(delta: number): void {
     const surface = this.rootsSurface()
     if (!surface || surface.roots.length === 0) return
-    const current = Math.max(0, surface.roots.findIndex((root) => root.sessionId === this.selectedRootSessionId))
+    const current = indexRootViews(surface.roots).positions.get(this.selectedRootSessionId ?? "") ?? 0
     const index = clamp(current + delta, 0, surface.roots.length - 1)
     const root = surface.roots[index]!
     if (root.sessionId === this.selectedRootSessionId) return
@@ -768,12 +775,12 @@ class OpenTuiPresentationController {
       pending.completed = true
       if (Exit.isFailure(exit) && this.pendingRootSelection === pending) {
         this.pendingRootSelection = undefined
-        this.selectedRootSessionId = this.rootsSurface()?.roots.find((root) => root.selected)?.sessionId ?? null
+        this.selectedRootSessionId = this.rootsSurface()?.selectedSessionId ?? this.rootsSurface()?.roots[0]?.sessionId ?? null
         this.render()
       }
       if (this.pendingRootSelection === pending &&
         this.selectionAcknowledged(pending.selectionId) &&
-        this.rootsSurface()?.roots.some((root) => root.selected && root.sessionId === sessionId)) {
+        this.rootsSurface()?.selectedSessionId === sessionId) {
         this.pendingRootSelection = undefined
       }
     }))))
@@ -1160,12 +1167,16 @@ class OpenTuiPresentationController {
   }
 
   private render(): void {
-    if (this.stopping || this.renderTimer) return
-    this.renderTimer = setTimeout(() => {
-      this.renderTimer = undefined
-      try { this.renderFrame() }
-      catch (cause) { this.reportRenderFailure("Render frame", cause) }
-    }, 0)
+    if (this.stopping) return
+    this.renderDirty = true
+    this.renderer.requestRender()
+  }
+
+  private readonly prepareFrame = async (): Promise<void> => {
+    if (!this.renderDirty || this.stopping) return
+    this.renderDirty = false
+    try { this.renderFrame() }
+    catch (cause) { this.reportRenderFailure("Render frame", cause) }
   }
 
   private renderFrame(): void {
@@ -1409,7 +1420,7 @@ class OpenTuiPresentationController {
       node._tag === "Endpoint" && node.status === "working"
     ) ?? false
     const rootsWorking = this.viewModel?.surface._tag === "Roots" &&
-      this.viewModel.surface.roots.some((root) => root.status === "working")
+      indexRootViews(this.viewModel.surface.roots).working
     const pickerWorking = this.leafPicker?.options.some((option) => option.status === "working")
     const animate = !this.tooSmall() && Boolean(this.viewModel?.refreshing || graphWorking || rootsWorking || pickerWorking)
     if (!animate) {
@@ -1468,7 +1479,8 @@ class OpenTuiPresentationController {
   }
 
   private selectedRoot(): RootViewModel | undefined {
-    return this.rootsSurface()?.roots.find((root) => root.sessionId === this.selectedRootSessionId)
+    const roots = this.rootsSurface()?.roots
+    return roots ? indexRootViews(roots).bySessionId.get(this.selectedRootSessionId ?? "") : undefined
   }
 
   private selectedGraphNode(): GraphNodeViewModel | undefined {
@@ -1887,8 +1899,8 @@ class OpenTuiPresentationController {
   private readonly guardedOnDialogActionsMouseUp = this.guardCallback("Handle dialog input", this.onDialogActionsMouseUp)
 
   private teardown(): void {
-    if (this.renderTimer) clearTimeout(this.renderTimer)
-    this.renderTimer = undefined
+    this.renderDirty = false
+    this.renderer.removeFrameCallback(this.prepareFrame)
     this.stopSpinner()
     if (this.started) {
       this.renderer.keyInput.off("keypress", this.guardedOnKeyPress)

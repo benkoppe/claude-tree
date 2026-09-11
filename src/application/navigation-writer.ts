@@ -1,16 +1,10 @@
-import { isDeepStrictEqual } from "node:util"
-
 import { Cause, Deferred, Effect, Exit, Scope } from "effect"
 
 import { PersistenceError } from "../domain/errors"
 import type { NavigationState } from "../domain/model"
-import type { ProjectState } from "../domain/persistence"
 
 export interface NavigationMetadataFacet {
-  readonly loadMetadata: Effect.Effect<ProjectState, PersistenceError>
-  readonly updateMetadata: (
-    transform: (state: ProjectState) => ProjectState,
-  ) => Effect.Effect<ProjectState, PersistenceError>
+  readonly saveNavigation: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
 }
 
 export interface NavigationWriter {
@@ -27,10 +21,12 @@ interface PendingNavigation {
 }
 
 const DRAIN_SCOPE_CLOSE_TIMEOUT_MS = 100
+export const NAVIGATION_SAVE_INTERVAL_MS = 200
 
 export function makeNavigationWriter(
   repository: NavigationMetadataFacet,
   reportFailure: (error: PersistenceError) => Effect.Effect<unknown> = () => Effect.void,
+  intervalMs = NAVIGATION_SAVE_INTERVAL_MS,
 ): Effect.Effect<NavigationWriter, never, Scope.Scope> {
   return Effect.gen(function*() {
     const drainScope = yield* Scope.make("sequential")
@@ -48,18 +44,8 @@ export function makeNavigationWriter(
     let queued: PendingNavigation | undefined
     let lastFailure: PersistenceError | undefined
     const idleWaiters = new Set<Deferred.Deferred<void, PersistenceError>>()
-
-    const persist = (navigation: NavigationState): Effect.Effect<void, PersistenceError> =>
-      Effect.matchCauseEffect(
-        Effect.suspend(() => repository.updateMetadata((state) => ({ ...state, navigation }))),
-        {
-          onFailure: (cause) => Effect.flatMap(Effect.suspend(() => repository.loadMetadata), (state) =>
-            isDeepStrictEqual(state.navigation, navigation)
-              ? Effect.void
-              : Effect.fail(Cause.squash(cause) as PersistenceError)),
-          onSuccess: () => Effect.void,
-        },
-      )
+    let wake = Deferred.makeUnsafe<void>()
+    let immediate = false
 
     const completeIdle = (failure?: PersistenceError): Effect.Effect<void> => Effect.gen(function*() {
       const waiters = [...idleWaiters]
@@ -86,20 +72,25 @@ export function makeNavigationWriter(
 
     const drain: Effect.Effect<void> = Effect.gen(function*() {
       while (true) {
+        if (queued && !immediate && intervalMs > 0) yield* Effect.raceFirst(Effect.sleep(intervalMs), Deferred.await(wake))
+        wake = Deferred.makeUnsafe<void>()
+        immediate = idleWaiters.size > 0
         const pending = queued
         queued = undefined
         if (!pending) {
           draining = false
+          immediate = false
           yield* completeIdle(lastFailure)
           return
         }
         current = pending
-        const exit = yield* Effect.exit(persist(pending.navigation))
+        const exit = yield* Effect.exit(Effect.suspend(() => repository.saveNavigation(pending.navigation)))
         current = undefined
         if (Exit.isSuccess(exit)) lastFailure = undefined
         else lastFailure = Cause.squash(exit.cause) as PersistenceError
         for (const waiter of pending.waiters) yield* Deferred.done(waiter, exit)
         if (lastFailure && pending.waiters.length === 0) yield* reportFailure(lastFailure)
+        if (queued === undefined) immediate = false
       }
     }).pipe(
       Effect.onExit((exit) => Exit.isFailure(exit) && draining
@@ -133,6 +124,10 @@ export function makeNavigationWriter(
           draining = true
           yield* Effect.forkIn(drain, drainScope)
         }
+        if (waiter) {
+          immediate = true
+          yield* Deferred.succeed(wake, undefined)
+        }
       })
 
     const write = (navigation: NavigationState) => Effect.gen(function*() {
@@ -147,6 +142,8 @@ export function makeNavigationWriter(
       }
       const waiter = yield* Deferred.make<void, PersistenceError>()
       idleWaiters.add(waiter)
+      immediate = true
+      yield* Deferred.succeed(wake, undefined)
       yield* Deferred.await(waiter)
     })
 

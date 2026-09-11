@@ -101,6 +101,8 @@ export interface AppRuntimeOptions {
   readonly completionDelaysMs?: readonly number[]
   readonly shutdownNavigationTimeoutMs?: number
   readonly shutdownTransitionTimeoutMs?: number
+  readonly navigationSaveIntervalMs?: number
+  readonly closeNavigationPersistence?: Effect.Effect<void, unknown>
 }
 
 export interface AppRuntime {
@@ -249,7 +251,7 @@ export function makeAppRuntime(
     ))
     const operations = makeApplicationOperations(options)
     const navigation = yield* makeNavigationWriter(options.metadata, (cause) =>
-      Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }))
+      Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }), options.navigationSaveIntervalMs)
     const preparedTerminals = new Map<string, PreparedTerminal>()
     const owners = new Map<string, OwnerCursor>()
     const unclaimedOwnerEvents = new Map<string, OwnerCursor["buffered"]>()
@@ -2086,7 +2088,12 @@ export function makeAppRuntime(
             orElse: () => Effect.void,
           }),
         )
+        const closeExit = yield* Effect.exit(options.closeNavigationPersistence ?? Effect.void)
+        if (Exit.isFailure(navigationExit) && Exit.isFailure(closeExit)) return yield* Effect.fail(new AggregateError([
+          Cause.squash(navigationExit.cause), Cause.squash(closeExit.cause),
+        ], "Navigation persistence could not be flushed and closed"))
         if (Exit.isFailure(navigationExit)) yield* Effect.failCause(navigationExit.cause)
+        if (Exit.isFailure(closeExit)) yield* Effect.failCause(closeExit.cause)
       })
       const [lifecycleExit, terminalExit] = yield* Effect.all([
         Effect.exit(lifecycleShutdown),

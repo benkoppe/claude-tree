@@ -68,7 +68,7 @@ test("highlighted status colors have readable contrast but root markers stay unh
     const foreground = luminance(statusColor(status, true))
     const background = luminance(theme.selected)
     expect((Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05)).toBeGreaterThanOrEqual(4.5)
-    const rendered = renderRoots([{ history: { _tag: "Ready" }, sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, selected: true, status }], "root", 1, 40)
+    const rendered = renderRoots([{ history: { _tag: "Ready" }, sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, status }], "root", 1, 40)
     const marker = rendered.content.chunks.find((chunk) => chunk.text.includes(statusMarker(status, 0)))
     expect(marker?.fg?.equals(statusColor(status, false))).toBeTrue()
     expect(marker?.bg?.equals(theme.background)).toBeTrue()

@@ -3,9 +3,9 @@ import { expect, test } from "bun:test"
 import { makeInitialApplicationState, available, type ApplicationState } from "../../src/application/state"
 import { selectConversationForest } from "../../src/application/selectors"
 import { reduceApplicationState } from "../../src/application/reducer"
-import { projectGraphViewModel, type GraphNodeViewModel } from "../../src/application/view-model"
+import { indexRootViews, projectApplicationViewModel, projectGraphViewModel, type GraphNodeViewModel, type RootViewModel } from "../../src/application/view-model"
 import type { AgentMessage } from "../../src/domain/model"
-import { renderGraph } from "../../src/presentation/render"
+import { renderGraph, renderRoots } from "../../src/presentation/render"
 
 function history(turns: number, blocks: number): AgentMessage[] {
   return Array.from({ length: turns }, (_, turn) => [
@@ -102,4 +102,47 @@ test("progress preserves catalogue selection and a late initial snapshot cannot 
   expect(state.provider.transcripts.get("unrelated")).toEqual(snapshot.transcripts.get("unrelated"))
   expect(state.refresh.initialPending).toBeFalse()
   expect(state.refresh.active.size).toBe(0)
+})
+
+test("root cursor updates preserve the ordered collection and its indexes", () => {
+  const initial = makeInitialApplicationState()
+  const sessions = Array.from({ length: 5_000 }, (_, index) => ({ id: `root-${index}`, title: `Root ${index}`, lastModified: index }))
+  const state = { ...initial, provider: {
+    sessions: new Map(sessions.map((session) => [session.id, session])),
+    transcripts: new Map(sessions.map((session) => [session.id, available(history(1, 1))])),
+  }, refresh: { ...initial.refresh, initialPending: false } }
+  const first = projectApplicationViewModel(state)
+  if (first.surface._tag !== "Roots") throw new Error("Expected roots")
+  const rows = first.surface.roots
+  const index = indexRootViews(rows)
+  for (let position = 0; position < 1_000; position++) {
+    const selectedSessionId = `root-${position}`
+    const view = projectApplicationViewModel({ ...state, surface: { _tag: "Roots", selectedSessionId } })
+    if (view.surface._tag !== "Roots") throw new Error("Expected roots")
+    expect(view.surface.roots).toBe(rows)
+    expect(indexRootViews(view.surface.roots)).toBe(index)
+    expect(view.surface.selectedSessionId).toBe(selectedSessionId)
+  }
+  const session = { ...sessions[0]!, lastModified: 100_000 }
+  const updated = projectApplicationViewModel({ ...state, provider: { ...state.provider,
+    sessions: new Map(state.provider.sessions).set(session.id, session),
+  } })
+  if (updated.surface._tag !== "Roots") throw new Error("Expected roots")
+  expect(updated.surface.roots).not.toBe(rows)
+  expect(updated.surface.roots[0]?.sessionId).toBe(session.id)
+})
+
+test("root rows reuse formatted content during movement and invalidate it on resize", () => {
+  let titleReads = 0
+  const roots: RootViewModel[] = Array.from({ length: 100 }, (_, index) => ({
+    sessionId: `root-${index}`, get title() { titleReads++; return `Root ${index} — 界 é `.repeat(10) },
+    lastModified: index, memberSessionIds: [`root-${index}`], messageCount: index,
+    history: { _tag: "Ready" }, status: "idle",
+  }))
+  renderRoots(roots, "root-0", 24, 120)
+  expect(titleReads).toBe(24)
+  for (let index = 0; index < 20; index++) renderRoots(roots, `root-${index}`, 24, 120)
+  expect(titleReads).toBe(24)
+  renderRoots(roots, "root-0", 24, 80)
+  expect(titleReads).toBe(48)
 })

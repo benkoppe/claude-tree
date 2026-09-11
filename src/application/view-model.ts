@@ -31,7 +31,6 @@ export interface RootViewModel {
   readonly memberSessionIds: readonly string[]
   readonly messageCount: number
   readonly status: SessionStatus
-  readonly selected: boolean
 }
 
 interface PositionedNodeViewModel {
@@ -82,7 +81,7 @@ export interface EndpointNodeViewModel extends PositionedNodeViewModel {
 export type GraphNodeViewModel = MessageNodeViewModel | EndpointNodeViewModel
 
 export type SurfaceViewModel =
-  | { readonly _tag: "Roots"; readonly roots: readonly RootViewModel[] }
+  | { readonly _tag: "Roots"; readonly roots: readonly RootViewModel[]; readonly selectedSessionId: string | null }
   | {
       readonly _tag: "Graph"
       readonly familySessionId: string
@@ -129,7 +128,44 @@ const graphViewCache = new WeakMap<ConversationGraph, {
   unviewed: ApplicationState["unviewedSessionIds"]
   view: GraphView
 }>()
-const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "selected" | "status" | "history">>()
+const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history">>()
+const rootViewCache = new WeakMap<ReturnType<typeof selectVisibleConversationForest>, {
+  provider: ApplicationState["provider"]
+  terminals: ApplicationState["terminals"]
+  historyStatus: ApplicationState["historyStatus"]
+  completions: ApplicationState["pendingCompletions"]
+  unviewed: ApplicationState["unviewedSessionIds"]
+  roots: readonly RootViewModel[]
+}>()
+
+export interface RootViewIndex {
+  readonly bySessionId: ReadonlyMap<string, RootViewModel>
+  readonly positions: ReadonlyMap<string, number>
+  readonly working: boolean
+  readonly messageCountWidth: number
+  readonly branchCountWidth: number
+}
+const rootIndexes = new WeakMap<readonly RootViewModel[], RootViewIndex>()
+
+export function indexRootViews(roots: readonly RootViewModel[]): RootViewIndex {
+  const cached = rootIndexes.get(roots)
+  if (cached) return cached
+  const bySessionId = new Map<string, RootViewModel>()
+  const positions = new Map<string, number>()
+  let working = false, messageCountWidth = 1, branchCountWidth = 1
+  roots.forEach((root, index) => {
+    for (const id of [root.sessionId, ...root.memberSessionIds]) {
+      bySessionId.set(id, root)
+      positions.set(id, index)
+    }
+    working ||= root.status === "working"
+    messageCountWidth = Math.max(messageCountWidth, String(root.messageCount).length)
+    branchCountWidth = Math.max(branchCountWidth, String(root.memberSessionIds.length).length)
+  })
+  const indexed = { bySessionId, positions, working, messageCountWidth, branchCountWidth }
+  rootIndexes.set(roots, indexed)
+  return indexed
+}
 
 export function projectApplicationViewModel(state: ApplicationState): ApplicationViewModel {
   return {
@@ -146,6 +182,9 @@ export function projectApplicationViewModel(state: ApplicationState): Applicatio
 export function projectRootsViewModel(state: ApplicationState): readonly RootViewModel[] {
   const data = selectProjectedData(state)
   const forest = selectVisibleConversationForest(state)
+  const cached = rootViewCache.get(forest)
+  if (cached && cached.provider === state.provider && cached.terminals === state.terminals && cached.historyStatus === state.historyStatus &&
+    cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds) return cached.roots
   const roots = forest.graphs.map((graph): RootViewModel => {
     let summary = rootSummaryCache.get(graph)
     if (!summary) {
@@ -163,10 +202,6 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       ...summary,
       history: selectFamilyHistoryStatus(state, summary.memberSessionIds),
       status: selectAggregateStatus(state, summary.memberSessionIds),
-      selected:
-        state.surface._tag === "Roots" &&
-        state.surface.selectedSessionId !== null &&
-        graph.sessionIds.has(state.surface.selectedSessionId),
     }
   })
   const pendingIds = new Set<string>()
@@ -186,12 +221,14 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       pendingRoots.push({ sessionId: root.id, title: root.title,
         lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest, state.provider.sessions.get(id)?.lastModified ?? 0), root.lastModified),
         memberSessionIds, messageCount: 0, history, status: selectAggregateStatus(state, memberSessionIds),
-        selected: state.surface._tag === "Roots" && memberSessionIds.includes(state.surface.selectedSessionId ?? ""),
       })
   }
-  return [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
+  const rows = [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
     (left, right) => right.lastModified - left.lastModified || left.sessionId.localeCompare(right.sessionId),
   )
+  rootViewCache.set(forest, { provider: state.provider, terminals: state.terminals, historyStatus: state.historyStatus,
+    completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, roots: rows })
+  return rows
 }
 
 export function projectGraphViewModel(
@@ -285,7 +322,11 @@ function withGraphSelection(view: GraphView, selectedNodeId: string | null): Gra
 }
 
 function projectSurface(state: ApplicationState): SurfaceViewModel {
-  if (state.surface._tag === "Roots") return { _tag: "Roots", roots: projectRootsViewModel(state) }
+  if (state.surface._tag === "Roots") {
+    const roots = projectRootsViewModel(state)
+    return { _tag: "Roots", roots, selectedSessionId: state.surface.selectedSessionId === null ? null
+      : indexRootViews(roots).bySessionId.get(state.surface.selectedSessionId)?.sessionId ?? null }
+  }
   if (state.surface._tag === "Graph") {
     return projectGraphViewModel(state, state.surface.familySessionId, state.surface.target)
   }

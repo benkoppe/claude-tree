@@ -62,7 +62,7 @@ test("failed recent history stays visible after startup, with its reason and ret
   state = finish(state, new Map([[parent.id, failure], [child.id, childRead], [other.id, otherRead]]))
   const roots = projectRootsViewModel(state)
   expect(roots.map((root) => root.sessionId)).toEqual([parent.id, other.id])
-  expect(roots[0]?.selected).toBeTrue()
+  expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: parent.id })
   expect(roots[0]?.history).toEqual({ _tag: "Unavailable", issues: [
     { sessionId: parent.id, reason: failure.reason, kind: "unavailable" },
   ] })

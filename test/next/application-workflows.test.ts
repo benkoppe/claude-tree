@@ -2272,7 +2272,7 @@ describe("application actor", () => {
       const replay = yield* Stream.runHead(runtime.viewModels)
       const view = Option.getOrThrow(replay)
       return view.surface._tag === "Roots"
-        ? view.surface.roots.find((root) => root.selected)?.title
+        ? view.surface.roots.find((root) => view.surface._tag === "Roots" && root.sessionId === view.surface.selectedSessionId)?.title
         : undefined
     })))
     expect(title).toBe("Root")
@@ -2959,6 +2959,25 @@ describe("application actor", () => {
     expect(Exit.isFailure(failures.flush)).toBeTrue()
   })
 
+  test("navigation worker close failures participate in the runtime shutdown result", async () => {
+    const fixture = makeFixture()
+    let closes = 0
+    let shutdownState: ApplicationState | undefined
+    const result = await Effect.runPromiseExit(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, closeNavigationPersistence: Effect.suspend(() => {
+        closes++
+        return Effect.fail(new Error("navigation worker did not close"))
+      }) })
+      const failure = yield* Effect.flip(runtime.shutdown)
+      expect(failure.message).toContain("navigation worker did not close")
+      shutdownState = yield* runtime.getState
+    })))
+    expect(Exit.isFailure(result)).toBeTrue()
+    expect(shutdownState?.shutdown).toBe("cleanup-incomplete")
+    expect(closes).toBe(1)
+    expect(fixture.shutdowns).toBe(1)
+  })
+
   test("forces a full snapshot after an ambiguous provider mutation", async () => {
     const fixture = makeFixture()
     fixture.branchOutcome = {
@@ -3204,6 +3223,7 @@ function makeFixture(): Fixture {
   })
 
   const metadata: ApplicationMetadataFacet = {
+    saveNavigation(navigation) { return this.updateMetadata((state) => ({ ...state, navigation })).pipe(Effect.asVoid) },
     instanceId: "instance",
     loadMetadata: Effect.sync(() => state),
     updateMetadata: (transform) => Effect.sync(() => {
@@ -3293,7 +3313,7 @@ function makeFixture(): Fixture {
     ownershipSnapshot: Effect.succeed([]),
     reconcileActivity: Effect.succeed([]),
   }
-  fixture.options = { provider, metadata, terminals }
+  fixture.options = { provider, metadata, terminals, navigationSaveIntervalMs: 0 }
   return fixture
 }
 
@@ -3302,6 +3322,11 @@ function metadataFacet(
   update: ApplicationMetadataFacet["updateMetadata"],
 ): ApplicationMetadataFacet {
   return {
+    saveNavigation(navigation) {
+      return this.updateMetadata((state) => ({ ...state, navigation })).pipe(Effect.asVoid,
+        Effect.catch((error) => this.loadMetadata.pipe(Effect.flatMap((state) =>
+          JSON.stringify(state.navigation) === JSON.stringify(navigation) ? Effect.void : Effect.fail(error)))))
+    },
     instanceId: "instance",
     loadMetadata: Effect.sync(load),
     updateMetadata: update,
