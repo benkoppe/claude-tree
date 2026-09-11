@@ -284,6 +284,8 @@ describe("Effect Codex provider", () => {
     ])])
 
     const messages = normalizeCodexThread(source)
+    expect(messages[0]?.text).toBe("Hello\nworld")
+    expect(messages[2]?.text).toBe("Final\nanswer")
     expect(messages.map(({ role, preview, visible }) => ({ role, preview, visible }))).toEqual([
       { role: "user", preview: "Hello world [image] [skill: review]", visible: true },
       { role: "system", preview: "[commandExecution]", visible: false },

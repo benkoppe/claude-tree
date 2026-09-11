@@ -173,6 +173,56 @@ test("opens the newly selected graph node without waiting for publication", asyn
   }
 })
 
+test("copies full text from the newly highlighted node before selection publication", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 24 })
+  const initial = branchingGraph("root-1", "Copy text")
+  if (initial.surface._tag !== "Graph") throw new Error("Expected graph")
+  const text = "Hello 🌲\n```ts\n  const answer = 42\n```\n"
+  const view = { ...initial, surface: { ...initial.surface, nodes: initial.surface.nodes.map((node) =>
+    node._tag === "Message" ? { ...node, text: node.id === "left-message" ? text : "Source" } : node,
+  ) } }
+  const copied: string[] = []
+  setup.renderer.copyToClipboardOSC52 = (text) => { copied.push(text); return true }
+  const running = await startPresentation(setup.renderer, view)
+  try {
+    await frame(setup, (value) => value.includes("c copy"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressKey("c")
+    expect(copied).toEqual([text])
+    setup.mockInput.pressKey("?")
+    await frame(setup, (value) => value.includes("About"))
+    setup.mockInput.pressKey("c")
+    expect(copied).toEqual([text])
+  } finally {
+    await running.stop()
+  }
+})
+
+test("copies drafts and reports empty nodes and clipboard failures", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 24 })
+  const copied: string[] = []
+  let succeeds = true
+  setup.renderer.copyToClipboardOSC52 = (text) => { copied.push(text); return succeeds }
+  const running = await startPresentation(setup.renderer, endpointGraph())
+  try {
+    await frame(setup, (value) => value.includes("pending text"))
+    setup.mockInput.pressKey("c")
+    expect(copied).toEqual(["pending text"])
+    succeeds = false
+    setup.mockInput.pressKey("c")
+    await frame(setup, (value) => value.includes("Unable to copy"))
+    await Effect.runPromise(running.harness.update(graphView("root-1", "Empty", [
+      endpointNode("empty", "empty", "Empty", 0, 0, [], true),
+    ])))
+    await frame(setup, (value) => value.includes("Empty"))
+    setup.mockInput.pressKey("c")
+    await frame(setup, (value) => value.includes("no text to copy"))
+    expect(copied).toEqual(["pending text", "pending text"])
+  } finally {
+    await running.stop()
+  }
+})
+
 test("forks the newly selected graph node without waiting for publication", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Rapid fork"))
@@ -298,7 +348,7 @@ test("deletes the newly selected graph node without waiting for publication", as
 })
 
 test("stops the newly selected graph endpoint without waiting for publication", async () => {
-  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const setup = await createTestRenderer({ width: 120, height: 24 })
   const graph = withLiveSessions(branchingGraph("root-1", "Rapid stop"), ["left"])
   const running = await startPresentation(setup.renderer, graph)
 
@@ -707,11 +757,14 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
   try {
     setup.mockInput.pressKey("q")
     releaseKittyKey(setup, 113)
+    setup.mockInput.pressKey("c")
+    releaseKittyKey(setup, 99)
     setup.mockInput.pressEscape()
     setup.mockInput.pressEnter()
     await Bun.sleep(10)
     expect(running.harness.calls).not.toContain("return-terminal")
-    expect(observed.filter((event) => ["q", "escape", "return"].includes(event.name)).every((event) => !event.stopped)).toBeTrue()
+    expect(observed.filter((event) => ["q", "c", "escape", "return"].includes(event.name)).every((event) => !event.stopped)).toBeTrue()
+    expect(observed).toContainEqual({ type: "press", name: "c", stopped: false })
 
     setup.mockInput.pressKey(" ", { ctrl: true })
     await frame(setup, (value) => value.includes("Message tree"))

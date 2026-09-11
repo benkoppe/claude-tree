@@ -12,6 +12,8 @@ export interface AgentMessage {
   readonly id: string
   readonly role: MessageRole
   readonly preview: string
+  /** Original text blocks in provider order, preserving whitespace. */
+  readonly text?: string
   readonly ordinal: number
   readonly visible: boolean
   readonly displayGroupId?: string

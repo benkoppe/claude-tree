@@ -28,6 +28,23 @@ const CHILD = "22222222-2222-4222-8222-222222222222"
 const NEW = "33333333-3333-4333-8333-333333333333"
 
 describe("Effect Claude provider", () => {
+  test("preserves original text blocks without synthetic tool or thinking labels", async () => {
+    const text = "こんにちは\n```ts\n  const x = 1\n```\n"
+    const provider = providerWith({ messages: { [ROOT]: [
+      message(ROOT, "user", "user", text),
+      message(ROOT, "agent", "assistant", "", undefined, "end_turn", [
+        { type: "text", text },
+        { type: "thinking", thinking: "private reasoning" },
+        { type: "tool_use", id: "tool", name: "Read", input: {} },
+        { type: "text", text: "Done.\n" },
+      ]),
+    ] } })
+    const reads = await Effect.runPromise(provider.readTranscripts([ROOT]))
+    const read = reads.get(ROOT)
+    if (read?._tag !== "Available") throw new Error("Expected transcript")
+    expect(read.messages.map((message) => message.text)).toEqual([text, `${text}\nDone.\n`])
+  })
+
   test("provides AgentProviderApi through an Effect layer", async () => {
     const id = await Effect.runPromise(Effect.provide(
       AgentProvider.use((provider) => Effect.succeed(provider.id)),

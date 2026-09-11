@@ -1274,13 +1274,16 @@ function waitForSidecar(
 
 function normalizeCodexItem(
   item: CodexThreadItem,
-): Pick<AgentMessage, "role" | "preview" | "visible"> {
+): Pick<AgentMessage, "role" | "preview" | "visible" | "text"> {
   if (item.type === "userMessage") {
     const preview = formatCodexUserInput(Array.isArray(item.content) ? item.content : [])
-    if (preview !== "[empty message]") return { role: "user", preview, visible: true }
+    const text = (Array.isArray(item.content) ? item.content : []).flatMap((input) =>
+      input.type === "text" && typeof input.text === "string" ? [input.text] : [],
+    ).join("\n")
+    if (preview !== "[empty message]") return { role: "user", preview, text, visible: true }
   }
   if (item.type === "agentMessage" && typeof item.text === "string" && item.text.trim()) {
-    return { role: "agent", preview: normalizePreview(item.text), visible: true }
+    return { role: "agent", preview: normalizePreview(item.text), text: item.text, visible: true }
   }
   return { role: "system", preview: `[${item.type || "unknown item"}]`, visible: false }
 }
