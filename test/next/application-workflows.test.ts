@@ -315,7 +315,7 @@ describe("application actor", () => {
       expect(catalogue.surface._tag).toBe("Roots")
       if (catalogue.surface._tag !== "Roots") throw new Error("Expected roots")
       expect(catalogue.surface.roots).toHaveLength(2)
-      expect(catalogue.surface.roots.every((root) => root.historyPending)).toBeTrue()
+      expect(catalogue.surface.roots.every((root) => root.history._tag === "Loading")).toBeTrue()
       yield* runtime.selectRoot(ROOT)
       yield* runtime.enterRoot(ROOT)
       expect(fixture.incrementalReads).toEqual([[ROOT]])
@@ -348,6 +348,30 @@ describe("application actor", () => {
       const state = yield* runtime.getState
       expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
       expect(state.selectionId).toBe("newer-selection")
+    })))
+  })
+
+  test("a failed startup root can be retried through Enter without global discovery", async () => {
+    const fixture = makeFixture()
+    const readable = fixture.snapshot
+    fixture.snapshot = { ...readable, transcripts: new Map(readable.transcripts).set(ROOT, { _tag: "Unavailable", reason: "history reconstruction failed" }) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      const view = yield* runtime.getViewModel
+      if (view.surface._tag !== "Roots") throw new Error("Expected roots")
+      expect(view.surface.roots.find((root) => root.sessionId === ROOT)?.history._tag).toBe("Unavailable")
+      yield* runtime.selectRoot(ROOT)
+      const failed = yield* Effect.flip(runtime.enterRoot(ROOT))
+      expect(failed.message).toContain("history reconstruction failed")
+      expect((yield* runtime.getState).surface).toEqual({ _tag: "Roots", selectedSessionId: ROOT })
+      fixture.snapshot = readable
+      yield* runtime.closeModal
+      yield* runtime.enterRoot(ROOT)
+      expect((yield* runtime.getState).surface._tag).toBe("Graph")
+      expect((yield* runtime.getState).historyStatus.get(ROOT)?._tag).toBe("Ready")
+      expect(fixture.incrementalReads).toEqual([[ROOT], [ROOT]])
+      expect(fixture.fullLoads).toBe(1)
     })))
   })
 

@@ -1432,6 +1432,7 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
       roots: [
         {
           sessionId: "root-1",
+          history: { _tag: "Ready" },
           title: firstTitle,
           lastModified: 2,
           memberSessionIds: ["root-1"],
@@ -1441,6 +1442,7 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
         },
         {
           sessionId: "root-2",
+          history: { _tag: "Ready" },
           title: "Second conversation",
           lastModified: 1,
           memberSessionIds: ["root-2"],

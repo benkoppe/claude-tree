@@ -32,6 +32,7 @@ test.each([22, 32])("node status badges are right-aligned without overwriting de
 test.each([40, 80])("root message and branch counts align numerically at width %i", (width) => {
   const messageCounts = [0, 1, 123, 12]
   const roots = [1, 2, 12, 100].map((count, index) => ({
+    history: { _tag: "Ready" as const },
     sessionId: `root-${count}`,
     title: "A long conversation title",
     memberSessionIds: Array.from({ length: count }, (_, index) => `session-${count}-${index}`),
@@ -67,7 +68,7 @@ test("highlighted status colors have readable contrast but root markers stay unh
     const foreground = luminance(statusColor(status, true))
     const background = luminance(theme.selected)
     expect((Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05)).toBeGreaterThanOrEqual(4.5)
-    const rendered = renderRoots([{ sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, selected: true, status }], "root", 1, 40)
+    const rendered = renderRoots([{ history: { _tag: "Ready" }, sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, selected: true, status }], "root", 1, 40)
     const marker = rendered.content.chunks.find((chunk) => chunk.text.includes(statusMarker(status, 0)))
     expect(marker?.fg?.equals(statusColor(status, false))).toBeTrue()
     expect(marker?.bg?.equals(theme.background)).toBeTrue()

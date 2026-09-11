@@ -931,7 +931,7 @@ class OpenTuiPresentationController {
     if (this.rootsSurface()) {
       const root = this.selectedRoot()
       if (!root) return
-      if (root.historyPending) {
+      if (root.history._tag === "Loading") {
         this.showError(HISTORY_LOADING_MESSAGE)
         return
       }
@@ -973,7 +973,7 @@ class OpenTuiPresentationController {
     if (roots) {
       const root = this.selectedRoot()
       if (!root) return
-      if (root.historyPending) {
+      if (root.history._tag === "Loading") {
         this.showError(HISTORY_LOADING_MESSAGE)
         return
       }
@@ -1280,6 +1280,9 @@ class OpenTuiPresentationController {
   private rootStatusChunks(): TextChunk[] {
     const root = this.selectedRoot()
     if (!root) return [chunk("No conversation selected", theme.textMuted)]
+    if (root.history._tag === "Unavailable") return [chunk(
+      truncateToWidth(root.history.issues[0]?.reason ?? "History unavailable; Enter retries loading", Math.max(1, this.renderer.terminalWidth - 2)), theme.danger,
+    )]
     const label = root.status === "idle" ? undefined
       : `${statusMarker(root.status, this.spinnerFrame)} ${statusLabel(root.status)}`
     return [

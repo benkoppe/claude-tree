@@ -21,10 +21,10 @@ import {
   type SessionStatus,
 } from "./selectors"
 import type { ApplicationModal, ApplicationState } from "./state"
-import { groupSessionFamilies } from "./forest-projection"
+import { selectCatalogueFamilies, selectFamilyHistoryStatus, type FamilyHistoryStatus } from "./catalogue"
 
 export interface RootViewModel {
-  readonly historyPending?: boolean
+  readonly history: FamilyHistoryStatus
   readonly sessionId: string
   readonly title: string
   readonly lastModified: number
@@ -129,7 +129,7 @@ const graphViewCache = new WeakMap<ConversationGraph, {
   unviewed: ApplicationState["unviewedSessionIds"]
   view: GraphView
 }>()
-const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "selected" | "status">>()
+const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "selected" | "status" | "history">>()
 
 export function projectApplicationViewModel(state: ApplicationState): ApplicationViewModel {
   return {
@@ -161,6 +161,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
     }
     return {
       ...summary,
+      history: selectFamilyHistoryStatus(state, summary.memberSessionIds),
       status: selectAggregateStatus(state, summary.memberSessionIds),
       selected:
         state.surface._tag === "Roots" &&
@@ -170,20 +171,23 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   })
   const pendingIds = new Set<string>()
   const pendingRoots: RootViewModel[] = []
-  if (state.refresh.initialPending) {
-    for (const group of groupSessionFamilies(new Map([...state.provider.sessions, ...state.local.sessions]), state.relations).values()) {
-      if (group.sessions.every((session) => state.provider.transcripts.has(session.id) || state.local.sessions.has(session.id))) continue
-      const memberSessionIds = group.sessions.map((session) => session.id)
-      for (const id of memberSessionIds) pendingIds.add(id)
-      const children = new Set(group.relations.map((relation) => relation.childSessionId))
-      const root = group.sessions.find((session) => !children.has(session.id)) ?? group.sessions[0]!
+  for (const family of selectCatalogueFamilies(state)) {
+      const history = selectFamilyHistoryStatus(state, family.sessionIds)
+      if (history._tag === "Ready") continue
+      const memberSessionIds = [...family.sessionIds]
+      const root = family.root
       if (state.removals.some((removal) => removal.kind === "tree" &&
-        (memberSessionIds.includes(removal.rootSessionId) || removal.memberSessionIds.some((id) => memberSessionIds.includes(id))))) continue
-      pendingRoots.push({ sessionId: root.id, title: root.title, lastModified: group.sessions.reduce((latest, session) => Math.max(latest, session.lastModified), root.lastModified),
-        memberSessionIds, messageCount: 0, historyPending: true, status: selectAggregateStatus(state, memberSessionIds),
+        (family.sessionIds.has(removal.rootSessionId) || removal.memberSessionIds.some((id) => family.sessionIds.has(id))))) continue
+      // Keep validated removals effective even when a later read fails.
+      const accepted = memberSessionIds.every((id) =>
+        (state.local.transcripts.get(id) ?? state.provider.transcripts.get(id))?._tag === "Available")
+      if (accepted) continue
+      for (const id of memberSessionIds) pendingIds.add(id)
+      pendingRoots.push({ sessionId: root.id, title: root.title,
+        lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest, state.provider.sessions.get(id)?.lastModified ?? 0), root.lastModified),
+        memberSessionIds, messageCount: 0, history, status: selectAggregateStatus(state, memberSessionIds),
         selected: state.surface._tag === "Roots" && memberSessionIds.includes(state.surface.selectedSessionId ?? ""),
       })
-    }
   }
   return [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
     (left, right) => right.lastModified - left.lastModified || left.sessionId.localeCompare(right.sessionId),

@@ -26,6 +26,7 @@ import {
   selectVisibleEndpointSessionIds,
 } from "./selectors"
 import { invalidatedRefreshSessionIds } from "./state"
+import { historyStatusForRead, selectCatalogueFamilies, selectFamilyHistoryStatus } from "./catalogue"
 import type {
   ActiveRefresh,
   ApplicationModal,
@@ -77,13 +78,25 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
     case "RefreshProgress": {
       const refresh = state.refresh.active.get(event.key)
       if (!refresh || refresh.generation !== event.generation) return state
+      const catalogued: ApplicationState = event.snapshot.sessions.length === 0 ? state : { ...state, provider: { ...state.provider,
+        sessions: new Map([...state.provider.sessions, ...event.snapshot.sessions.map((session) => [session.id, session] as const)]),
+      } }
+      const staged = new Map([...(refresh.stagedTranscripts ?? []), ...event.snapshot.transcripts])
+      const ready = new Map<string, TranscriptRead>()
+      for (const family of selectCatalogueFamilies(catalogued)) {
+        if (![...family.sessionIds].every((id) => staged.has(id) || state.provider.transcripts.has(id) || state.local.sessions.has(id))) continue
+        for (const id of family.sessionIds) {
+          const read = staged.get(id)
+          if (read) { ready.set(id, read); staged.delete(id) }
+        }
+      }
       const progressive = { ...state, refresh: { ...state.refresh, active: new Map(state.refresh.active).set(event.key, {
-        ...refresh, mode: "incremental" as const, sessionIds: new Set(event.snapshot.transcripts.keys()),
+        ...refresh, mode: "incremental" as const, sessionIds: new Set(ready.keys()),
       }) } }
-      const next = refreshSucceeded(progressive, event.key, event.generation, event.snapshot, true)
+      const next = refreshSucceeded(progressive, event.key, event.generation, { sessions: event.snapshot.sessions, transcripts: ready }, true)
       return { ...next, refresh: { ...next.refresh, initialPending: state.refresh.initialPending,
-        active: new Map(next.refresh.active).set(event.key, { ...refresh, progressSessionIds: new Set([
-          ...(refresh.progressSessionIds ?? []), ...event.snapshot.transcripts.keys(),
+        active: new Map(next.refresh.active).set(event.key, { ...refresh, stagedTranscripts: staged, progressSessionIds: new Set([
+          ...(refresh.progressSessionIds ?? []), ...ready.keys(),
         ]) }) } }
     }
     case "RefreshStarted": {
@@ -128,12 +141,27 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       if (invalidated.size > 0 && [...sessionIds].every((sessionId) => invalidated.has(sessionId))) {
         return removeRefresh(state, event.key, event.generation)
       }
+      if (active.stagedTranscripts?.size) {
+        const transcripts = new Map(active.stagedTranscripts)
+        for (const id of sessionIds) {
+          if (!transcripts.has(id) && !active.progressSessionIds?.has(id)) transcripts.set(id, { _tag: "Unavailable", reason: event.message })
+        }
+        const partial = { ...state, refresh: { ...state.refresh, active: new Map(state.refresh.active).set(event.key, {
+          ...active, mode: "incremental" as const, sessionIds: new Set(transcripts.keys()),
+        }) } }
+        const next = refreshSucceeded(partial, event.key, event.generation, { sessions: [], transcripts })
+        return { ...next, modal: { _tag: "Error", message: event.message } }
+      }
       const replacementCandidates = new Map(state.replacementCandidates)
       for (const sessionId of replacementCandidates.keys()) {
         if (invalidated.has(sessionId)) continue
         if (active.mode === "full" || active.sessionIds.has(sessionId)) replacementCandidates.delete(sessionId)
       }
-      const next = { ...removeRefresh(state, event.key, event.generation), replacementCandidates }
+      const historyStatus = new Map(state.historyStatus)
+      for (const id of sessionIds) {
+        if (!invalidated.has(id) && !(active.progressSessionIds?.has(id))) historyStatus.set(id, { _tag: "Unavailable", reason: event.message })
+      }
+      const next = { ...removeRefresh(state, event.key, event.generation), replacementCandidates, historyStatus }
       if (active.completionVersion !== undefined) {
         const sessionId = [...active.sessionIds][0] ?? ""
         if (!invalidated.has(sessionId)) {
@@ -323,6 +351,12 @@ function refreshSucceeded(
 ): ApplicationState {
   const active = state.refresh.active.get(key)
   if (!active || active.generation !== generation) return state
+  if (active.mode === "full") {
+    const unread = snapshot.sessions.filter((session) => !snapshot.transcripts.has(session.id) && !active.progressSessionIds?.has(session.id))
+    if (unread.length) snapshot = { ...snapshot, transcripts: new Map([...snapshot.transcripts, ...unread.map((session) => [
+      session.id, { _tag: "Unavailable" as const, reason: "Provider did not return this session's history" },
+    ] as const)]) }
+  }
   const incomingSessions = new Map(snapshot.sessions.map((session) => [session.id, session]))
   const sessions = active.mode === "full"
     ? preserveOwnedSessions(state, incomingSessions)
@@ -348,6 +382,13 @@ function refreshSucceeded(
     if (!staleSessionIds.has(sessionId)) appliedGenerationBySession.set(sessionId, generation)
   }
   const localSessions = new Map(state.local.sessions)
+  const historyStatus = new Map(state.historyStatus)
+  for (const session of snapshot.sessions) {
+    if (!historyStatus.has(session.id) && !state.provider.transcripts.has(session.id)) historyStatus.set(session.id, { _tag: "Pending" })
+  }
+  if (active.mode === "full") for (const id of historyStatus.keys()) {
+    if (!sessions.has(id) && !state.local.sessions.has(id)) historyStatus.delete(id)
+  }
   const localTranscripts = new Map(state.local.transcripts)
   const temporarySessionIds = new Set(state.local.temporarySessionIds)
   const rewindAnchors = new Map(state.rewindAnchors)
@@ -364,6 +405,7 @@ function refreshSucceeded(
 
   for (const [sessionId, incoming] of snapshot.transcripts) {
     if (staleSessionIds.has(sessionId)) continue
+    historyStatus.set(sessionId, historyStatusForRead(incoming))
     if (active.reason === "manual" && incoming._tag === "Unavailable") {
       unavailableReasons.push(`${sessionId}: ${incoming.reason}`)
     }
@@ -492,6 +534,7 @@ function refreshSucceeded(
   const retainedTemporaryIds = reuseSet(state.local.temporarySessionIds, temporarySessionIds)
   return repairNavigatorSurface({
     ...without,
+    historyStatus: reuseMap(state.historyStatus, historyStatus),
     provider: providerSessions === state.provider.sessions && providerTranscripts === state.provider.transcripts
       ? state.provider : { sessions: providerSessions, transcripts: providerTranscripts },
     local: retainedLocalSessions === state.local.sessions && retainedLocalTranscripts === state.local.transcripts && retainedTemporaryIds === state.local.temporarySessionIds
@@ -534,7 +577,8 @@ function projectLocalSession(
   if (transcript !== undefined) transcripts.set(session.id, transcript)
   const temporarySessionIds = new Set(state.local.temporarySessionIds)
   if (temporary ?? session.transient) temporarySessionIds.add(session.id)
-  return { ...state, local: { sessions, transcripts, temporarySessionIds } }
+  return { ...state, historyStatus: new Map(state.historyStatus).set(session.id, transcript ? historyStatusForRead(transcript) : { _tag: "Ready" }),
+    local: { sessions, transcripts, temporarySessionIds } }
 }
 
 function terminalShown(
@@ -763,6 +807,7 @@ function rollbackTransient(
   if (!state.local.temporarySessionIds.has(sessionId)) return state
   return {
     ...state,
+    historyStatus: withoutMap(state.historyStatus, sessionId),
     local: {
       sessions: withoutMap(state.local.sessions, sessionId),
       transcripts: withoutMap(state.local.transcripts, sessionId),
@@ -798,6 +843,7 @@ function adoptSessionIdentity(
     const localSessions = new Map(state.local.sessions).set(sessionId, session)
     return {
       ...state,
+      historyStatus: new Map(state.historyStatus).set(sessionId, { _tag: "Ready" }),
       local: {
         sessions: localSessions,
         transcripts: state.local.transcripts,
@@ -836,10 +882,13 @@ function adoptSessionIdentity(
     active.set(key, {
       ...refresh,
       sessionIds: migrateSet(refresh.sessionIds, previousSessionId, sessionId),
+      ...(refresh.stagedTranscripts ? { stagedTranscripts: withoutMap(refresh.stagedTranscripts, previousSessionId) } : {}),
+      ...(refresh.progressSessionIds ? { progressSessionIds: migrateSet(refresh.progressSessionIds, previousSessionId, sessionId) } : {}),
     })
   }
   return {
     ...state,
+    historyStatus: migrateMapKey(state.historyStatus, previousSessionId, sessionId),
     provider: {
       sessions: migrateMapKey(state.provider.sessions, previousSessionId, sessionId),
       transcripts: migrateMapKey(state.provider.transcripts, previousSessionId, sessionId),
@@ -918,6 +967,7 @@ function reconcileTranscript(
   readonly unstable?: boolean
 } {
   const retained = completion ? { _tag: "Available" as const, messages: completion.baseline } : previous ?? incoming
+  if (incoming._tag !== "Available" && previous?._tag === "Available") return { read: retained, accepted: false }
   if (incoming._tag !== "Available" && (nonIdle || terminal?.unresolvedRewind || terminal?.replacement)) {
     return { read: retained, accepted: false }
   }
@@ -1179,9 +1229,13 @@ function repairNavigatorSurface(
   const requested = preferred ?? state.surface as NavigatorSurface
   const forest = selectConversationForest(state)
   if (requested._tag === "Roots") {
-    if (state.refresh.initialPending && requested.selectedSessionId !== null &&
-      state.provider.sessions.has(requested.selectedSessionId) && !state.provider.transcripts.has(requested.selectedSessionId)) {
-      return { ...state, surface: requested }
+    // The first successful read is not a navigation request.
+    if (requested.selectedSessionId === null) return { ...state, surface: requested }
+    const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(requested.selectedSessionId!))
+    if (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready") {
+      const removed = state.removals.some((removal) => removal.kind === "tree" &&
+        (family.sessionIds.has(removal.rootSessionId) || removal.memberSessionIds.some((id) => family.sessionIds.has(id))))
+      if (!removed) return { ...state, surface: { _tag: "Roots", selectedSessionId: family.root.id } }
     }
     const selected = requested.selectedSessionId === null
       ? undefined

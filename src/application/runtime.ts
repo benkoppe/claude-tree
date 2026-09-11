@@ -46,7 +46,7 @@ import type {
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
 import { makeNavigationWriter } from "./navigation-writer"
-import { groupSessionFamilies } from "./forest-projection"
+import { selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
   makeApplicationOperations,
   rollbackPersistedBranch,
@@ -994,7 +994,6 @@ export function makeAppRuntime(
           }
           return
         }
-        if (command.refresh.reason === "initial" && Exit.isFailure(exit)) return
         const reconciliationSessionIds = new Set([
           ...(Exit.isSuccess(exit) ? state.replacementCandidates.keys() : []),
           ...invalidatedSessionIds,
@@ -1022,12 +1021,16 @@ export function makeAppRuntime(
             } else {
               const graph = projectGraphViewModel(state, command.enterRoot.sessionId)
               const node = graph.nodes.find((node) => node.selected)
+              const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(command.enterRoot!.sessionId))
+              const history = selectFamilyHistoryStatus(state, family?.sessionIds ?? [command.enterRoot.sessionId])
+              const problem = history._tag === "Unavailable" ? history.issues.map((issue) => `${issue.sessionId}: ${issue.reason}`).join("\n") : undefined
               if (!node) {
-                yield* reject(command.reply, "EnterRoot", "invalid", "Conversation history is unavailable")
+                yield* failReply(command.reply, "EnterRoot", "Load conversation", new Error(problem ?? "Conversation has no visible messages"))
               } else {
                 const surface = { _tag: "Graph" as const, familySessionId: graph.familySessionId, target: node.target }
                 yield* publish({ _tag: "Navigated", surface })
                 yield* startNavigation(surface)
+                if (problem) yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: problem } })
                 yield* Deferred.succeed(command.reply, undefined)
               }
             }
@@ -1415,11 +1418,10 @@ export function makeAppRuntime(
             return
           }
           case "EnterRoot": {
-            const family = [...groupSessionFamilies(state.provider.sessions, state.relations).values()]
-              .find((group) => group.sessions.some((session) => session.id === intent.sessionId))
-            if (family?.sessions.some((session) => !state.provider.transcripts.has(session.id))) {
+            const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
+            if (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready") {
               const refresh: ActiveRefresh = { key: "refresh:navigation", generation: state.refresh.generation + 1,
-                reason: "terminal-return", mode: "incremental", sessionIds: new Set(family.sessions.map((session) => session.id)) }
+                reason: "terminal-return", mode: "incremental", sessionIds: family.sessionIds }
               yield* supersede(refresh.key)
               yield* publish({ _tag: "RefreshStarted", refresh })
               yield* launch(refresh.key, { _tag: "Refresh", refresh, reply: envelope.reply,
@@ -1464,6 +1466,10 @@ export function makeAppRuntime(
             return
           }
           case "ResumeSession": {
+            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
+              yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
+              return
+            }
             const session = selectProjectedData(state).sessions.get(intent.sessionId)
             if (!session || session.transient) {
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not resumable`)
@@ -1491,6 +1497,10 @@ export function makeAppRuntime(
             }
             if (running) {
               yield* reject(envelope.reply, intent._tag, "busy", `Session ${intent.sessionId} is ${running.phase}`)
+              return
+            }
+            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
+              yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
               return
             }
             const session = selectProjectedData(state).sessions.get(intent.sessionId)
@@ -2483,14 +2493,16 @@ function restoreNavigatorSurface(
   state: ApplicationState,
   navigation: NavigationState | undefined,
 ): NavigatorSurface {
-  if (!navigation) return { _tag: "Roots", selectedSessionId: null }
+  if (!navigation) return state.surface._tag === "Roots" ? state.surface : { _tag: "Roots", selectedSessionId: null }
   const forest = selectConversationForest(state)
   if (navigation.view === "roots") {
     const graph = navigation.selectedSessionId
       ? forest.graphBySessionId.get(navigation.selectedSessionId) ??
         forest.graphByRootSessionId.get(navigation.selectedSessionId)
       : undefined
-    return { _tag: "Roots", selectedSessionId: graph?.rootSessionId ?? null }
+    const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(navigation.selectedSessionId ?? ""))
+    return { _tag: "Roots", selectedSessionId: graph?.rootSessionId ??
+      (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready" ? family.root.id : null) }
   }
   const sessionId = navigation.view === "terminal" ? navigation.sessionId : navigation.familySessionId
   const graph = forest.graphBySessionId.get(sessionId) ?? forest.graphByRootSessionId.get(sessionId)
