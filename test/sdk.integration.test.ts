@@ -481,6 +481,93 @@ test("the Claude provider validates SDK-imported source and child records", asyn
   }
 })
 
+test("filesystem import preserves compacted roots and real SDK forks without replacing the SDK active context", async () => {
+  const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-startup-import-")))
+  const projectDir = join(configDir, "project")
+  const projectKey = "startup-import-fixture"
+  const sessionId = crypto.randomUUID()
+  const ids = Array.from({ length: 6 }, () => crypto.randomUUID())
+  const firstBoundary = crypto.randomUUID(), firstSummary = crypto.randomUUID()
+  const restoredUser = crypto.randomUUID(), restoredAgent = crypto.randomUUID()
+  const timestamp = "2026-09-11T12:00:00.000Z"
+  const entries: SessionStoreEntry[] = [
+    userEntry(sessionId, ids[0]!, null, "before compaction", timestamp),
+    agentEntry(sessionId, ids[1]!, ids[0]!, "earlier answer", timestamp),
+    // A later root replaces this path, while the physical old records remain.
+    userEntry(sessionId, restoredUser, null, "replacement question", timestamp),
+    agentEntry(sessionId, restoredAgent, restoredUser, "replacement answer", timestamp),
+    // Cross the pinned SDK's filesystem precompaction-read threshold.
+    { type: "file-history-snapshot", snapshot: "x".repeat(6 * 1024 * 1024) },
+    { type: "system", subtype: "compact_boundary", uuid: firstBoundary, parentUuid: null,
+      logicalParentUuid: restoredAgent, sessionId, timestamp, compactMetadata: {} },
+    { ...userEntry(sessionId, firstSummary, firstBoundary, "first compact summary", timestamp), isCompactSummary: true },
+    { type: "system", subtype: "compact_boundary", uuid: ids[2]!, parentUuid: null,
+      logicalParentUuid: firstSummary, sessionId, timestamp,
+      compactMetadata: { preservedMessages: { uuids: ids.slice(0, 2), anchorUuid: ids[3] } } },
+    { ...userEntry(sessionId, ids[3]!, ids[2]!, "compact summary", timestamp), isCompactSummary: true },
+    userEntry(sessionId, ids[4]!, ids[3]!, "after compaction", timestamp),
+    agentEntry(sessionId, ids[5]!, ids[4]!, "latest answer", timestamp),
+  ]
+  try {
+    await mkdir(projectDir, { recursive: true })
+    const transcriptDir = join(configDir, "projects", projectKey)
+    await mkdir(transcriptDir, { recursive: true })
+    await writeFile(join(transcriptDir, `${sessionId}.jsonl`), entries.map((entry) => JSON.stringify({ ...entry, cwd: projectDir })).join("\n") + "\n")
+    const script = `
+      import { Effect } from "effect"
+      import { getSessionMessages, getSessionInfo, forkSession, listSessions, importSessionToStore, InMemorySessionStore } from "@anthropic-ai/claude-agent-sdk"
+      import { makeClaudeProvider } from "./src/infrastructure/providers/claude/provider.ts"
+      const dir = ${JSON.stringify(projectDir)}, id = ${JSON.stringify(sessionId)}
+      const active = await getSessionMessages(id, { dir })
+      const store = new InMemorySessionStore()
+      await importSessionToStore(id, store, { dir, includeSubagents: false })
+      const imported = await getSessionMessages(id, { dir, sessionStore: store })
+      const storeActiveProvider = makeClaudeProvider(dir, { sdk: {
+        getSessionInfo, forkSession, listSessions, importSessionToStore,
+        getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: store }),
+      } })
+      const storeActiveRead = (await Effect.runPromise(storeActiveProvider.readTranscripts([id]))).get(id)
+      const provider = makeClaudeProvider(dir, { resolveExecutable: () => "/usr/bin/claude" })
+      const read = (await Effect.runPromise(provider.readTranscripts([id]))).get(id)
+      if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+      const branch = await Effect.runPromise(provider.branchFrom({ sessionId: id, messageId: ${JSON.stringify(restoredAgent)} }))
+      if (branch._tag !== "ValidatedBranch") throw new Error(JSON.stringify(branch))
+      const snapshot = await Effect.runPromise(provider.loadSessionSnapshot)
+      console.log(JSON.stringify({
+        active: active.map(m => m.uuid), imported: imported.map(m => m.uuid),
+        storeActiveOutcome: storeActiveRead._tag,
+        history: read.messages.map(m => ({ id: m.id, historical: Boolean(m.historical) })),
+        sessions: snapshot.sessions.length,
+        outcomes: [...snapshot.transcripts.values()].map(read => read._tag),
+        shared: branch.derivation.sharedMessages.length,
+      }))
+    `
+    const subprocess = Bun.spawn([process.execPath, "-e", script], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
+      stdout: "pipe", stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      subprocess.exited, Bun.readableStreamToText(subprocess.stdout), Bun.readableStreamToText(subprocess.stderr),
+    ])
+    expect(stderr).toBe("")
+    expect(exitCode).toBe(0)
+    const result = JSON.parse(stdout)
+    expect(result.imported.length).toBeGreaterThan(result.active.length)
+    expect(result.storeActiveOutcome).toBe("Unavailable")
+    const historyIds = result.history.map((message: { id: string }) => message.id)
+    expect(historyIds).toContain(restoredUser)
+    expect(historyIds).not.toContain(ids[0])
+    expect(result.imported).toContain(ids[0])
+    for (const message of result.history) expect(message.historical).toBe(!result.active.includes(message.id))
+    expect(result.sessions).toBe(2)
+    expect(result.outcomes).toEqual(["Available", "Available"])
+    expect(result.shared).toBe(2)
+  } finally {
+    await rm(configDir, { recursive: true, force: true })
+  }
+})
+
 function userEntry(
   sessionId: string,
   uuid: string,
