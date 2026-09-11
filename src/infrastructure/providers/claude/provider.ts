@@ -1164,6 +1164,7 @@ function normalizeTranscript(
       id: candidate.uuid,
       role: sourceRole(sourceType),
       preview: formatMessage(candidate.message),
+      text: extractMessageText(candidate.message),
       ordinal,
       visible,
       sourceType,
@@ -1322,6 +1323,16 @@ export function formatMessage(message: unknown): string {
     else if (block.type === "thinking") parts.push("[thinking]")
   }
   return normalizePreview(parts.join(" ") || "[non-text message]")
+}
+
+function extractMessageText(message: unknown): string {
+  if (typeof message === "string") return message
+  if (!isRecord(message)) return ""
+  if (typeof message.content === "string") return message.content
+  if (!Array.isArray(message.content)) return ""
+  return message.content.flatMap((block) =>
+    isRecord(block) && block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+  ).join("\n")
 }
 
 export function extractUserPromptText(message: unknown): string | undefined {

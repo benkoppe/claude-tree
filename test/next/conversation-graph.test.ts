@@ -24,6 +24,27 @@ const CHILD = "child:opaque/id"
 const GRANDCHILD = "grandchild:opaque/id"
 
 describe("next conversation graph", () => {
+  test("preserves grouped full text across shared history and exact fork boundaries", () => {
+    const parent = [
+      { ...message("u", "user", "question", 0), text: "Question\n  detail" },
+      { ...message("a1", "agent", "first", 1), displayGroupId: "u", text: "First\n```ts\n  code()\n```" },
+      { ...message("a2", "agent", "second", 2), displayGroupId: "u", text: "Second 🌲\n" },
+      { ...message("a3", "agent", "third", 3), displayGroupId: "u", text: "Parent only" },
+    ]
+    const child = parent.slice(0, 3).map((entry) => ({ ...entry, id: `copy-${entry.id}` }))
+    for (const retainedParent of [parent, []]) {
+      const graph = buildConversationForest(
+        [session(ROOT, 20), session(CHILD, 10)],
+        new Map([[ROOT, retainedParent], [CHILD, child]]),
+        [relation(CHILD, ROOT, "a2", shared(parent, child, 3))],
+      ).graphs[0]!
+      expect(graph.warnings).toEqual([])
+      const grouped = nodes(graph).find((node) => node.aliases.some((alias) => alias.messageId === "copy-a2"))!
+      expect(grouped.text).toBe(`${parent[1]!.text}\n\n${parent[2]!.text}`)
+      expect(grouped.text).not.toContain("Parent only")
+    }
+  })
+
   test("collapses a stopped copied-only leaf after its parent rewinds or takes a new path", () => {
     const parent = [message("hello", "user", "Hello", 0), message("answer", "agent", "answer", 1)]
     const child = parent.map((entry) => ({ ...entry, id: `copy-${entry.id}` }))

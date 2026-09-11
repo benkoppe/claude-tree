@@ -18,6 +18,7 @@ export interface MessageGraphNode extends GraphNodeBase {
   kind: "message"
   role: AgentMessage["role"]
   preview: string
+  text?: string
   internal: boolean
   aliases: ForkTarget[]
   forkTarget?: ForkTarget
@@ -752,6 +753,7 @@ interface ProjectedSharedGroup {
   indexes: number[]
   role: AgentMessage["role"]
   preview: string
+  text: string
   internal: boolean
   existingNodeId?: string
   splitFromNodeId?: string
@@ -896,6 +898,7 @@ function reconcileSharedPath(
         childIds: [],
         role: group.role,
         preview: group.preview,
+        text: group.text,
         internal: group.internal,
         aliases,
         forkTarget: { sessionId: childSessionId, messageId: lastPair.childMessageId },
@@ -967,6 +970,7 @@ function reconcileSharedPath(
     const node = nodeId === undefined ? undefined : graph.nodes.get(nodeId)
     if (node?.kind !== "message") return "shared history has contradictory ancestry"
     node.preview = group.preview
+    node.text = group.text
     node.internal = group.internal
     for (const messageIndex of group.indexes) {
       const pair = relation.sharedMessages[messageIndex]!
@@ -1013,6 +1017,7 @@ function projectSharedPath(
     if (message.displayGroupId !== undefined && openDisplayGroup?.id === message.displayGroupId) {
       openDisplayGroup.group.indexes.push(index)
       openDisplayGroup.group.preview = `${openDisplayGroup.group.preview} ${preview}`
+      openDisplayGroup.group.text = joinMessageText(openDisplayGroup.group.text, message.text)
       openDisplayGroup.group.internal = openDisplayGroup.group.internal && !message.visible
       if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
       continue
@@ -1021,6 +1026,7 @@ function projectSharedPath(
       indexes: [index],
       role: message.role,
       preview,
+      text: message.text ?? "",
       internal: !message.visible,
     }
     groups.push(group)
@@ -1030,6 +1036,10 @@ function projectSharedPath(
     if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
   }
   return groups
+}
+
+function joinMessageText(left: string | undefined, right: string | undefined): string {
+  return [left, right].filter((text): text is string => Boolean(text)).join("\n\n")
 }
 
 function appendSessionMessages(
@@ -1060,6 +1070,7 @@ function appendSessionMessages(
         : undefined
     if (groupedNode?.kind === "message") {
       groupedNode.preview = `${groupedNode.preview} ${preview}`
+      groupedNode.text = joinMessageText(groupedNode.text, message.text)
       groupedNode.internal = groupedNode.internal && !message.visible
       addAlias(groupedNode, alias)
       groupedNode.forkTarget = alias
@@ -1077,6 +1088,7 @@ function appendSessionMessages(
       childIds: [],
       role: message.role,
       preview,
+      text: message.text ?? "",
       internal: !message.visible,
       aliases: [alias],
       forkTarget: alias,
@@ -1283,7 +1295,7 @@ function sameCopiedMessage(left: AgentMessage, right: AgentMessage): boolean {
   }
   return (
     left.role === right.role &&
-    left.preview === right.preview &&
+    left.preview === right.preview && left.text === right.text &&
     left.visible === right.visible
   )
 }

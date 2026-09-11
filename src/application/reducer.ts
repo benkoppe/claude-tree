@@ -1041,7 +1041,7 @@ function sameMessage(left: AgentMessage, right: AgentMessage | undefined): boole
 // Compaction and turn completion can update metadata without replacing logical history.
 function sameLogicalMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
   return right !== undefined && left.id === right.id && left.role === right.role &&
-    left.preview === right.preview && left.ordinal === right.ordinal && left.visible === right.visible &&
+    left.preview === right.preview && left.text === right.text && left.ordinal === right.ordinal && left.visible === right.visible &&
     left.displayGroupId === right.displayGroupId &&
     left.copyIdentity === right.copyIdentity && left.historyBoundary === right.historyBoundary
 }

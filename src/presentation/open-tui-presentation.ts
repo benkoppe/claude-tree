@@ -93,6 +93,7 @@ type FooterAction =
   | "quit"
   | "open"
   | "fork"
+  | "copy"
   | "stop"
   | "remove"
   | "roots"
@@ -167,6 +168,7 @@ const GRAPH_CONTROLS: readonly FooterControl[] = [
   { key: "g/G", description: "top/bottom" },
   { key: "Enter", description: "open", action: "open" },
   { key: "f", description: "fork", action: "fork" },
+  { key: "c", description: "copy", action: "copy" },
   { key: "d", description: "delete", action: "remove" },
   { key: "x", description: "kill", action: "stop" },
   { key: "r", description: "refresh", action: "refresh" },
@@ -654,7 +656,7 @@ class OpenTuiPresentationController {
     const jumpToLeaf = isShiftedKey(key, "g")
     const direction = graphDirection(key)
     const recognized = isExitKey(key) || back || jumpToTop || jumpToLeaf || direction !== undefined || isEnterKey(key) ||
-      ["f", "d", "x", "n", "r"].some((name) => isUnmodifiedKey(key, name))
+      ["f", "c", "d", "x", "n", "r"].some((name) => isUnmodifiedKey(key, name))
     if (!recognized) return
     key.stopPropagation()
     if (isExitKey(key)) {
@@ -675,6 +677,8 @@ class OpenTuiPresentationController {
       this.openSelected()
     } else if (isUnmodifiedKey(key, "f") && !key.repeated) {
       this.forkSelected()
+    } else if (isUnmodifiedKey(key, "c") && !key.repeated) {
+      this.copySelected()
     } else if (isUnmodifiedKey(key, "d") && !key.repeated) {
       this.showRemovalConfirmation()
     } else if (isUnmodifiedKey(key, "x") && !key.repeated) {
@@ -887,6 +891,21 @@ class OpenTuiPresentationController {
       }
       this.pendingMouseAction = null
       this.render()
+    }
+  }
+
+  private copySelected(): void {
+    const selected = this.selectedGraphNode()
+    if (!selected) return
+    const text = selected._tag === "Message" ? selected.text : selected.draft?.text
+    if (!text) {
+      this.showError("This node has no text to copy")
+      return
+    }
+    try {
+      if (!this.renderer.copyToClipboardOSC52(text)) this.showError("Unable to copy node text to the clipboard")
+    } catch (cause) {
+      this.showError(`Unable to copy node text: ${errorMessage(cause)}`)
     }
   }
 
@@ -1584,6 +1603,7 @@ class OpenTuiPresentationController {
     else if (action === "quit") this.enqueue(this.stop, true, true)
     else if (action === "open") this.openSelected()
     else if (action === "fork") this.forkSelected()
+    else if (action === "copy") this.copySelected()
     else if (action === "stop") this.showStopConfirmation()
     else if (action === "remove") this.showRemovalConfirmation()
     else if (action === "roots") this.showRoots()

@@ -46,6 +46,12 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
+## Tree Shortcuts
+
+Press **`c`** in the tree to copy the highlighted node's full text, preserving line breaks, indentation, and Markdown. Grouped Agent nodes copy their represented messages in order. Draft nodes copy the available draft preview, which may be approximate. Nodes without text leave the clipboard untouched.
+
+Copy uses the host terminal's OSC 52 clipboard support, the same mechanism used for clipboard writes from embedded agent terminals.
+
 ## Activity Recovery
 
 Working indicators combine terminal activity observations with a short wait for the provider's completed transcript. Hidden sessions are checked automatically, and `r` in the navigator resamples live terminals as well as refreshing conversation history.

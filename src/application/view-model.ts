@@ -67,6 +67,7 @@ export interface MessageNodeViewModel extends PositionedNodeViewModel {
   readonly _tag: "Message"
   readonly role: AgentMessage["role"]
   readonly preview: string
+  readonly text?: string
   readonly aliases: readonly MessageRef[]
 }
 
@@ -304,6 +305,7 @@ function messageViewModel(
     ...position,
     role: node.role,
     preview: node.preview,
+    text: node.text ?? "",
     aliases: node.aliases,
     target: { kind: "message", preferred, aliases: node.aliases },
   }
