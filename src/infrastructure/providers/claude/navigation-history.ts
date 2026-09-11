@@ -1,44 +1,16 @@
-import { isDeepStrictEqual } from "node:util"
-
 import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
+import {
+  isLinkedCompaction, NavigationHistoryError, object, parentOf, RecordEvidence,
+  type LinkedCompactionRecord, type TranscriptRecord,
+} from "./record-evidence"
 
-const TRANSCRIPT_TYPES = new Set(["user", "assistant", "progress", "system", "attachment"])
-
-interface TranscriptRecord extends SessionStoreEntry {
-  readonly uuid: string
-}
-
-interface LinkedCompactionRecord extends TranscriptRecord {
-  readonly logicalParentUuid: string
-}
+export { isLinkedCompaction, NavigationHistoryError } from "./record-evidence"
 
 export interface NavigationHistoryProjection {
   /** Effective SDK records in their last-occurrence order, before logical rewiring. */
   readonly sourceRecords: readonly SessionStoreEntry[]
   readonly records: readonly SessionStoreEntry[]
   readonly changed: boolean
-}
-
-export class NavigationHistoryError extends Error {
-  constructor(
-    readonly kind: "missing-active-record" | "missing-logical-parent" | "cycle" | "invalid-preservation" | "ambiguous-preservation" | "missing-preservation-source",
-    message: string,
-    readonly recordId: string,
-    readonly parentId?: string,
-    readonly sourceSessionId?: string,
-  ) {
-    super(message)
-    this.name = "NavigationHistoryError"
-  }
-}
-
-export function isLinkedCompaction(entry: SessionStoreEntry): entry is LinkedCompactionRecord {
-  return isTranscriptRecord(entry) && entry.type === "system" &&
-    entry.subtype === "compact_boundary" && typeof entry.logicalParentUuid === "string"
-}
-
-function isTranscriptRecord(entry: SessionStoreEntry): entry is TranscriptRecord {
-  return typeof entry === "object" && entry !== null && TRANSCRIPT_TYPES.has(entry.type) && typeof entry.uuid === "string"
 }
 
 /** The SDK resolves repeated transcript UUIDs last-write-wins, ignoring metadata
@@ -48,29 +20,13 @@ export function projectNavigationHistory(
   selectedRecordIds: readonly string[],
   ancestors: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map(),
 ): NavigationHistoryProjection {
-  const effective = new Map<string, { readonly record: TranscriptRecord; readonly index: number }>()
-  const versions = new Map<string, TranscriptRecord[]>()
-  entries.forEach((entry, index) => {
-    if (isTranscriptRecord(entry)) {
-      const previous = effective.get(entry.uuid)
-      if (previous) {
-        const history = versions.get(entry.uuid) ?? [previous.record]
-        history.push(entry)
-        versions.set(entry.uuid, history)
-      }
-      effective.set(entry.uuid, { record: entry, index })
-    }
-  })
-  const sourceRecords: TranscriptRecord[] = []
-  entries.forEach((entry, index) => {
-    const candidate = isTranscriptRecord(entry) ? effective.get(entry.uuid) : undefined
-    if (candidate?.index === index) sourceRecords.push(candidate.record)
-  })
+  const evidence = new RecordEvidence(entries, ancestors)
+  const effective = evidence.current.effective
+  const sourceRecords = evidence.current.ordered
   // Without logical compaction links there is no application-owned reconstruction:
   // the ordinary SDK read already supplies the authoritative conversation.
   if (!sourceRecords.some(isLinkedCompaction)) return { sourceRecords, records: sourceRecords, changed: false }
-  const source = new Map(sourceRecords.map((record) => [record.uuid, record]))
-  const repairs = preservationRepairs(source, versions, new Set(selectedRecordIds), preservationReferenceResolver(source, versions, ancestors))
+  const repairs = preservationRepairs(evidence, new Set(selectedRecordIds))
   const complete = new Set<string>()
   const boundaries = new Set<string>()
 
@@ -90,7 +46,7 @@ export function projectNavigationHistory(
           `${boundary ? `Compaction boundary ${boundary.uuid}` : `SDK-selected record ${selectedId}`} has cyclic navigation ancestry: ${description}`,
           boundary?.uuid ?? selectedId, boundary?.logicalParentUuid)
       }
-      const record: TranscriptRecord | undefined = effective.get(currentId)?.record
+      const record: TranscriptRecord | undefined = effective.get(currentId)
       // Ordinary dangling parents are an SDK-supported truncated prefix. An
       // explicit compaction history link, however, promises a resolvable record.
       if (!record) break
@@ -146,22 +102,11 @@ interface ParentRepairs {
   readonly problems: Map<string, NavigationHistoryError>
 }
 
-function parentOf(record: TranscriptRecord): string | null {
-  return typeof record.parentUuid === "string" && record.parentUuid.length > 0 ? record.parentUuid : null
-}
-
-function sameRecordPayload(left: TranscriptRecord, right: TranscriptRecord): boolean {
-  return left.type === right.type && left.subtype === right.subtype && isDeepStrictEqual(left.message, right.message) &&
-    (left.type !== "system" || isDeepStrictEqual(left.compactMetadata, right.compactMetadata))
-}
-
-function object(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-}
-
 type ResolvePreservationReference = (boundary: LinkedCompactionRecord, id: string) => string
 
-function preservation(record: LinkedCompactionRecord, source: ReadonlyMap<string, TranscriptRecord>, versions: ReadonlyMap<string, readonly TranscriptRecord[]>, resolve: ResolvePreservationReference): Preservation | undefined {
+function preservation(record: LinkedCompactionRecord, evidence: RecordEvidence): Preservation | undefined {
+  const source = evidence.current.effective
+  const resolve: ResolvePreservationReference = (boundary, id) => evidence.resolveReference(boundary, id)
   if (!object(record.compactMetadata)) return undefined
   const metadata = record.compactMetadata
   const messages = metadata.preservedMessages
@@ -205,8 +150,7 @@ function preservation(record: LinkedCompactionRecord, source: ReadonlyMap<string
     const parent = source.get(id)
     return parent ? parentOf(parent) : undefined
   })
-  if (!currentAnchor && !(versions.get(anchor) ?? []).some((version) =>
-    sameRecordPayload(source.get(anchor)!, version) && parentOf(version) === record.uuid)) {
+  if (!currentAnchor && !evidence.hasHistoricalParent(source.get(anchor)!, record.uuid)) {
     return invalid("preservation anchor does not belong to this boundary")
   }
   const contextParents = messages !== undefined
@@ -229,17 +173,16 @@ function reaches(start: string | null, target: string, parent: (id: string) => s
 }
 
 function preservationRepairs(
-  source: ReadonlyMap<string, TranscriptRecord>,
-  versions: ReadonlyMap<string, readonly TranscriptRecord[]>,
+  evidence: RecordEvidence,
   selected: ReadonlySet<string>,
-  resolve: ResolvePreservationReference,
 ): ParentRepairs {
+  const source = evidence.current.effective
   const result: ParentRepairs = { parents: new Map(), problems: new Map() }
   const preservations: Preservation[] = []
   for (const record of source.values()) {
     if (!isLinkedCompaction(record)) continue
     try {
-      const retained = preservation(record, source, versions, resolve)
+      const retained = preservation(record, evidence)
       if (retained) preservations.push(retained)
     } catch (error) {
       if (!(error instanceof NavigationHistoryError)) throw error
@@ -247,14 +190,6 @@ function preservationRepairs(
     }
   }
   if (preservations.length === 0) return result
-  const versionParents = new Map<string, ReadonlySet<string | null>>()
-  const parentsFor = (record: TranscriptRecord): ReadonlySet<string | null> => {
-    const cached = versionParents.get(record.uuid)
-    if (cached) return cached
-    const parents = new Set((versions.get(record.uuid) ?? [record]).filter((version) => sameRecordPayload(record, version)).map(parentOf))
-    versionParents.set(record.uuid, parents)
-    return parents
-  }
   const logicalParent = (id: string): string | null | undefined => {
     const record = source.get(id)
     if (!record) return undefined
@@ -294,7 +229,18 @@ function preservationRepairs(
       for (const [id, contextParent] of retained.contextParents) {
         const record = source.get(id)!
         if (parentOf(record) !== contextParent || !ancestors.has(id)) continue
-        const candidates = new Set([...parentsFor(record)].filter((parent) => parent !== contextParent && !headAnchors.get(id)?.has(parent ?? "")))
+        let candidates: ReadonlySet<string | null>
+        try {
+          const excluded = new Set([contextParent, ...(headAnchors.get(id) ?? [])])
+          // A head parented to its own summary needs historical evidence. An
+          // internal predecessor may already be an unchanged historical edge.
+          candidates = id === retained.members[0] ? evidence.historicalParents(record, excluded)
+            : new Set([...evidence.availableParents(record)].filter((parent) => parent === null || !excluded.has(parent)))
+        } catch (error) {
+          if (!(error instanceof NavigationHistoryError)) throw error
+          historicalProblems.set(JSON.stringify([retained.boundary.uuid, id]), { boundaryId: retained.boundary.uuid, recordId: id, error })
+          continue
+        }
         if (candidates.size === 1) {
           const parent = [...candidates][0]!
           if (!result.parents.has(id) || result.parents.get(id) !== parent) {
@@ -388,7 +334,7 @@ function preservationRepairs(
     for (const { retained, historical, continuation } of byParent.get(parent) ?? []) {
       if (historical.has(record.uuid)) continue
       const selectedContinuation = selected.has(record.uuid) && contextSelected(retained)
-      const originalAnchor = parentsFor(record).has(retained.anchor)
+      const originalAnchor = evidence.availableParents(record).has(retained.anchor)
       if ((selectedContinuation || originalAnchor) && !reaches(continuation, record.uuid, logicalParent)) candidates.set(continuation, retained)
     }
     if (candidates.size === 1) result.parents.set(record.uuid, candidates.keys().next().value!)
@@ -399,87 +345,4 @@ function preservationRepairs(
     if (reaches(logicalParent(boundaryId) ?? null, recordId, logicalParent)) result.problems.set(boundaryId, error)
   }
   return result
-}
-
-interface Provenance {
-  readonly sessionId: string
-  readonly messageUuid: string
-}
-
-function provenance(record: TranscriptRecord): Provenance | undefined {
-  const value = record.forkedFrom
-  return object(value) && typeof value.sessionId === "string" && typeof value.messageUuid === "string"
-    ? { sessionId: value.sessionId, messageUuid: value.messageUuid } : undefined
-}
-
-/** SDK forks remap record UUIDs but can retain preservation metadata's older
- * UUIDs. Resolve those references only through matching copied-record evidence. */
-function preservationReferenceResolver(
-  source: ReadonlyMap<string, TranscriptRecord>,
-  versions: ReadonlyMap<string, readonly TranscriptRecord[]>,
-  ancestors: ReadonlyMap<string, readonly SessionStoreEntry[]>,
-): ResolvePreservationReference {
-  const indexes = new Map<string, Map<string, TranscriptRecord[]>>()
-  for (const [sessionId, entries] of ancestors) {
-    const index = new Map<string, TranscriptRecord[]>()
-    for (const entry of entries) {
-      if (!isTranscriptRecord(entry)) continue
-      const versions = index.get(entry.uuid) ?? []
-      versions.push(entry)
-      index.set(entry.uuid, versions)
-    }
-    indexes.set(sessionId, index)
-  }
-  const evidencedVersion = (child: TranscriptRecord, records: readonly TranscriptRecord[]): TranscriptRecord | undefined => {
-    const candidates = records.filter((record) => sameRecordPayload(child, record))
-    const origins = new Set(candidates.flatMap((record) => {
-      const origin = provenance(record)
-      return origin ? [JSON.stringify(origin)] : []
-    }))
-    if (origins.size > 1) return undefined
-    return candidates.findLast((record) => provenance(record) !== undefined) ?? candidates.at(-1)
-  }
-  const parentRecord = (child: TranscriptRecord, ref: Provenance): TranscriptRecord | undefined =>
-    evidencedVersion(child, indexes.get(ref.sessionId)?.get(ref.messageUuid) ?? [])
-  let aliases: Map<string, Map<string, Set<string>>> | undefined
-  const buildAliases = () => {
-    const result = new Map<string, Map<string, Set<string>>>()
-    for (const current of source.values()) {
-      let record = evidencedVersion(current, versions.get(current.uuid) ?? [current])
-      const visited = new Set<string>()
-      while (record) {
-        const ref = provenance(record)
-        if (!ref || visited.has(JSON.stringify(ref))) break
-        visited.add(JSON.stringify(ref))
-        let byId = result.get(ref.sessionId)
-        if (!byId) result.set(ref.sessionId, byId = new Map())
-        const ids = byId.get(ref.messageUuid) ?? new Set<string>()
-        ids.add(current.uuid)
-        byId.set(ref.messageUuid, ids)
-        record = parentRecord(record, ref)
-      }
-    }
-    return result
-  }
-  return (boundary, id) => {
-    if (source.has(id)) return id
-    aliases ??= buildAliases()
-    let record = evidencedVersion(boundary, versions.get(boundary.uuid) ?? [boundary])
-    const visited = new Set<string>()
-    while (record) {
-      const ref = provenance(record)
-      if (!ref || visited.has(JSON.stringify(ref))) break
-      visited.add(JSON.stringify(ref))
-      const candidates = aliases.get(ref.sessionId)?.get(id)
-      if (candidates?.size === 1) return candidates.values().next().value!
-      if (candidates && candidates.size > 1) throw new NavigationHistoryError("ambiguous-preservation",
-        `Compaction boundary ${boundary.uuid} has conflicting copies of preservation reference ${id}`, boundary.uuid, id)
-      if (!ancestors.has(ref.sessionId)) throw new NavigationHistoryError("missing-preservation-source",
-        `Compaction boundary ${boundary.uuid} requires copied-record evidence from session ${ref.sessionId} for preservation reference ${id}`,
-        boundary.uuid, id, ref.sessionId)
-      record = parentRecord(record, ref)
-    }
-    throw new NavigationHistoryError("invalid-preservation",
-      `Compaction boundary ${boundary.uuid} cannot resolve preservation reference ${id} through copied-record evidence`, boundary.uuid, id)
-  }
 }

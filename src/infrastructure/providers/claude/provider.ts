@@ -55,7 +55,7 @@ export interface ClaudeSdk {
   readonly importSessionToStore: (
     sessionId: string,
     store: SessionStore,
-    options: { readonly dir: string; readonly includeSubagents: boolean },
+    options: { readonly dir?: string; readonly includeSubagents: boolean },
   ) => Promise<void>
 }
 
@@ -902,7 +902,7 @@ export class ClaudeProvider implements AgentProviderApi {
         const cause = attempt.cause
         if (cause instanceof NavigationHistoryError && cause.kind === "missing-preservation-source" &&
           cause.sourceSessionId && !ancestors.has(cause.sourceSessionId)) {
-          const source = yield* this.readSessionEntries(cause.sourceSessionId, operation, deadline).pipe(
+          const source = yield* this.readSessionEntries(cause.sourceSessionId, operation, deadline, "provider").pipe(
             Effect.mapError((error) => this.protocolError(operation,
               `Compaction preservation for session ${sessionId} requires source session ${cause.sourceSessionId}: ${error.message}`, error)),
           )
@@ -948,6 +948,7 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
+    lookup: "project" | "provider" = "project",
   ): Effect.Effect<readonly SessionStoreEntry[], ProviderError | ProviderProtocolError> {
     const entries: SessionStoreEntry[] = []
     const store: SessionStore = {
@@ -963,7 +964,7 @@ export class ClaudeProvider implements AgentProviderApi {
     return this.callSdk(
       operation,
       () => this.sdk.importSessionToStore(sessionId, store, {
-        dir: this.projectPath,
+        ...(lookup === "project" ? { dir: this.projectPath } : {}),
         includeSubagents: false,
       }),
       this.provenanceImportTimeoutMs,

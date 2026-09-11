@@ -634,6 +634,94 @@ test("filesystem preservation cycles recover across SDK forks without depending 
   }
 })
 
+test("single-version SDK forks recover five preserved records through attachment ancestry on fresh filesystem reads", async () => {
+  const configDir = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-single-version-")))
+  const projectDir = join(configDir, "project")
+  const projectKey = "single-version-fork-fixture"
+  const sessionId = crypto.randomUUID()
+  const ids = Array.from({ length: 10 }, () => crypto.randomUUID())
+  const timestamp = "2026-09-11T12:00:00.000Z"
+  const question = userEntry(sessionId, ids[0]!, null, "original question", timestamp)
+  const preserved: SessionStoreEntry[] = [
+    agentEntry(sessionId, ids[1]!, ids[0]!, "preserved answer", timestamp),
+    userEntry(sessionId, ids[2]!, ids[1]!, "preserved question", timestamp),
+    agentEntry(sessionId, ids[3]!, ids[2]!, "another preserved answer", timestamp),
+    userEntry(sessionId, ids[4]!, ids[3]!, "another preserved question", timestamp),
+    { type: "attachment", uuid: ids[5]!, sessionId, parentUuid: ids[4], attachment: { type: "fixture", data: "attachment evidence" } },
+  ]
+  const compact: SessionStoreEntry = { type: "system", subtype: "compact_boundary", uuid: ids[6]!, sessionId, parentUuid: null,
+    logicalParentUuid: ids[5], compactMetadata: { preservedMessages: { uuids: ids.slice(1, 6), anchorUuid: ids[7] } } }
+  const summary = { ...userEntry(sessionId, ids[7]!, ids[6]!, "summary", timestamp), isCompactSummary: true }
+  const continuation = userEntry(sessionId, ids[8]!, ids[5]!, "current question", timestamp)
+  const response = agentEntry(sessionId, ids[9]!, ids[8]!, "current answer", timestamp)
+  const originals = [question, ...preserved, compact, summary, continuation, response]
+  // The SDK can fork a compacted store snapshot containing only the context
+  // version; original parent evidence remains in the source's physical file.
+  const snapshot = [question, compact, summary,
+    ...preserved.map((record, index) => ({ ...record, parentUuid: index === 0 ? ids[7] : ids[index] })), continuation, response]
+  try {
+    await mkdir(projectDir, { recursive: true })
+    const transcriptDir = join(configDir, "projects", projectKey)
+    await mkdir(transcriptDir, { recursive: true })
+    const ancestorDir = join(configDir, "projects", "ancestor-project-fixture")
+    await mkdir(ancestorDir, { recursive: true })
+    const originalPath = join(ancestorDir, `${sessionId}.jsonl`)
+    await writeFile(originalPath, originals.map((record) => JSON.stringify({ ...record, cwd: projectDir })).join("\n") + "\n")
+    const script = `
+      import { writeFile, unlink } from "node:fs/promises"
+      import { Effect } from "effect"
+      import { forkSession, InMemorySessionStore } from "@anthropic-ai/claude-agent-sdk"
+      import { makeClaudeProvider } from "./src/infrastructure/providers/claude/provider.ts"
+      const dir = ${JSON.stringify(projectDir)}, projectKey = ${JSON.stringify(projectKey)}
+      const store = new InMemorySessionStore()
+      await store.append({ projectKey, sessionId: ${JSON.stringify(sessionId)} }, ${JSON.stringify(snapshot)})
+      const child = await forkSession(${JSON.stringify(sessionId)}, { dir, sessionStore: store, upToMessageId: ${JSON.stringify(ids[9])} })
+      const childEntries = store.getEntries({ projectKey, sessionId: child.sessionId })
+      const childAnswer = childEntries.find(record => record.forkedFrom?.messageUuid === ${JSON.stringify(ids[1])})
+      const childTail = childEntries.find(record => record.forkedFrom?.messageUuid === ${JSON.stringify(ids[9])})
+      await writeFile(${JSON.stringify(transcriptDir)} + "/" + child.sessionId + ".jsonl", childEntries.map(record => JSON.stringify(record)).join("\\n") + "\\n")
+      const grandchild = await forkSession(child.sessionId, { dir, sessionStore: store, upToMessageId: childTail.uuid })
+      const grandEntries = store.getEntries({ projectKey, sessionId: grandchild.sessionId })
+      await writeFile(${JSON.stringify(transcriptDir)} + "/" + grandchild.sessionId + ".jsonl", grandEntries.map(record => JSON.stringify(record)).join("\\n") + "\\n")
+      const makeProvider = () => makeClaudeProvider(dir, { resolveExecutable: () => "/usr/bin/claude" })
+      const first = (await Effect.runPromise(makeProvider().readTranscripts([child.sessionId]))).get(child.sessionId)
+      const second = (await Effect.runPromise(makeProvider().readTranscripts([grandchild.sessionId]))).get(grandchild.sessionId)
+      if (first?._tag !== "Available" || second?._tag !== "Available") throw new Error(JSON.stringify({ first, second }))
+      const fork = await Effect.runPromise(makeProvider().branchFrom({ sessionId: grandchild.sessionId,
+        messageId: grandEntries.find(record => record.forkedFrom?.messageUuid === childTail.uuid).uuid }))
+      if (fork._tag !== "ValidatedBranch") throw new Error(JSON.stringify(fork))
+      await unlink(${JSON.stringify(originalPath)})
+      const missing = (await Effect.runPromise(makeProvider().readTranscripts([child.sessionId]))).get(child.sessionId)
+      console.log(JSON.stringify({
+        localVersions: childEntries.filter(record => record.uuid === childAnswer.uuid).length,
+        first: first.messages.filter(message => message.visible).map(message => message.preview),
+        second: second.messages.filter(message => message.visible).map(message => message.preview),
+        copied: fork.derivation.sharedMessages.length,
+        missing: missing?._tag,
+        missingReason: missing?._tag === "Unavailable" && missing.reason.includes("requires source session"),
+      }))
+    `
+    const subprocess = Bun.spawn([process.execPath, "-e", script], {
+      cwd: join(import.meta.dir, ".."), env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
+      stdout: "pipe", stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      subprocess.exited, Bun.readableStreamToText(subprocess.stdout), Bun.readableStreamToText(subprocess.stderr),
+    ])
+    expect(stderr).toBe("")
+    expect(exitCode).toBe(0)
+    const result = JSON.parse(stdout)
+    expect(result.localVersions).toBe(1)
+    expect(result.first).toEqual(["original question", "preserved answer", "preserved question", "another preserved answer", "another preserved question", "current question", "current answer"])
+    expect(result.second).toEqual(result.first)
+    expect(result.copied).toBe(8)
+    expect(result.missing).toBe("Unavailable")
+    expect(result.missingReason).toBeTrue()
+  } finally {
+    await rm(configDir, { recursive: true, force: true })
+  }
+})
+
 function userEntry(
   sessionId: string,
   uuid: string,
