@@ -272,10 +272,15 @@ export class ClaudeProvider implements AgentProviderApi {
       unique(sessionIds).map((sessionId) =>
         Effect.gen({ self: this }, function*() {
           const readDeadline = publish ? yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs) : deadline
+          const messages = yield* this.readClaudeTranscript(sessionId, "readTranscripts", readDeadline)
+          if (messages === undefined) return undefined
+          if (messages.length === 0) {
+            const info = yield* this.callSdk("getSessionInfo", () => this.sdk.getSessionInfo(sessionId, { dir: this.projectPath }),
+              this.listSessionsTimeoutMs, readDeadline)
+            if (info === undefined) return undefined
+          }
           const entries = yield* this.readSessionEntries(sessionId, "readTranscripts", readDeadline)
-          const messages = yield* this.readClaudeTranscript(sessionId, "readTranscripts", readDeadline, entries)
-          return messages === undefined || messages.length === 0 ? messages
-            : yield* this.readNavigationHistory(sessionId, messages, entries, "readTranscripts", readDeadline)
+          return yield* this.readNavigationHistory(sessionId, messages, entries, "readTranscripts", readDeadline)
         }).pipe(
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
@@ -329,7 +334,6 @@ export class ClaudeProvider implements AgentProviderApi {
         target.sessionId,
         "branchFrom",
         deadline,
-        sourceEntries,
       )
       const sourceTranscript = yield* this.readNavigationHistory(target.sessionId, activeTranscript, sourceEntries, "branchFrom", deadline)
       const selectedIndex = sourceTranscript.findIndex((message) => message.id === target.messageId)
@@ -770,9 +774,8 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
-    entries?: readonly SessionStoreEntry[],
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
-    return this.readClaudeTranscript(sessionId, operation, deadline, entries).pipe(
+    return this.readClaudeTranscript(sessionId, operation, deadline).pipe(
       Effect.flatMap((messages) => messages === undefined
         ? Effect.fail(this.providerError(operation, `Claude session ${sessionId} was not found`))
         : Effect.succeed(messages)),
@@ -783,13 +786,10 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
-    entries?: readonly SessionStoreEntry[],
   ): Effect.Effect<readonly ClaudeMessage[] | undefined, ProviderError | ProviderProtocolError> {
     return this.callSdk(
       operation,
-      () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath,
-        ...(entries === undefined ? {} : { sessionStore: this.snapshotStore(sessionId, entries) }),
-      }),
+      () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath }),
       this.transcriptReadTimeoutMs,
       deadline,
     ).pipe(
