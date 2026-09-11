@@ -99,7 +99,14 @@ export interface ActiveRefresh {
   readonly completionVersion?: number
   readonly ambiguityReason?: string
   readonly progressSessionIds?: ReadonlySet<string>
+  readonly stagedTranscripts?: ReadonlyMap<string, TranscriptRead>
 }
+
+export type SessionHistoryStatus =
+  | { readonly _tag: "Pending" }
+  | { readonly _tag: "Ready" }
+  | { readonly _tag: "Unavailable"; readonly reason: string }
+  | { readonly _tag: "Missing" }
 
 export interface ProviderSnapshotState {
   readonly sessions: ReadonlyMap<string, AgentSession>
@@ -113,6 +120,8 @@ export interface LocalOverlayState {
 }
 
 export interface ApplicationState {
+  /** Latest read outcome, independent of retained accepted history. */
+  readonly historyStatus: ReadonlyMap<string, SessionHistoryStatus>
   readonly selectionId: string | null
   readonly provider: ProviderSnapshotState
   readonly local: LocalOverlayState
@@ -150,6 +159,7 @@ export function makeInitialApplicationState(
   initial: InitialApplicationState = {},
 ): ApplicationState {
   return {
+    historyStatus: new Map(),
     selectionId: null,
     provider: { sessions: new Map(), transcripts: new Map() },
     local: { sessions: new Map(), transcripts: new Map(), temporarySessionIds: new Set() },

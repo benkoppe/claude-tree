@@ -163,7 +163,9 @@ export function renderRoots(
     const status = statusMarker(root.status, spinnerFrame)
     const branchLabel = root.memberSessionIds.length === 1 ? "branch" : "branches"
     const messageLabel = root.messageCount === 1 ? "message" : "messages"
-    const counts = root.historyPending ? "Loading history…" : `${String(root.messageCount).padStart(messageCountWidth)} ${messageLabel.padEnd("messages".length)}  ${String(root.memberSessionIds.length).padStart(branchCountWidth)} ${branchLabel.padEnd("branches".length)}`
+    const counts = root.history._tag === "Loading" ? "Loading history…"
+      : root.history._tag === "Unavailable" ? "History unavailable · Enter to retry"
+      : `${String(root.messageCount).padStart(messageCountWidth)} ${messageLabel.padEnd("messages".length)}  ${String(root.memberSessionIds.length).padStart(branchCountWidth)} ${branchLabel.padEnd("branches".length)}`
     const style = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
     canvas.paint(3, row, Math.max(0, safeWidth - 3), 1, style)
     canvas.write(1, row, status, {
@@ -180,7 +182,7 @@ export function renderRoots(
     if (metadataX > titleX) {
       canvas.write(metadataX, row, truncateToWidth(counts, safeWidth - metadataX - 1), {
         ...style,
-        fg: selected ? theme.selectedText : theme.textMuted,
+        fg: root.history._tag === "Unavailable" ? theme.danger : selected ? theme.selectedText : theme.textMuted,
       })
     }
   }

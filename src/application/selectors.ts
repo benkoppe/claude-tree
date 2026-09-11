@@ -6,6 +6,7 @@ import type { AgentMessage, AgentSession, MessageRef, TranscriptRead } from "../
 import { SESSION_STATUS_PRIORITY, type SessionStatus } from "../domain/session-status"
 import type { ApplicationState } from "./state"
 import { projectForest } from "./forest-projection"
+import { selectHistoryStatus } from "./catalogue"
 
 export type { SessionStatus } from "../domain/session-status"
 
@@ -14,12 +15,13 @@ export interface ProjectedApplicationData {
   readonly transcripts: ReadonlyMap<string, readonly AgentMessage[]>
 }
 
-type ForestInputs = Pick<ApplicationState, "local" | "terminals" | "rewindAnchors" | "relations" | "removals">
+type ForestInputs = Pick<ApplicationState, "local" | "terminals" | "rewindAnchors" | "relations" | "removals" | "historyStatus">
 const forestCache = new WeakMap<ApplicationState["provider"], ForestInputs & { readonly forest: ConversationForest }>()
 const projectedCache = new WeakMap<ApplicationState["provider"], {
   readonly local: ApplicationState["local"]
   readonly rewindAnchors: ApplicationState["rewindAnchors"]
   readonly terminals: ApplicationState["terminals"]
+  readonly historyStatus: ApplicationState["historyStatus"]
   readonly data: ProjectedApplicationData
 }>()
 const visibleForestCache = new WeakMap<ConversationForest, { visible: ReadonlySet<string>; forest: ConversationForest }>()
@@ -30,7 +32,7 @@ function sameKeys(left: ReadonlyMap<string, unknown>, right: ReadonlyMap<string,
 
 export function selectProjectedData(state: ApplicationState): ProjectedApplicationData {
   const cached = projectedCache.get(state.provider)
-  if (cached && cached.local === state.local && cached.rewindAnchors === state.rewindAnchors &&
+  if (cached && cached.local === state.local && cached.historyStatus === state.historyStatus && cached.rewindAnchors === state.rewindAnchors &&
     sameKeys(cached.terminals, state.terminals)) return cached.data
   const sessions = new Map(state.provider.sessions)
   const reads = new Map(state.provider.transcripts)
@@ -46,12 +48,12 @@ export function selectProjectedData(state: ApplicationState): ProjectedApplicati
       transcripts.set(sessionId, projectRewind(read.messages, state.rewindAnchors.get(sessionId)?.targetMessageId))
       continue
     }
-    if (state.local.sessions.has(sessionId) || state.terminals.has(sessionId)) {
+    if (state.local.sessions.has(sessionId) || state.terminals.has(sessionId) || selectHistoryStatus(state, sessionId)._tag !== "Pending") {
       projectedSessions.set(sessionId, session)
     }
   }
   const data = { sessions: projectedSessions, transcripts }
-  projectedCache.set(state.provider, { local: state.local, rewindAnchors: state.rewindAnchors, terminals: state.terminals, data })
+  projectedCache.set(state.provider, { local: state.local, historyStatus: state.historyStatus, rewindAnchors: state.rewindAnchors, terminals: state.terminals, data })
   return data
 }
 
@@ -85,7 +87,7 @@ export function selectFamilySessionIds(
 
 export function selectConversationForest(state: ApplicationState): ConversationForest {
   const cached = forestCache.get(state.provider)
-  if (cached && cached.local === state.local && sameKeys(cached.terminals, state.terminals) &&
+  if (cached && cached.local === state.local && cached.historyStatus === state.historyStatus && sameKeys(cached.terminals, state.terminals) &&
     cached.rewindAnchors === state.rewindAnchors && cached.relations === state.relations &&
     cached.removals === state.removals) return cached.forest
   const data = selectProjectedData(state)
@@ -99,7 +101,7 @@ export function selectConversationForest(state: ApplicationState): ConversationF
   // changes can reuse the graph; never mutate a forest returned by this selector.
   forestCache.set(state.provider, {
     local: state.local, terminals: state.terminals, rewindAnchors: state.rewindAnchors,
-    relations: state.relations, removals: state.removals, forest,
+    relations: state.relations, removals: state.removals, historyStatus: state.historyStatus, forest,
   })
   return forest
 }
