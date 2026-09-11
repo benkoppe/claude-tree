@@ -35,6 +35,7 @@ import {
 } from "../../../services/provider"
 import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
+import { projectNavigationHistory } from "./navigation-history"
 
 export interface ClaudeSdk {
   readonly getSessionInfo: (sessionId: string, options: { readonly dir: string }) => Promise<SDKSessionInfo | undefined>
@@ -45,7 +46,7 @@ export interface ClaudeSdk {
   }) => Promise<readonly SDKSessionInfo[]>
   readonly getSessionMessages: (
     sessionId: string,
-    options: { readonly dir: string; readonly sessionStore?: SessionStore },
+    options: { readonly dir: string; readonly sessionStore?: SessionStore; readonly includeSystemMessages?: boolean },
   ) => Promise<readonly SessionMessage[] | null | undefined>
   readonly forkSession: (
     sessionId: string,
@@ -98,6 +99,12 @@ interface ClaudeMessage extends AgentMessage {
   readonly sourceType: "user" | "assistant" | "system"
   readonly rawMessage: unknown
   readonly replayText?: string
+}
+
+interface ClaudeActiveContext {
+  readonly messages: readonly ClaudeMessage[]
+  /** SDK-selected system tail anchors compaction even when no user/agent is visible. */
+  readonly systemAnchorId?: string
 }
 
 interface ConversationRecord {
@@ -272,15 +279,15 @@ export class ClaudeProvider implements AgentProviderApi {
       unique(sessionIds).map((sessionId) =>
         Effect.gen({ self: this }, function*() {
           const readDeadline = publish ? yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs) : deadline
-          const messages = yield* this.readClaudeTranscript(sessionId, "readTranscripts", readDeadline)
-          if (messages === undefined) return undefined
-          if (messages.length === 0) {
+          const context = yield* this.readActiveContext(sessionId, "readTranscripts", readDeadline)
+          if (context === undefined) return undefined
+          if (context.messages.length === 0 && context.systemAnchorId === undefined) {
             const info = yield* this.callSdk("getSessionInfo", () => this.sdk.getSessionInfo(sessionId, { dir: this.projectPath }),
               this.listSessionsTimeoutMs, readDeadline)
             if (info === undefined) return undefined
           }
           const entries = yield* this.readSessionEntries(sessionId, "readTranscripts", readDeadline)
-          return yield* this.readNavigationHistory(sessionId, messages, entries, "readTranscripts", readDeadline)
+          return yield* this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline)
         }).pipe(
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
@@ -330,12 +337,13 @@ export class ClaudeProvider implements AgentProviderApi {
         Math.min(this.operationTimeoutMs, this.forkValidationTimeoutMs),
       )
       const sourceEntries = yield* this.readSessionEntries(target.sessionId, "branchFrom", deadline)
-      const activeTranscript = yield* this.requireTranscript(
+      const activeContext = yield* this.requireActiveContext(
         target.sessionId,
         "branchFrom",
         deadline,
       )
-      const sourceTranscript = yield* this.readNavigationHistory(target.sessionId, activeTranscript, sourceEntries, "branchFrom", deadline)
+      const activeTranscript = activeContext.messages
+      const sourceTranscript = yield* this.readNavigationHistory(target.sessionId, activeContext, sourceEntries, "branchFrom", deadline)
       const selectedIndex = sourceTranscript.findIndex((message) => message.id === target.messageId)
       const selected = sourceTranscript[selectedIndex]
       if (selected === undefined) {
@@ -619,14 +627,14 @@ export class ClaudeProvider implements AgentProviderApi {
           yield* Effect.sleep(Math.min(this.retryDelays[attempt - 1] ?? 0, remaining))
         }
 
-        const activeRead = yield* this.readClaudeTranscript(
+        const activeRead = yield* this.readActiveContext(
           childSessionId,
           "validateFork",
           deadline,
         ).pipe(
           Effect.match({
             onFailure: (error) => ({ _tag: "Failure" as const, error }),
-            onSuccess: (messages) => ({ _tag: "Success" as const, messages }),
+            onSuccess: (context) => ({ _tag: "Success" as const, context }),
           }),
         )
         if (activeRead._tag === "Failure") {
@@ -635,12 +643,12 @@ export class ClaudeProvider implements AgentProviderApi {
           if (activeRead.error._tag === "ProviderProtocolError") break
           continue
         }
-        if (activeRead.messages === undefined) {
+        if (activeRead.context === undefined) {
           transcript = { _tag: "Missing" }
           lastReason = "its transcript is not available yet"
           continue
         }
-        transcript = { _tag: "Available", messages: activeRead.messages }
+        transcript = { _tag: "Available", messages: activeRead.context.messages }
 
         const physicalRead = yield* this.readSessionEntries(
           childSessionId,
@@ -661,14 +669,14 @@ export class ClaudeProvider implements AgentProviderApi {
         const validation = validateFork(
           parentSessionId,
           sourcePrefix,
-          activeRead.messages,
+          activeRead.context.messages,
           yield* this.normalizeRecords(physicalRead.entries, "validateFork", childSessionId),
         )
         if (validation._tag === "Valid") {
           return {
             _tag: "Valid" as const,
             transcript: { _tag: "Available" as const, messages: yield* this.readNavigationHistory(
-              childSessionId, activeRead.messages, physicalRead.entries, "validateFork", deadline,
+              childSessionId, activeRead.context, physicalRead.entries, "validateFork", deadline,
             ) },
             sharedMessages: validation.sharedMessages,
           }
@@ -770,33 +778,43 @@ export class ClaudeProvider implements AgentProviderApi {
     )
   }
 
-  private requireTranscript(
+  private requireActiveContext(
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
-  ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
-    return this.readClaudeTranscript(sessionId, operation, deadline).pipe(
-      Effect.flatMap((messages) => messages === undefined
+  ): Effect.Effect<ClaudeActiveContext, ProviderError | ProviderProtocolError> {
+    return this.readActiveContext(sessionId, operation, deadline).pipe(
+      Effect.flatMap((context) => context === undefined
         ? Effect.fail(this.providerError(operation, `Claude session ${sessionId} was not found`))
-        : Effect.succeed(messages)),
+        : Effect.succeed(context)),
     )
   }
 
-  private readClaudeTranscript(
+  private readActiveContext(
     sessionId: string,
     operation: string,
     deadline: OperationDeadline,
-  ): Effect.Effect<readonly ClaudeMessage[] | undefined, ProviderError | ProviderProtocolError> {
+  ): Effect.Effect<ClaudeActiveContext | undefined, ProviderError | ProviderProtocolError> {
     return this.callSdk(
       operation,
-      () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath }),
+      () => this.sdk.getSessionMessages(sessionId, { dir: this.projectPath, includeSystemMessages: true }),
       this.transcriptReadTimeoutMs,
       deadline,
     ).pipe(
       Effect.flatMap((messages) => {
         if (messages === null || messages === undefined) return Effect.succeed(undefined)
         return Effect.try({
-          try: () => normalizeTranscript(sessionId, messages),
+          try: () => {
+            if (!Array.isArray(messages)) throw new Error("Transcript is not an array")
+            const systemAnchor = messages.findLast((message) => message.type === "system")
+            if (systemAnchor && (typeof systemAnchor.uuid !== "string" || systemAnchor.uuid.length === 0)) {
+              throw new Error("SDK-selected system record has no UUID")
+            }
+            return {
+              messages: normalizeTranscript(sessionId, messages.filter((message) => message.type !== "system")),
+              ...(systemAnchor ? { systemAnchorId: systemAnchor.uuid } : {}),
+            }
+          },
           catch: (cause) => this.protocolError(
             operation,
             `Claude returned an invalid transcript for session ${sessionId}`,
@@ -824,42 +842,37 @@ export class ClaudeProvider implements AgentProviderApi {
 
   private readNavigationHistory(
     sessionId: string,
-    active: readonly ClaudeMessage[],
+    context: ClaudeActiveContext,
     entries: readonly SessionStoreEntry[],
     operation: string,
     deadline: OperationDeadline,
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
-    const linked = entries.some((entry) => isLinkedCompaction(entry))
-    if (!linked) return Effect.succeed(markCompactionSummaries(active, entries))
-    // An in-memory read projection only. The SDK still selects the live path and
-    // handles streamed blocks; no provider transcript is written or synthesized.
-    return Effect.try({
-      try: () => {
-        const indexes = new Map(entries.map((entry, index) => [entry.uuid, index]))
-        return entries.map((entry, index) => {
-          if (!isLinkedCompaction(entry)) return entry
-          const parentIndex = indexes.get(entry.logicalParentUuid as string)
-          if (parentIndex === undefined || parentIndex >= index) throw new Error("Compaction has a missing or cyclic logical parent")
-          return { ...entry, parentUuid: entry.logicalParentUuid, compactMetadata: undefined }
-        })
-      },
-      catch: (cause) => this.protocolError(operation, `Claude has invalid compaction links for session ${sessionId}`, cause),
-    }).pipe(
-      Effect.flatMap((projected) => this.readStoredTranscript(sessionId, projected, operation, deadline)),
-      Effect.flatMap((messages) => Effect.try({
+    return Effect.gen({ self: this }, function*() {
+      const active = context.messages
+      const projection = yield* Effect.try({
+        try: () => projectNavigationHistory(entries, [
+          ...active.map((message) => message.id), ...(context.systemAnchorId ? [context.systemAnchorId] : []),
+        ]),
+        catch: (cause) => this.protocolError(operation,
+          `Claude has invalid navigation ancestry for session ${sessionId}: ${errorMessage(cause)}`, cause),
+      })
+      if (!projection.changed) return markCompactionSummaries(active, projection.sourceRecords)
+      const messages = yield* this.readStoredTranscript(sessionId, projection.records, operation, deadline, context.systemAnchorId)
+      return yield* Effect.try({
         try: () => {
           const activeIds = new Set(active.map((message) => message.id))
-          const normalized = markCompactionSummaries(messages, entries)
+          const normalized = markCompactionSummaries(messages, projection.sourceRecords)
           const historyById = new Map(normalized.map((message) => [message.id, message]))
-          if (active.some((message) => historyById.get(message.id)?.copyIdentity !== message.copyIdentity ||
-            historyById.get(message.id)?.role !== message.role)) {
-            throw new Error("Compaction history does not contain the active context")
+          const mismatch = active.find((message) => historyById.get(message.id)?.copyIdentity !== message.copyIdentity ||
+            historyById.get(message.id)?.role !== message.role)
+          if (mismatch) {
+            throw new Error(`Compaction history does not preserve active record ${mismatch.id} with its exact role and payload`)
           }
           return normalized.map((message) => activeIds.has(message.id) ? message : { ...message, historical: true as const })
         },
-        catch: (cause) => this.protocolError(operation, `Claude compaction history could not be validated for session ${sessionId}`, cause),
-      })),
-    )
+        catch: (cause) => this.protocolError(operation, `Claude compaction history could not be validated for session ${sessionId}: ${errorMessage(cause)}`, cause),
+      })
+    })
   }
 
   private readStoredTranscript(
@@ -867,12 +880,20 @@ export class ClaudeProvider implements AgentProviderApi {
     entries: readonly SessionStoreEntry[],
     operation: string,
     deadline: OperationDeadline,
+    systemAnchorId?: string,
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
     const sessionStore = this.snapshotStore(sessionId, entries)
-    return this.callSdk(operation, () => getSessionMessages(sessionId, { dir: this.projectPath, sessionStore }),
+    return this.callSdk(operation, () => getSessionMessages(sessionId, { dir: this.projectPath, sessionStore,
+      ...(systemAnchorId === undefined ? {} : { includeSystemMessages: true }),
+    }),
       this.transcriptReadTimeoutMs, deadline).pipe(Effect.flatMap((messages) => Effect.try({
-        try: () => normalizeTranscript(sessionId, messages),
-        catch: (cause) => this.protocolError(operation, `Claude returned invalid stored history for session ${sessionId}`, cause),
+        try: () => {
+          if (systemAnchorId !== undefined && !messages.some((message) => message.type === "system" && message.uuid === systemAnchorId)) {
+            throw new Error(`Navigation history does not preserve SDK-selected system record ${systemAnchorId}`)
+          }
+          return normalizeTranscript(sessionId, systemAnchorId === undefined ? messages : messages.filter((message) => message.type !== "system"))
+        },
+        catch: (cause) => this.protocolError(operation, `Claude returned invalid stored history for session ${sessionId}: ${errorMessage(cause)}`, cause),
       })))
   }
 
@@ -1177,10 +1198,6 @@ function normalizeTranscript(
       ...(replayText === undefined ? {} : { replayText }),
     }
   })
-}
-
-function isLinkedCompaction(entry: SessionStoreEntry): boolean {
-  return entry.type === "system" && entry.subtype === "compact_boundary" && typeof entry.logicalParentUuid === "string"
 }
 
 function markCompactionSummaries(
