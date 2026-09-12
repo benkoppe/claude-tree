@@ -57,6 +57,14 @@ export interface CatalogueFamily {
   readonly sessionIds: ReadonlySet<string>
 }
 
+export function describeSession(state: ApplicationState, sessionId: string): string {
+  const session = state.local.sessions.get(sessionId) ?? state.provider.sessions.get(sessionId)
+  const title = session?.title.trim()
+  const label = title && title !== sessionId ? `${title} (${sessionId})` : sessionId
+  const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(sessionId))
+  return family && family.root.id !== sessionId ? `${family.root.title} → ${label}` : label
+}
+
 const catalogueCache = new WeakMap<ApplicationState["provider"]["sessions"], {
   local: ApplicationState["local"]["sessions"]
   relations: ApplicationState["relations"]

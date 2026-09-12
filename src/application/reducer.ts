@@ -26,7 +26,7 @@ import {
   selectVisibleEndpointSessionIds,
 } from "./selectors"
 import { invalidatedRefreshSessionIds } from "./state"
-import { historyStatusForRead, selectCatalogueFamilies, selectFamilyHistoryStatus } from "./catalogue"
+import { describeSession, historyStatusForRead, selectCatalogueFamilies, selectFamilyHistoryStatus } from "./catalogue"
 import type {
   ActiveRefresh,
   ApplicationModal,
@@ -401,13 +401,14 @@ function refreshSucceeded(
   }
   const unstableSessionIds = new Set<string>()
   const unavailableReasons: string[] = []
+  const sessionLabelsState = { ...state, provider: { ...state.provider, sessions } }
   const unviewedSessionIds = new Set(state.unviewedSessionIds)
 
   for (const [sessionId, incoming] of snapshot.transcripts) {
     if (staleSessionIds.has(sessionId)) continue
     historyStatus.set(sessionId, historyStatusForRead(incoming))
     if (active.reason === "manual" && incoming._tag === "Unavailable") {
-      unavailableReasons.push(`${sessionId}: ${incoming.reason}`)
+      unavailableReasons.push(`${describeSession(sessionLabelsState, sessionId)}\n${incoming.reason}`)
     }
     const previousRead = selectTranscriptRead(state, sessionId)
     const terminal = state.terminals.get(sessionId)
@@ -556,7 +557,7 @@ function refreshSucceeded(
     refresh: { ...without.refresh, initialPending: state.refresh.initialPending &&
       (progress || [...without.refresh.active.values()].some((refresh) => refresh.reason === "initial")), appliedGenerationBySession },
     ...(unavailableReasons.length > 0
-      ? { modal: { _tag: "Error", message: `Conversation refresh failed: ${unavailableReasons.join("; ")}` } as const }
+      ? { modal: { _tag: "Error", message: `Conversation refresh failed:\n\n${unavailableReasons.join("\n\n")}` } as const }
       : unstableSessionIds.size > 0
       ? { modal: { _tag: "Error", message: "Conversation history kept changing during refresh. Refresh again when the session is idle." } as const }
       : completionExhausted

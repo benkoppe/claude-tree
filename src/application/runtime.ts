@@ -46,7 +46,7 @@ import type {
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
 import { makeNavigationWriter } from "./navigation-writer"
-import { selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
+import { describeSession, selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
   makeApplicationOperations,
   rollbackPersistedBranch,
@@ -939,7 +939,7 @@ export function makeAppRuntime(
             owners.get(check.ownerId)?.lastSequenceId === check.sequenceId &&
             state.terminals.get(check.sessionId)?.activity === "working")
           if (issues.length > 0) {
-            const details = issues.map((check) => `${check.sessionId}: ${check.issue === "observer-failed"
+            const details = issues.map((check) => `${describeSession(state, check.sessionId)}: ${check.issue === "observer-failed"
               ? "terminal observation failed" : "terminal screen is not recognized"}`).join("; ")
             yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: [
               state.modal !== previousModal && state.modal?._tag === "Error" ? state.modal.message : undefined,
@@ -1025,7 +1025,7 @@ export function makeAppRuntime(
               const node = graph.nodes.find((node) => node.selected)
               const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(command.enterRoot!.sessionId))
               const history = selectFamilyHistoryStatus(state, family?.sessionIds ?? [command.enterRoot.sessionId])
-              const problem = history._tag === "Unavailable" ? history.issues.map((issue) => `${issue.sessionId}: ${issue.reason}`).join("\n") : undefined
+              const problem = history._tag === "Unavailable" ? history.issues.map((issue) => `${describeSession(state, issue.sessionId)}\n${issue.reason}`).join("\n\n") : undefined
               if (!node) {
                 yield* failReply(command.reply, "EnterRoot", "Load conversation", new Error(problem ?? "Conversation has no visible messages"))
               } else {
