@@ -1,0 +1,1357 @@
+import { isDeepStrictEqual } from "node:util"
+
+import type {
+  AgentMessage,
+  AgentSession,
+  AgentSessionSnapshot,
+  DraftPreview,
+  NavigationState,
+  NavigationTarget,
+  TerminalObservation,
+  TranscriptRead,
+} from "../domain/model"
+import type { ConversationGraph, ConversationGraphNode } from "../domain/conversation-graph"
+import { initialVisibleGraphNodeId, visibleGraphNodeId } from "../domain/graph-layout"
+import type {
+  BranchRelation,
+  ConversationRemoval,
+  IdentityTransitionKind,
+} from "../domain/persistence"
+import { replaceSessionIdInProjectState } from "../services/provider-state-repository"
+import {
+  selectConversationForest,
+  selectFamilyRootSessionId,
+  selectProjectedTranscript,
+  selectTranscriptRead,
+  selectVisibleEndpointSessionIds,
+} from "./selectors"
+import { invalidatedRefreshSessionIds } from "./state"
+import { historyStatusForRead, selectCatalogueFamilies, selectFamilyHistoryStatus } from "./catalogue"
+import type {
+  ActiveRefresh,
+  ApplicationModal,
+  ApplicationState,
+  ApplicationSurface,
+  NavigatorSurface,
+  PendingCompletion,
+  RewindAnchor,
+  TerminalState,
+} from "./state"
+
+export const MAX_COMPLETION_REFRESH_ATTEMPTS = 4
+const MAX_REPLACEMENT_READS = 3
+
+export type StateEvent =
+  | { readonly _tag: "RefreshProgress"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
+  | { readonly _tag: "RefreshStarted"; readonly refresh: ActiveRefresh; readonly replaceAll?: boolean }
+  | { readonly _tag: "RefreshSucceeded"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
+  | { readonly _tag: "RefreshFailed"; readonly key: string; readonly generation: number; readonly message: string }
+  | { readonly _tag: "RefreshSuperseded"; readonly key: string; readonly generation: number }
+  | { readonly _tag: "LocalSessionProjected"; readonly session: AgentSession; readonly transcript?: TranscriptRead; readonly temporary?: boolean }
+  | { readonly _tag: "PersistedBranchProjected"; readonly session: AgentSession; readonly relation: BranchRelation; readonly transcript?: TranscriptRead }
+  | { readonly _tag: "TransientSessionRolledBack"; readonly sessionId: string; readonly restoreTo: NavigatorSurface }
+  | { readonly _tag: "Navigated"; readonly surface: ApplicationSurface; readonly selectionId?: string }
+  | { readonly _tag: "TerminalShowStarted"; readonly sessionId: string }
+  | { readonly _tag: "TerminalShown"; readonly sessionId: string; readonly ownerId: string; readonly returnTo: NavigatorSurface }
+  | { readonly _tag: "TerminalShowFailed"; readonly sessionId: string; readonly restoreTo: NavigatorSurface; readonly message?: string }
+  | { readonly _tag: "TerminalReturned"; readonly sessionId: string; readonly draft?: DraftPreview }
+  | { readonly _tag: "TerminalActivityObserved"; readonly sessionId: string; readonly ownerId: string; readonly activity: "working" | "blocked" | "idle"; readonly wasVisible: boolean }
+  | { readonly _tag: "TerminalObservationObserved"; readonly sessionId: string; readonly ownerId: string; readonly observation: TerminalObservation }
+  | { readonly _tag: "TerminalDraftObserved"; readonly sessionId: string; readonly draft?: DraftPreview }
+  | { readonly _tag: "TerminalStopping"; readonly sessionId: string }
+  | { readonly _tag: "TerminalStopped"; readonly sessionId: string; readonly cleanupIncomplete?: boolean; readonly focusExitedSession?: boolean }
+  | { readonly _tag: "CompletionAttemptAdvanced"; readonly sessionId: string; readonly message?: string }
+  | { readonly _tag: "SubmissionDiscoveryAdvanced"; readonly sessionId: string; readonly ownerId: string; readonly revision: number; readonly exhausted?: boolean }
+  | { readonly _tag: "SessionIdentityAdopted"; readonly previousSessionId: string; readonly session: AgentSession; readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation }
+  | { readonly _tag: "RemovalPersisted"; readonly removal: ConversationRemoval; readonly stoppedSessionIds: readonly string[]; readonly fallback: NavigatorSurface }
+  | { readonly _tag: "ModalOpened"; readonly modal: ApplicationModal }
+  | { readonly _tag: "ModalClosed" }
+  | { readonly _tag: "ShutdownStarted" }
+  | { readonly _tag: "ShutdownCompleted" }
+  | { readonly _tag: "ShutdownFailed"; readonly message: string }
+
+export function reduceApplicationState(state: ApplicationState, event: StateEvent): ApplicationState {
+  if (state.shutdown === "stopped" || state.shutdown === "cleanup-incomplete") return state
+  if (state.shutdown === "shutting-down" && !isShutdownEvent(event)) return state
+
+  switch (event._tag) {
+    case "RefreshProgress": {
+      const refresh = state.refresh.active.get(event.key)
+      if (!refresh || refresh.generation !== event.generation) return state
+      const catalogued: ApplicationState = event.snapshot.sessions.length === 0 ? state : { ...state, provider: { ...state.provider,
+        sessions: new Map([...state.provider.sessions, ...event.snapshot.sessions.map((session) => [session.id, session] as const)]),
+      } }
+      const staged = new Map([...(refresh.stagedTranscripts ?? []), ...event.snapshot.transcripts])
+      const ready = new Map<string, TranscriptRead>()
+      for (const family of selectCatalogueFamilies(catalogued)) {
+        if (![...family.sessionIds].every((id) => staged.has(id) || state.provider.transcripts.has(id) || state.local.sessions.has(id))) continue
+        for (const id of family.sessionIds) {
+          const read = staged.get(id)
+          if (read) { ready.set(id, read); staged.delete(id) }
+        }
+      }
+      const progressive = { ...state, refresh: { ...state.refresh, active: new Map(state.refresh.active).set(event.key, {
+        ...refresh, mode: "incremental" as const, sessionIds: new Set(ready.keys()),
+      }) } }
+      const next = refreshSucceeded(progressive, event.key, event.generation, { sessions: event.snapshot.sessions, transcripts: ready }, true)
+      return { ...next, refresh: { ...next.refresh, initialPending: state.refresh.initialPending,
+        active: new Map(next.refresh.active).set(event.key, { ...refresh, stagedTranscripts: staged, progressSessionIds: new Set([
+          ...(refresh.progressSessionIds ?? []), ...ready.keys(),
+        ]) }) } }
+    }
+    case "RefreshStarted": {
+      const active = event.replaceAll ? new Map<string, ActiveRefresh>() : new Map(state.refresh.active)
+      const sessionIds = event.refresh.mode === "full"
+        ? new Set([...state.provider.sessions.keys(), ...state.local.sessions.keys(), ...state.terminals.keys()])
+        : event.refresh.sessionIds
+      const historyRevisions = new Map([...sessionIds].map((sessionId) => {
+        const terminal = state.terminals.get(sessionId)
+        return [sessionId, {
+          ...(terminal?.ownerId === undefined ? {} : { ownerId: terminal.ownerId }),
+          revision: terminal?.historyRevision ?? 0,
+        }] as const
+      }))
+      active.set(event.refresh.key, { ...event.refresh, historyRevisions })
+      return {
+        ...state,
+        refresh: {
+          ...state.refresh,
+          generation: Math.max(state.refresh.generation, event.refresh.generation),
+          active,
+          initialPending: state.refresh.initialPending,
+        },
+      }
+    }
+    case "RefreshSuperseded":
+      return removeRefresh(state, event.key, event.generation)
+    case "RefreshFailed": {
+      const active = state.refresh.active.get(event.key)
+      if (!active || active.generation !== event.generation) return state
+      const invalidated = new Set(invalidatedRefreshSessionIds(state, active))
+      for (const [sessionId, generation] of state.refresh.appliedGenerationBySession) {
+        if (generation > event.generation) invalidated.add(sessionId)
+      }
+      const sessionIds = active.mode === "full"
+        ? new Set([
+            ...active.sessionIds, ...(active.historyRevisions?.keys() ?? []),
+            ...state.provider.sessions.keys(), ...state.local.sessions.keys(), ...state.terminals.keys(),
+            ...state.replacementCandidates.keys(), ...state.pendingCompletions.keys(),
+          ])
+        : active.sessionIds
+      if (invalidated.size > 0 && [...sessionIds].every((sessionId) => invalidated.has(sessionId))) {
+        return removeRefresh(state, event.key, event.generation)
+      }
+      if (active.stagedTranscripts?.size) {
+        const transcripts = new Map(active.stagedTranscripts)
+        for (const id of sessionIds) {
+          if (!transcripts.has(id) && !active.progressSessionIds?.has(id)) transcripts.set(id, { _tag: "Unavailable", reason: event.message })
+        }
+        const partial = { ...state, refresh: { ...state.refresh, active: new Map(state.refresh.active).set(event.key, {
+          ...active, mode: "incremental" as const, sessionIds: new Set(transcripts.keys()),
+        }) } }
+        const next = refreshSucceeded(partial, event.key, event.generation, { sessions: [], transcripts })
+        return { ...next, modal: { _tag: "Error", message: event.message } }
+      }
+      const replacementCandidates = new Map(state.replacementCandidates)
+      for (const sessionId of replacementCandidates.keys()) {
+        if (invalidated.has(sessionId)) continue
+        if (active.mode === "full" || active.sessionIds.has(sessionId)) replacementCandidates.delete(sessionId)
+      }
+      const historyStatus = new Map(state.historyStatus)
+      for (const id of sessionIds) {
+        if (!invalidated.has(id) && !(active.progressSessionIds?.has(id))) historyStatus.set(id, { _tag: "Unavailable", reason: event.message })
+      }
+      const next = { ...removeRefresh(state, event.key, event.generation), replacementCandidates, historyStatus }
+      if (active.completionVersion !== undefined) {
+        const sessionId = [...active.sessionIds][0] ?? ""
+        if (!invalidated.has(sessionId)) {
+          return state.pendingCompletions.get(sessionId)?.version === active.completionVersion
+            ? advanceCompletion(next, sessionId, event.message)
+            : next
+        }
+      }
+      if (active.reason === "ambiguity") {
+        const ambiguity = active.ambiguityReason ?? "Provider branch mutation outcome is ambiguous"
+        return {
+          ...next,
+          refresh: { ...next.refresh, initialPending: false },
+          modal: {
+            _tag: "Error",
+            message: `${ambiguity}; reconciliation failed: ${event.message}`,
+          },
+        }
+      }
+      return {
+        ...next,
+        refresh: { ...next.refresh, initialPending: false },
+        modal: { _tag: "Error", message: event.message },
+      }
+    }
+    case "RefreshSucceeded":
+      return refreshSucceeded(state, event.key, event.generation, event.snapshot)
+    case "LocalSessionProjected":
+      return projectLocalSession(state, event.session, event.transcript, event.temporary)
+    case "PersistedBranchProjected": {
+      const projected = projectLocalSession(state, event.session, event.transcript, event.session.transient)
+      return {
+        ...projected,
+        relations: upsertRelation(projected.relations, event.relation),
+      }
+    }
+    case "TransientSessionRolledBack":
+      return rollbackTransient(state, event.sessionId, event.restoreTo)
+    case "Navigated":
+      return { ...state, surface: event.surface, selectionId: event.selectionId ?? null }
+    case "TerminalShowStarted":
+      return {
+        ...state,
+        terminals: new Map(state.terminals).set(event.sessionId, {
+          ...state.terminals.get(event.sessionId),
+          activity: state.terminals.get(event.sessionId)?.activity ?? "idle",
+          phase: "showing",
+        }),
+      }
+    case "TerminalShown":
+      return terminalShown(state, event.sessionId, event.ownerId, event.returnTo)
+    case "TerminalShowFailed": {
+      const terminals = new Map(state.terminals)
+      if (terminals.get(event.sessionId)?.phase === "showing") terminals.delete(event.sessionId)
+      return {
+        ...state,
+        terminals,
+        surface: event.restoreTo,
+        ...(event.message === undefined ? {} : { modal: { _tag: "Error", message: event.message } as const }),
+      }
+    }
+    case "TerminalReturned":
+      return terminalReturned(state, event.sessionId, event.draft)
+    case "TerminalActivityObserved":
+      return terminalActivity(state, event)
+    case "TerminalObservationObserved": {
+      const terminal = state.terminals.get(event.sessionId)
+      if (!terminal || terminal.ownerId !== event.ownerId || terminal.phase !== "running") return state
+      const observed = {
+        ...state,
+        terminals: new Map(state.terminals).set(event.sessionId, { ...terminal, observationReceived: true }),
+      }
+      if (event.observation._tag === "Rewind") {
+        const { replacement, rewindRestore: _, ...rest } = terminal
+        const anchor = state.rewindAnchors.get(event.sessionId)
+        return {
+          ...observed,
+          terminals: new Map(observed.terminals).set(event.sessionId, {
+            ...rest, observationReceived: true, unresolvedRewind: true, pendingSubmission: undefined,
+            historyRevision: (terminal.historyRevision ?? 0) + 1, activity: "idle",
+            ...(anchor?.submitted && anchor.submissionText !== undefined && replacement
+              ? { rewindRestore: { anchor, replacement } } : {}),
+          }),
+          drafts: withoutMap(state.drafts, event.sessionId),
+          rewindAnchors: withoutMap(state.rewindAnchors, event.sessionId),
+          replacementCandidates: withoutMap(state.replacementCandidates, event.sessionId),
+          pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId),
+        }
+      }
+      return event.observation._tag === "Draft"
+        ? observeDraft(observed, event.sessionId, event.observation.draft ?? undefined)
+        : observeSubmission(observed, event.sessionId, event.observation.text)
+    }
+    case "TerminalDraftObserved":
+      return observeDraft(state, event.sessionId, event.draft)
+    case "TerminalStopping": {
+      const terminal = state.terminals.get(event.sessionId)
+      return terminal
+        ? { ...state, terminals: new Map(state.terminals).set(event.sessionId, { ...terminal, pendingSubmission: undefined, phase: "stopping" }) }
+        : state
+    }
+    case "TerminalStopped":
+      return terminalStopped(
+        state,
+        event.sessionId,
+        event.cleanupIncomplete ?? false,
+        event.focusExitedSession ?? false,
+      )
+    case "CompletionAttemptAdvanced":
+      return advanceCompletion(state, event.sessionId, event.message)
+    case "SubmissionDiscoveryAdvanced": {
+      const terminal = state.terminals.get(event.sessionId)
+      if (!terminal?.pendingSubmission || terminal.ownerId !== event.ownerId || terminal.historyRevision !== event.revision) return state
+      const { pendingSubmission, ...rest } = terminal
+      return { ...state, terminals: new Map(state.terminals).set(event.sessionId, event.exhausted
+        ? rest
+        : { ...terminal, pendingSubmission: { ...pendingSubmission, attempt: pendingSubmission.attempt + 1 } }) }
+    }
+    case "SessionIdentityAdopted":
+      return adoptSessionIdentity(
+        state,
+        event.previousSessionId,
+        event.session,
+        event.kind,
+        event.relation,
+      )
+    case "RemovalPersisted": {
+      let next = state
+      for (const sessionId of event.stoppedSessionIds) next = terminalStopped(next, sessionId, false)
+      return repairNavigatorSurface({
+        ...next,
+        removals: [...next.removals, event.removal],
+        modal: null,
+      }, event.fallback)
+    }
+    case "ModalOpened":
+      return { ...state, modal: event.modal }
+    case "ModalClosed":
+      return { ...state, modal: null }
+    case "ShutdownStarted":
+      return {
+        ...state,
+        shutdown: "shutting-down",
+        terminals: new Map([...state.terminals].map(([id, terminal]) => [id, { ...terminal, pendingSubmission: undefined }])),
+        modal: null,
+        pendingCompletions: new Map(),
+        replacementCandidates: new Map(),
+        refresh: { ...state.refresh, active: new Map() },
+      }
+    case "ShutdownCompleted":
+      return {
+        ...state,
+        shutdown: "stopped",
+        terminals: new Map(),
+        drafts: new Map(),
+        rewindAnchors: new Map(),
+        pendingCompletions: new Map(),
+        unviewedSessionIds: new Set(),
+      }
+    case "ShutdownFailed":
+      return {
+        ...state,
+        shutdown: "cleanup-incomplete",
+        terminals: new Map([...state.terminals].map(([sessionId, terminal]) => [
+          sessionId,
+          { ...terminal, phase: "cleanup-incomplete" as const },
+        ])),
+        modal: { _tag: "Error", message: event.message },
+      }
+  }
+}
+
+export function navigationForSurface(surface: ApplicationSurface): NavigationState {
+  if (surface._tag === "Roots") return { view: "roots", selectedSessionId: surface.selectedSessionId }
+  if (surface._tag === "Graph") {
+    return { view: "graph", familySessionId: surface.familySessionId, target: surface.target }
+  }
+  return { view: "terminal", sessionId: surface.sessionId }
+}
+
+function refreshSucceeded(
+  state: ApplicationState,
+  key: string,
+  generation: number,
+  snapshot: AgentSessionSnapshot,
+  progress = false,
+): ApplicationState {
+  const active = state.refresh.active.get(key)
+  if (!active || active.generation !== generation) return state
+  if (active.mode === "full") {
+    const unread = snapshot.sessions.filter((session) => !snapshot.transcripts.has(session.id) && !active.progressSessionIds?.has(session.id))
+    if (unread.length) snapshot = { ...snapshot, transcripts: new Map([...snapshot.transcripts, ...unread.map((session) => [
+      session.id, { _tag: "Unavailable" as const, reason: "Provider did not return this session's history" },
+    ] as const)]) }
+  }
+  const incomingSessions = new Map(snapshot.sessions.map((session) => [session.id, session]))
+  const sessions = active.mode === "full"
+    ? preserveOwnedSessions(state, incomingSessions)
+    : new Map([...state.provider.sessions, ...incomingSessions])
+  const transcripts = active.mode === "full"
+    ? preserveOwnedTranscripts(state, snapshot.transcripts)
+    : new Map([...state.provider.transcripts, ...snapshot.transcripts])
+  const appliedGenerationBySession = new Map(state.refresh.appliedGenerationBySession)
+  const staleSessionIds = new Set(invalidatedRefreshSessionIds(state, active))
+  if (active.mode === "full") for (const id of active.progressSessionIds ?? []) staleSessionIds.add(id)
+  for (const [sessionId, appliedGeneration] of appliedGenerationBySession) {
+    if (appliedGeneration > generation) staleSessionIds.add(sessionId)
+  }
+  for (const sessionId of staleSessionIds) {
+    const session = state.provider.sessions.get(sessionId)
+    const transcript = state.provider.transcripts.get(sessionId)
+    if (session) sessions.set(sessionId, session)
+    else sessions.delete(sessionId)
+    if (transcript) transcripts.set(sessionId, transcript)
+    else transcripts.delete(sessionId)
+  }
+  for (const sessionId of snapshot.transcripts.keys()) {
+    if (!staleSessionIds.has(sessionId)) appliedGenerationBySession.set(sessionId, generation)
+  }
+  const localSessions = new Map(state.local.sessions)
+  const historyStatus = new Map(state.historyStatus)
+  for (const session of snapshot.sessions) {
+    if (!historyStatus.has(session.id) && !state.provider.transcripts.has(session.id)) historyStatus.set(session.id, { _tag: "Pending" })
+  }
+  if (active.mode === "full") for (const id of historyStatus.keys()) {
+    if (!sessions.has(id) && !state.local.sessions.has(id)) historyStatus.delete(id)
+  }
+  const localTranscripts = new Map(state.local.transcripts)
+  const temporarySessionIds = new Set(state.local.temporarySessionIds)
+  const rewindAnchors = new Map(state.rewindAnchors)
+  const drafts = new Map(state.drafts)
+  const pendingCompletions = new Map(state.pendingCompletions)
+  const replacementCandidates = new Map(state.replacementCandidates)
+  const terminals = new Map(state.terminals)
+  for (const sessionId of replacementCandidates.keys()) {
+    if (!sessions.has(sessionId) && !localSessions.has(sessionId)) replacementCandidates.delete(sessionId)
+  }
+  const unstableSessionIds = new Set<string>()
+  const unavailableReasons: string[] = []
+  const unviewedSessionIds = new Set(state.unviewedSessionIds)
+
+  for (const [sessionId, incoming] of snapshot.transcripts) {
+    if (staleSessionIds.has(sessionId)) continue
+    historyStatus.set(sessionId, historyStatusForRead(incoming))
+    if (active.reason === "manual" && incoming._tag === "Unavailable") {
+      unavailableReasons.push(`${sessionId}: ${incoming.reason}`)
+    }
+    const previousRead = selectTranscriptRead(state, sessionId)
+    const terminal = state.terminals.get(sessionId)
+    const nonIdle = terminal?.activity === "working" || terminal?.activity === "blocked"
+    const reconciled = reconcileTranscript(
+      previousRead, incoming, nonIdle, rewindAnchors.get(sessionId),
+      pendingCompletions.get(sessionId), replacementCandidates.get(sessionId),
+      terminal,
+    )
+    transcripts.set(sessionId, reconciled.read)
+    if (reconciled.candidate) replacementCandidates.set(sessionId, reconciled.candidate)
+    else replacementCandidates.delete(sessionId)
+    if (reconciled.unstable) unstableSessionIds.add(sessionId)
+    if (reconciled.completed) {
+      if (pendingCompletions.get(sessionId)?.markUnviewed) unviewedSessionIds.add(sessionId)
+      pendingCompletions.delete(sessionId)
+    } else if (reconciled.accepted && reconciled.read._tag === "Available") {
+      const completion = pendingCompletions.get(sessionId)
+      if (completion) pendingCompletions.set(sessionId, { ...completion, baseline: reconciled.read.messages })
+    }
+    if (reconciled.clearAnchor) rewindAnchors.delete(sessionId)
+    if (terminal && reconciled.replacement) {
+      const { rewindRestore: _, ...rest } = terminal
+      terminals.set(sessionId, { ...rest, unresolvedRewind: false, replacement: reconciled.replacement,
+        ...(terminal.pendingSubmission ? { pendingSubmission: {
+          ...terminal.pendingSubmission, baseline: reconciled.replacement.prefix,
+        } } : {}) })
+    }
+    const submission = terminals.get(sessionId)?.pendingSubmission
+    if (submission && reconciled.accepted && reconciled.read._tag === "Available" &&
+      isTranscriptPrefix(submission.baseline, reconciled.read.messages) &&
+      reconciled.read.messages.slice(submission.baseline.length).some((message) => message.visible && message.role === "user")) {
+      const { pendingSubmission: _, ...settled } = terminals.get(sessionId)!
+      terminals.set(sessionId, settled)
+    }
+    const acceptedTerminal = terminals.get(sessionId)
+    if (acceptedTerminal?.replacement && reconciled.accepted && reconciled.read._tag === "Available") {
+      terminals.set(sessionId, { ...acceptedTerminal, replacement: {
+        ...acceptedTerminal.replacement,
+        prefix: stableTranscriptWhileNonIdle(acceptedTerminal.replacement.prefix, reconciled.read.messages),
+        ...(reconciled.completed || (!nonIdle && !pendingCompletions.has(sessionId) && !acceptedTerminal.pendingSubmission)
+          ? { settled: true } : {}),
+      } })
+    }
+    if (reconciled.clearAnchor || reconciled.completed) {
+      const draft = drafts.get(sessionId)
+      if (draft?.submitted) drafts.delete(sessionId)
+      else if (draft && reconciled.clearAnchor) drafts.set(sessionId, { text: draft.text, exact: draft.exact })
+    }
+    if (!reconciled.accepted || incoming._tag !== "Available") continue
+    localTranscripts.delete(sessionId)
+    const session = sessions.get(sessionId)
+    if (session && !session.transient) {
+      localSessions.delete(sessionId)
+      temporarySessionIds.delete(sessionId)
+    }
+  }
+
+  const cleansUndiscoveredTemporarySessions = active.mode === "full" || active.reason === "stop"
+  if (cleansUndiscoveredTemporarySessions) {
+    for (const sessionId of temporarySessionIds) {
+      if (staleSessionIds.has(sessionId)) continue
+      if (state.terminals.has(sessionId)) continue
+      const discovered = incomingSessions.get(sessionId)
+      if (discovered) {
+        if (!discovered.transient) {
+          localSessions.set(sessionId, discovered)
+          temporarySessionIds.delete(sessionId)
+        }
+        continue
+      }
+      if (active.mode !== "full" && !active.sessionIds.has(sessionId)) continue
+      localSessions.delete(sessionId)
+      localTranscripts.delete(sessionId)
+      temporarySessionIds.delete(sessionId)
+    }
+  }
+
+  for (const [sessionId, completion] of pendingCompletions) {
+    if (staleSessionIds.has(sessionId)) continue
+    transcripts.set(sessionId, { _tag: "Available", messages: completion.baseline })
+  }
+
+  let completionExhausted = false
+  if (active.completionVersion !== undefined) {
+    for (const sessionId of active.sessionIds) {
+      if (staleSessionIds.has(sessionId)) continue
+      const completion = pendingCompletions.get(sessionId)
+      if (!completion || completion.version !== active.completionVersion) continue
+      const advanced = advanceCompletionValue(completion)
+      if (advanced) pendingCompletions.set(sessionId, advanced)
+      else {
+        pendingCompletions.delete(sessionId)
+        const terminal = terminals.get(sessionId)
+        if (terminal?.replacement) terminals.set(sessionId, {
+          ...terminal, replacement: { ...terminal.replacement, settled: true },
+        })
+        const incoming = snapshot.transcripts.get(sessionId)
+        // Idle can also mean cancelled. A successful read with no completed turn
+        // is not a failed read, and must not manufacture a completion error.
+        completionExhausted ||= incoming?._tag !== "Available"
+        if (!unstableSessionIds.has(sessionId) && !replacementCandidates.has(sessionId) && incoming?._tag === "Available" && !sameTranscript(completion.baseline, incoming.messages)) {
+          replacementCandidates.set(sessionId, { messages: incoming.messages, attempts: 1 })
+        }
+      }
+    }
+  }
+
+  const without = removeRefresh(state, key, generation)
+  for (const [id, session] of sessions) {
+    const previous = state.provider.sessions.get(id)
+    if (previous && isDeepStrictEqual(previous, session)) sessions.set(id, previous)
+  }
+  for (const [id, read] of transcripts) {
+    const previous = state.provider.transcripts.get(id)
+    if (previous?._tag === "Available" && read._tag === "Available" && sameTranscript(previous.messages, read.messages)) {
+      transcripts.set(id, previous)
+    }
+  }
+  const providerSessions = reuseMap(state.provider.sessions, sessions)
+  const providerTranscripts = reuseMap(state.provider.transcripts, transcripts)
+  const retainedLocalSessions = reuseMap(state.local.sessions, localSessions)
+  const retainedLocalTranscripts = reuseMap(state.local.transcripts, localTranscripts)
+  const retainedTemporaryIds = reuseSet(state.local.temporarySessionIds, temporarySessionIds)
+  return repairNavigatorSurface({
+    ...without,
+    historyStatus: reuseMap(state.historyStatus, historyStatus),
+    provider: providerSessions === state.provider.sessions && providerTranscripts === state.provider.transcripts
+      ? state.provider : { sessions: providerSessions, transcripts: providerTranscripts },
+    local: retainedLocalSessions === state.local.sessions && retainedLocalTranscripts === state.local.transcripts && retainedTemporaryIds === state.local.temporarySessionIds
+      ? state.local : { sessions: retainedLocalSessions, transcripts: retainedLocalTranscripts, temporarySessionIds: retainedTemporaryIds },
+    rewindAnchors: reuseMap(state.rewindAnchors, rewindAnchors),
+    drafts: reuseMap(state.drafts, drafts),
+    pendingCompletions: reuseMap(state.pendingCompletions, pendingCompletions),
+    replacementCandidates,
+    terminals: reuseMap(state.terminals, terminals),
+    unviewedSessionIds: reuseSet(state.unviewedSessionIds, unviewedSessionIds),
+    refresh: { ...without.refresh, initialPending: state.refresh.initialPending &&
+      (progress || [...without.refresh.active.values()].some((refresh) => refresh.reason === "initial")), appliedGenerationBySession },
+    ...(unavailableReasons.length > 0
+      ? { modal: { _tag: "Error", message: `Conversation refresh failed: ${unavailableReasons.join("; ")}` } as const }
+      : unstableSessionIds.size > 0
+      ? { modal: { _tag: "Error", message: "Conversation history kept changing during refresh. Refresh again when the session is idle." } as const }
+      : completionExhausted
+      ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
+      : {}),
+  })
+}
+
+function reuseMap<K, V>(previous: ReadonlyMap<K, V>, next: ReadonlyMap<K, V>): ReadonlyMap<K, V> {
+  return previous.size === next.size && [...next].every(([key, value]) => previous.has(key) && previous.get(key) === value)
+    ? previous : next
+}
+
+function reuseSet<A>(previous: ReadonlySet<A>, next: ReadonlySet<A>): ReadonlySet<A> {
+  return previous.size === next.size && [...next].every((value) => previous.has(value)) ? previous : next
+}
+
+function projectLocalSession(
+  state: ApplicationState,
+  session: AgentSession,
+  transcript?: TranscriptRead,
+  temporary?: boolean,
+): ApplicationState {
+  const sessions = new Map(state.local.sessions).set(session.id, session)
+  const transcripts = new Map(state.local.transcripts)
+  if (transcript !== undefined) transcripts.set(session.id, transcript)
+  const temporarySessionIds = new Set(state.local.temporarySessionIds)
+  if (temporary ?? session.transient) temporarySessionIds.add(session.id)
+  return { ...state, historyStatus: new Map(state.historyStatus).set(session.id, transcript ? historyStatusForRead(transcript) : { _tag: "Ready" }),
+    local: { sessions, transcripts, temporarySessionIds } }
+}
+
+function terminalShown(
+  state: ApplicationState,
+  sessionId: string,
+  ownerId: string,
+  returnTo: NavigatorSurface,
+): ApplicationState {
+  const previous = state.terminals.get(sessionId)
+  const pendingCompletions = new Map(state.pendingCompletions)
+  const completion = pendingCompletions.get(sessionId)
+  if (completion?.ownerId !== ownerId) pendingCompletions.delete(sessionId)
+  else if (completion) pendingCompletions.set(sessionId, { ...completion, markUnviewed: false })
+  return {
+    ...state,
+    surface: { _tag: "Terminal", sessionId, returnTo },
+    terminals: new Map(state.terminals).set(sessionId, {
+      ...(previous?.ownerId === ownerId ? previous : {}),
+      ownerId,
+      activity: previous?.activity ?? "idle",
+      phase: "running",
+    }),
+    pendingCompletions,
+    ...(previous?.ownerId !== ownerId ? {
+      replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
+      rewindAnchors: withoutMap(state.rewindAnchors, sessionId),
+    } : {}),
+    unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
+  }
+}
+
+function terminalReturned(state: ApplicationState, sessionId: string, draft?: DraftPreview): ApplicationState {
+  const observed = draft === undefined || state.terminals.get(sessionId)?.observationReceived || state.drafts.has(sessionId)
+    ? state
+    : { ...state, drafts: new Map(state.drafts).set(sessionId, { text: draft.text, exact: draft.exact }) }
+  const surface: NavigatorSurface = {
+    _tag: "Graph",
+    familySessionId: selectFamilyRootSessionId(observed, sessionId),
+    target: { kind: "endpoint", sessionId },
+  }
+  return { ...observed, surface }
+}
+
+function terminalActivity(
+  state: ApplicationState,
+  event: Extract<StateEvent, { readonly _tag: "TerminalActivityObserved" }>,
+): ApplicationState {
+  const existing = state.terminals.get(event.sessionId)
+  if (!existing || existing.ownerId !== event.ownerId) return state
+  const { pendingSubmission: _, ...idleTerminal } = existing
+  const terminals = new Map(state.terminals).set(event.sessionId, {
+    ...(event.activity === "idle" ? idleTerminal : existing), activity: event.activity,
+  })
+  const rewindAnchors = new Map(state.rewindAnchors)
+  const drafts = new Map(state.drafts)
+  if (event.activity === "working") {
+    const anchor = rewindAnchors.get(event.sessionId)
+    if (anchor) rewindAnchors.set(event.sessionId, { ...anchor, submitted: true })
+    const draft = drafts.get(event.sessionId)
+    if (draft?.rewind) drafts.set(event.sessionId, { ...draft, submitted: true })
+  }
+  if (event.activity !== "idle") {
+    return {
+      ...state,
+      terminals,
+      rewindAnchors,
+      drafts,
+      pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId),
+      replacementCandidates: existing.unresolvedRewind || existing.pendingSubmission ||
+        (existing.replacement && !existing.replacement.settled)
+        ? state.replacementCandidates : withoutMap(state.replacementCandidates, event.sessionId),
+    }
+  }
+  const draft = drafts.get(event.sessionId)
+  const anchor = rewindAnchors.get(event.sessionId)
+  if ((anchor && !anchor.submitted) || (draft?.rewind && !draft.submitted) ||
+    (existing.unresolvedRewind && !existing.pendingSubmission && existing.activity === "idle" &&
+      !state.pendingCompletions.has(event.sessionId))) {
+    return { ...state, terminals, pendingCompletions: withoutMap(state.pendingCompletions, event.sessionId) }
+  }
+  const version = state.nextCompletionVersion + 1
+  return {
+    ...state,
+    terminals,
+    rewindAnchors,
+    pendingCompletions: new Map(state.pendingCompletions).set(event.sessionId, {
+      ownerId: event.ownerId,
+      version,
+      baseline: selectProjectedTranscript(state, event.sessionId),
+      markUnviewed: !event.wasVisible,
+      attempt: 0,
+    }),
+    nextCompletionVersion: version,
+  }
+}
+
+function observeDraft(state: ApplicationState, sessionId: string, draft?: DraftPreview): ApplicationState {
+  const drafts = new Map(state.drafts)
+  const rewindAnchors = new Map(state.rewindAnchors)
+  const terminals = new Map(state.terminals)
+  if (draft) drafts.set(sessionId, draft)
+  else drafts.delete(sessionId)
+  if (draft?.rewind) {
+    const read = selectTranscriptRead(state, sessionId)
+    const targetText = normalizeDraftText(draft.rewindTarget ?? draft.text)
+    const matches = read?._tag === "Available"
+      ? read.messages.filter((message) =>
+          message.role === "user" && message.visible && matchesRewindTarget(message.preview, draft))
+      : []
+    const restore = terminals.get(sessionId)?.rewindRestore
+    const previousAnchor = rewindAnchors.get(sessionId) ?? restore?.anchor
+    const restoresSubmission = previousAnchor?.submitted && previousAnchor.submissionText !== undefined &&
+      matchesRewindTarget(previousAnchor.submissionText, draft)
+    if (restoresSubmission) {
+      rewindAnchors.set(sessionId, { ...previousAnchor, targetText, submitted: draft.submitted ?? false })
+      const terminal = terminals.get(sessionId)
+      if (terminal && restore) {
+        const { rewindRestore: _, ...rest } = terminal
+        terminals.set(sessionId, { ...rest, unresolvedRewind: false, replacement: restore.replacement })
+      }
+    } else if (matches.length === 1) {
+      const terminal = terminals.get(sessionId)
+      if (terminal && read?._tag === "Available") {
+        const { rewindRestore: _, ...rest } = terminal
+        const targetIndex = read.messages.findIndex((message) => message.id === matches[0]!.id)
+        terminals.set(sessionId, { ...rest, unresolvedRewind: false, replacement: {
+          prefix: read.messages.slice(0, targetIndex),
+          discardedMessageIds: new Set([
+            ...(terminal.replacement?.discardedMessageIds ?? []),
+            ...read.messages.slice(targetIndex).map((message) => message.id),
+          ]),
+        } })
+      }
+      rewindAnchors.set(sessionId, {
+        targetMessageId: matches[0]!.id,
+        submitted: draft.submitted ?? false,
+        targetText,
+        ...(draft.submitted ? { submissionText: draft.text } : {}),
+      })
+    } else {
+      const previousDraft = state.drafts.get(sessionId)
+      const sameRewind = previousAnchor?.targetText === targetText ||
+        (previousDraft?.rewind && normalizeDraftText(previousDraft.rewindTarget ?? previousDraft.text) === targetText)
+      if (!sameRewind) rewindAnchors.delete(sessionId)
+      else if (previousAnchor) rewindAnchors.set(sessionId, { ...previousAnchor, submitted: draft.submitted ?? false })
+      const terminal = terminals.get(sessionId)
+      if (terminal && !rewindAnchors.has(sessionId) && !terminal.replacement) {
+        terminals.set(sessionId, { ...terminal, unresolvedRewind: true })
+      }
+    }
+  }
+  return {
+    ...state, drafts, rewindAnchors, terminals,
+    ...(draft?.rewind && !draft.submitted
+      ? { pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+          terminals: state.terminals.has(sessionId)
+            ? new Map(terminals).set(sessionId, {
+                ...terminals.get(sessionId)!, pendingSubmission: undefined, activity: "idle",
+                historyRevision: (state.terminals.get(sessionId)?.historyRevision ?? 0) + 1,
+              })
+            : state.terminals,
+          replacementCandidates: withoutMap(state.replacementCandidates, sessionId) }
+      : {}),
+  }
+}
+
+function observeSubmission(state: ApplicationState, sessionId: string, text?: string): ApplicationState {
+  const anchor = state.rewindAnchors.get(sessionId)
+  const draft = state.drafts.get(sessionId)
+  const terminal = state.terminals.get(sessionId)
+  const { rewindRestore: _, ...submittedTerminal } = terminal ?? {}
+  return {
+    ...state,
+    terminals: terminal
+      ? new Map(state.terminals).set(sessionId, {
+          ...submittedTerminal, activity: terminal.activity, phase: terminal.phase,
+          historyRevision: (terminal.historyRevision ?? 0) + 1,
+          pendingSubmission: { baseline: selectProjectedTranscript(state, sessionId), attempt: 0 },
+        })
+      : state.terminals,
+    rewindAnchors: anchor
+      ? new Map(state.rewindAnchors).set(sessionId, { ...anchor, submitted: true, submissionText: text })
+      : state.rewindAnchors,
+    drafts: draft ? new Map(state.drafts).set(sessionId, { ...draft, submitted: true }) : state.drafts,
+    pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+    replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
+  }
+}
+
+function terminalStopped(
+  state: ApplicationState,
+  sessionId: string,
+  cleanupIncomplete: boolean,
+  focusExitedSession = false,
+): ApplicationState {
+  const terminal = state.terminals.get(sessionId)
+  const wasVisible = state.surface._tag === "Terminal" && state.surface.sessionId === sessionId
+  const terminals = new Map(state.terminals)
+  if (cleanupIncomplete) {
+    terminals.set(sessionId, {
+      ...(terminal?.ownerId === undefined ? {} : { ownerId: terminal.ownerId }),
+      activity: terminal?.activity ?? "idle",
+      phase: "cleanup-incomplete",
+    })
+  } else terminals.delete(sessionId)
+  const stopped = {
+    ...state,
+    terminals,
+    surface: wasVisible ? state.surface.returnTo : state.surface,
+    drafts: withoutMap(state.drafts, sessionId),
+    rewindAnchors: withoutMap(state.rewindAnchors, sessionId),
+    pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+    replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
+    unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
+  }
+  return focusExitedSession || wasVisible
+    ? repairNavigatorSurface(stopped, stoppedSessionSurface(state, sessionId))
+    : stopped
+}
+
+function rollbackTransient(
+  state: ApplicationState,
+  sessionId: string,
+  restoreTo: NavigatorSurface,
+): ApplicationState {
+  if (!state.local.temporarySessionIds.has(sessionId)) return state
+  return {
+    ...state,
+    historyStatus: withoutMap(state.historyStatus, sessionId),
+    local: {
+      sessions: withoutMap(state.local.sessions, sessionId),
+      transcripts: withoutMap(state.local.transcripts, sessionId),
+      temporarySessionIds: without(state.local.temporarySessionIds, sessionId),
+    },
+    relations: state.relations.filter((relation) => relation.childSessionId !== sessionId),
+    surface: restoreTo,
+    terminals: withoutMap(state.terminals, sessionId),
+    drafts: withoutMap(state.drafts, sessionId),
+    rewindAnchors: withoutMap(state.rewindAnchors, sessionId),
+    pendingCompletions: withoutMap(state.pendingCompletions, sessionId),
+    replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
+    unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
+  }
+}
+
+function adoptSessionIdentity(
+  state: ApplicationState,
+  previousSessionId: string,
+  session: AgentSession,
+  kind: IdentityTransitionKind,
+  relation?: BranchRelation,
+): ApplicationState {
+  if (previousSessionId === session.id) return state
+  const sessionId = session.id
+  const replacement = { kind, ...(relation === undefined ? {} : { relation }) }
+  if (kind === "native-fork") {
+    const metadata = replaceSessionIdInProjectState({
+      relations: state.relations,
+      removals: state.removals,
+      navigation: navigationForSurface(state.surface),
+    }, previousSessionId, sessionId, replacement)
+    const localSessions = new Map(state.local.sessions).set(sessionId, session)
+    return {
+      ...state,
+      historyStatus: new Map(state.historyStatus).set(sessionId, { _tag: "Ready" }),
+      local: {
+        sessions: localSessions,
+        transcripts: state.local.transcripts,
+        temporarySessionIds: session.transient
+          ? new Set(state.local.temporarySessionIds).add(sessionId)
+          : state.local.temporarySessionIds,
+      },
+      relations: relation === undefined ? metadata.relations : upsertRelation(metadata.relations, relation),
+      removals: metadata.removals,
+      surface: replaceSessionIdInSurface(
+        state.surface,
+        previousSessionId,
+        sessionId,
+        replacement,
+      ),
+      modal: replaceSessionIdInModal(state, previousSessionId, sessionId, replacement),
+      terminals: migrateMapKey(state.terminals, previousSessionId, sessionId),
+      drafts: migrateMapKey(state.drafts, previousSessionId, sessionId),
+      rewindAnchors: migrateMapKey(state.rewindAnchors, previousSessionId, sessionId),
+      pendingCompletions: migrateMapKey(state.pendingCompletions, previousSessionId, sessionId),
+      unviewedSessionIds: migrateSet(state.unviewedSessionIds, previousSessionId, sessionId),
+    }
+  }
+  const metadata = replaceSessionIdInProjectState({
+    relations: state.relations,
+    removals: state.removals,
+    navigation: navigationForSurface(state.surface),
+  }, previousSessionId, sessionId, replacement)
+  const localSessions = migrateMapKey(state.local.sessions, previousSessionId, sessionId)
+  localSessions.set(sessionId, session)
+  const temporarySessionIds = without(state.local.temporarySessionIds, previousSessionId)
+  temporarySessionIds.add(sessionId)
+  const surface = replaceSessionIdInSurface(state.surface, previousSessionId, sessionId, replacement)
+  const active = new Map<string, ActiveRefresh>()
+  for (const [key, refresh] of state.refresh.active) {
+    active.set(key, {
+      ...refresh,
+      sessionIds: migrateSet(refresh.sessionIds, previousSessionId, sessionId),
+      ...(refresh.stagedTranscripts ? { stagedTranscripts: withoutMap(refresh.stagedTranscripts, previousSessionId) } : {}),
+      ...(refresh.progressSessionIds ? { progressSessionIds: migrateSet(refresh.progressSessionIds, previousSessionId, sessionId) } : {}),
+    })
+  }
+  return {
+    ...state,
+    historyStatus: migrateMapKey(state.historyStatus, previousSessionId, sessionId),
+    provider: {
+      sessions: migrateMapKey(state.provider.sessions, previousSessionId, sessionId),
+      transcripts: migrateMapKey(state.provider.transcripts, previousSessionId, sessionId),
+    },
+    local: {
+      sessions: localSessions,
+      transcripts: migrateMapKey(state.local.transcripts, previousSessionId, sessionId),
+      temporarySessionIds,
+    },
+    relations: relation === undefined ? metadata.relations : upsertRelation(metadata.relations, relation),
+    removals: metadata.removals,
+    surface,
+    modal: replaceSessionIdInModal(state, previousSessionId, sessionId, replacement),
+    terminals: migrateMapKey(state.terminals, previousSessionId, sessionId),
+    drafts: migrateMapKey(state.drafts, previousSessionId, sessionId),
+    rewindAnchors: migrateMapKey(state.rewindAnchors, previousSessionId, sessionId),
+    pendingCompletions: migrateMapKey(state.pendingCompletions, previousSessionId, sessionId),
+    unviewedSessionIds: migrateSet(state.unviewedSessionIds, previousSessionId, sessionId),
+    replacementCandidates: migrateMapKey(state.replacementCandidates, previousSessionId, sessionId),
+    refresh: {
+      ...state.refresh,
+      active,
+      appliedGenerationBySession: migrateMapKey(state.refresh.appliedGenerationBySession, previousSessionId, sessionId),
+    },
+  }
+}
+
+function advanceCompletion(state: ApplicationState, sessionId: string, message?: string): ApplicationState {
+  const completion = state.pendingCompletions.get(sessionId)
+  if (!completion) return state
+  const next = advanceCompletionValue(completion)
+  const pendingCompletions = new Map(state.pendingCompletions)
+  if (next) pendingCompletions.set(sessionId, next)
+  else pendingCompletions.delete(sessionId)
+  const terminal = state.terminals.get(sessionId)
+  return {
+    ...state,
+    pendingCompletions,
+    ...(!next && terminal?.replacement ? { terminals: new Map(state.terminals).set(sessionId, {
+      ...terminal, replacement: { ...terminal.replacement, settled: true },
+    }) } : {}),
+    ...(next || message === undefined
+      ? {}
+      : { modal: { _tag: "Error", message: "Completed response did not become available" } as const }),
+  }
+}
+
+function advanceCompletionValue(completion: PendingCompletion): PendingCompletion | undefined {
+  const attempt = completion.attempt + 1
+  return attempt >= MAX_COMPLETION_REFRESH_ATTEMPTS ? undefined : { ...completion, attempt }
+}
+
+function removeRefresh(state: ApplicationState, key: string, generation: number): ApplicationState {
+  const active = state.refresh.active.get(key)
+  if (!active || active.generation !== generation) return state
+  const next = new Map(state.refresh.active)
+  next.delete(key)
+  return { ...state, refresh: { ...state.refresh, active: next } }
+}
+
+function reconcileTranscript(
+  previous: TranscriptRead | undefined,
+  incoming: TranscriptRead,
+  nonIdle: boolean,
+  anchor: RewindAnchor | undefined,
+  completion: PendingCompletion | undefined,
+  candidate: { readonly messages: readonly AgentMessage[]; readonly attempts: number; readonly userPrefix?: boolean } | undefined,
+  terminal: TerminalState | undefined,
+): {
+  readonly read: TranscriptRead
+  readonly accepted: boolean
+  readonly clearAnchor?: boolean
+  readonly completed?: boolean
+  readonly candidate?: { readonly messages: readonly AgentMessage[]; readonly attempts: number; readonly userPrefix?: boolean }
+  readonly replacement?: TerminalState["replacement"]
+  readonly unstable?: boolean
+} {
+  const retained = completion ? { _tag: "Available" as const, messages: completion.baseline } : previous ?? incoming
+  if (incoming._tag !== "Available" && previous?._tag === "Available") return { read: retained, accepted: false }
+  if (incoming._tag !== "Available" && (nonIdle || terminal?.unresolvedRewind || terminal?.replacement)) {
+    return { read: retained, accepted: false }
+  }
+  const targetIndex = previous?._tag === "Available" && anchor
+    ? previous.messages.findIndex((message) => message.id === anchor.targetMessageId) : -1
+  let baseline = targetIndex >= 0 && previous?._tag === "Available"
+    ? previous.messages.slice(0, targetIndex)
+    : retained._tag === "Available" ? retained.messages : []
+  const replacement = terminal?.replacement
+  if (incoming._tag === "Available" && (
+    (replacement && ((!replacement.settled && !isTranscriptPrefix(replacement.prefix, incoming.messages)) ||
+      incoming.messages.some((message) => replacement.discardedMessageIds.has(message.id)))) ||
+    (!replacement && targetIndex >= 0 && (!isTranscriptPrefix(baseline, incoming.messages) ||
+      (previous?._tag === "Available" && incoming.messages.some((message) =>
+        previous.messages.slice(targetIndex).some((old) => old.id === message.id)))))
+  )) return { read: retained, accepted: false }
+  const unexpectedReplacement = incoming._tag === "Available" && previous?._tag === "Available" &&
+    !isTranscriptPrefix(previous.messages, incoming.messages) && !anchor && (!replacement || replacement.settled)
+  const replacedCompletedTurn = unexpectedReplacement && completion !== undefined &&
+    !isTranscriptPrefix(incoming.messages, previous.messages) && completionTranscriptReady([], incoming.messages)
+  const recoverUserPrefix = unexpectedReplacement &&
+    (terminal?.unresolvedRewind || terminal?.pendingSubmission !== undefined || completion !== undefined)
+  let recoveredReplacement: TerminalState["replacement"]
+  let confirmedReplacement = false
+  // Matching reads are a bounded consistency heuristic, not provider revisions.
+  // A prefix alone never proves that a new turn completed.
+  if (recoverUserPrefix && incoming._tag === "Available" && previous?._tag === "Available") {
+    let commonLength = 0
+    while (commonLength < previous.messages.length && sameLogicalMessage(previous.messages[commonLength]!, incoming.messages[commonLength])) commonLength += 1
+    const oldIds = new Set(previous.messages.map((message) => message.id))
+    const suffix = incoming.messages.slice(commonLength)
+    // Retained identities must be the exact logical prefix, never a reordered or mutated old path.
+    if (suffix.some((message) => oldIds.has(message.id))) return { read: retained, accepted: false }
+    const novelUser = suffix.some((message) => message.visible && message.role === "user")
+    if (novelUser || terminal?.unresolvedRewind) {
+      baseline = incoming.messages.slice(0, commonLength)
+      const userPrefix = stableTranscriptWhileNonIdle(baseline, incoming.messages)
+      confirmedReplacement = candidate?.userPrefix === true && isTranscriptPrefix(candidate.messages, userPrefix) &&
+        candidate.messages.length === userPrefix.length
+      if (!confirmedReplacement) {
+        const attempts = (candidate?.attempts ?? 0) + 1
+        return { read: retained, accepted: false, ...(attempts >= MAX_REPLACEMENT_READS
+          ? { unstable: true } : { candidate: { messages: userPrefix, attempts, userPrefix: true } }) }
+      }
+      recoveredReplacement = { prefix: baseline,
+        discardedMessageIds: new Set([
+          ...(replacement?.discardedMessageIds ?? []),
+          ...previous.messages.slice(commonLength).map((message) => message.id),
+        ]) }
+    }
+  }
+  if (unexpectedReplacement && !confirmedReplacement && !nonIdle && (!completion || replacedCompletedTurn)) {
+    confirmedReplacement = candidate !== undefined && !candidate.userPrefix && sameTranscript(candidate.messages, incoming.messages)
+    if (!confirmedReplacement) {
+      const attempts = (candidate?.attempts ?? 0) + 1
+      return {
+        read: retained, accepted: false,
+        ...(attempts >= MAX_REPLACEMENT_READS
+          ? { unstable: true }
+          : { candidate: { messages: incoming.messages, attempts } }),
+      }
+    }
+  }
+  if (unexpectedReplacement && nonIdle && !confirmedReplacement) return { read: retained, accepted: false }
+  const completed = completion !== undefined && incoming._tag === "Available" &&
+    completionTranscriptReady(confirmedReplacement && !recoveredReplacement ? [] : baseline, incoming.messages)
+  if (completion && !completed && incoming._tag !== "Available") return { read: retained, accepted: false }
+  const read = incoming._tag === "Available" && (nonIdle || (completion && !completed))
+    ? { _tag: "Available" as const, messages: stableTranscriptWhileNonIdle(baseline, incoming.messages) }
+    : incoming
+  if (confirmedReplacement && !recoveredReplacement && terminal && previous?._tag === "Available" && read._tag === "Available") {
+    const retainedIds = new Set(read.messages.map((message) => message.id))
+    recoveredReplacement = { prefix: read.messages, settled: !completion || completed,
+      discardedMessageIds: new Set([
+        ...(replacement?.discardedMessageIds ?? []),
+        ...previous.messages.filter((message) => !retainedIds.has(message.id)).map((message) => message.id),
+      ]) }
+  }
+  // Invalidate placement from the accepted history only, never a rejected working read.
+  const clearAnchor = anchor !== undefined && read._tag === "Available" &&
+    !read.messages.some((message) => message.id === anchor.targetMessageId)
+  return { read, accepted: true, completed, clearAnchor, ...(recoveredReplacement ? { replacement: recoveredReplacement } : {}) }
+}
+
+function completionTranscriptReady(
+  previous: readonly AgentMessage[],
+  refreshed: readonly AgentMessage[],
+): boolean {
+  if (!isTranscriptPrefix(previous, refreshed)) return false
+  if (previous.length === refreshed.length) return false
+  const lastVisibleUserIndex = refreshed.findLastIndex((message) => message.role === "user" && message.visible)
+  const afterUser = refreshed.slice(lastVisibleUserIndex + 1)
+  const signals = refreshed.slice(Math.max(0, lastVisibleUserIndex)).filter((message) => message.turnComplete !== undefined)
+  return signals.at(-1)?.turnComplete ?? afterUser.some((message) => message.role === "agent")
+}
+
+function stableTranscriptWhileNonIdle(
+  previous: readonly AgentMessage[],
+  refreshed: readonly AgentMessage[],
+): readonly AgentMessage[] {
+  if (!isTranscriptPrefix(previous, refreshed)) return previous
+  let acceptedLength = previous.length
+  for (let index = previous.length; index < refreshed.length; index += 1) {
+    if (refreshed[index]?.role === "user" && refreshed[index]?.visible) acceptedLength = index + 1
+  }
+  return refreshed.slice(0, acceptedLength)
+}
+
+function isTranscriptPrefix(prefix: readonly AgentMessage[], transcript: readonly AgentMessage[]): boolean {
+  return prefix.length <= transcript.length && prefix.every((message, index) => sameLogicalMessage(message, transcript[index]))
+}
+
+function sameTranscript(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
+  return left.length === right.length && left.every((message, index) => sameMessage(message, right[index]))
+}
+
+function sameMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
+  return sameLogicalMessage(left, right) && left.historical === right?.historical && left.turnComplete === right?.turnComplete
+}
+
+// Compaction and turn completion can update metadata without replacing logical history.
+function sameLogicalMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
+  return right !== undefined && left.id === right.id && left.role === right.role &&
+    left.preview === right.preview && left.text === right.text && left.ordinal === right.ordinal && left.visible === right.visible &&
+    left.displayGroupId === right.displayGroupId &&
+    left.copyIdentity === right.copyIdentity && left.historyBoundary === right.historyBoundary
+}
+
+function preserveOwnedSessions(
+  state: ApplicationState,
+  incoming: ReadonlyMap<string, AgentSession>,
+): Map<string, AgentSession> {
+  const sessions = new Map(incoming)
+  for (const sessionId of state.terminals.keys()) {
+    const session = state.local.sessions.get(sessionId) ?? state.provider.sessions.get(sessionId)
+    if (!sessions.has(sessionId) && session) sessions.set(sessionId, session)
+  }
+  return sessions
+}
+
+function preserveOwnedTranscripts(
+  state: ApplicationState,
+  incoming: ReadonlyMap<string, TranscriptRead>,
+): Map<string, TranscriptRead> {
+  const transcripts = new Map(incoming)
+  for (const sessionId of state.terminals.keys()) {
+    const transcript = selectTranscriptRead(state, sessionId)
+    if (!transcripts.has(sessionId) && transcript) transcripts.set(sessionId, transcript)
+  }
+  return transcripts
+}
+
+function replaceSessionIdInSurface(
+  surface: ApplicationSurface,
+  previousSessionId: string,
+  sessionId: string,
+  options: { readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation },
+): ApplicationSurface {
+  if (surface._tag === "Terminal") {
+    return {
+      ...surface,
+      sessionId: surface.sessionId === previousSessionId ? sessionId : surface.sessionId,
+      returnTo: replaceNavigatorSurface(surface.returnTo, previousSessionId, sessionId, options),
+    }
+  }
+  return replaceNavigatorSurface(surface, previousSessionId, sessionId, options)
+}
+
+function replaceNavigatorSurface(
+  surface: NavigatorSurface,
+  previousSessionId: string,
+  sessionId: string,
+  options: { readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation },
+): NavigatorSurface {
+  const navigation = replaceSessionIdInProjectState({
+    relations: [],
+    removals: [],
+    navigation: navigationForSurface(surface),
+  }, previousSessionId, sessionId, options).navigation
+  if (navigation?.view === "roots") {
+    return { _tag: "Roots", selectedSessionId: navigation.selectedSessionId }
+  }
+  if (navigation?.view === "graph") {
+    return {
+      _tag: "Graph",
+      familySessionId: navigation.familySessionId,
+      target: navigation.target,
+    }
+  }
+  return surface
+}
+
+function replaceSessionIdInModal(
+  state: ApplicationState,
+  previousSessionId: string,
+  sessionId: string,
+  options: { readonly kind: IdentityTransitionKind; readonly relation?: BranchRelation },
+): ApplicationModal | null {
+  const modal = state.modal
+  if (modal?._tag === "ConfirmStop") {
+    return { ...modal, sessionId: modal.sessionId === previousSessionId ? sessionId : modal.sessionId }
+  }
+  if (modal?._tag === "ConfirmRemoval") {
+    const metadata = replaceSessionIdInProjectState({
+      relations: state.relations,
+      removals: [modal.removal],
+    }, previousSessionId, sessionId, options)
+    const removal = metadata.removals[0]
+    if (!removal || removalContainsSession(removal, previousSessionId)) return null
+    return {
+      ...modal,
+      removal,
+      affectedSessionIds: [...new Set(modal.affectedSessionIds.map((id) =>
+        id === previousSessionId ? sessionId : id))],
+    }
+  }
+  return modal
+}
+
+function stoppedSessionSurface(state: ApplicationState, sessionId: string): NavigatorSurface {
+  const forest = selectConversationForest(state)
+  const graph = forest.graphBySessionId.get(sessionId)
+  const endpointId = graph?.endpointBySessionId.get(sessionId)
+  if (graph && endpointId) {
+    if (!state.local.temporarySessionIds.has(sessionId)) {
+      return {
+        _tag: "Graph",
+        familySessionId: graph.rootSessionId,
+        target: { kind: "endpoint", sessionId },
+      }
+    }
+    let node = graph.nodes.get(endpointId)
+    while (node?.parentId) {
+      node = graph.nodes.get(node.parentId)
+      if (node && node.kind !== "origin") {
+        const target = navigationTargetForNode(node)
+        if (target) {
+          return { _tag: "Graph", familySessionId: graph.rootSessionId, target }
+        }
+      }
+    }
+    const graphIndex = forest.graphs.indexOf(graph)
+    const remaining = forest.graphs.filter((candidate) => candidate !== graph)
+    const selected = remaining[Math.min(
+      Math.max(0, graphIndex),
+      Math.max(0, remaining.length - 1),
+    )]
+    return { _tag: "Roots", selectedSessionId: selected?.rootSessionId ?? null }
+  }
+  if (state.surface._tag === "Terminal") return state.surface.returnTo
+  return state.surface
+}
+
+function repairNavigatorSurface(
+  state: ApplicationState,
+  preferred?: NavigatorSurface,
+): ApplicationState {
+  if (!preferred && state.surface._tag === "Terminal") return state
+  const requested = preferred ?? state.surface as NavigatorSurface
+  const forest = selectConversationForest(state)
+  if (requested._tag === "Roots") {
+    // The first successful read is not a navigation request.
+    if (requested.selectedSessionId === null) return { ...state, surface: requested }
+    const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(requested.selectedSessionId!))
+    if (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready") {
+      const removed = state.removals.some((removal) => removal.kind === "tree" &&
+        (family.sessionIds.has(removal.rootSessionId) || removal.memberSessionIds.some((id) => family.sessionIds.has(id))))
+      if (!removed) return { ...state, surface: { _tag: "Roots", selectedSessionId: family.root.id } }
+    }
+    const selected = requested.selectedSessionId === null
+      ? undefined
+      : forest.graphBySessionId.get(requested.selectedSessionId) ??
+        forest.graphByRootSessionId.get(requested.selectedSessionId)
+    return {
+      ...state,
+      surface: {
+        _tag: "Roots",
+        selectedSessionId: selected?.rootSessionId ?? forest.graphs[0]?.rootSessionId ?? null,
+      },
+    }
+  }
+
+  const graph = forest.graphBySessionId.get(requested.familySessionId) ??
+    forest.graphByRootSessionId.get(requested.familySessionId)
+  if (!graph) {
+    return {
+      ...state,
+      surface: { _tag: "Roots", selectedSessionId: forest.graphs[0]?.rootSessionId ?? null },
+    }
+  }
+  const requestedNodeId = nodeIdForNavigationTarget(graph, requested.target)
+  const visibleSessionIds = selectVisibleEndpointSessionIds(state)
+  const selectedNodeId = visibleGraphNodeId(graph, requestedNodeId, visibleSessionIds) ??
+    initialVisibleGraphNodeId(graph, visibleSessionIds)
+  const selected = selectedNodeId ? graph.nodes.get(selectedNodeId) : undefined
+  const target = selected && selected.kind !== "origin"
+    ? navigationTargetForNode(selected)
+    : undefined
+  if (!target) {
+    return {
+      ...state,
+      surface: { _tag: "Roots", selectedSessionId: graph.rootSessionId },
+    }
+  }
+  return {
+    ...state,
+    surface: { _tag: "Graph", familySessionId: graph.rootSessionId, target },
+  }
+}
+
+function nodeIdForNavigationTarget(
+  graph: ConversationGraph,
+  target: NavigationTarget,
+): string | undefined {
+  if (target.kind === "endpoint") return graph.endpointBySessionId.get(target.sessionId)
+  for (const reference of [target.preferred, ...target.aliases]) {
+    for (const node of graph.nodes.values()) {
+      if (
+        node.kind === "message" &&
+        node.aliases.some((alias) =>
+          alias.sessionId === reference.sessionId && alias.messageId === reference.messageId)
+      ) return node.id
+    }
+  }
+  return undefined
+}
+
+function navigationTargetForNode(node: Exclude<ConversationGraphNode, { readonly kind: "origin" }>): NavigationTarget | undefined {
+  if (node.kind === "endpoint") return { kind: "endpoint", sessionId: node.session.id }
+  const preferred = node.forkTarget ?? node.aliases.at(-1) ?? node.aliases[0]
+  return preferred
+    ? { kind: "message", preferred, aliases: node.aliases }
+    : undefined
+}
+
+function removalContainsSession(removal: ConversationRemoval, sessionId: string): boolean {
+  if (removal.kind === "tree") {
+    return removal.rootSessionId === sessionId || removal.memberSessionIds.includes(sessionId)
+  }
+  if (removal.target.kind === "endpoint") return removal.target.sessionId === sessionId
+  return removal.target.aliases.some((alias) => alias.sessionId === sessionId)
+}
+
+function upsertRelation(relations: readonly BranchRelation[], relation: BranchRelation): readonly BranchRelation[] {
+  return [...relations.filter((item) => item.childSessionId !== relation.childSessionId), relation]
+}
+
+function migrateMapKey<V>(source: ReadonlyMap<string, V>, previous: string, next: string): Map<string, V> {
+  const migrated = new Map(source)
+  const value = migrated.get(previous)
+  migrated.delete(previous)
+  if (value !== undefined && !migrated.has(next)) migrated.set(next, value)
+  return migrated
+}
+
+function migrateSet(source: ReadonlySet<string>, previous: string, next: string): Set<string> {
+  const migrated = new Set(source)
+  if (migrated.delete(previous)) migrated.add(next)
+  return migrated
+}
+
+function without<T>(source: ReadonlySet<T>, value: T): Set<T> {
+  const next = new Set(source)
+  next.delete(value)
+  return next
+}
+
+function withoutMap<K, V>(source: ReadonlyMap<K, V>, key: K): Map<K, V> {
+  const next = new Map(source)
+  next.delete(key)
+  return next
+}
+
+function normalizeDraftText(text: string): string {
+  return text.replace(/\s+/gu, " ").trim()
+}
+
+function matchesRewindTarget(text: string, draft: DraftPreview): boolean {
+  if (!draft.rewindTargetLines?.length) return normalizeDraftText(text) === normalizeDraftText(draft.rewindTarget ?? draft.text)
+  const rows = draft.rewindTargetLines.map((row) => normalizeDraftText(row)
+    .replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(/ /gu, "\\s+"))
+  return new RegExp(`^${rows.join("\\s*")}$`, "u").test(text.trim())
+}
+
+function isShutdownEvent(event: StateEvent): boolean {
+  return event._tag === "ShutdownCompleted" || event._tag === "ShutdownFailed"
+}

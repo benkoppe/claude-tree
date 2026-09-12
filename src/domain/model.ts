@@ -1,0 +1,127 @@
+export interface AgentSession {
+  readonly id: string
+  readonly title: string
+  readonly lastModified: number
+  readonly gitBranch?: string
+  readonly transient?: boolean
+}
+
+export type MessageRole = "user" | "agent" | "system"
+
+export interface AgentMessage {
+  readonly id: string
+  readonly role: MessageRole
+  readonly preview: string
+  /** Original text blocks in provider order, preserving whitespace. */
+  readonly text?: string
+  readonly ordinal: number
+  readonly visible: boolean
+  readonly displayGroupId?: string
+  readonly turnComplete?: boolean
+  readonly copyIdentity?: string
+  /** Provider-confirmed context compaction, not a user rewind or new prompt. */
+  readonly historyBoundary?: "compaction"
+  /** Provider-confirmed pre-compaction history outside the active context. */
+  readonly historical?: true
+}
+
+export interface MessageRef {
+  readonly sessionId: string
+  readonly messageId: string
+}
+
+export interface DraftPreview {
+  readonly text: string
+  readonly exact: boolean
+  readonly rewind?: boolean
+  readonly rewindTarget?: string
+  /** Original complete multiline composer rows, before edits; only row joins may be ambiguous. */
+  readonly rewindTargetLines?: readonly string[]
+  readonly submitted?: boolean
+}
+
+export type AgentActivity = "working" | "blocked" | "idle"
+
+export interface TerminalScreen {
+  readonly lines: readonly string[]
+  readonly cursor: {
+    readonly x: number
+    readonly y: number
+    readonly visible: boolean
+  }
+}
+
+export interface TerminalObserver {
+  observeInput?(data: Uint8Array): TerminalSubmissionObservation | void
+  observeOutput(data: Uint8Array): readonly AgentActivity[]
+  observeScreen(screen: TerminalScreen): AgentActivity | undefined
+  /** Explicit, bounded resampling; normal render frames must not advance recovery confirmation. */
+  reconcileScreen?(screen: TerminalScreen, phase: "sample" | "confirm"): AgentActivity | undefined
+  /** Undefined is unknown; null is a positively observed empty composer. */
+  observeDraft(screen: TerminalScreen): DraftPreview | null | undefined
+  /** Drain semantic occurrences once, before publishing the same snapshot's draft or activity. */
+  takeObservations?(): readonly TerminalObservation[]
+}
+
+export interface TerminalSubmissionObservation {
+  readonly _tag: "Submission"
+  readonly text?: string
+}
+
+export type TerminalObservation =
+  /** A confirmed conversation restore, independent of composer readability or session identity. */
+  | { readonly _tag: "Rewind" }
+  | { readonly _tag: "Draft"; readonly draft: DraftPreview | null }
+  | TerminalSubmissionObservation
+
+export interface SharedMessage {
+  readonly parentMessageId: string
+  readonly childMessageId: string
+}
+
+export interface BranchDerivation {
+  readonly childSessionId: string
+  readonly parentSessionId: string
+  readonly sourceMessageId: string
+  readonly sharedMessages: readonly SharedMessage[]
+}
+
+export interface AgentSessionSnapshot {
+  readonly sessions: readonly AgentSession[]
+  readonly transcripts: ReadonlyMap<string, TranscriptRead>
+}
+
+export type TranscriptRead =
+  | { readonly _tag: "Available"; readonly messages: readonly AgentMessage[] }
+  | { readonly _tag: "Missing" }
+  | { readonly _tag: "Unavailable"; readonly reason: string }
+
+export type NavigationTarget =
+  | {
+      readonly kind: "message"
+      readonly preferred: MessageRef
+      readonly aliases: readonly MessageRef[]
+    }
+  | { readonly kind: "endpoint"; readonly sessionId: string }
+
+export type NavigationState =
+  | { readonly view: "roots"; readonly selectedSessionId: string | null }
+  | {
+      readonly view: "graph"
+      readonly familySessionId: string
+      readonly target: NavigationTarget
+    }
+  | { readonly view: "terminal"; readonly sessionId: string }
+
+export class NullTerminalObserver implements TerminalObserver {
+  observeInput(): void {}
+  observeOutput(): readonly AgentActivity[] {
+    return []
+  }
+  observeScreen(): undefined {
+    return undefined
+  }
+  observeDraft(): undefined {
+    return undefined
+  }
+}
