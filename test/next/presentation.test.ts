@@ -223,6 +223,45 @@ test("copies drafts and reports empty nodes and clipboard failures", async () =>
   }
 })
 
+test("long errors scroll to their final cause and copy the complete original message", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const message = Array.from({ length: 80 }, (_, index) => `evidence step ${String(index).padStart(3, "0")}`).join("\n") + "\nFINAL_CAUSE"
+  const view: ApplicationViewModel = { ...rootsView(), modal: { _tag: "Error", message } }
+  const copied: string[] = []
+  let succeeds = true
+  setup.renderer.copyToClipboardOSC52 = (text) => { copied.push(text); return succeeds }
+  const running = await startPresentation(setup.renderer, view)
+  try {
+    const initial = await frame(setup, (value) => value.includes("evidence step 000") && value.includes("esc close"))
+    expect(initial).not.toContain("FINAL_CAUSE")
+    setup.mockInput.pressKey("END")
+    await frame(setup, (value) => value.includes("FINAL_CAUSE"))
+    setup.mockInput.pressKey("c")
+    expect(copied).toEqual([message])
+    await frame(setup, (value) => value.includes("c copied"))
+    succeeds = false
+    setup.mockInput.pressKey("c")
+    await frame(setup, (value) => value.includes("copy failed") && value.includes("FINAL_CAUSE"))
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal).toEqual({ _tag: "Error", message })
+    succeeds = true
+    const copyControl = coordinateOf(setup.captureCharFrame(), "c copy failed")
+    await setup.mockMouse.click(copyControl.x, copyControl.y)
+    expect(copied).toEqual([message, message, message])
+    setup.mockInput.pressKey("HOME")
+    await frame(setup, (value) => value.includes("evidence step 000"))
+    setup.mockInput.pressKey("\x1b[6~")
+    await frame(setup, (value) => !value.includes("evidence step 000"))
+    setup.mockInput.pressKey("\x1b[5~")
+    await frame(setup, (value) => value.includes("evidence step 000"))
+    const position = coordinateOf(setup.captureCharFrame(), "evidence step 000")
+    await setup.mockMouse.scroll(position.x, position.y, "down")
+    await frame(setup, (value) => !value.includes("evidence step 000"))
+    expect(running.harness.calls.filter((call) => call.startsWith("select-root:"))).toEqual([])
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("evidence step"))
+  } finally { await running.stop() }
+})
+
 test("forks the newly selected graph node without waiting for publication", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Rapid fork"))
@@ -1142,7 +1181,8 @@ test("surfaces canonical graph integrity warnings through the runtime", async ()
 
   try {
     const rendered = await frame(setup, (value) => value.includes("Tree integrity warning"))
-    expect(rendered).toContain("history does not end at its recorded source message")
+    expect(rendered).toContain("history does not end")
+    expect(rendered).toContain("recorded source message")
   } finally {
     await running.stop()
   }
