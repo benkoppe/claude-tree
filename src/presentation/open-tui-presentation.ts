@@ -2,6 +2,7 @@ import {
   BoxRenderable,
   CliRenderEvents,
   RGBA,
+  ScrollBoxRenderable,
   TextAttributes,
   TextRenderable,
   type CliRenderer,
@@ -150,7 +151,7 @@ type PendingMouseAction =
   | ContentMouseAction
   | { readonly kind: "footer"; readonly action: FooterAction }
   | { readonly kind: "picker"; readonly index: number }
-  | { readonly kind: "dialog-action"; readonly choice: "confirm" | "cancel" | "close" }
+  | { readonly kind: "dialog-action"; readonly choice: "confirm" | "cancel" | "close" | "copy" }
 
 const ROOT_CONTROLS: readonly FooterControl[] = [
   { key: "↑↓/jk", description: "select" },
@@ -264,6 +265,8 @@ class OpenTuiPresentationController {
   private readonly dialogTitle: TextRenderable
   private readonly dialogEscape: TextRenderable
   private readonly dialogBody: TextRenderable
+  private readonly errorScroll: ScrollBoxRenderable
+  private readonly errorText: TextRenderable
   private readonly dialogActions: TextRenderable
 
   private viewModel: ApplicationViewModel | undefined
@@ -281,6 +284,8 @@ class OpenTuiPresentationController {
   private leafPicker: LeafPickerState | null = null
   private modalChoice: "confirm" | "cancel" = "cancel"
   private modalIdentity: string | null = null
+  private errorMessage: string | undefined
+  private errorCopyState: "idle" | "copied" | "failed" = "idle"
   private actionPending = false
   private terminalOpening = false
   private started = false
@@ -430,6 +435,16 @@ class OpenTuiPresentationController {
       onMouseUp: this.guardedOnDialogBodyMouseUp,
       onMouseScroll: this.guardedOnDialogBodyMouseScroll,
     })
+    this.errorScroll = new ScrollBoxRenderable(renderer, {
+      id: "error-scroll", flexGrow: 1, visible: false, scrollX: false, scrollY: true,
+      backgroundColor: theme.element,
+      contentOptions: { flexDirection: "column", backgroundColor: theme.element },
+    })
+    this.errorText = new TextRenderable(renderer, {
+      id: "error-text", width: "100%", flexShrink: 0, wrapMode: "word", selectable: false,
+      fg: theme.textMuted, bg: theme.element, content: "",
+    })
+    this.errorScroll.add(this.errorText)
     this.dialogActions = new TextRenderable(renderer, {
       id: "next-dialog-actions",
       height: 1,
@@ -443,6 +458,7 @@ class OpenTuiPresentationController {
     })
     this.dialogPanel.add(dialogHeader)
     this.dialogPanel.add(this.dialogBody)
+    this.dialogPanel.add(this.errorScroll)
     this.dialogPanel.add(this.dialogActions)
     this.dialogOverlay.add(this.dialogPanel)
     renderer.root.add(this.dialogOverlay)
@@ -721,6 +737,21 @@ class OpenTuiPresentationController {
       return
     }
     if (modal._tag === "About" || modal._tag === "Error") {
+      if (modal._tag === "Error") {
+        if (isUnmodifiedKey(key, "c") && !key.repeated) { this.copyError(); return }
+        const delta = listNavigationDelta(key)
+        if (delta !== undefined) { this.errorScroll.scrollBy(delta); this.render(); return }
+        if (isUnmodifiedKey(key, "pageup") || isUnmodifiedKey(key, "pagedown")) {
+          this.errorScroll.scrollBy((key.name === "pageup" ? -1 : 1) * Math.max(1, this.errorScroll.viewport.height - 1))
+          this.render()
+          return
+        }
+        if (isUnmodifiedKey(key, "home") || isUnmodifiedKey(key, "end")) {
+          this.errorScroll.scrollTo(key.name === "home" ? 0 : this.errorScroll.scrollHeight)
+          this.render()
+          return
+        }
+      }
       if (
         isUnmodifiedKey(key, "escape") || isUnmodifiedKey(key, "q") ||
         isEnterKey(key) || isQuestionMarkKey(key)
@@ -737,6 +768,18 @@ class OpenTuiPresentationController {
       return
     }
     if (isEnterKey(key) && !key.repeated) this.completeConfirmation(this.modalChoice)
+  }
+
+  private copyError(): void {
+    const modal = this.viewModel?.modal
+    if (modal?._tag !== "Error") return
+    try { this.errorCopyState = this.renderer.copyToClipboardOSC52(modal.message) ? "copied" : "failed" }
+    catch { this.errorCopyState = "failed" }
+    this.render()
+  }
+
+  private errorCopyLabel(): string {
+    return this.errorCopyState === "copied" ? "c copied" : this.errorCopyState === "failed" ? "c copy failed" : "c copy"
   }
 
   private moveRoot(delta: number): void {
@@ -1148,6 +1191,8 @@ class OpenTuiPresentationController {
     }
     if (identity === this.modalIdentity) return
     this.modalIdentity = identity
+    this.errorCopyState = "idle"
+    this.errorScroll.scrollTo(0)
     this.pendingMouseAction = null
     if (modal?._tag === "ConfirmStop" || modal?._tag === "ConfirmStopTree") this.modalChoice = "confirm"
     if (modal?._tag === "ConfirmRemoval") this.modalChoice = "cancel"
@@ -1328,6 +1373,8 @@ class OpenTuiPresentationController {
       return
     }
     this.dialogOverlay.paddingTop = Math.floor(this.renderer.terminalHeight / 4)
+    this.errorScroll.visible = modal?._tag === "Error" && !picker
+    this.dialogBody.visible = !this.errorScroll.visible
     this.dialogPanel.maxWidth = Math.max(1, this.renderer.terminalWidth - 2)
     if (picker) {
       const maximumRows = Math.max(1, Math.floor(this.renderer.terminalHeight / 2) - 2)
@@ -1343,14 +1390,21 @@ class OpenTuiPresentationController {
     } else if (modal) {
       const content = modalContent(modal)
       const about = modal._tag === "About"
-      this.dialogPanel.width = Math.min(about ? 76 : 60, this.renderer.terminalWidth - 4)
-      this.dialogPanel.height = Math.min(
-        about ? 18 : modal._tag === "Error" ? 9 : 12,
+      this.dialogPanel.width = Math.min(about ? 76 : modal._tag === "Error" ? 100 : 60, this.renderer.terminalWidth - 4)
+      const dialogHeight = Math.min(
+        about ? 18 : modal._tag === "Error" ? Math.max(9, Math.floor(this.renderer.terminalHeight * 0.65)) : 12,
         this.renderer.terminalHeight - 2,
       )
+      this.dialogPanel.height = dialogHeight
+      if (modal._tag === "Error") this.dialogOverlay.paddingTop = Math.max(0, Math.floor((this.renderer.terminalHeight - dialogHeight) / 2))
       this.dialogTitle.content = content.title
       this.dialogBody.wrapMode = "word"
-      this.dialogBody.content = content.body
+      if (modal._tag === "Error") {
+        if (modal.message !== this.errorMessage) {
+          this.errorMessage = modal.message
+          this.errorText.content = modal.message
+        }
+      } else this.dialogBody.content = content.body
       this.dialogActions.visible = true
       this.dialogActions.content = this.modalActions(modal)
     }
@@ -1388,9 +1442,12 @@ class OpenTuiPresentationController {
   }
 
   private modalActions(modal: ApplicationModal) {
-    if (modal._tag === "About" || modal._tag === "Error") {
-      return styledText([chunk(modal._tag === "About" ? "close" : "esc close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
-    }
+    if (modal._tag === "About") return styledText([chunk("close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
+    if (modal._tag === "Error") return styledText([
+      chunk("↑↓ scroll  ", theme.textMuted),
+      chunk(this.errorCopyLabel(), theme.selectedText, TextAttributes.BOLD, theme.primary),
+      chunk("  ", theme.textMuted), chunk("esc close", theme.selectedText, TextAttributes.BOLD, theme.primary),
+    ])
     const label = modal._tag === "ConfirmStopTree" ? "Kill" : modal._tag === "ConfirmStop" ? "Stop" : "Delete"
     return styledText([
       chunk(
@@ -1717,15 +1774,21 @@ class OpenTuiPresentationController {
     if (choice !== pending.choice) return
     event.preventDefault()
     event.stopPropagation()
-    if (choice === "close") this.enqueue(this.appRuntime.closeModal)
+    if (choice === "copy") this.copyError()
+    else if (choice === "close") this.enqueue(this.appRuntime.closeModal)
     else this.completeConfirmation(choice)
   }
 
-  private dialogActionAt(event: MouseEvent): "confirm" | "cancel" | "close" | undefined {
+  private dialogActionAt(event: MouseEvent): "confirm" | "cancel" | "close" | "copy" | undefined {
     const modal = this.visibleModal()
     if (!modal || event.y - this.dialogActions.screenY !== 0) return undefined
-    if (modal._tag === "About" || modal._tag === "Error") return "close"
+    if (modal._tag === "About") return "close"
     const x = event.x - this.dialogActions.screenX
+    if (modal._tag === "Error") {
+      const copyStart = displayWidth("↑↓ scroll  ")
+      const copyEnd = copyStart + displayWidth(this.errorCopyLabel())
+      return x >= copyStart && x < copyEnd ? "copy" : x >= copyEnd + 2 ? "close" : undefined
+    }
     return x < displayWidth("Cancel  ") ? "cancel" : "confirm"
   }
 
