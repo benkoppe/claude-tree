@@ -454,7 +454,7 @@ describe("Effect Claude provider", () => {
     const provider = providerWith({
       messages: { [ROOT]: activeParent, [CHILD]: copied },
       physical: {
-        [ROOT]: physicalParent,
+        [ROOT]: physicalParent.map((entry, index) => ({ ...entry, sessionId: ROOT, parentUuid: physicalParent[index - 1]?.uuid ?? null })),
         [CHILD]: copied.map((entry, index) =>
           copiedRecord(entry, ROOT, physicalParent[index]!.uuid),
         ),
@@ -472,6 +472,22 @@ describe("Effect Claude provider", () => {
       { parentMessageId: "parent-1", childMessageId: "child-1" },
       { parentMessageId: "parent-2", childMessageId: "child-2" },
     ])
+  })
+
+  test("distinct copied source identities cannot collapse onto one repeated child UUID", async () => {
+    const parent = [message(ROOT, "one", "assistant", "same payload"), message(ROOT, "two", "assistant", "same payload")]
+    const copied = parent.map((entry) => copyMessage(entry, CHILD, "collapsed"))
+    const provider = providerWith({
+      messages: { [ROOT]: parent, [CHILD]: [copied[1]!] },
+      physical: {
+        [ROOT]: parent,
+        [CHILD]: copied.map((entry, index) => copiedRecord(entry, ROOT, parent[index]!.uuid)),
+      },
+    })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "two" }))
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected an invalid copied-prefix result")
+    expect(outcome.reason).toContain("distinct source records map to the same child identity")
   })
 
   test("validates physical records omitted from both compacted active transcripts", async () => {
