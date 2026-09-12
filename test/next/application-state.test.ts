@@ -28,6 +28,20 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
+  test("manual refresh identifies multiple failures by current title with an ID fallback", () => {
+    let state = loadedState()
+    const refresh = activeRefresh("manual", 1, "manual", "full")
+    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
+    state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: refresh.key, generation: 1,
+      snapshot: { sessions: [session(ROOT, "Renamed session"), session("untitled", "")],
+        transcripts: new Map<string, TranscriptRead>([
+          [ROOT, { _tag: "Unavailable", reason: "first failure" }],
+          ["untitled", { _tag: "Unavailable", reason: "second failure" }],
+        ]) } })
+    expect(state.modal).toEqual({ _tag: "Error", message:
+      "Conversation refresh failed:\n\nRenamed session (root)\nfirst failure\n\nuntitled\nsecond failure" })
+  })
+
   test("standardizes live state and priority across sessions, roots, and trees", () => {
     for (const activity of ["idle", "working", "blocked"] as const) {
       const state: ApplicationState = {
@@ -751,7 +765,7 @@ describe("application state reducer", () => {
         expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
         expect(state.provider.transcripts.get("other")).toEqual(available([]))
         expect(state.modal).toEqual(stale ? null : {
-          _tag: "Error", message: "Conversation refresh failed: root: permission denied",
+          _tag: "Error", message: "Conversation refresh failed:\n\nRoot (root)\npermission denied",
         })
       })
     }
