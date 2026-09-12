@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util"
 
 import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
+import type { HistoryTrace } from "../../../diagnostics/history-trace"
 
 const TRANSCRIPT_TYPES = new Set(["user", "assistant", "progress", "system", "attachment"])
 const ENVELOPE_FIELDS = new Set([
@@ -106,7 +107,7 @@ export class RecordEvidence {
   private readonly parentCache = new Map<string, ReadonlySet<string | null>>()
   private readonly matches = new WeakMap<TranscriptRecord, Map<ScopeId, Map<string, readonly TranscriptRecord[]>>>()
 
-  constructor(entries: readonly SessionStoreEntry[], snapshots: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map()) {
+  constructor(entries: readonly SessionStoreEntry[], snapshots: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map(), private readonly trace?: HistoryTrace) {
     this.current = new RecordIndex(entries)
     this.currentSessionId = [...snapshots].find(([, records]) => records === entries)?.[0]
     this.scopes.set(null, this.current)
@@ -158,6 +159,7 @@ export class RecordEvidence {
     while (true) {
       if (visited.has(scope)) {
         if (!required) return
+        this.trace?.lineage(record.uuid, scope, "cycle")
         throw new NavigationHistoryError("invalid-provenance", `Record ${record.uuid} has cyclic copy lineage`, record.uuid)
       }
       visited.add(scope)
@@ -167,6 +169,7 @@ export class RecordEvidence {
         return this.needSource(record, scope!)
       }
       const versions = this.matchingVersions(record, scope, id)
+      if (required) this.trace?.versions(record, scope, id, index.versions(id), versions, start)
       if (versions.length === 0) {
         if (!required) return
         throw new NavigationHistoryError("invalid-provenance",
@@ -248,11 +251,16 @@ export class RecordEvidence {
       const mapped = this.mappedId(null, scope, current.id, record.uuid)
       if (mapped !== undefined) { result.add(mapped); continue }
       if (visits.get(current.id) === "complete") continue
-      if (visits.get(current.id) === "visiting") throw new NavigationHistoryError("cycle",
-        `Record ${record.uuid} has cyclic omitted-progress ancestry in session ${scope}`, record.uuid, current.id)
+      if (visits.get(current.id) === "visiting") {
+        this.trace?.parent(record.uuid, scope, current.id, "cycle")
+        throw new NavigationHistoryError("cycle", `Record ${record.uuid} has cyclic omitted-progress ancestry in session ${scope}`, record.uuid, current.id)
+      }
       const parent = index.effective.get(current.id)
-      if (parent?.type !== "progress") throw new NavigationHistoryError("invalid-preservation",
-        `Historical parent ${current.id} of record ${record.uuid} in session ${scope} has no evidenced copy in the current transcript`, record.uuid, current.id)
+      if (parent?.type !== "progress") {
+        this.trace?.parent(record.uuid, scope, current.id, "unmapped")
+        throw new NavigationHistoryError("invalid-preservation", `Historical parent ${current.id} of record ${record.uuid} in session ${scope} has no evidenced copy in the current transcript`, record.uuid, current.id)
+      }
+      this.trace?.parent(record.uuid, scope, current.id, "omitted-progress")
       visits.set(current.id, "visiting")
       stack.push({ id: current.id, exit: true })
       const versions = index.versions(current.id)
@@ -304,10 +312,13 @@ export class RecordEvidence {
       try { this.origin(step.versions) }
       catch (error) { if (!(error instanceof NavigationHistoryError)) throw error; break }
       for (const version of step.versions) {
+        let parent: string | null = null
         try {
-          for (const parent of this.translateParent(step.scope, parentOf(version), record)) result.add(parent)
+          parent = parentOf(version)
+          for (const translated of this.translateParent(step.scope, parent, record)) result.add(translated)
         } catch (error) {
           if (!(error instanceof NavigationHistoryError)) throw error
+          this.trace?.parent(record.uuid, step.scope, parent, "optional-evidence-unavailable")
           // Optional evidence is not an instruction to read unrelated source files.
         }
       }
@@ -324,16 +335,39 @@ export class RecordEvidence {
 
   historicalParents(record: TranscriptRecord, excluded: ReadonlySet<string>): ReadonlySet<string | null> {
     for (const step of this.lineage(record, null, true)) {
-      this.origin(step.versions)
+      try {
+        const origin = this.origin(step.versions)
+        this.trace?.lineage(record.uuid, step.scope, origin ? "origin" : "end", origin?.sessionId)
+      } catch (error) {
+        this.trace?.lineage(record.uuid, step.scope, error instanceof NavigationHistoryError && error.kind === "ambiguous-preservation" ? "conflicting" : "invalid")
+        throw error
+      }
       const candidates = new Set<string | null>()
-      for (const version of step.versions) {
-        const parent = parentOf(version)
-        const mapped = parent === null ? null : step.scope === null ? parent : this.mappedId(null, step.scope, parent, record.uuid)
-        if (mapped !== undefined && mapped !== null && excluded.has(mapped)) continue
-        if (parent !== null && step.scope !== null && this.isContextHeadParent(step.scope, version, parent)) continue
-        for (const value of this.translateParent(step.scope, parent, record)) {
-          if (value === null || !excluded.has(value)) candidates.add(value)
+      const before = this.trace ? new Set<string | null>() : undefined
+      let complete = false
+      try {
+        for (const version of step.versions) {
+          const parent = parentOf(version)
+          before?.add(parent)
+          const mapped = parent === null ? null : step.scope === null ? parent : this.mappedId(null, step.scope, parent, record.uuid)
+          if (mapped !== undefined && mapped !== null && excluded.has(mapped)) {
+            this.trace?.parent(record.uuid, step.scope, parent, "excluded-context", mapped)
+            continue
+          }
+          if (parent !== null && step.scope !== null && this.isContextHeadParent(step.scope, version, parent)) {
+            this.trace?.parent(record.uuid, step.scope, parent, "excluded-context-head")
+            continue
+          }
+          for (const value of this.translateParent(step.scope, parent, record)) {
+            if (value === null || !excluded.has(value)) {
+              candidates.add(value)
+              this.trace?.parent(record.uuid, step.scope, parent, "accepted", value)
+            } else this.trace?.parent(record.uuid, step.scope, parent, "excluded-context", value)
+          }
         }
+        complete = true
+      } finally {
+        this.trace?.search(record.uuid, step.scope, step.versions.length, before?.size ?? 0, candidates.size, complete ? "complete" : "failed")
       }
       if (candidates.size > 0) return candidates
     }

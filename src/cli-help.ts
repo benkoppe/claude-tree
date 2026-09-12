@@ -5,6 +5,17 @@ export const CLI_HELP = `${PROGRAM_NAME} [--codex] [PROJECT]
 Explore and run coding-agent conversations for PROJECT (default: current directory).
 Claude Code is used by default; pass --codex to use Codex.
 
+History diagnostics (Claude Code):
+  --diagnose-history SESSION_ID [PROJECT]
+    Read one session through the production history resolver and print a sanitized
+    JSON report. No interactive terminal, provider mutation, or app-state writes.
+    Reports anonymous labels, counts, comparison flags, and the build revision.
+
+Error dialogs:
+  Up/Down, Page Up/Down, Home/End, mouse wheel  scroll the full error
+  c               copy the complete original error
+  Escape          close
+
 Root picker:
   Up/Down or k/j  select a conversation family
   Mouse wheel     select a conversation family
