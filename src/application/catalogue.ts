@@ -10,6 +10,7 @@ export interface HistoryIssue {
 
 export type FamilyHistoryStatus =
   | { readonly _tag: "Ready" }
+  | { readonly _tag: "Limited"; readonly contextMessageCount: number }
   | { readonly _tag: "Loading" }
   | { readonly _tag: "Unavailable"; readonly issues: readonly HistoryIssue[] }
 
@@ -17,7 +18,7 @@ const pending: SessionHistoryStatus = { _tag: "Pending" }
 const ready: SessionHistoryStatus = { _tag: "Ready" }
 
 export function historyStatusForRead(read: TranscriptRead): SessionHistoryStatus {
-  return read._tag === "Available" ? ready : read
+  return read._tag === "Available" ? read.coverage ? { _tag: "Limited", context: read } : ready : read
 }
 
 export function selectHistoryStatus(state: ApplicationState, sessionId: string): SessionHistoryStatus {
@@ -32,16 +33,23 @@ export function selectHistoryStatus(state: ApplicationState, sessionId: string):
 export function selectFamilyHistoryStatus(state: ApplicationState, sessionIds: Iterable<string>): FamilyHistoryStatus {
   const issues: HistoryIssue[] = []
   let loading = false
+  let limited = false
+  let contextMessageCount = 0
   for (const id of sessionIds) {
     const status = selectHistoryStatus(state, id)
     if (status._tag === "Pending") loading = true
+    if (status._tag === "Limited") {
+      limited = true
+      contextMessageCount += status.context.messages.filter((message) => message.visible).length
+    }
     if (status._tag === "Unavailable" || status._tag === "Missing") issues.push({
       sessionId: id,
       reason: status._tag === "Missing" ? "Session history was not found" : status.reason,
       kind: status._tag === "Missing" ? "missing" : "unavailable",
     })
   }
-  return issues.length ? { _tag: "Unavailable", issues } : loading ? { _tag: "Loading" } : { _tag: "Ready" }
+  return issues.length ? { _tag: "Unavailable", issues } : loading ? { _tag: "Loading" }
+    : limited ? { _tag: "Limited", contextMessageCount } : { _tag: "Ready" }
 }
 
 export interface CatalogueFamily {

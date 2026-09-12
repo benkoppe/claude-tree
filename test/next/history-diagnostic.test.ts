@@ -18,7 +18,7 @@ import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provid
 const SECRET = "PRIVATE_CHAT_CONTENT_AND_FIELD_7c5f39"
 const PRIVATE_PATH = "/private/work/secret-project-7c5f39"
 
-function fixture(available: boolean, contextFailure?: unknown) {
+function fixture(available: boolean, contextFailure?: unknown, mismatchedImport = false) {
   const sessionId = crypto.randomUUID()
   const ids = Array.from({ length: 5 }, () => crypto.randomUUID())
   const question: SessionStoreEntry = { type: "user", uuid: ids[0]!, parentUuid: null, sessionId, message: { role: "user", content: SECRET } }
@@ -40,7 +40,8 @@ function fixture(available: boolean, contextFailure?: unknown) {
       if (contextFailure !== undefined) return Promise.reject(contextFailure)
       return getSessionMessages(id, { ...options, sessionStore: { load: async () => entries, append: async () => { throw new Error("read only") } } })
     },
-    importSessionToStore: async (id, store) => { reads.push("records"); await store.append({ projectKey: PRIVATE_PATH, sessionId: id }, entries) },
+    importSessionToStore: async (id, store) => { reads.push("records"); await store.append({ projectKey: PRIVATE_PATH, sessionId: id },
+      mismatchedImport ? entries.map((record) => record.uuid === answer.uuid ? { ...record, message: { role: "assistant", content: "changed" } } : record) : entries) },
     forkSession: async () => { mutations++; throw new Error(SECRET) },
   }, resolveExecutable: () => { throw new Error("Diagnostics must not prepare a terminal") } })
   return { sessionId, ids, entries, make, reads, mutations: () => mutations }
@@ -56,17 +57,29 @@ test.each([false, true])("diagnostics use the production read outcome and preser
   expect(observed).toEqual(normal)
   expect(f.reads).toEqual(normalReads)
   expect(f.mutations()).toBe(0)
-  const report = trace.finish(UNKNOWN_BUILD, observed.get(f.sessionId)!._tag)
+  const read = observed.get(f.sessionId)!
+  expect(read._tag).toBe("Available")
+  const report = trace.finish(UNKNOWN_BUILD, read._tag === "Available" && read.coverage ? "Limited" : read._tag)
   expect(HistoryDiagnosticReportSchema.safeParse(report).success).toBeTrue()
   const output = JSON.stringify(report)
   for (const privateValue of [SECRET, PRIVATE_PATH, f.sessionId, ...f.ids]) expect(output).not.toContain(privateValue)
   expect(report.events.some((event) => event.event === "parent-search")).toBeTrue()
   if (!available) {
-    expect(report.failure?.code).toBe("ambiguous-preservation")
+    expect(report.outcome).toBe("Limited")
+    expect(report.failure?.code).toBe("history-gap")
     expect(report.events.some((event) => event.event === "decision" && event.action === "no-parent" && event.record === report.failure?.related_record)).toBeTrue()
     expect(report.events.some((event) => event.event === "decision" && event.action === "no-parent" && event.candidates === 0)).toBeTrue()
     expect(report.events.some((event) => event.event === "lineage" && event.state === "end")).toBeTrue()
   }
+})
+
+test("a historical gap cannot admit SDK context whose payload changed before import", async () => {
+  const f = fixture(false, undefined, true)
+  const trace = new HistoryTrace(f.sessionId)
+  const read = (await Effect.runPromise(f.make().readTranscripts([f.sessionId], trace))).get(f.sessionId)
+  expect(read?._tag).toBe("Unavailable")
+  expect(trace.finish(UNKNOWN_BUILD, "Unavailable").failure?.code).toBe("active-record-mismatch")
+  expect(f.mutations()).toBe(0)
 })
 
 test("comparison diagnostics expose fixed field names, not field values or arbitrary payload keys", () => {

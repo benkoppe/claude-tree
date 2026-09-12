@@ -22,7 +22,7 @@ process.once("message", (value) => {
   Effect.runPromise(provider.readTranscripts([job.sessionId], trace)).then((reads) => {
     const read = reads.get(job.sessionId)
     if (!read) trace.fail("worker", "unexpected-failure")
-    send(trace.finish(job.build, read?._tag ?? "Unavailable", read?._tag === "Available"
+    send(trace.finish(job.build, read?._tag === "Available" && read.coverage ? "Limited" : read?._tag ?? "Unavailable", read?._tag === "Available"
       ? { messages: read.messages.length, visible: read.messages.filter((message) => message.visible).length } : undefined))
   }, () => {
     trace.fail("worker", "unexpected-failure")

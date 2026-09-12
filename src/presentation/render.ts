@@ -51,6 +51,7 @@ function prepareRootRow(root: RootViewModel, width: number, messageWidth: number
   const cached = rootRows.get(root)
   if (cached?.key === key) return cached
   const counts = root.history._tag === "Loading" ? "Loading history…"
+    : root.history._tag === "Limited" ? `${root.history.contextMessageCount} visible context records · History gap · Open available`
     : root.history._tag === "Unavailable" ? "History unavailable · Enter to retry"
     : `${String(root.messageCount).padStart(messageWidth)} ${(root.messageCount === 1 ? "message" : "messages").padEnd(8)}  ${String(root.memberSessionIds.length).padStart(branchWidth)} ${(root.memberSessionIds.length === 1 ? "branch" : "branches").padEnd(8)}`
   const titleX = 4

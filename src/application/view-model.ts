@@ -121,6 +121,7 @@ const layoutCache = new WeakMap<ConversationGraph, {
   aliases: ReadonlyMap<string, ReadonlyMap<string, string>>
 }>()
 const graphViewCache = new WeakMap<ConversationGraph, {
+  historyStatus: ApplicationState["historyStatus"]
   layout: ReturnType<typeof layoutConversationGraph>
   terminals: ApplicationState["terminals"]
   drafts: ApplicationState["drafts"]
@@ -270,7 +271,7 @@ export function projectGraphViewModel(
     null
   const cached = graphViewCache.get(graph)
   if (cached && cached.layout === layout && cached.terminals === state.terminals && cached.drafts === state.drafts &&
-    cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds) {
+    cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds && cached.historyStatus === state.historyStatus) {
     return withGraphSelection(cached.view, selectedNodeId)
   }
   const nodes = [...layout.nodes.values()]
@@ -305,11 +306,12 @@ export function projectGraphViewModel(
     unselectedNodes: nodes,
     selectedNodeId: null,
     status: selectAggregateStatus(state, graph.sessionIds),
-    warnings: [...graph.warnings],
+    warnings: [...[...graph.sessionIds].flatMap((id) => state.historyStatus.get(id)?._tag === "Limited"
+      ? ["History gap: showing the last accepted snapshot (SDK context order until history is verified). Open the session to continue; forking awaits verified history."] : []), ...graph.warnings],
     worldWidth: layout.worldWidth,
     worldHeight: layout.worldHeight,
   }
-  graphViewCache.set(graph, { layout, terminals: state.terminals, drafts: state.drafts,
+  graphViewCache.set(graph, { historyStatus: state.historyStatus, layout, terminals: state.terminals, drafts: state.drafts,
     completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, view })
   return withGraphSelection(view, selectedNodeId)
 }

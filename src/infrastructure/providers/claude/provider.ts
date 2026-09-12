@@ -36,6 +36,7 @@ import {
 import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
 import { NavigationHistoryError, projectNavigationHistory } from "./navigation-history"
+import { RecordEvidence } from "./record-evidence"
 import { safeHistoryFailure, type HistoryTrace, type HistoryStage, type HistoryFailure } from "../../../diagnostics/history-trace"
 
 export interface ClaudeSdk {
@@ -104,6 +105,7 @@ interface ClaudeMessage extends AgentMessage {
 
 interface ClaudeActiveContext {
   readonly messages: readonly ClaudeMessage[]
+  readonly systemIds: readonly string[]
   /** SDK-selected system tail anchors compaction even when no user/agent is visible. */
   readonly systemAnchorId?: string
 }
@@ -285,28 +287,34 @@ export class ClaudeProvider implements AgentProviderApi {
           const readDeadline = publish ? yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs) : deadline
           const context = yield* this.traced(trace, "active-context", sessionId,
             this.readActiveContext(sessionId, "readTranscripts", readDeadline), (context) => context?.messages.length ?? 0)
-          if (context === undefined) return undefined
+          if (context === undefined) return { _tag: "Missing" as const }
           if (context.messages.length === 0 && context.systemAnchorId === undefined) {
             const info = yield* this.traced(trace, "session-info", sessionId, this.callSdk("getSessionInfo", () => this.sdk.getSessionInfo(sessionId, { dir: this.projectPath }),
               this.listSessionsTimeoutMs, readDeadline))
-            if (info === undefined) return undefined
+            if (info === undefined) return { _tag: "Missing" as const }
           }
           const entries = yield* this.traced(trace, "session-records", sessionId,
             this.readSessionEntries(sessionId, "readTranscripts", readDeadline), (entries) => entries.length)
-          return yield* this.traced(trace, "navigation-history", sessionId,
-            this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline, trace), (messages) => messages.length)
+          const sdkContext = this.contextSnapshot(context, entries)
+          const navigation = yield* this.traced(trace, "navigation-history", sessionId,
+            this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline, trace), (messages) => messages.length).pipe(Effect.result)
+          if (navigation._tag === "Success") return { _tag: "Available" as const, messages: navigation.success, context: sdkContext }
+          const error = navigation.failure
+          const gap = error.cause
+          if (!(gap instanceof NavigationHistoryError) || gap.kind !== "history-gap") return yield* Effect.fail(error)
+          yield* Effect.try({
+            try: () => this.validateContextSnapshot(sessionId, context, entries),
+            catch: (cause) => this.protocolError("readTranscripts", "SDK context does not match the imported session records", cause),
+          }).pipe(Effect.tapError(() => Effect.sync(() => trace?.fail("validation", "active-record-mismatch", sessionId))))
+          return { _tag: "Available" as const, messages: sdkContext.messages, context: sdkContext,
+            coverage: { _tag: "Limited" as const, boundaryId: gap.recordId, reason: "historical-parent-unproven" as const } }
         }).pipe(
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
               sessionId,
               { _tag: "Unavailable", reason: error.message },
             ],
-            onSuccess: (messages): readonly [string, TranscriptRead] => [
-              sessionId,
-              messages === undefined
-                ? { _tag: "Missing" }
-                : { _tag: "Available", messages },
-            ],
+            onSuccess: (read): readonly [string, TranscriptRead] => [sessionId, read],
           }),
           Effect.tap(([id, read]) => Effect.suspend(() => {
             if (!publish) return Effect.void
@@ -688,7 +696,7 @@ export class ClaudeProvider implements AgentProviderApi {
         if (validation._tag === "Valid") {
           return {
             _tag: "Valid" as const,
-            transcript: { _tag: "Available" as const, messages: yield* this.readNavigationHistory(
+            transcript: { _tag: "Available" as const, context: this.contextSnapshot(activeRead.context, physicalRead.entries), messages: yield* this.readNavigationHistory(
               childSessionId, activeRead.context, physicalRead.entries, "validateFork", deadline,
             ) },
             sharedMessages: validation.sharedMessages,
@@ -829,6 +837,7 @@ export class ClaudeProvider implements AgentProviderApi {
             }
             return {
               messages: normalizeTranscript(sessionId, messages.filter((message) => message.type !== "system")),
+              systemIds: messages.filter((message) => message.type === "system").map((message) => message.uuid),
               ...(systemAnchor ? { systemAnchorId: systemAnchor.uuid } : {}),
             }
           },
@@ -855,6 +864,26 @@ export class ClaudeProvider implements AgentProviderApi {
         cause,
       ),
     })
+  }
+
+  private contextSnapshot(context: ClaudeActiveContext, entries: readonly SessionStoreEntry[]): NonNullable<Extract<TranscriptRead, { _tag: "Available" }>["context"]> {
+    const records = new RecordEvidence(entries).current.effective
+    const boundaryId = context.systemIds.findLast((id) => {
+      const record = records.get(id)
+      return record?.type === "system" && record.subtype === "compact_boundary"
+    }) ?? null
+    return { messages: markCompactionSummaries(context.messages, [...records.values()]), boundaryId }
+  }
+
+  private validateContextSnapshot(sessionId: string, context: ClaudeActiveContext, entries: readonly SessionStoreEntry[]): void {
+    const records = new RecordEvidence(entries).current.effective
+    for (const message of context.messages) {
+      const record = records.get(message.id)
+      if (!record || record.type !== message.sourceType || !isDeepStrictEqual(record.message, message.rawMessage)) {
+        throw new Error(`SDK context record ${message.id} does not match the imported session ${sessionId}`)
+      }
+    }
+    if (context.systemIds.some((id) => records.get(id)?.type !== "system")) throw new Error("SDK-selected system evidence is missing")
   }
 
   private readNavigationHistory(

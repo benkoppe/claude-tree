@@ -183,7 +183,7 @@ test("an SDK-empty conversation cannot resurrect unrelated imported history", as
   const f = fixture()
   const { provider } = await providerFor(f.sessionId, [f.question, { ...f.compact, logicalParentUuid: f.ids[6] }, f.summary], [])
   const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
-  expect(read).toEqual({ _tag: "Available", messages: [] })
+  expect(read).toMatchObject({ _tag: "Available", messages: [], context: { messages: [], boundaryId: null } })
 })
 
 test("historical streamed blocks and tool results remain available to SDK reconstruction", async () => {
@@ -293,7 +293,7 @@ test("changed payloads cannot supply historical ancestry for a preserved UUID", 
   const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
   expect(read?._tag).toBe("Unavailable")
   const error = await Effect.runPromise(Effect.flip(provider.branchFrom({ sessionId: f.sessionId, messageId: f.ids[5]! })))
-  expect(error.message).toContain("no evidenced historical parents")
+  expect(error.message).toContain("unmatched versions and no proven historical parent")
   expect(forks()).toBe(0)
 })
 

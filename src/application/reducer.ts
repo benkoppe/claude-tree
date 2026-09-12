@@ -426,7 +426,8 @@ function refreshSucceeded(
       pendingCompletions.delete(sessionId)
     } else if (reconciled.accepted && reconciled.read._tag === "Available") {
       const completion = pendingCompletions.get(sessionId)
-      if (completion) pendingCompletions.set(sessionId, { ...completion, baseline: reconciled.read.messages })
+      if (completion) pendingCompletions.set(sessionId, { ...completion, baseline: reconciled.read.messages,
+        ...(reconciled.coverageChanged ? { coverageChanged: true } : {}) })
     }
     if (reconciled.clearAnchor) rewindAnchors.delete(sessionId)
     if (terminal && reconciled.replacement) {
@@ -435,6 +436,11 @@ function refreshSucceeded(
         ...(terminal.pendingSubmission ? { pendingSubmission: {
           ...terminal.pendingSubmission, baseline: reconciled.replacement.prefix,
         } } : {}) })
+    }
+    if (reconciled.coverageChanged && reconciled.read._tag === "Available") {
+      const current = terminals.get(sessionId)
+      if (current?.pendingSubmission) terminals.set(sessionId, { ...current,
+        pendingSubmission: { ...current.pendingSubmission, baseline: reconciled.read.messages } })
     }
     const submission = terminals.get(sessionId)?.pendingSubmission
     if (submission && reconciled.accepted && reconciled.read._tag === "Available" &&
@@ -488,7 +494,8 @@ function refreshSucceeded(
 
   for (const [sessionId, completion] of pendingCompletions) {
     if (staleSessionIds.has(sessionId)) continue
-    transcripts.set(sessionId, { _tag: "Available", messages: completion.baseline })
+    const read = transcripts.get(sessionId)
+    transcripts.set(sessionId, { ...(read?._tag === "Available" ? read : {}), _tag: "Available", messages: completion.baseline })
   }
 
   let completionExhausted = false
@@ -509,7 +516,7 @@ function refreshSucceeded(
         // Idle can also mean cancelled. A successful read with no completed turn
         // is not a failed read, and must not manufacture a completion error.
         completionExhausted ||= incoming?._tag !== "Available"
-        if (!unstableSessionIds.has(sessionId) && !replacementCandidates.has(sessionId) && incoming?._tag === "Available" && !sameTranscript(completion.baseline, incoming.messages)) {
+        if (!unstableSessionIds.has(sessionId) && !replacementCandidates.has(sessionId) && incoming?._tag === "Available" && !incoming.coverage && !sameTranscript(completion.baseline, incoming.messages)) {
           replacementCandidates.set(sessionId, { messages: incoming.messages, attempts: 1 })
         }
       }
@@ -524,7 +531,8 @@ function refreshSucceeded(
   for (const [id, read] of transcripts) {
     const previous = state.provider.transcripts.get(id)
     if (previous?._tag === "Available" && read._tag === "Available" && sameTranscript(previous.messages, read.messages)) {
-      transcripts.set(id, previous)
+      transcripts.set(id, isDeepStrictEqual(previous.coverage, read.coverage) && isDeepStrictEqual(previous.context, read.context)
+        ? previous : { ...read, messages: previous.messages })
     }
   }
   const providerSessions = reuseMap(state.provider.sessions, sessions)
@@ -965,8 +973,51 @@ function reconcileTranscript(
   readonly candidate?: { readonly messages: readonly AgentMessage[]; readonly attempts: number; readonly userPrefix?: boolean }
   readonly replacement?: TerminalState["replacement"]
   readonly unstable?: boolean
+  readonly coverageChanged?: boolean
 } {
-  const retained = completion ? { _tag: "Available" as const, messages: completion.baseline } : previous ?? incoming
+  const retained = completion ? { ...(previous?._tag === "Available" ? previous : {}), _tag: "Available" as const, messages: completion.baseline } : previous ?? incoming
+  // Context coverage cannot replace an accepted navigation path or prove a turn.
+  // The latest independently usable context lives in historyStatus, even while
+  // navigation remains at its last accepted snapshot.
+  if (incoming._tag === "Available" && incoming.coverage) return {
+    read: previous?._tag === "Available" ? retained : incoming,
+    accepted: false,
+  }
+  if (previous?._tag === "Available" && previous.coverage && incoming._tag === "Available") {
+    // A complete reconstruction can add or reorder historical records ahead of
+    // the old context. Confirm this representation change without inferring a
+    // rewind or completion from the newly visible prefix.
+    if (terminal?.replacement && incoming.messages.some((message) => terminal.replacement!.discardedMessageIds.has(message.id))) {
+      return { read: retained, accepted: false }
+    }
+    if (terminal?.replacement && !terminal.replacement.settled) {
+      const records = new Map(incoming.messages.map((message, index) => [message.id, { message, index }]))
+      let previousPosition = -1
+      if (terminal.replacement.prefix.some((message) => {
+        const entry = records.get(message.id)
+        if (!entry) return true
+        if (!message.historyBoundary) {
+          if (entry.index <= previousPosition) return true
+          previousPosition = entry.index
+        }
+        const current = entry.message
+        const { displayGroupId: _, ...content } = message
+        return !sameLogicalMessage({ ...content, ordinal: current.ordinal,
+          ...(current.displayGroupId !== undefined ? { displayGroupId: current.displayGroupId } : {}) }, current)
+      })) return { read: retained, accepted: false }
+    }
+    if (anchor && incoming.messages.some((message) => message.id === anchor.targetMessageId)) return { read: retained, accepted: false }
+    if (!candidate || !sameTranscript(candidate.messages, incoming.messages)) {
+      const attempts = (candidate?.attempts ?? 0) + 1
+      return { read: retained, accepted: false, ...(attempts >= MAX_REPLACEMENT_READS
+        ? { unstable: true } : { candidate: { messages: incoming.messages, attempts } }) }
+    }
+    const messages = nonIdle || completion
+      ? incoming.messages.slice(0, incoming.messages.findLastIndex((message) => message.visible && message.role === "user") + 1)
+      : incoming.messages
+    return { read: { ...incoming, messages }, accepted: true, coverageChanged: true, clearAnchor: anchor !== undefined,
+      ...(terminal?.replacement ? { replacement: { ...terminal.replacement, prefix: messages } } : {}) }
+  }
   if (incoming._tag !== "Available" && previous?._tag === "Available") return { read: retained, accepted: false }
   if (incoming._tag !== "Available" && (nonIdle || terminal?.unresolvedRewind || terminal?.replacement)) {
     return { read: retained, accepted: false }
@@ -1032,11 +1083,11 @@ function reconcileTranscript(
     }
   }
   if (unexpectedReplacement && nonIdle && !confirmedReplacement) return { read: retained, accepted: false }
-  const completed = completion !== undefined && incoming._tag === "Available" &&
+  const completed = completion !== undefined && !completion.coverageChanged && incoming._tag === "Available" &&
     completionTranscriptReady(confirmedReplacement && !recoveredReplacement ? [] : baseline, incoming.messages)
   if (completion && !completed && incoming._tag !== "Available") return { read: retained, accepted: false }
   const read = incoming._tag === "Available" && (nonIdle || (completion && !completed))
-    ? { _tag: "Available" as const, messages: stableTranscriptWhileNonIdle(baseline, incoming.messages) }
+    ? { ...incoming, messages: stableTranscriptWhileNonIdle(baseline, incoming.messages) }
     : incoming
   if (confirmedReplacement && !recoveredReplacement && terminal && previous?._tag === "Available" && read._tag === "Available") {
     const retainedIds = new Set(read.messages.map((message) => message.id))
