@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test"
 import { Deferred, Effect, Fiber } from "effect"
+import { TestClock } from "effect/testing"
 
-import { makeNavigationWriter } from "../../src/application/navigation-writer"
+import { makeNavigationWriter, NAVIGATION_SAVE_INTERVAL_MS } from "../../src/application/navigation-writer"
 import { PersistenceError, SessionOwnedError } from "../../src/domain/errors"
 import type { ProjectState } from "../../src/domain/persistence"
 
@@ -9,10 +10,8 @@ test("navigation writes fail promptly after explicit close", async () => {
   let writes = 0
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const writer = yield* makeNavigationWriter({
-      loadMetadata: Effect.succeed({ relations: [], removals: [] }),
-      updateMetadata: (transform) => Effect.sync(() => {
+      saveNavigation: () => Effect.sync(() => {
         writes += 1
-        return transform({ relations: [], removals: [] })
       }),
     })
     yield* writer.close
@@ -32,13 +31,11 @@ test("identical in-flight navigation requests share one durable write", async ()
     const started = yield* Deferred.make<void>()
     const release = yield* Deferred.make<void>()
     const writer = yield* makeNavigationWriter({
-      loadMetadata: Effect.sync(() => state),
-      updateMetadata: (transform) => Effect.gen(function*() {
+      saveNavigation: (navigation) => Effect.gen(function*() {
         writes += 1
         yield* Deferred.succeed(started, undefined)
         yield* Deferred.await(release)
-        state = transform(state)
-        return state
+        state = { ...state, navigation }
       }),
     })
     const navigation = { view: "roots" as const, selectedSessionId: "root" }
@@ -70,15 +67,13 @@ test("a held durable write retains only the latest of a thousand accepted cursor
     let state: ProjectState = { relations: [], removals: [] }
     let writes = 0
     const writer = yield* makeNavigationWriter({
-      loadMetadata: Effect.sync(() => state),
-      updateMetadata: (transform) => Effect.gen(function*() {
+      saveNavigation: (navigation) => Effect.gen(function*() {
         writes++
         yield* Deferred.succeed(started, undefined)
         yield* Deferred.await(release)
-        state = transform(state)
-        return state
+        state = { ...state, navigation }
       }),
-    })
+    }, undefined, 0)
     yield* writer.schedule({ view: "roots", selectedSessionId: "first" })
     yield* Deferred.await(started)
     for (let index = 0; index < 1_000; index++) {
@@ -93,4 +88,41 @@ test("a held durable write retains only the latest of a thousand accepted cursor
     expect(writes).toBe(2)
     expect(state.navigation).toEqual({ view: "roots", selectedSessionId: "root-999" })
   })))
+})
+
+test("sustained movement saves at a bounded cadence and flush bypasses the remaining delay", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const saved: string[] = []
+    const writer = yield* makeNavigationWriter({ saveNavigation: (navigation) => Effect.sync(() => {
+      if (navigation.view === "roots") saved.push(navigation.selectedSessionId!)
+    }) })
+    for (let index = 0; index < 8; index++) {
+      yield* writer.schedule({ view: "roots", selectedSessionId: String(index) })
+      yield* Effect.yieldNow
+      yield* TestClock.adjust(NAVIGATION_SAVE_INTERVAL_MS / 4)
+    }
+    expect(saved).toEqual(["3", "7"])
+    yield* writer.schedule({ view: "roots", selectedSessionId: "final" })
+    yield* writer.flush
+    expect(saved).toEqual(["3", "7", "final"])
+    yield* writer.schedule({ view: "roots", selectedSessionId: "after-flush" })
+    yield* Effect.yieldNow
+    expect(saved).toHaveLength(3)
+    yield* TestClock.adjust(NAVIGATION_SAVE_INTERVAL_MS)
+    expect(saved.at(-1)).toBe("after-flush")
+  })).pipe(Effect.provide(TestClock.layer())))
+})
+
+test("scheduled persistence failures are reported and flush observes them", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const error = new PersistenceError({ operation: "save navigation", path: "/state", message: "worker failed" })
+    const reported: PersistenceError[] = []
+    const writer = yield* makeNavigationWriter({ saveNavigation: () => Effect.fail(error) },
+      (failure) => Effect.sync(() => { reported.push(failure) }))
+    yield* writer.schedule({ view: "roots", selectedSessionId: "root" })
+    yield* Effect.yieldNow
+    yield* TestClock.adjust(NAVIGATION_SAVE_INTERVAL_MS)
+    expect(reported).toEqual([error])
+    expect(yield* Effect.flip(writer.flush)).toBe(error)
+  })).pipe(Effect.provide(TestClock.layer())))
 })

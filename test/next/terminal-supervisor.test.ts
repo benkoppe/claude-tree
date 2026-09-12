@@ -135,6 +135,7 @@ for (const provider of [
           branchFrom: () => Effect.die("Unexpected branch"),
         }
         const metadata: ApplicationMetadataFacet = {
+          saveNavigation(navigation) { return this.updateMetadata((state) => ({ ...state, navigation })).pipe(Effect.asVoid) },
           instanceId: "recovery-instance",
           loadMetadata: Effect.sync(() => metadataState),
           updateMetadata: (transform) => Effect.sync(() => { metadataState = transform(metadataState); return metadataState }),

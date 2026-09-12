@@ -10,6 +10,7 @@ import type {
   RootViewModel,
   SurfaceViewModel,
 } from "../application/view-model"
+import { indexRootViews } from "../application/view-model"
 import type { SessionStatus } from "../application/selectors"
 import { displayWidth, graphemes, truncateToWidth } from "./text"
 import { presentationTheme as theme } from "./theme"
@@ -35,6 +36,43 @@ export interface RenderedRoots {
   readonly text: string
   readonly startIndex: number
   readonly endIndex: number
+}
+
+interface PreparedRootRow {
+  readonly key: string
+  readonly text: string
+  readonly normal: readonly TextChunk[]
+  readonly selected: readonly TextChunk[]
+}
+const rootRows = new WeakMap<RootViewModel, PreparedRootRow>()
+
+function prepareRootRow(root: RootViewModel, width: number, messageWidth: number, branchWidth: number): PreparedRootRow {
+  const key = `${width}:${messageWidth}:${branchWidth}`
+  const cached = rootRows.get(root)
+  if (cached?.key === key) return cached
+  const counts = root.history._tag === "Loading" ? "Loading history…"
+    : root.history._tag === "Unavailable" ? "History unavailable · Enter to retry"
+    : `${String(root.messageCount).padStart(messageWidth)} ${(root.messageCount === 1 ? "message" : "messages").padEnd(8)}  ${String(root.memberSessionIds.length).padStart(branchWidth)} ${(root.memberSessionIds.length === 1 ? "branch" : "branches").padEnd(8)}`
+  const titleX = 4
+  const metadataX = Math.max(titleX, width - displayWidth(counts) - 1)
+  const title = truncateToWidth(root.title, Math.max(0, metadataX - titleX - 2))
+  const metadata = metadataX > titleX ? truncateToWidth(counts, width - metadataX - 1) : ""
+  const gap = " ".repeat(Math.max(0, metadataX - titleX - displayWidth(title)))
+  const ending = " ".repeat(Math.max(0, width - metadataX - displayWidth(metadata)))
+  const makeChunks = (selected: boolean) => {
+    const bg = selected ? theme.selected : theme.background
+    const fg = selected ? theme.selectedText : theme.text
+    return [
+      chunk(" ", fg, TextAttributes.NONE, bg),
+      chunk(title, fg, selected ? TextAttributes.BOLD : TextAttributes.NONE, bg),
+      chunk(gap, fg, TextAttributes.NONE, bg),
+      chunk(metadata, root.history._tag === "Unavailable" ? theme.danger : selected ? theme.selectedText : theme.textMuted, TextAttributes.NONE, bg),
+      chunk(ending, fg, TextAttributes.NONE, bg),
+    ]
+  }
+  const row = { key, text: ` ${title}${gap}${metadata}${ending}`, normal: makeChunks(false), selected: makeChunks(true) }
+  rootRows.set(root, row)
+  return row
 }
 
 interface VerticalEntry {
@@ -143,50 +181,38 @@ export function renderRoots(
     return { ...canvas.viewport(0, 0, safeWidth, safeHeight), startIndex: 0, endIndex: 0 }
   }
 
-  const selectedIndex = Math.max(0, roots.findIndex((root) => root.sessionId === selectedSessionId))
+  const index = indexRootViews(roots)
+  const selectedIndex = index.positions.get(selectedSessionId ?? "") ?? 0
   const maximumStart = Math.max(0, roots.length - safeHeight)
   let start = clamp(viewportStart, 0, maximumStart)
   if (selectedIndex < start) start = selectedIndex
   if (selectedIndex >= start + safeHeight) start = selectedIndex - safeHeight + 1
   start = clamp(start, 0, maximumStart)
   const end = Math.min(roots.length, start + safeHeight)
-  const canvas = new SparseCanvas()
-
-  const messageCountWidth = roots.reduce((width, root) => Math.max(width, String(root.messageCount).length), 1)
-  const branchCountWidth = roots.reduce((width, root) => Math.max(width, String(root.memberSessionIds.length).length), 1)
-  for (let index = start; index < end; index += 1) {
-    const root = roots[index]!
-    const row = index - start
+  const chunks: TextChunk[] = []
+  const lines: string[] = []
+  for (let position = start; position < end; position += 1) {
+    const root = roots[position]!
     const selected = root.sessionId === selectedSessionId
-    const background = selected ? theme.selected : theme.background
-    const foreground = selected ? theme.selectedText : theme.text
     const status = statusMarker(root.status, spinnerFrame)
-    const branchLabel = root.memberSessionIds.length === 1 ? "branch" : "branches"
-    const messageLabel = root.messageCount === 1 ? "message" : "messages"
-    const counts = root.history._tag === "Loading" ? "Loading history…"
-      : root.history._tag === "Unavailable" ? "History unavailable · Enter to retry"
-      : `${String(root.messageCount).padStart(messageCountWidth)} ${messageLabel.padEnd("messages".length)}  ${String(root.memberSessionIds.length).padStart(branchCountWidth)} ${branchLabel.padEnd("branches".length)}`
-    const style = { fg: foreground, bg: background, attributes: TextAttributes.NONE }
-    canvas.paint(3, row, Math.max(0, safeWidth - 3), 1, style)
-    canvas.write(1, row, status, {
-      ...DEFAULT_STYLE,
-      fg: statusColor(root.status, false),
-      attributes: TextAttributes.BOLD,
-    })
-    const titleX = 4
-    const metadataX = Math.max(titleX, safeWidth - displayWidth(counts) - 1)
-    canvas.write(titleX, row, truncateToWidth(root.title, Math.max(0, metadataX - titleX - 2)), {
-      ...style,
-      attributes: selected ? TextAttributes.BOLD : TextAttributes.NONE,
-    })
-    if (metadataX > titleX) {
-      canvas.write(metadataX, row, truncateToWidth(counts, safeWidth - metadataX - 1), {
-        ...style,
-        fg: root.history._tag === "Unavailable" ? theme.danger : selected ? theme.selectedText : theme.textMuted,
-      })
+    chunks.push(chunk(" ", theme.text))
+    if (safeWidth > 1) chunks.push(chunk(status, statusColor(root.status), TextAttributes.BOLD))
+    if (safeWidth > 2) chunks.push(chunk(" ", theme.text))
+    let body = ""
+    if (safeWidth > 3) {
+      const row = prepareRootRow(root, safeWidth, index.messageCountWidth, index.branchCountWidth)
+      for (const item of selected ? row.selected : row.normal) chunks.push({ ...item })
+      body = row.text
     }
+    lines.push((` ${status} `.slice(0, Math.min(3, safeWidth)) + body).trimEnd())
+    if (lines.length < safeHeight) chunks.push(chunk("\n", theme.text))
   }
-  return { ...canvas.viewport(0, 0, safeWidth, safeHeight), startIndex: start, endIndex: end }
+  while (lines.length < safeHeight) {
+    chunks.push(chunk(" ".repeat(safeWidth), theme.text))
+    lines.push("")
+    if (lines.length < safeHeight) chunks.push(chunk("\n", theme.text))
+  }
+  return { content: styledText(chunks), text: lines.join("\n"), startIndex: start, endIndex: end }
 }
 
 export function renderGraph(

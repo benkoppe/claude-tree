@@ -10,6 +10,7 @@ import { setProcessTitle } from "./process-title"
 import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import { makeAppRuntime } from "./application"
 import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
+import { makeNavigationPersistenceWorker } from "./infrastructure/metadata/navigation-persistence"
 import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
 import { makeClaudeProvider } from "./infrastructure/providers/claude"
 import { createCodexProvider } from "./infrastructure/providers/codex"
@@ -26,6 +27,7 @@ import {
 } from "./services/terminal-supervisor"
 
 export const SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const
+const INTERACTIVE_FRAME_RATE = 60
 
 export type ShutdownSignal = (typeof SHUTDOWN_SIGNALS)[number]
 
@@ -104,6 +106,11 @@ export function composeProductionApplication(
     const repository = yield* makeProviderStateRepository(persistenceOptions).pipe(
       Effect.provideService(PersistencePlatform, nativePersistencePlatform),
     )
+    const navigation = yield* makeNavigationPersistenceWorker({ ...persistenceOptions,
+      projectDirectory: repository.projectPath,
+      instanceId: repository.instanceId,
+      stateHome: nativePersistencePlatform.stateHome(),
+    })
     const herdr = yield* makeLiveHerdrReporter()
     const bridge = makeTerminalEventBridge()
     const terminals = yield* makeTerminalSupervisor({
@@ -113,7 +120,8 @@ export function composeProductionApplication(
       events: bridge.events,
     })
     yield* composeApplicationLifecycle(
-      makeAppRuntime({ provider, metadata: repository, terminals }),
+      makeAppRuntime({ provider, metadata: { ...repository, saveNavigation: navigation.saveNavigation }, terminals,
+        closeNavigationPersistence: navigation.close }),
       (appRuntime) => {
         bridge.bind(appRuntime.terminalEvents)
         return reportApplicationToHerdr(herdr, appRuntime.viewModels).pipe(
@@ -262,6 +270,8 @@ function makeOpenTuiRenderer(): Effect.Effect<CliRenderer, Error, Scope.Scope> {
         exitSignals: [],
         useMouse: true,
         useKittyKeyboard: { events: true },
+        targetFps: INTERACTIVE_FRAME_RATE,
+        maxFps: INTERACTIVE_FRAME_RATE,
         backgroundColor: presentationTheme.background,
       }),
       catch: toError,

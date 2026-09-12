@@ -21,6 +21,7 @@ export type ApplicationMetadataFacet = Pick<
   ProviderStateRepositoryApi,
   | "instanceId"
   | "loadMetadata"
+  | "saveNavigation"
   | "updateMetadata"
   | "commitRemoval"
   | "pendingAdoptions"

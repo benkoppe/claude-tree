@@ -262,9 +262,9 @@ test("root key repeats coalesce and stale publications cannot rewind the local c
   if (initial.surface._tag !== "Roots") throw new Error("Expected roots")
   const base = initial.surface.roots[0]!
   const roots = Array.from({ length: 200 }, (_, index) => ({ ...base,
-    sessionId: `root-${index}`, title: `Conversation ${index}`, selected: index === 0,
+    sessionId: `root-${index}`, title: `Conversation ${index}`, memberSessionIds: [`root-${index}`],
   }))
-  const view: ApplicationViewModel = { ...initial, surface: { _tag: "Roots", roots } }
+  const view: ApplicationViewModel = { ...initial, surface: { _tag: "Roots", roots, selectedSessionId: "root-0" } }
   const release = Deferred.makeUnsafe<void>()
   let attempts = 0
   const running = await startPresentation(setup.renderer, view, new Map(), undefined, Effect.succeed(true), {
@@ -277,9 +277,7 @@ test("root key repeats coalesce and stale publications cannot rewind the local c
     setup.mockInput.pressArrow("down")
     await waitFor(() => attempts === 1)
     for (let index = 0; index < 100; index++) setup.mockInput.pressArrow("down")
-    await running.harness.update({ ...view, surface: { _tag: "Roots", roots: roots.map((root) => ({
-      ...root, selected: root.sessionId === "root-1",
-    })) } }).pipe(Effect.runPromise)
+    await running.harness.update({ ...view, surface: { _tag: "Roots", roots, selectedSessionId: "root-1" } }).pipe(Effect.runPromise)
     await frame(setup, () => isSelected(setup, "Conversation 101"))
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressEnter()
@@ -289,6 +287,46 @@ test("root key repeats coalesce and stale publications cannot rewind the local c
       "select-root:root-1", "select-root:root-102",
     ])
   } finally {
+    await running.stop()
+  }
+})
+
+test("a burst of root movement prepares content once at the native frame boundary", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const initial = rootsView()
+  if (initial.surface._tag !== "Roots") throw new Error("Expected roots")
+  const base = initial.surface.roots[0]!
+  const roots = Array.from({ length: 200 }, (_, index) => ({ ...base,
+    sessionId: `root-${index}`, title: `Conversation ${index}`, memberSessionIds: [`root-${index}`],
+  }))
+  const running = await startPresentation(setup.renderer, { ...initial,
+    surface: { _tag: "Roots", roots, selectedSessionId: "root-0" },
+  })
+  let content: ReturnType<typeof setup.renderer.root.findDescendantById>
+  try {
+    await frame(setup, () => isSelected(setup, "Conversation 0"))
+    setup.renderer.stop()
+    content = setup.renderer.root.findDescendantById("next-content")!
+    let prototype = Object.getPrototypeOf(content)
+    let descriptor: PropertyDescriptor | undefined
+    while (prototype && !descriptor) {
+      descriptor = Object.getOwnPropertyDescriptor(prototype, "content")
+      prototype = Object.getPrototypeOf(prototype)
+    }
+    if (!descriptor?.set) throw new Error("Expected content setter")
+    let preparations = 0
+    Object.defineProperty(content, "content", { configurable: true,
+      get: () => descriptor!.get?.call(content),
+      set: (value) => { preparations++; descriptor!.set!.call(content, value) },
+    })
+    for (let index = 0; index < 100; index++) setup.mockInput.pressArrow("down")
+    expect(preparations).toBe(0)
+    await frame(setup, () => isSelected(setup, "Conversation 100"))
+    await waitFor(() => running.harness.calls.includes("select-root:root-100"))
+    await setup.renderOnce()
+    expect(preparations).toBe(1)
+  } finally {
+    if (content) Reflect.deleteProperty(content, "content")
     await running.stop()
   }
 })
@@ -644,6 +682,7 @@ test("runs an action and accepts later input when its pending render defects", a
     await frame(setup, (value) => value.includes("Conversation roots"))
     setup.mockInput.pressKey("r")
     await waitFor(() => running.harness.calls.filter((call) => call === "refresh").length === 1)
+    await frame(setup, (value) => value.includes("pending render defect"))
     setup.mockInput.pressEscape()
     await frame(setup, (value) => value.includes("Conversation roots") && !value.includes("pending render defect"))
     setup.mockInput.pressKey("r")
@@ -1325,10 +1364,7 @@ function makeHarness(
             selectionId: selectionId ?? null,
             surface: {
               ...roots.surface,
-              roots: roots.surface.roots.map((root) => ({
-                ...root,
-                selected: root.sessionId === sessionId,
-              })),
+              selectedSessionId: sessionId,
             },
           }).pipe(Effect.as(true))
         }
@@ -1338,10 +1374,7 @@ function makeHarness(
           selectionId: selectionId ?? null,
           surface: {
             ...surface,
-            roots: surface.roots.map((root) => ({
-              ...root,
-              selected: root.sessionId === sessionId,
-            })),
+            selectedSessionId: sessionId,
           },
         }).pipe(Effect.as(true))
         }
@@ -1429,6 +1462,7 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
     ...baseView(),
     surface: {
       _tag: "Roots",
+      selectedSessionId: "root-1",
       roots: [
         {
           sessionId: "root-1",
@@ -1438,7 +1472,6 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
           memberSessionIds: ["root-1"],
           messageCount: 1,
           status: "idle",
-          selected: true,
         },
         {
           sessionId: "root-2",
@@ -1448,7 +1481,6 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
           memberSessionIds: ["root-2"],
           messageCount: 2,
           status: "working",
-          selected: false,
         },
       ],
     },
