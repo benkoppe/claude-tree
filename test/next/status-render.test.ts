@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import type { EndpointNodeViewModel } from "../../src/application/view-model"
+import type { EndpointNodeViewModel, RootViewModel } from "../../src/application/view-model"
 import { renderGraph, renderRoots, statusMarker, statusLabel, statusColor } from "../../src/presentation/render"
 import { presentationTheme as theme } from "../../src/presentation/theme"
 import type { RGBA } from "@opentui/core"
@@ -54,6 +54,20 @@ test.each([40, 80])("root message and branch counts align numerically at width %
   }
   const scrolled = renderRoots(roots, "root-100", 1, width)
   expect(scrolled.text).toBe(rows[3]!)
+})
+
+test.each([60, 80, 120])("history gaps precede aligned root counts at width %i", (width) => {
+  const roots: RootViewModel[] = ["Ready", "Limited"].map((status, index) => ({
+    sessionId: `root-${index}`, title: `Session ${index}`, lastModified: 0, status: "idle",
+    memberSessionIds: [`root-${index}`], messageCount: 12,
+    history: status === "Ready" ? { _tag: "Ready" } : { _tag: "Limited", contextMessageCount: 99 },
+  }))
+  const [normal, limited] = renderRoots(roots, roots[0]!.sessionId, 2, width).text.split("\n")
+  expect(limited).toContain("History gap  12 messages")
+  expect(limited!.indexOf("12 messages")).toBe(normal!.indexOf("12 messages"))
+  expect(limited!.indexOf("1 branch")).toBe(normal!.indexOf("1 branch"))
+  expect(limited).not.toContain("99")
+  expect(limited).not.toContain("Open available")
 })
 
 test("highlighted status colors have readable contrast but root markers stay unhighlighted", () => {
