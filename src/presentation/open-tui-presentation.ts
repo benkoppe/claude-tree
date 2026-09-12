@@ -286,6 +286,7 @@ class OpenTuiPresentationController {
   private modalIdentity: string | null = null
   private errorMessage: string | undefined
   private errorCopyState: "idle" | "copied" | "failed" = "idle"
+  private errorChoice: "copy" | "close" = "close"
   private actionPending = false
   private terminalOpening = false
   private started = false
@@ -738,6 +739,15 @@ class OpenTuiPresentationController {
     }
     if (modal._tag === "About" || modal._tag === "Error") {
       if (modal._tag === "Error") {
+        if (["tab", "left", "right", "h", "l"].some((name) => isUnmodifiedKey(key, name))) {
+          this.errorChoice = this.errorChoice === "copy" ? "close" : "copy"
+          this.render()
+          return
+        }
+        if (isEnterKey(key) && this.errorChoice === "copy") {
+          if (!key.repeated) this.copyError()
+          return
+        }
         if (isUnmodifiedKey(key, "c") && !key.repeated) { this.copyError(); return }
         const delta = listNavigationDelta(key)
         if (delta !== undefined) { this.errorScroll.scrollBy(delta); this.render(); return }
@@ -779,7 +789,7 @@ class OpenTuiPresentationController {
   }
 
   private errorCopyLabel(): string {
-    return this.errorCopyState === "copied" ? "c copied" : this.errorCopyState === "failed" ? "c copy failed" : "c copy"
+    return this.errorCopyState === "copied" ? "Copied" : this.errorCopyState === "failed" ? "Copy failed" : "↑↓ scroll · c copy · esc close"
   }
 
   private moveRoot(delta: number): void {
@@ -1192,6 +1202,7 @@ class OpenTuiPresentationController {
     if (identity === this.modalIdentity) return
     this.modalIdentity = identity
     this.errorCopyState = "idle"
+    this.errorChoice = "close"
     this.errorScroll.scrollTo(0)
     this.pendingMouseAction = null
     if (modal?._tag === "ConfirmStop" || modal?._tag === "ConfirmStopTree") this.modalChoice = "confirm"
@@ -1444,9 +1455,14 @@ class OpenTuiPresentationController {
   private modalActions(modal: ApplicationModal) {
     if (modal._tag === "About") return styledText([chunk("close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
     if (modal._tag === "Error") return styledText([
-      chunk("↑↓ scroll  ", theme.textMuted),
-      chunk(this.errorCopyLabel(), theme.selectedText, TextAttributes.BOLD, theme.primary),
-      chunk("  ", theme.textMuted), chunk("esc close", theme.selectedText, TextAttributes.BOLD, theme.primary),
+      ...(["copy", "close"] as const).flatMap((choice) => [
+        chunk(choice === "copy" ? "Copy" : "Close",
+          this.errorChoice === choice ? theme.selectedText : theme.textMuted,
+          this.errorChoice === choice ? TextAttributes.BOLD : TextAttributes.NONE,
+          this.errorChoice === choice ? theme.primary : theme.element),
+        chunk("  ", theme.textMuted, TextAttributes.NONE, theme.element),
+      ]),
+      chunk(this.errorCopyLabel(), theme.textMuted, TextAttributes.NONE, theme.element),
     ])
     const label = modal._tag === "ConfirmStopTree" ? "Kill" : modal._tag === "ConfirmStop" ? "Stop" : "Delete"
     return styledText([
@@ -1785,9 +1801,7 @@ class OpenTuiPresentationController {
     if (modal._tag === "About") return "close"
     const x = event.x - this.dialogActions.screenX
     if (modal._tag === "Error") {
-      const copyStart = displayWidth("↑↓ scroll  ")
-      const copyEnd = copyStart + displayWidth(this.errorCopyLabel())
-      return x >= copyStart && x < copyEnd ? "copy" : x >= copyEnd + 2 ? "close" : undefined
+      return x >= 0 && x < 4 ? "copy" : x >= 6 && x < 11 ? "close" : undefined
     }
     return x < displayWidth("Cancel  ") ? "cancel" : "confirm"
   }
