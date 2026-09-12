@@ -1,4 +1,5 @@
 import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
+import type { HistoryTrace } from "../../../diagnostics/history-trace"
 import {
   isLinkedCompaction, NavigationHistoryError, object, parentOf, RecordEvidence,
   type LinkedCompactionRecord, type TranscriptRecord,
@@ -19,14 +20,15 @@ export function projectNavigationHistory(
   entries: readonly SessionStoreEntry[],
   selectedRecordIds: readonly string[],
   ancestors: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map(),
+  trace?: HistoryTrace,
 ): NavigationHistoryProjection {
-  const evidence = new RecordEvidence(entries, ancestors)
+  const evidence = new RecordEvidence(entries, ancestors, trace)
   const effective = evidence.current.effective
   const sourceRecords = evidence.current.ordered
   // Without logical compaction links there is no application-owned reconstruction:
   // the ordinary SDK read already supplies the authoritative conversation.
   if (!sourceRecords.some(isLinkedCompaction)) return { sourceRecords, records: sourceRecords, changed: false }
-  const repairs = preservationRepairs(evidence, new Set(selectedRecordIds))
+  const repairs = preservationRepairs(evidence, new Set(selectedRecordIds), trace)
   const complete = new Set<string>()
   const boundaries = new Set<string>()
 
@@ -175,6 +177,7 @@ function reaches(start: string | null, target: string, parent: (id: string) => s
 function preservationRepairs(
   evidence: RecordEvidence,
   selected: ReadonlySet<string>,
+  trace?: HistoryTrace,
 ): ParentRepairs {
   const source = evidence.current.effective
   const result: ParentRepairs = { parents: new Map(), problems: new Map() }
@@ -245,9 +248,11 @@ function preservationRepairs(
           const parent = [...candidates][0]!
           if (!result.parents.has(id) || result.parents.get(id) !== parent) {
             result.parents.set(id, parent)
+            trace?.decision(retained.boundary.uuid, id, "restore-parent", candidates.size, parent)
             changed = true
           }
         } else if (candidates.size > 1 || id === retained.members[0]) {
+          trace?.decision(retained.boundary.uuid, id, candidates.size === 0 ? "no-parent" : "conflicting-parents", candidates.size)
           historicalProblems.set(JSON.stringify([retained.boundary.uuid, id]), {
             boundaryId: retained.boundary.uuid, recordId: id,
             error: new NavigationHistoryError("ambiguous-preservation",
@@ -295,7 +300,10 @@ function preservationRepairs(
       })
       if (later.length && later.every((id) => !selected.has(id))) cutIndex = index
     }
-    if (cutIndex !== undefined) result.parents.set(retained.boundary.uuid, region[cutIndex]!)
+    if (cutIndex !== undefined) {
+      result.parents.set(retained.boundary.uuid, region[cutIndex]!)
+      trace?.decision(retained.boundary.uuid, retained.boundary.uuid, "rewind-prefix", undefined, region[cutIndex]!)
+    }
   }
 
   // Context retention can also pull ordinary descendants of the declared tail
@@ -316,6 +324,7 @@ function preservationRepairs(
         if (!reaches(parent, id, logicalParent)) {
           contextPlacements.set(id, parent)
           result.parents.set(id, parent)
+          trace?.decision(retained.boundary.uuid, id, "context-placement", undefined, parent)
         }
       }
     }
@@ -337,12 +346,18 @@ function preservationRepairs(
       const originalAnchor = evidence.availableParents(record).has(retained.anchor)
       if ((selectedContinuation || originalAnchor) && !reaches(continuation, record.uuid, logicalParent)) candidates.set(continuation, retained)
     }
-    if (candidates.size === 1) result.parents.set(record.uuid, candidates.keys().next().value!)
+    if (candidates.size === 1) {
+      const parent = candidates.keys().next().value!
+      result.parents.set(record.uuid, parent)
+      trace?.decision(candidates.get(parent)!.boundary.uuid, record.uuid, "reconnect-continuation", 1, parent)
+    }
     else if (candidates.size > 1) result.problems.set(record.uuid, new NavigationHistoryError("ambiguous-preservation",
       `Record ${record.uuid} has multiple evidenced compaction continuations`, record.uuid))
   }
   for (const { boundaryId, recordId, error } of historicalProblems.values()) {
-    if (reaches(logicalParent(boundaryId) ?? null, recordId, logicalParent)) result.problems.set(boundaryId, error)
+    const required = reaches(logicalParent(boundaryId) ?? null, recordId, logicalParent)
+    trace?.decision(boundaryId, recordId, required ? "required-error" : "ignored-error")
+    if (required) result.problems.set(boundaryId, error)
   }
   return result
 }

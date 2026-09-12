@@ -52,6 +52,26 @@ Press **`c`** in the tree to copy the highlighted node's full text, preserving l
 
 Copy uses the host terminal's OSC 52 clipboard support, the same mechanism used for clipboard writes from embedded agent terminals.
 
+## Private History Diagnostics
+
+For a Claude history-loading failure, run this from the same project directory as the navigator, using the session ID shown in the error:
+
+```sh
+claude-tree --diagnose-history SESSION_ID > history-diagnostic.json
+```
+
+You can also supply the project directory explicitly:
+
+```sh
+claude-tree --diagnose-history SESSION_ID /path/to/project
+```
+
+This headless command uses the production Claude history reader and ancestry resolver. It does not open agent terminals or modify application state or provider transcripts. The JSON report includes anonymous session/record labels, read stages, matching-version counts, fixed comparison-field names, parent-filtering decisions, and the final outcome. It excludes conversation text, payload values, content hashes, filesystem paths, original UUIDs, and raw exception messages. SDK output is isolated from the report.
+
+Share the JSON report when investigating a loading failure. `outcome: "Unavailable"` is a valid diagnostic result, not a failure to produce the report. Large traces explicitly report `omitted_events` and omitted per-version comparisons. Nix packages embed their build revision; source checkouts report their own HEAD and whether application sources are dirty. Unversioned installations report an unknown revision rather than the work project's commit.
+
+Error dialogs also support Up/Down, Page Up/Page Down, Home/End, and mouse-wheel scrolling. Press **`c`** to copy the complete original error, or click **copy**. That copy is verbatim; the diagnostic command produces the sanitized report.
+
 ## Activity Recovery
 
 Working indicators combine terminal activity observations with a short wait for the provider's completed transcript. Hidden sessions are checked automatically, and `r` in the navigator resamples live terminals as well as refreshing conversation history.

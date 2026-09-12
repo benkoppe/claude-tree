@@ -1,4 +1,4 @@
-_: {
+{ self, ... }: {
   perSystem =
     {
       inputs',
@@ -8,6 +8,10 @@ _: {
     }:
     let
       package = builtins.fromJSON (builtins.readFile ../package.json);
+      buildMetadata = builtins.toJSON {
+        revision = self.rev or (if self ? dirtyRev then builtins.substring 0 40 self.dirtyRev else null);
+        dirty = if self ? rev then false else if self ? dirtyRev then true else null;
+      };
       bun2nix = inputs'.bun2nix.packages.default;
       providerPackages = [
         inputs'.llm-agents.packages.claude-code
@@ -55,6 +59,8 @@ _: {
 
           mkdir -p "$out/lib/claude-tree" "$out/bin"
           cp -R src package.json node_modules "$out/lib/claude-tree"
+          chmod u+w "$out/lib/claude-tree/src/build-metadata.json"
+          cp ${pkgs.writeText "claude-tree-build-metadata.json" buildMetadata} "$out/lib/claude-tree/src/build-metadata.json"
           makeWrapper ${lib.getExe pkgs.bun} "$out/bin/claude-tree" \
             --add-flags "$out/lib/claude-tree/src/cli.ts"
 

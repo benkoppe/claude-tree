@@ -12,8 +12,8 @@ import { makeAppRuntime } from "./application"
 import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
 import { makeNavigationPersistenceWorker } from "./infrastructure/metadata/navigation-persistence"
 import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
-import { makeClaudeProvider } from "./infrastructure/providers/claude"
-import { createCodexProvider } from "./infrastructure/providers/codex"
+import { UNKNOWN_BUILD } from "./build-info"
+import { HistoryDiagnosticReportSchema, HistoryTrace, type HistoryDiagnosticReport } from "./diagnostics/history-trace"
 import {
   BunPtyProcessFactory,
   OpenTuiTerminalRenderer,
@@ -53,6 +53,7 @@ export interface CliProgramEnvironment {
   readonly runApplication: (
     options: Extract<CliOptions, { readonly command: "run" }>,
   ) => Effect.Effect<void, unknown>
+  readonly diagnoseHistory?: (options: Extract<CliOptions, { command: "diagnose-history" }>) => Effect.Effect<HistoryDiagnosticReport, unknown>
 }
 
 export interface ApplicationLifecycleRuntime<E = never> {
@@ -68,7 +69,8 @@ export function makeCliProgram(environment: CliProgramEnvironment): Effect.Effec
   return Effect.gen(function*() {
     const options = yield* Effect.try({
       try: () => parseCliArguments(environment.args),
-      catch: toError,
+      catch: (cause) => environment.args.some((argument) => argument.startsWith("--diagnose-history"))
+        ? new Error("Invalid history diagnostic arguments. Use --help for usage.") : toError(cause),
     })
     if (options.command === "help") {
       yield* Effect.sync(() => environment.writeStdout(CLI_HELP))
@@ -78,11 +80,27 @@ export function makeCliProgram(environment: CliProgramEnvironment): Effect.Effec
       yield* Effect.sync(() => environment.writeStdout(`${PROGRAM_NAME} ${PROGRAM_VERSION}\n`))
       return
     }
+    if (options.command === "diagnose-history") {
+      const report = yield* Effect.suspend(() => (environment.diagnoseHistory ?? makeProductionHistoryDiagnostic)(options)).pipe(
+        Effect.flatMap((value) => Effect.try({ try: () => HistoryDiagnosticReportSchema.parse(value), catch: () => undefined })),
+        Effect.catchCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.sync(() => {
+          const trace = new HistoryTrace("diagnostic")
+          trace.fail("worker", "unexpected-failure")
+          return trace.finish(UNKNOWN_BUILD, "Unavailable")
+        })),
+      )
+      yield* Effect.sync(() => environment.writeStdout(JSON.stringify(report, null, 2) + "\n"))
+      return
+    }
     if (!environment.stdinIsTTY || !environment.stdoutIsTTY) {
       return yield* Effect.fail(new Error("claude-tree requires an interactive terminal"))
     }
     yield* environment.runApplication(options)
   })
+}
+
+export function makeProductionHistoryDiagnostic(options: Extract<CliOptions, { command: "diagnose-history" }>): Effect.Effect<HistoryDiagnosticReport, unknown> {
+  return Effect.promise(() => import("./diagnostics/run-history")).pipe(Effect.flatMap((module) => module.runHistoryDiagnostic(options)))
 }
 
 export function makeProductionApplication(
@@ -257,9 +275,14 @@ function makeProvider(
   provider: "claude" | "codex",
   projectPath: string,
 ): Effect.Effect<AgentProviderApi, unknown> {
-  return provider === "codex"
-    ? createCodexProvider(projectPath)
-    : Effect.succeed(makeClaudeProvider(projectPath))
+  return Effect.gen(function*() {
+    if (provider === "codex") {
+      const { createCodexProvider } = yield* Effect.promise(() => import("./infrastructure/providers/codex"))
+      return yield* createCodexProvider(projectPath)
+    }
+    const { makeClaudeProvider } = yield* Effect.promise(() => import("./infrastructure/providers/claude"))
+    return makeClaudeProvider(projectPath)
+  })
 }
 
 function makeOpenTuiRenderer(): Effect.Effect<CliRenderer, Error, Scope.Scope> {

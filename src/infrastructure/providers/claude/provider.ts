@@ -36,6 +36,7 @@ import {
 import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
 import { NavigationHistoryError, projectNavigationHistory } from "./navigation-history"
+import { safeHistoryFailure, type HistoryTrace, type HistoryStage, type HistoryFailure } from "../../../diagnostics/history-trace"
 
 export interface ClaudeSdk {
   readonly getSessionInfo: (sessionId: string, options: { readonly dir: string }) => Promise<SDKSessionInfo | undefined>
@@ -192,6 +193,7 @@ export class ClaudeProvider implements AgentProviderApi {
   private readonly listSessionsTimeoutMs: number
   private readonly transcriptReadTimeoutMs: number
   private readonly provenanceImportTimeoutMs: number
+  private readonly timeoutErrors = new WeakSet<object>()
 
   constructor(
     private readonly projectPath: string,
@@ -240,10 +242,11 @@ export class ClaudeProvider implements AgentProviderApi {
 
   readTranscripts(
     sessionIds: readonly string[],
+    trace?: HistoryTrace,
   ): Effect.Effect<ReadonlyMap<string, TranscriptRead>, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const deadline = yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs)
-      return yield* this.readTranscriptsWithin(sessionIds, deadline)
+      return yield* this.readTranscriptsWithin(sessionIds, deadline, undefined, trace)
     })
   }
 
@@ -273,21 +276,25 @@ export class ClaudeProvider implements AgentProviderApi {
     sessionIds: readonly string[],
     deadline: OperationDeadline,
     publish?: (transcripts: ReadonlyMap<string, TranscriptRead>) => Effect.Effect<void>,
+    trace?: HistoryTrace,
   ): Effect.Effect<ReadonlyMap<string, TranscriptRead>> {
     const pending = new Map<string, TranscriptRead>()
     return Effect.all(
       unique(sessionIds).map((sessionId) =>
         Effect.gen({ self: this }, function*() {
           const readDeadline = publish ? yield* this.makeDeadline("readTranscripts", this.operationTimeoutMs) : deadline
-          const context = yield* this.readActiveContext(sessionId, "readTranscripts", readDeadline)
+          const context = yield* this.traced(trace, "active-context", sessionId,
+            this.readActiveContext(sessionId, "readTranscripts", readDeadline), (context) => context?.messages.length ?? 0)
           if (context === undefined) return undefined
           if (context.messages.length === 0 && context.systemAnchorId === undefined) {
-            const info = yield* this.callSdk("getSessionInfo", () => this.sdk.getSessionInfo(sessionId, { dir: this.projectPath }),
-              this.listSessionsTimeoutMs, readDeadline)
+            const info = yield* this.traced(trace, "session-info", sessionId, this.callSdk("getSessionInfo", () => this.sdk.getSessionInfo(sessionId, { dir: this.projectPath }),
+              this.listSessionsTimeoutMs, readDeadline))
             if (info === undefined) return undefined
           }
-          const entries = yield* this.readSessionEntries(sessionId, "readTranscripts", readDeadline)
-          return yield* this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline)
+          const entries = yield* this.traced(trace, "session-records", sessionId,
+            this.readSessionEntries(sessionId, "readTranscripts", readDeadline), (entries) => entries.length)
+          return yield* this.traced(trace, "navigation-history", sessionId,
+            this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline, trace), (messages) => messages.length)
         }).pipe(
           Effect.match({
             onFailure: (error): readonly [string, TranscriptRead] => [
@@ -856,14 +863,16 @@ export class ClaudeProvider implements AgentProviderApi {
     entries: readonly SessionStoreEntry[],
     operation: string,
     deadline: OperationDeadline,
+    trace?: HistoryTrace,
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const active = context.messages
       const projection = yield* this.projectNavigationHistoryWithProvenance(sessionId, entries, [
         ...active.map((message) => message.id), ...(context.systemAnchorId ? [context.systemAnchorId] : []),
-      ], operation, deadline)
+      ], operation, deadline, trace)
       if (!projection.changed) return markCompactionSummaries(active, projection.sourceRecords)
-      const messages = yield* this.readStoredTranscript(sessionId, projection.records, operation, deadline, context.systemAnchorId)
+      const messages = yield* this.traced(trace, "sdk-reconstruction", sessionId,
+        this.readStoredTranscript(sessionId, projection.records, operation, deadline, context.systemAnchorId, trace), (messages) => messages.length)
       return yield* Effect.try({
         try: () => {
           const activeIds = new Set(active.map((message) => message.id))
@@ -872,6 +881,7 @@ export class ClaudeProvider implements AgentProviderApi {
           const mismatch = active.find((message) => historyById.get(message.id)?.copyIdentity !== message.copyIdentity ||
             historyById.get(message.id)?.role !== message.role)
           if (mismatch) {
+            trace?.fail("validation", "active-record-mismatch", sessionId, mismatch.id)
             throw new Error(`Compaction history does not preserve active record ${mismatch.id} with its exact role and payload`)
           }
           return normalized.map((message) => activeIds.has(message.id) ? message : { ...message, historical: true as const })
@@ -887,22 +897,33 @@ export class ClaudeProvider implements AgentProviderApi {
     selectedIds: readonly string[],
     operation: string,
     deadline: OperationDeadline,
+    trace?: HistoryTrace,
   ): Effect.Effect<ReturnType<typeof projectNavigationHistory>, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const ancestors = new Map<string, readonly SessionStoreEntry[]>([[sessionId, entries]])
+      let attemptNumber = 0
       while (true) {
+        trace?.projection(++attemptNumber, "started", { selected: selectedIds.length })
         const attempt = yield* Effect.try({
-          try: () => projectNavigationHistory(entries, selectedIds, ancestors),
+          try: () => projectNavigationHistory(entries, selectedIds, ancestors, trace),
           catch: (cause) => cause,
         }).pipe(Effect.match({
           onSuccess: (projection) => ({ _tag: "Projected" as const, projection }),
           onFailure: (cause) => ({ _tag: "Failed" as const, cause }),
         }))
-        if (attempt._tag === "Projected") return attempt.projection
+        if (attempt._tag === "Projected") {
+          trace?.projection(attemptNumber, "succeeded", { changed: attempt.projection.changed })
+          return attempt.projection
+        }
         const cause = attempt.cause
+        trace?.projection(attemptNumber, "failed", { code: this.failureCode(cause),
+          ...(cause instanceof NavigationHistoryError ? { recordId: cause.recordId,
+            ...(cause.parentId && entries.some((entry) => entry.uuid === cause.parentId) ? { relatedRecordId: cause.parentId } : {}),
+          } : {}) })
         if (cause instanceof NavigationHistoryError && cause.kind === "missing-preservation-source" &&
           cause.sourceSessionId && !ancestors.has(cause.sourceSessionId)) {
-          const source = yield* this.readSessionEntries(cause.sourceSessionId, operation, deadline, "provider").pipe(
+          const source = yield* this.traced(trace, "ancestor-records", cause.sourceSessionId,
+            this.readSessionEntries(cause.sourceSessionId, operation, deadline, "provider"), (records) => records.length).pipe(
             Effect.mapError((error) => this.protocolError(operation,
               `Compaction preservation for session ${sessionId} requires source session ${cause.sourceSessionId}: ${error.message}`, error)),
           )
@@ -921,6 +942,7 @@ export class ClaudeProvider implements AgentProviderApi {
     operation: string,
     deadline: OperationDeadline,
     systemAnchorId?: string,
+    trace?: HistoryTrace,
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
     const sessionStore = this.snapshotStore(sessionId, entries)
     return this.callSdk(operation, () => getSessionMessages(sessionId, { dir: this.projectPath, sessionStore,
@@ -929,6 +951,7 @@ export class ClaudeProvider implements AgentProviderApi {
       this.transcriptReadTimeoutMs, deadline).pipe(Effect.flatMap((messages) => Effect.try({
         try: () => {
           if (systemAnchorId !== undefined && !messages.some((message) => message.type === "system" && message.uuid === systemAnchorId)) {
+            trace?.fail("validation", "system-anchor-missing", sessionId, systemAnchorId)
             throw new Error(`Navigation history does not preserve SDK-selected system record ${systemAnchorId}`)
           }
           return normalizeTranscript(sessionId, systemAnchorId === undefined ? messages : messages.filter((message) => message.type !== "system"))
@@ -1123,17 +1146,46 @@ export class ClaudeProvider implements AgentProviderApi {
   }
 
   private timeoutError(operation: string, timeoutMs: number): ProviderError {
-    return this.providerError(
+    const error = this.providerError(
       operation,
       `Claude ${operation} timed out after ${timeoutMs}ms`,
     )
+    this.timeoutErrors.add(error)
+    return error
   }
 
   private deadlineError(deadline: OperationDeadline): ProviderError {
-    return this.providerError(
-      deadline.operation,
-      `Claude ${deadline.operation} timed out after ${deadline.timeoutMs}ms`,
-    )
+    return this.timeoutError(deadline.operation, deadline.timeoutMs)
+  }
+
+  private failureCode(cause: unknown, sessionId?: string): HistoryFailure {
+    let code: HistoryFailure = "unexpected-failure"
+    try {
+      for (let depth = 0; depth < 8; depth++) {
+        if (cause instanceof NavigationHistoryError) return safeHistoryFailure(cause.kind)
+        if (typeof cause === "object" && cause !== null && this.timeoutErrors.has(cause)) return "timeout"
+        if (typeof cause === "object" && cause !== null) {
+          const errno = Object.getOwnPropertyDescriptor(cause, "code")?.value
+          if (errno === "EACCES" || errno === "EPERM") return "permission-denied"
+          if (errno === "ENOENT") return "source-not-found"
+          const message = Object.getOwnPropertyDescriptor(cause, "message")?.value
+          if (sessionId !== undefined && message === `Session ${sessionId} not found`) return "source-not-found"
+        }
+        if (!(cause instanceof ProviderError) && !(cause instanceof ProviderProtocolError)) return code
+        code = cause instanceof ProviderProtocolError ? "protocol-error" : "sdk-request-failed"
+        if (cause.cause === undefined) return code
+        cause = cause.cause
+      }
+    } catch { return code }
+    return code
+  }
+
+  private traced<A, E>(trace: HistoryTrace | undefined, stage: HistoryStage, sessionId: string,
+    effect: Effect.Effect<A, E>, size?: (value: A) => number): Effect.Effect<A, E> {
+    if (!trace) return effect
+    return Effect.sync(() => trace.stage(stage, sessionId, "started")).pipe(Effect.andThen(effect),
+      Effect.tap((value) => Effect.sync(() => trace.stage(stage, sessionId, "succeeded", size?.(value)))),
+      Effect.tapError((error) => Effect.sync(() => trace.stage(stage, sessionId, "failed", undefined, this.failureCode(error, sessionId)))))
   }
 
   private providerError(operation: string, message: string, cause?: unknown): ProviderError {
