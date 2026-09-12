@@ -25,6 +25,12 @@ const projectedCache = new WeakMap<ApplicationState["provider"], {
   readonly data: ProjectedApplicationData
 }>()
 const visibleForestCache = new WeakMap<ConversationForest, { visible: ReadonlySet<string>; forest: ConversationForest }>()
+const visibleEndpointCache = new WeakMap<ApplicationState["historyStatus"], {
+  local: ApplicationState["local"]["sessions"]
+  transcripts: ApplicationState["provider"]["transcripts"]
+  terminals: ApplicationState["terminals"]
+  ids: ReadonlySet<string>
+}>()
 
 function sameKeys(left: ReadonlyMap<string, unknown>, right: ReadonlyMap<string, unknown>): boolean {
   return left === right || (left.size === right.size && [...left.keys()].every((key) => right.has(key)))
@@ -94,7 +100,11 @@ export function selectConversationForest(state: ApplicationState): ConversationF
   const forest = projectForest(
     data.sessions,
     data.transcripts,
-    state.relations,
+    state.relations.filter((relation) => {
+      const parent = selectTranscriptRead(state, relation.parentSessionId)
+      const child = selectTranscriptRead(state, relation.childSessionId)
+      return !(parent?._tag === "Available" && parent.coverage) && !(child?._tag === "Available" && child.coverage)
+    }),
     state.removals,
   )
   // Reducer collections are immutable. Navigation, modal, and refresh bookkeeping
@@ -117,7 +127,14 @@ export function selectVisibleConversationForest(state: ApplicationState): Conver
 }
 
 export function selectVisibleEndpointSessionIds(state: ApplicationState): ReadonlySet<string> {
-  return new Set([...state.local.sessions.keys(), ...state.terminals.keys()])
+  const cached = visibleEndpointCache.get(state.historyStatus)
+  if (cached && cached.local === state.local.sessions && cached.transcripts === state.provider.transcripts && sameKeys(cached.terminals, state.terminals)) return cached.ids
+  const ids = new Set([...state.local.sessions.keys(), ...state.terminals.keys(),
+    ...[...state.historyStatus].flatMap(([id, status]) => status._tag === "Limited" ? [id] : []),
+    ...[...state.provider.transcripts].flatMap(([id, read]) => read._tag === "Available" && read.coverage ? [id] : []),
+  ])
+  visibleEndpointCache.set(state.historyStatus, { local: state.local.sessions, transcripts: state.provider.transcripts, terminals: state.terminals, ids })
+  return ids
 }
 
 export function selectSessionStatus(state: ApplicationState, sessionId: string): SessionStatus {

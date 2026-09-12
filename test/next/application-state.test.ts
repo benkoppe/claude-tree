@@ -80,6 +80,82 @@ describe("application state reducer", () => {
     })
   }
 
+  function readCoverage(state: ApplicationState, read: TranscriptRead): ApplicationState {
+    const refresh = activeRefresh("refresh:full", state.refresh.generation + 1, "manual", "full")
+    return reduceApplicationState(reduceApplicationState(state, { _tag: "RefreshStarted", refresh }), {
+      _tag: "RefreshSucceeded", key: refresh.key, generation: refresh.generation,
+      snapshot: { ...snapshot(session(ROOT, "Root"), []), transcripts: new Map([[ROOT, read]]) },
+    })
+  }
+
+  const limited = (messages: readonly AgentMessage[]): TranscriptRead => ({ _tag: "Available", messages,
+    context: { messages, boundaryId: "compact" }, coverage: { _tag: "Limited", boundaryId: "compact", reason: "historical-parent-unproven" } })
+
+  test("complete to limited to complete retains history and never confirms a context-only rewind", () => {
+    let state = loadedState(original)
+    const forest = selectConversationForest(state)
+    for (let index = 0; index < 3; index++) {
+      state = readCoverage(state, limited(original.slice(-1)))
+      expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+      expect(state.replacementCandidates.size).toBe(0)
+      expect(state.historyStatus.get(ROOT)?._tag).toBe("Limited")
+      expect(projectRootsViewModel(state)[0]?.history).toEqual({ _tag: "Limited", contextMessageCount: 1 })
+      expect(projectGraphViewModel(state, ROOT).warnings[0]).toContain("History gap")
+      expect(selectConversationForest(state).graphs[0]).toBe(forest.graphs[0])
+    }
+    state = readCoverage(state, available(original))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+    expect(state.historyStatus.get(ROOT)?._tag).toBe("Ready")
+    expect(projectGraphViewModel(state, ROOT).warnings).toEqual([])
+    expect(state.unviewedSessionIds.size).toBe(0)
+  })
+
+  test("limited coverage preserves completion and rewind evidence without false updates", () => {
+    let state: ApplicationState = { ...loadedState(original), terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false })
+    const completion = state.pendingCompletions.get(ROOT)
+    state = { ...state, rewindAnchors: new Map([[ROOT, { targetMessageId: "q2", submitted: false }]]) }
+    const anchors = state.rewindAnchors
+    for (let index = 0; index < 3; index++) state = readCoverage(state, limited([message("novel", "agent", "answer", 0)]))
+    expect(state.pendingCompletions.get(ROOT)).toEqual(completion)
+    expect(state.rewindAnchors).toBe(anchors)
+    expect(state.unviewedSessionIds.size).toBe(0)
+    expect(state.replacementCandidates.size).toBe(0)
+  })
+
+  test("expanding cold-start context coverage cannot manufacture a completed turn", () => {
+    const context = [message("q2", "user", "later", 0)]
+    let state = readCoverage(makeInitialApplicationState(), limited(context))
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(context)
+    state = { ...state, terminals: new Map([[ROOT, { ownerId: "owner", activity: "working", phase: "running" }]]) }
+    state = reduceApplicationState(state, { _tag: "TerminalActivityObserved", sessionId: ROOT, ownerId: "owner", activity: "idle", wasVisible: false })
+    const expanded = [...original, message("a2", "agent", "already present", 3)]
+    for (let index = 0; index < 4; index++) state = readCoverage(state, available(expanded))
+    expect(state.unviewedSessionIds.size).toBe(0)
+    expect(state.pendingCompletions.get(ROOT)?.coverageChanged).toBeTrue()
+    expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
+  })
+
+  test("context-only paths do not merge through retained cross-session correspondence", () => {
+    const copies = original.map((entry) => ({ ...entry, id: `child-${entry.id}` }))
+    const relation = { childSessionId: "child", parentSessionId: ROOT, sourceMessageId: "q2",
+      sharedMessages: original.map((entry, index) => ({ parentMessageId: entry.id, childMessageId: copies[index]!.id })),
+      createdAt: "2026-09-01T00:00:00.000Z" }
+    const state: ApplicationState = { ...loadedState(original), relations: [relation], provider: {
+      sessions: new Map([[ROOT, session(ROOT, "Root")], ["child", session("child", "Child")]]),
+      transcripts: new Map([[ROOT, available(original)], ["child", limited(copies.slice(-1))]]),
+    } }
+    const forest = selectConversationForest(state)
+    expect(forest.graphBySessionId.get(ROOT)).not.toBe(forest.graphBySessionId.get("child"))
+    expect(state.relations).toEqual([relation])
+  })
+
+  test("empty SDK context with a history gap keeps a resumable endpoint", () => {
+    const state = readCoverage(makeInitialApplicationState(), limited([]))
+    expect(projectRootsViewModel(state)[0]?.history).toEqual({ _tag: "Limited", contextMessageCount: 0 })
+    expect(projectGraphViewModel(state, ROOT).nodes.some((node) => node._tag === "Endpoint" && node.session.id === ROOT)).toBeTrue()
+  })
+
   test("confirms external rewinds including rewinds to an empty conversation", () => {
     for (const shortened of [original.slice(0, 2), []]) {
       const suspected = readReplacement(loadedState(original), shortened)

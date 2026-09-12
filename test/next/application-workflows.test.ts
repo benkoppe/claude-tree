@@ -456,6 +456,29 @@ describe("application actor", () => {
     expect(fixture.prepareResumeReceiver).toBe(fixture.options.provider)
   })
 
+  test("limited history permits opening the owned stock session but rejects a fork before mutation", async () => {
+    const fixture = makeFixture()
+    const messages = [message("q", "user", "question", 0)]
+    fixture.snapshot = { sessions: [session(ROOT, "Root")], transcripts: new Map([[ROOT, {
+      _tag: "Available", messages, context: { messages, boundaryId: "boundary" },
+      coverage: { _tag: "Limited", boundaryId: "boundary", reason: "historical-parent-unproven" },
+    }]]) }
+    let mutations = 0
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider: { ...fixture.options.provider,
+        branchFrom: () => Effect.sync(() => { mutations++; return fixture.branchOutcome }),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      const error = yield* Effect.flip(runtime.branchFrom({ sessionId: ROOT, messageId: "q" }))
+      expect(error).toBeInstanceOf(IntentRejectedError)
+      yield* runtime.enterRoot(ROOT)
+      yield* runtime.openEndpoint(ROOT)
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: ROOT })
+      expect(fixture.calls.filter((call) => call === `show:${ROOT}`)).toHaveLength(1)
+      expect(mutations).toBe(0)
+    })))
+  })
+
   test("contains a synchronous terminal show defect and serves a later request", async () => {
     const fixture = makeFixture()
     const show = fixture.options.terminals.show

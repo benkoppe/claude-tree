@@ -14,7 +14,7 @@ const stage = z.enum(["setup", "worker", "active-context", "session-info", "sess
 const failure = z.enum([
   "project-unavailable", "worker-failed", "diagnostic-timeout", "invalid-diagnostic-report", "cleanup-failed", "unexpected-failure",
   "timeout", "sdk-request-failed", "source-not-found", "permission-denied", "protocol-error", "missing-active-record", "missing-logical-parent", "cycle", "invalid-preservation",
-  "ambiguous-preservation", "missing-preservation-source", "invalid-provenance", "active-record-mismatch", "system-anchor-missing",
+  "ambiguous-preservation", "missing-preservation-source", "invalid-provenance", "history-gap", "active-record-mismatch", "system-anchor-missing",
 ])
 const differences = z.enum(["type", "subtype", "message.id", "message.type", "message.role", "message.model", "message.content", "message.usage", "message.stop_reason", "message.stop_sequence", "attachment", "data", "compactMetadata", "other-payload", "comparison-unavailable"])
 const failureSchema = z.object({ stage, code: failure, session: session.optional(), record: record.optional(), related_record: record.optional() }).strict()
@@ -33,7 +33,7 @@ export const HistoryDiagnosticReportSchema = z.object({
   format: z.literal("claude-tree/history-diagnostic-v1"),
   provider: z.literal("claude"),
   build: z.object({ version: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/), revision: z.string().regex(/^[0-9a-f]{40}$/).nullable(), dirty: z.boolean().nullable(), source: z.enum(["embedded", "checkout", "unknown"]) }).strict(),
-  outcome: z.enum(["Available", "Missing", "Unavailable"]),
+  outcome: z.enum(["Available", "Limited", "Missing", "Unavailable"]),
   failure: failureSchema.nullable(),
   message_count: count.optional(),
   visible_message_count: count.optional(),
@@ -88,7 +88,8 @@ export class HistoryTrace {
   }
 
   fail(at: HistoryStage, code: HistoryFailure, sessionId?: string, recordId?: string, relatedId?: string): void {
-    this.firstFailure ??= { stage: at, code,
+    if (this.firstFailure && !(this.firstFailure.code === "history-gap" && code !== "history-gap")) return
+    this.firstFailure = { stage: at, code,
       ...(sessionId === undefined ? {} : { session: this.session(sessionId) }),
       ...(recordId === undefined ? {} : { record: this.record(recordId) }),
       ...(relatedId === undefined ? {} : { related_record: this.record(relatedId) }),
@@ -149,7 +150,7 @@ export class HistoryTrace {
 
   finish(build: BuildInfo, outcome: HistoryDiagnosticReport["outcome"], counts?: { messages: number; visible: number }): HistoryDiagnosticReport {
     return { format: "claude-tree/history-diagnostic-v1", provider: "claude", build, outcome,
-      failure: outcome === "Unavailable" ? this.firstFailure ?? { stage: "worker", code: "unexpected-failure" } : null,
+      failure: outcome === "Unavailable" || outcome === "Limited" ? this.firstFailure ?? { stage: "worker", code: "unexpected-failure" } : null,
       ...(counts === undefined ? {} : { message_count: counts.messages, visible_message_count: counts.visible }),
       events: [...this.events], omitted_events: this.omitted }
   }

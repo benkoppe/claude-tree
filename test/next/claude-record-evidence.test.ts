@@ -6,6 +6,8 @@ import { TestClock } from "effect/testing"
 import { NavigationHistoryError, projectNavigationHistory } from "../../src/infrastructure/providers/claude/navigation-history"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
 import { RecordEvidence } from "../../src/infrastructure/providers/claude/record-evidence"
+import { HistoryTrace } from "../../src/diagnostics/history-trace"
+import { UNKNOWN_BUILD } from "../../src/build-info"
 
 function fixture() {
   const question = { type: "user", uuid: "question", parentUuid: null, message: { role: "user", content: "question" } }
@@ -57,6 +59,44 @@ test("parent lookup follows multiple copy generations and uses the child's ident
   const projection = projectNavigationHistory(grandchild, f.selected.map((id) => `grandchild:${id}`),
     new Map([["child-session", f.current], ["parent", f.parents]]))
   expect(projection.records.find((record) => record.uuid === "grandchild:child:answer")?.parentUuid).toBe("grandchild:child:question")
+})
+
+test("three exhausted matching copy generations return validated SDK context with an explicit gap", async () => {
+  const f = fixture()
+  const [localId, middleId, sourceId] = Array.from({ length: 3 }, () => crypto.randomUUID()) as [string, string, string]
+  const source = f.parents.map((record) => ({ ...record, sessionId: sourceId,
+    ...(record.uuid === "answer" ? { parentUuid: "summary" } : {}) }))
+  const middle = copy(source, sourceId, "middle").map((record) => ({ ...record, sessionId: middleId }))
+  const local: SessionStoreEntry[] = copy(middle, middleId, "local").map((record) => ({ ...record, sessionId: localId }))
+  local.push({ type: "user", uuid: "continuation", parentUuid: "local:middle:attachment", sessionId: localId,
+    message: { role: "user", content: "continue" } })
+  const snapshots = new Map([[localId, local], [middleId, middle], [sourceId, source]])
+  const imports: string[] = []
+  let mutations = 0
+  const provider = new ClaudeProvider(process.cwd(), { sdk: {
+    listSessions: async () => [],
+    getSessionInfo: async (id) => ({ sessionId: id, summary: "fixture", lastModified: 1 }),
+    getSessionMessages: (id, options) => getSessionMessages(id, { ...options, sessionStore: {
+      load: async () => snapshots.get(id)!, append: async () => { throw new Error("Read only") },
+    } }),
+    importSessionToStore: async (id, store) => {
+      imports.push(id)
+      await store.append({ projectKey: "fixture", sessionId: id }, snapshots.get(id)!)
+    },
+    forkSession: async () => { mutations++; throw new Error("Unexpected mutation") },
+  } })
+  const trace = new HistoryTrace(localId)
+  const read = (await Effect.runPromise(provider.readTranscripts([localId], trace))).get(localId)
+  expect(read).toMatchObject({ _tag: "Available", coverage: { _tag: "Limited", reason: "historical-parent-unproven" } })
+  if (read?._tag !== "Available") throw new Error("Expected readable context")
+  expect(read.messages.map((message) => message.id)).toContain("continuation")
+  expect(read.context?.messages).toEqual(read.messages)
+  expect(imports).toEqual([localId, middleId, sourceId])
+  const report = trace.finish(UNKNOWN_BUILD, "Limited")
+  const searches = report.events.filter((event) => event.event === "parent-search" && event.before === 1 && event.after === 0)
+  expect(new Set(searches.flatMap((event) => event.event === "parent-search" ? [event.session] : [])).size).toBe(3)
+  expect(report.failure?.code).toBe("history-gap")
+  expect(mutations).toBe(0)
 })
 
 test("attachment payloads are checked when extending copy lineage", () => {
@@ -149,6 +189,19 @@ test("ancestor context parents are excluded even when that old summary was not c
   ]
   const projection = projectNavigationHistory(f.current, f.selected, new Map([["parent", parents]]))
   expect(projection.records.find((record) => record.uuid === "child:answer")?.parentUuid).toBe("child:question")
+})
+
+test("an earlier summary remains a valid parent when it did not reparent this preserved head", () => {
+  const f = fixture()
+  const older: SessionStoreEntry[] = [
+    { type: "system", subtype: "compact_boundary", uuid: "old-boundary", parentUuid: null, logicalParentUuid: "question" },
+    { type: "user", uuid: "old-summary", parentUuid: "old-boundary", isCompactSummary: true,
+      message: { role: "user", content: "earlier summary" } },
+  ]
+  const parents = [...f.parents.map((record) => record.uuid === "answer" ? { ...record, parentUuid: "old-summary" } : record), ...older]
+  const current = [...f.current, ...copy(older, "parent", "child")]
+  const projection = projectNavigationHistory(current, f.selected, new Map([["parent", parents]]))
+  expect(projection.records.find((record) => record.uuid === "child:answer")?.parentUuid).toBe("child:old-summary")
 })
 
 test("cycles in source-session lineage fail without synthesizing an original parent", () => {

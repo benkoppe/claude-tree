@@ -81,6 +81,8 @@ export interface RewindAnchor {
 }
 
 export interface PendingCompletion {
+  /** Restored coverage cannot establish completion for this pending cycle. */
+  readonly coverageChanged?: boolean
   readonly ownerId: string
   readonly version: number
   /** Accepted history through the persisted user, excluding the pending assistant tail. */
@@ -105,6 +107,7 @@ export interface ActiveRefresh {
 export type SessionHistoryStatus =
   | { readonly _tag: "Pending" }
   | { readonly _tag: "Ready" }
+  | { readonly _tag: "Limited"; readonly context: Extract<TranscriptRead, { _tag: "Available" }> }
   | { readonly _tag: "Unavailable"; readonly reason: string }
   | { readonly _tag: "Missing" }
 

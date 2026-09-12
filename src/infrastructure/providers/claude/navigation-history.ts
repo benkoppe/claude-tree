@@ -31,6 +31,7 @@ export function projectNavigationHistory(
   const repairs = preservationRepairs(evidence, new Set(selectedRecordIds), trace)
   const complete = new Set<string>()
   const boundaries = new Set<string>()
+  let gap: NavigationHistoryError | undefined
 
   for (const selectedId of selectedRecordIds) {
     if (!effective.has(selectedId)) throw new NavigationHistoryError("missing-active-record",
@@ -53,6 +54,10 @@ export function projectNavigationHistory(
       // explicit compaction history link, however, promises a resolvable record.
       if (!record) break
       const problem = repairs.problems.get(currentId)
+      if (problem?.kind === "history-gap") {
+        gap ??= problem
+        break
+      }
       if (problem) throw problem
       visiting.set(currentId, path.length)
       path.push(record)
@@ -70,6 +75,7 @@ export function projectNavigationHistory(
     for (const record of path) complete.add(record.uuid)
   }
 
+  if (gap) throw gap
   return {
     sourceRecords,
     records: boundaries.size === 0 ? sourceRecords : sourceRecords.map((record) => {
@@ -255,7 +261,7 @@ function preservationRepairs(
           trace?.decision(retained.boundary.uuid, id, candidates.size === 0 ? "no-parent" : "conflicting-parents", candidates.size)
           historicalProblems.set(JSON.stringify([retained.boundary.uuid, id]), {
             boundaryId: retained.boundary.uuid, recordId: id,
-            error: new NavigationHistoryError("ambiguous-preservation",
+            error: new NavigationHistoryError(candidates.size === 0 ? "history-gap" : "ambiguous-preservation",
               `Compaction boundary ${retained.boundary.uuid}: preserved record ${id} has ${candidates.size === 0 ? "no evidenced" : "multiple conflicting"} historical parents`,
               retained.boundary.uuid, id),
           })
@@ -357,7 +363,7 @@ function preservationRepairs(
   for (const { boundaryId, recordId, error } of historicalProblems.values()) {
     const required = reaches(logicalParent(boundaryId) ?? null, recordId, logicalParent)
     trace?.decision(boundaryId, recordId, required ? "required-error" : "ignored-error")
-    if (required) result.problems.set(boundaryId, error)
+    if (required && (!result.problems.has(boundaryId) || result.problems.get(boundaryId)?.kind === "history-gap")) result.problems.set(boundaryId, error)
   }
   return result
 }

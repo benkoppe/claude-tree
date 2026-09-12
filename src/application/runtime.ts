@@ -1421,7 +1421,8 @@ export function makeAppRuntime(
           }
           case "EnterRoot": {
             const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
-            if (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready") {
+            const history = family && selectFamilyHistoryStatus(state, family.sessionIds)
+            if (family && (history?._tag === "Loading" || history?._tag === "Unavailable")) {
               const refresh: ActiveRefresh = { key: "refresh:navigation", generation: state.refresh.generation + 1,
                 reason: "terminal-return", mode: "incremental", sessionIds: family.sessionIds }
               yield* supersede(refresh.key)
@@ -1520,6 +1521,10 @@ export function makeAppRuntime(
             return
           }
           case "BranchFrom":
+            if (selectHistoryStatus(state, intent.target.sessionId)._tag === "Limited") {
+              yield* reject(envelope.reply, intent._tag, "invalid", "Historical coverage is incomplete; refresh to establish a verified fork prefix")
+              return
+            }
             yield* launch(`branch:${envelope.correlationId}`, {
               _tag: "Branch",
               restoreTo: navigatorSurface(intent.target.sessionId),

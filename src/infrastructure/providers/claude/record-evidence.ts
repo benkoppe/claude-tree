@@ -19,7 +19,7 @@ export interface LinkedCompactionRecord extends TranscriptRecord {
 
 export class NavigationHistoryError extends Error {
   constructor(
-    readonly kind: "missing-active-record" | "missing-logical-parent" | "cycle" | "invalid-preservation" | "ambiguous-preservation" | "missing-preservation-source" | "invalid-provenance",
+    readonly kind: "missing-active-record" | "missing-logical-parent" | "cycle" | "invalid-preservation" | "ambiguous-preservation" | "missing-preservation-source" | "invalid-provenance" | "history-gap",
     message: string,
     readonly recordId: string,
     readonly parentId?: string,
@@ -334,7 +334,9 @@ export class RecordEvidence {
   }
 
   historicalParents(record: TranscriptRecord, excluded: ReadonlySet<string>): ReadonlySet<string | null> {
+    let conflictingVersions = false
     for (const step of this.lineage(record, null, true)) {
+      conflictingVersions ||= this.scopes.get(step.scope)!.versions(step.versions[0]!.uuid).length !== step.versions.length
       try {
         const origin = this.origin(step.versions)
         this.trace?.lineage(record.uuid, step.scope, origin ? "origin" : "end", origin?.sessionId)
@@ -371,6 +373,8 @@ export class RecordEvidence {
       }
       if (candidates.size > 0) return candidates
     }
+    if (conflictingVersions) throw new NavigationHistoryError("ambiguous-preservation",
+      `Record ${record.uuid} has unmatched versions and no proven historical parent`, record.uuid)
     return new Set()
   }
 }

@@ -92,7 +92,18 @@ export interface AgentSessionSnapshot {
 }
 
 export type TranscriptRead =
-  | { readonly _tag: "Available"; readonly messages: readonly AgentMessage[] }
+  | {
+      readonly _tag: "Available"
+      readonly messages: readonly AgentMessage[]
+      /** Independently validated SDK context, used across coverage changes. */
+      readonly context?: { readonly messages: readonly AgentMessage[]; readonly boundaryId: string | null }
+      /** Limited messages describe SDK context order, not reconstructed ancestry. */
+      readonly coverage?: {
+        readonly _tag: "Limited"
+        readonly boundaryId: string
+        readonly reason: "historical-parent-unproven"
+      }
+    }
   | { readonly _tag: "Missing" }
   | { readonly _tag: "Unavailable"; readonly reason: string }
 
