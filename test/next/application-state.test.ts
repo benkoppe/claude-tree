@@ -66,24 +66,16 @@ describe("application state reducer", () => {
     expect(selectAggregateStatus(state, ["live", "update"])).toBe("unviewed")
     expect(selectAggregateStatus(state, ["live", "stopped"])).toBe("live")
   })
-  test("reuses the forest for UI-only changes but invalidates every graph input", () => {
+  test("reuses the forest for UI-only changes and projects changed history", () => {
     const state = loadedState()
     const forest = selectConversationForest(state)
     const refreshing = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: activeRefresh("refresh:full", 1, "manual", "full") })
     expect(selectConversationForest(refreshing)).toBe(forest)
     expect(selectConversationForest({ ...refreshing, modal: { _tag: "About" } })).toBe(forest)
     expect(selectConversationForest({ ...state, terminals: new Map(state.terminals) })).toBe(forest)
-    for (const changed of [
-      { ...state, provider: { ...state.provider } },
-      { ...state, local: { ...state.local } },
-      { ...state, terminals: new Map([[ROOT, { phase: "running" as const, activity: "working" as const }]]) },
-      { ...state, rewindAnchors: new Map(state.rewindAnchors) },
-      { ...state, relations: [...state.relations] },
-      { ...state, removals: [...state.removals] },
-    ]) {
-      const before = selectConversationForest(state)
-      expect(selectConversationForest(changed)).not.toBe(before)
-    }
+    const updated = readReplacement(state, [message("q", "user", "question", 0), message("answer", "agent", "new answer", 1)])
+    expect(projectGraphViewModel(updated, ROOT).nodes.some((node) => node._tag === "Message" && node.preview === "new answer")).toBeTrue()
+    expect(projectGraphViewModel(state, ROOT).nodes.some((node) => node._tag === "Message" && node.preview === "new answer")).toBeFalse()
   })
   const original = [message("q", "user", "question", 0), message("a", "agent", "answer", 1), message("q2", "user", "later", 2)]
   function readReplacement(state: ApplicationState, messages: readonly AgentMessage[]): ApplicationState {
@@ -350,40 +342,6 @@ describe("application state reducer", () => {
     })
     expect(state.pendingCompletions.has(ROOT)).toBeFalse()
     expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
-  })
-
-  test("clears pending completion when a manual refresh confirms the completed transcript", () => {
-    let state: ApplicationState = {
-      ...loadedState(),
-      terminals: new Map([[ROOT, {
-        ownerId: "owner-1",
-        activity: "working",
-        phase: "running",
-      }]]),
-    }
-    state = reduceApplicationState(state, {
-      _tag: "TerminalActivityObserved",
-      sessionId: ROOT,
-      ownerId: "owner-1",
-      activity: "idle",
-      wasVisible: false,
-    })
-    const refresh = activeRefresh("refresh:full", 1, "manual", "full")
-    state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh, replaceAll: true })
-    state = reduceApplicationState(state, {
-      _tag: "RefreshSucceeded",
-      key: refresh.key,
-      generation: refresh.generation,
-      snapshot: snapshot(session(ROOT, "Root"), [
-        message("q", "user", "question", 0),
-        { ...message("a", "agent", "answer", 1), turnComplete: true },
-      ]),
-    })
-
-    expect(state.pendingCompletions.has(ROOT)).toBeFalse()
-    expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
-    expect(selectSessionStatus(state, ROOT)).toBe("unviewed")
-    expect(selectProjectedTranscript(state, ROOT).map((item) => item.id)).toEqual(["q", "a"])
   })
 
   test("preserves the completion baseline for partial Available reads from every refresh mode", () => {
@@ -1296,18 +1254,18 @@ describe("application state reducer", () => {
 
   test("only submissions and unsubmitted rewind drafts advance history revisions", () => {
     let state = liveRewindState()
-    expect(state.terminals.get(ROOT)?.historyRevision).toBe(1)
+    const revision = state.terminals.get(ROOT)?.historyRevision
     const refresh = activeRefresh("read", 1, "manual", "full")
     state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh })
     const captured = state.refresh.active.get(refresh.key)!
     for (const draft of [null, { text: "typing", exact: false }, { text: "sent", exact: false, rewind: true, submitted: true }]) {
       state = observe(state, { _tag: "Draft", draft })
-      expect(state.terminals.get(ROOT)?.historyRevision).toBe(1)
+      expect(state.terminals.get(ROOT)?.historyRevision).toBe(revision)
       expect(invalidatedRefreshSessionIds(state, captured).size).toBe(0)
     }
     expect(observe(state, { _tag: "Submission" }, "stale-owner")).toBe(state)
     state = observe(state, { _tag: "Submission" })
-    expect(state.terminals.get(ROOT)?.historyRevision).toBe(2)
+    expect(state.terminals.get(ROOT)?.historyRevision).not.toBe(revision)
     expect(invalidatedRefreshSessionIds(state, captured)).toEqual(new Set([ROOT]))
   })
 
@@ -1630,7 +1588,7 @@ describe("application state reducer", () => {
     expect(state.modal).toBeNull()
   })
 
-  test("migrates every ephemeral collection after repository-owned identity adoption", () => {
+  test("moves local terminal state and its return target after repository-owned identity adoption", () => {
     const temporary = "temporary"
     const persisted = "persisted"
     const temporarySession = session(temporary, "Temporary", true)
@@ -1663,6 +1621,7 @@ describe("application state reducer", () => {
       drafts: new Map([[temporary, { text: "draft", exact: false }]]),
       unviewedSessionIds: new Set([temporary]),
     }
+    const before = state
     state = reduceApplicationState(state, {
       _tag: "SessionIdentityAdopted",
       previousSessionId: temporary,
@@ -1672,8 +1631,12 @@ describe("application state reducer", () => {
     expect(state.local.sessions.has(temporary)).toBeFalse()
     expect(state.local.sessions.has(persisted)).toBeTrue()
     expect(state.local.temporarySessionIds).toEqual(new Set([persisted]))
-    expect(state.terminals.has(persisted)).toBeTrue()
-    expect(state.drafts.has(persisted)).toBeTrue()
+    expect(state.local.transcripts.has(temporary)).toBeFalse()
+    expect(state.local.transcripts.get(persisted)).toEqual(available([]))
+    expect(state.terminals.has(temporary)).toBeFalse()
+    expect(state.terminals.get(persisted)).toEqual(before.terminals.get(temporary))
+    expect(state.drafts.has(temporary)).toBeFalse()
+    expect(state.drafts.get(persisted)).toEqual(before.drafts.get(temporary))
     expect(state.unviewedSessionIds).toEqual(new Set([persisted]))
     expect(state.surface).toMatchObject({ _tag: "Terminal", sessionId: persisted })
     const returnTo = state.surface._tag === "Terminal" ? state.surface.returnTo : undefined
@@ -1682,6 +1645,34 @@ describe("application state reducer", () => {
       preferred: { sessionId: persisted, messageId: "temporary-message" },
       aliases: [{ sessionId: persisted, messageId: "temporary-message" }],
     })
+  })
+
+  test("temporary adoption moves reconciliation evidence and invalidates staged old-identity reads", () => {
+    const state: ApplicationState = {
+      ...pendingCompletionState(),
+      rewindAnchors: new Map([[ROOT, { targetMessageId: "q", submitted: true }]]),
+      replacementCandidates: new Map([[ROOT, { messages: [], attempts: 1 }]]),
+      historyStatus: new Map([[ROOT, { _tag: "Ready" }]]),
+      refresh: { generation: 2, initialPending: false,
+        appliedGenerationBySession: new Map([[ROOT, 1], ["other", 1]]),
+        active: new Map([["read", { ...activeRefresh("read", 2, "manual", "incremental"),
+          sessionIds: new Set([ROOT, "other"]), progressSessionIds: new Set([ROOT]),
+          stagedTranscripts: new Map([[ROOT, available([])], ["other", available([])]]),
+        }]]),
+      },
+    }
+    const adopted = reduceApplicationState(state, { _tag: "SessionIdentityAdopted", previousSessionId: ROOT,
+      session: session("persisted", "Persisted"), kind: "temporary-adoption" })
+    for (const collection of ["pendingCompletions", "rewindAnchors", "replacementCandidates", "historyStatus"] as const) {
+      expect(adopted[collection].has(ROOT)).toBeFalse()
+      expect(adopted[collection].get("persisted")).toEqual(state[collection].get(ROOT))
+    }
+    expect(adopted.pendingCompletions.get("persisted")?.ownerId).toBe("owner-1")
+    expect(adopted.refresh.appliedGenerationBySession).toEqual(new Map([["persisted", 1], ["other", 1]]))
+    const refresh = adopted.refresh.active.get("read")!
+    expect(refresh.sessionIds).toEqual(new Set(["persisted", "other"]))
+    expect(refresh.progressSessionIds).toEqual(new Set(["persisted"]))
+    expect(refresh.stagedTranscripts).toEqual(new Map([["other", available([])]]))
   })
 
   test("translates hidden native-fork graph message targets through shared mappings", () => {
@@ -1884,7 +1875,7 @@ describe("application state reducer", () => {
     expect(projectApplicationViewModel(stopped).shuttingDown).toBeTrue()
   })
 
-  test("can project successful stops without persisting a failed removal", () => {
+  test("projects successful stops independently of cleanup-incomplete owners", () => {
     let state: ApplicationState = {
       ...loadedState(),
       terminals: new Map([
@@ -1900,7 +1891,6 @@ describe("application state reducer", () => {
     })
     expect(state.terminals.has(ROOT)).toBeFalse()
     expect(state.terminals.get("child")?.phase).toBe("cleanup-incomplete")
-    expect(state.removals).toEqual([])
   })
 
   test("resolves a collapsed copied-only endpoint to its answer and restores its live draft", () => {

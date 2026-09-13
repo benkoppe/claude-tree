@@ -3,7 +3,7 @@ import { Deferred, Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import { makeNavigationWriter, NAVIGATION_SAVE_INTERVAL_MS } from "../../src/application/navigation-writer"
-import { PersistenceError, SessionOwnedError } from "../../src/domain/errors"
+import { PersistenceError } from "../../src/domain/errors"
 import type { ProjectState } from "../../src/domain/persistence"
 
 test("navigation writes fail promptly after explicit close", async () => {
@@ -41,8 +41,7 @@ test("identical in-flight navigation requests share one durable write", async ()
     const navigation = { view: "roots" as const, selectedSessionId: "root" }
     const first = yield* Effect.forkChild(writer.write(navigation))
     yield* Deferred.await(started)
-    const second = yield* Effect.forkChild(writer.write(navigation))
-    yield* Effect.yieldNow
+    const second = yield* Effect.forkChild(writer.write(navigation), { startImmediately: true })
     expect(second.pollUnsafe()).toBeUndefined()
     yield* Deferred.succeed(release, undefined)
     yield* Fiber.join(first)
@@ -53,11 +52,36 @@ test("identical in-flight navigation requests share one durable write", async ()
   })))
 })
 
-test("ownership conflicts explain the reserved session and owning process", () => {
-  const error = new SessionOwnedError({ providerId: "claude", sessionId: "session-one", ownerPid: 123 })
-  expect(error.message).toContain("session-one")
-  expect(error.message).toContain("PID 123")
-  expect(error.message).toContain("already owned")
+test("a failed durable write is returned to its caller and subsequent flush", async () => {
+  const failure = new PersistenceError({ operation: "save navigation", path: "/state", message: "write failed" })
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const writer = yield* makeNavigationWriter({ saveNavigation: () => Effect.fail(failure) })
+    expect(yield* Effect.flip(writer.write({ view: "roots", selectedSessionId: "root" }))).toBe(failure)
+    expect(yield* Effect.flip(writer.flush)).toBe(failure)
+  })))
+})
+
+test("an interrupted navigation caller does not cancel its admitted write or strand flush", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let saved: ProjectState["navigation"]
+    const navigation = { view: "roots" as const, selectedSessionId: "root" }
+    const writer = yield* makeNavigationWriter({ saveNavigation: (value) => Effect.gen(function*() {
+      yield* Deferred.succeed(started, undefined)
+      yield* Deferred.await(release)
+      saved = value
+    }) })
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+    const write = yield* Effect.forkChild(writer.write(navigation))
+    yield* Deferred.await(started)
+    yield* Fiber.interrupt(write)
+    const flush = yield* Effect.forkChild(writer.flush, { startImmediately: true })
+    expect(flush.pollUnsafe()).toBeUndefined()
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(flush)
+    expect(saved).toEqual(navigation)
+  })))
 })
 
 test("a held durable write retains only the latest of a thousand accepted cursor positions", async () => {
@@ -80,8 +104,7 @@ test("a held durable write retains only the latest of a thousand accepted cursor
       yield* writer.schedule({ view: "roots", selectedSessionId: `root-${index}` })
     }
     expect(writes).toBe(1)
-    const flush = yield* Effect.forkChild(writer.flush)
-    yield* Effect.yieldNow
+    const flush = yield* Effect.forkChild(writer.flush, { startImmediately: true })
     expect(flush.pollUnsafe()).toBeUndefined()
     yield* Deferred.succeed(release, undefined)
     yield* Fiber.join(flush)

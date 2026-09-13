@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { EventEmitter } from "node:events"
 import type { Worker } from "node:worker_threads"
 
-import { Effect, Exit, Fiber } from "effect"
+import { Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import { makeNavigationPersistenceWorker, NAVIGATION_WORKER_CLOSE_TIMEOUT_MS } from "../../src/infrastructure/metadata/navigation-persistence"
@@ -90,9 +90,14 @@ test.each(["incompatible", "missing"])("worker startup rejects %s state without 
 
 class ControlledWorker extends EventEmitter {
   readonly requests: NavigationWorkerRequest[] = []
+  readonly savePosted = Deferred.makeUnsafe<void>()
+  readonly closePosted = Deferred.makeUnsafe<void>()
   terminated = 0
   unreferenced = 0
-  postMessage(message: NavigationWorkerRequest) { this.requests.push(message) }
+  postMessage(message: NavigationWorkerRequest) {
+    this.requests.push(message)
+    Deferred.doneUnsafe(message._tag === "Save" ? this.savePosted : this.closePosted, Effect.void)
+  }
   unref() { this.unreferenced++ }
   terminate() { this.terminated++; this.emit("exit", 1); return Promise.resolve(1) }
   create = (): Worker => {
@@ -106,7 +111,7 @@ test("worker exit settles in-flight requests and rejects further saves", async (
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const persistence = yield* makeNavigationPersistenceWorker({ projectDirectory: "/project", providerId: "claude", instanceId: "instance" }, worker.create)
     const save = yield* Effect.forkChild(Effect.exit(persistence.saveNavigation({ view: "roots", selectedSessionId: "root" })))
-    yield* Effect.yieldNow
+    yield* Deferred.await(worker.savePosted)
     worker.emit("error", new Error("worker crashed"))
     worker.emit("exit", 1)
     expect(Exit.isFailure(yield* Fiber.join(save))).toBeTrue()
@@ -121,9 +126,9 @@ test("close never terminates a worker holding an unfinished transaction", async 
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const persistence = yield* makeNavigationPersistenceWorker({ projectDirectory: "/project", providerId: "claude", instanceId: "instance" }, worker.create)
     const save = yield* Effect.forkChild(persistence.saveNavigation({ view: "roots", selectedSessionId: "root" }))
-    yield* Effect.yieldNow
+    yield* Deferred.await(worker.savePosted)
     const closing = yield* Effect.forkChild(Effect.flip(persistence.close))
-    yield* Effect.yieldNow
+    yield* Deferred.await(worker.closePosted)
     yield* TestClock.adjust(NAVIGATION_WORKER_CLOSE_TIMEOUT_MS)
     expect((yield* Fiber.join(closing)).message).toContain("did not finish closing")
     expect(worker.terminated).toBe(0)
