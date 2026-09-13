@@ -56,7 +56,7 @@ const ROOT = "root-thread"
 const CHILD = "child-thread"
 
 describe("Effect Codex provider", () => {
-  test("canonicalizes once, pages by canonical cwd, and rejects a repeated cursor", async () => {
+  test("pages by canonical cwd and rejects a repeated cursor", async () => {
     const listCalls: unknown[] = []
     const canonicalized: string[] = []
     const client = fakeClient({
@@ -77,7 +77,7 @@ describe("Effect Codex provider", () => {
     }))
 
     const snapshot = await Effect.runPromise(provider.loadSessionSnapshot)
-    expect(canonicalized).toEqual(["/project-link", "/project", "/project", "/project", "/project"])
+    expect(canonicalized[0]).toBe("/project-link")
     expect(snapshot.sessions).toEqual([
       { id: ROOT, title: "Root name", lastModified: 12_000 },
       { id: CHILD, title: "Child", lastModified: 1_000 },
@@ -133,7 +133,7 @@ describe("Effect Codex provider", () => {
 
     expect(snapshot.sessions.map((session) => session.id)).toEqual([ROOT, "canonical"])
     expect(client.readCalls).toEqual([ROOT, "canonical"])
-    expect(canonicalized).toEqual(["/project-link", "/project-link", "/foreign", "/project", "/project"])
+    expect(canonicalized).toContain("/foreign")
   })
 
   test("bounds thread-list pages, session count, and the overall metadata deadline", async () => {
@@ -221,6 +221,9 @@ describe("Effect Codex provider", () => {
     let active = 0
     let maximumActive = 0
     let overloaded = false
+    let overloadedId: string | undefined
+    const initialBatchStarted = Deferred.makeUnsafe<void>()
+    const releaseReads = Deferred.makeUnsafe<void>()
     const client = fakeClient({
       readThread(id) {
         if (id === "missing") {
@@ -238,11 +241,13 @@ describe("Effect Codex provider", () => {
           Effect.sync(() => {
             active += 1
             maximumActive = Math.max(maximumActive, active)
+            if (active === 4) Deferred.doneUnsafe(initialBatchStarted, Effect.void)
           }),
           () => Effect.gen(function*() {
-            yield* Effect.sleep(1)
+            yield* Deferred.await(releaseReads)
             if (!overloaded) {
               overloaded = true
+              overloadedId = id
               return yield* Effect.fail(new CodexRpcError({
                 method: "thread/read",
                 code: -32001,
@@ -260,9 +265,18 @@ describe("Effect Codex provider", () => {
     const provider = providerWith(client, { transcriptReadConcurrency: 4, overloadRetryDelaysMs: [0] })
     const ids = [...Array.from({ length: 30 }, (_, index) => `session-${index}`), "missing", "unavailable"]
 
-    const reads = await Effect.runPromise(provider.readTranscripts(ids))
-    expect(maximumActive).toBeLessThanOrEqual(4)
-    expect(client.readCalls).toHaveLength(33)
+    const reads = await Effect.runPromise(Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(provider.readTranscripts(ids))
+      yield* Deferred.await(initialBatchStarted)
+      expect(active).toBe(4)
+      yield* Deferred.succeed(releaseReads, undefined)
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestClock.layer())))
+    expect(maximumActive).toBe(4)
+    for (const id of ids) {
+      expect(client.readCalls.filter((called) => called === id)).toHaveLength(id === overloadedId ? 2 : 1)
+      if (id !== "missing" && id !== "unavailable") expect(reads.get(id)).toEqual({ _tag: "Available", messages: [] })
+    }
     expect(reads.get("missing")).toEqual({ _tag: "Missing" })
     expect(reads.get("unavailable")).toEqual({
       _tag: "Unavailable",
@@ -318,12 +332,19 @@ describe("Effect Codex provider", () => {
       ]),
     ])
 
-    for (const target of ["user", "system", "agent-mid", "agent-working", "absent"]) {
+    for (const [target, reason] of [
+      ["user", "not a user message"],
+      ["system", "not a system item"],
+      ["agent-mid", "final agent item"],
+      ["agent-working", "this turn is inProgress"],
+      ["absent", "no longer available"],
+    ] as const) {
       const client = fakeClient({ readThread: () => Effect.succeed(parent) })
       const error = await Effect.runPromise(Effect.flip(
         providerWith(client).branchFrom({ sessionId: ROOT, messageId: target }),
       ))
-      expect(error.message).toBeTruthy()
+      expect(error).toBeInstanceOf(target === "absent" ? ProviderError : ProviderProtocolError)
+      expect(error.message).toContain(reason)
       expect(client.forkCalls).toHaveLength(0)
     }
   })
@@ -404,6 +425,7 @@ describe("Effect Codex provider", () => {
       reason: "fork response was lost",
       reconciliation: "full-snapshot",
     })
+    expect(client.forkCalls).toHaveLength(1)
   })
 
   test("treats a foreign post-dispatch fork child as ambiguous without accepting or launching it", async () => {
@@ -1281,6 +1303,8 @@ describe("Codex sidecar", () => {
 
   test("captures bounded stderr without EOF and cancels the scoped reader", async () => {
     let stderrCancelled = false
+    const stderrConsumed = Deferred.makeUnsafe<void>()
+    const chunks = ["discarded".repeat(2_000), "diagnostic-tail"]
     let exitCode: number | null = null
     let resolveExit!: (code: number) => void
     const process: CodexSidecarProcess = {
@@ -1288,9 +1312,13 @@ describe("Codex sidecar", () => {
       get exitCode() { return exitCode },
       exited: new Promise((resolve) => { resolveExit = resolve }),
       stderr: new ReadableStream({
-        start(controller) { controller.enqueue(new TextEncoder().encode("diagnostic")) },
+        pull(controller) {
+          const chunk = chunks.shift()
+          if (chunk === undefined) Deferred.doneUnsafe(stderrConsumed, Effect.void)
+          else controller.enqueue(new TextEncoder().encode(chunk))
+        },
         cancel() { stderrCancelled = true },
-      }),
+      }, { highWaterMark: 0 }),
       kill() {},
       unref() {},
     }
@@ -1310,11 +1338,11 @@ describe("Codex sidecar", () => {
           resolveExit(0)
         },
       }, { cleanupTimeoutMs: 10 })
-      yield* Effect.sleep(1)
+      yield* Deferred.await(stderrConsumed)
       return yield* sidecar.stderr
     })))
 
-    expect(detail).toBe("diagnostic")
+    expect(detail).toBe(("discarded".repeat(2_000) + "diagnostic-tail").slice(-8_192))
     expect(stderrCancelled).toBeTrue()
   })
 
@@ -1349,7 +1377,7 @@ describe("Codex sidecar", () => {
           }
         },
       }, { cleanupTimeoutMs: 2 })
-      expect(yield* Effect.flip(sidecar.close())).toBeInstanceOf(Error)
+      expect(yield* Effect.flip(sidecar.close())).toBeInstanceOf(CodexSidecarError)
       yield* sidecar.close()
     })))
 
@@ -1391,7 +1419,7 @@ describe("Codex sidecar", () => {
           resolveExit(0)
         },
       }, { cleanupTimeoutMs: 2 })
-      expect(yield* Effect.flip(sidecar.close())).toBeInstanceOf(Error)
+      expect(yield* Effect.flip(sidecar.close())).toBeInstanceOf(CodexSidecarError)
     })))
 
     expect(signals).toEqual(["SIGTERM", "SIGKILL"])

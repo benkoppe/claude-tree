@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { Effect } from "effect"
 import { ClaudeProvider } from "../src/infrastructure/providers/claude/provider"
 import { buildConversationForest } from "../src/domain/conversation-graph"
+import { runSubprocess } from "./subprocess"
 
 import {
   forkSession,
@@ -12,65 +13,6 @@ import {
   InMemorySessionStore,
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk"
-
-test("the pinned SDK forks through a selected historical UUID", async () => {
-  const store = new InMemorySessionStore()
-  const sourceSessionId = crypto.randomUUID()
-  const userId = crypto.randomUUID()
-  const agentId = crypto.randomUUID()
-  const timestamp = "2026-08-30T12:00:00.000Z"
-  const projectKey = process.cwd().replaceAll("/", "-")
-  const entries: SessionStoreEntry[] = [
-    {
-      type: "user",
-      uuid: userId,
-      parentUuid: null,
-      sessionId: sourceSessionId,
-      timestamp,
-      cwd: process.cwd(),
-      message: { role: "user", content: "hello" },
-    },
-    {
-      type: "assistant",
-      uuid: agentId,
-      parentUuid: userId,
-      sessionId: sourceSessionId,
-      timestamp,
-      cwd: process.cwd(),
-      message: {
-        id: "msg_test",
-        type: "message",
-        role: "assistant",
-        model: "test",
-        content: [{ type: "text", text: "hello back" }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 1, output_tokens: 1 },
-      },
-    },
-  ]
-  await store.append({ projectKey, sessionId: sourceSessionId }, entries)
-
-  const result = await forkSession(sourceSessionId, {
-    dir: process.cwd(),
-    sessionStore: store,
-    upToMessageId: agentId,
-  })
-  const sourceMessages = await getSessionMessages(sourceSessionId, {
-    dir: process.cwd(),
-    sessionStore: store,
-  })
-  const childMessages = await getSessionMessages(result.sessionId, {
-    dir: process.cwd(),
-    sessionStore: store,
-  })
-
-  expect(result.sessionId).not.toBe(sourceSessionId)
-  expect(sourceMessages.map((message) => message.uuid)).toEqual([userId, agentId])
-  expect(childMessages).toHaveLength(2)
-  expect(childMessages.map((message) => message.uuid)).not.toEqual([userId, agentId])
-  expect(childMessages.map((message) => message.type)).toEqual(["user", "assistant"])
-})
 
 test("the pinned SDK preserves consecutive message roles at an exact fork boundary", async () => {
   const store = new InMemorySessionStore()
@@ -88,6 +30,8 @@ test("the pinned SDK preserves consecutive message roles at an exact fork bounda
     agentEntry(sourceSessionId, agentTwoId, agentOneId, "second answer", timestamp),
   ]
   await store.append({ projectKey, sessionId: sourceSessionId }, entries)
+  const sourceBefore = await getSessionMessages(sourceSessionId, { dir: process.cwd(), sessionStore: store })
+  const physicalBefore = structuredClone(store.getEntries({ projectKey, sessionId: sourceSessionId }))
 
   const result = await forkSession(sourceSessionId, {
     dir: process.cwd(),
@@ -100,9 +44,13 @@ test("the pinned SDK preserves consecutive message roles at an exact fork bounda
   })
 
   expect(childMessages.map((message) => message.type)).toEqual(["user", "user", "assistant"])
-  expect(childMessages.map((message) => message.uuid)).not.toContain(userOneId)
-  expect(childMessages.map((message) => message.uuid)).not.toContain(userTwoId)
-  expect(childMessages.map((message) => message.uuid)).not.toContain(agentOneId)
+  expect(result.sessionId).not.toBe(sourceSessionId)
+  expect(childMessages.map((message) => message.message)).toEqual(sourceBefore.slice(0, 3).map((message) => message.message))
+  const sourceIds = sourceBefore.map((message) => message.uuid)
+  for (const child of childMessages) expect(sourceIds).not.toContain(child.uuid)
+  expect(new Set(childMessages.map((message) => message.uuid)).size).toBe(3)
+  expect(await getSessionMessages(sourceSessionId, { dir: process.cwd(), sessionStore: store })).toEqual(sourceBefore)
+  expect(store.getEntries({ projectKey, sessionId: sourceSessionId })).toEqual(physicalBefore)
 })
 
 test("the pinned SDK returns streamed assistant blocks as separate transcript records", async () => {
@@ -457,21 +405,14 @@ test("the Claude provider validates SDK-imported source and child records", asyn
       if (prepared._tag !== "ValidatedBranch") throw new Error("Unexpected branch outcome")
       console.log(prepared.derivation.sharedMessages.length)
     `
-    const subprocess = Bun.spawn([globalThis.process.execPath, "-e", script], {
+    const [exitCode, stdout, stderr] = await runSubprocess([process.execPath, "-e", script], {
       cwd: join(import.meta.dir, ".."),
       env: {
         ...globalThis.process.env,
         CLAUDE_CONFIG_DIR: configDir,
         CLAUDE_CODE_PROJECT_DIR_NAME: projectKey,
       },
-      stdout: "pipe",
-      stderr: "pipe",
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      subprocess.exited,
-      Bun.readableStreamToText(subprocess.stdout),
-      Bun.readableStreamToText(subprocess.stderr),
-    ])
 
     expect(stderr).toBe("")
     expect(exitCode).toBe(0)
@@ -542,14 +483,10 @@ test("filesystem import preserves compacted roots and real SDK forks without rep
         shared: branch.derivation.sharedMessages.length,
       }))
     `
-    const subprocess = Bun.spawn([process.execPath, "-e", script], {
+    const [exitCode, stdout, stderr] = await runSubprocess([process.execPath, "-e", script], {
       cwd: join(import.meta.dir, ".."),
       env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
-      stdout: "pipe", stderr: "pipe",
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      subprocess.exited, Bun.readableStreamToText(subprocess.stdout), Bun.readableStreamToText(subprocess.stderr),
-    ])
     expect(stderr).toBe("")
     expect(exitCode).toBe(0)
     const result = JSON.parse(stdout)
@@ -615,13 +552,9 @@ test("filesystem preservation cycles recover across SDK forks without depending 
       const historical = await fork(child.session.id, child.derivation.sharedMessages.find(pair => pair.parentMessageId === ${JSON.stringify(ids[1])}).childMessageId)
       console.log(JSON.stringify({ original, descendant, historical: await read(historical.session.id), copied: historical.derivation.sharedMessages.length }))
     `
-    const subprocess = Bun.spawn([process.execPath, "-e", script], {
+    const [exitCode, stdout, stderr] = await runSubprocess([process.execPath, "-e", script], {
       cwd: join(import.meta.dir, ".."), env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
-      stdout: "pipe", stderr: "pipe",
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      subprocess.exited, Bun.readableStreamToText(subprocess.stdout), Bun.readableStreamToText(subprocess.stderr),
-    ])
     expect(stderr).toBe("")
     expect(exitCode).toBe(0)
     const result = JSON.parse(stdout)
@@ -701,13 +634,9 @@ test("single-version SDK forks recover five preserved records through attachment
         missingReason: missing?._tag === "Unavailable" && missing.reason.includes("requires source session"),
       }))
     `
-    const subprocess = Bun.spawn([process.execPath, "-e", script], {
+    const [exitCode, stdout, stderr] = await runSubprocess([process.execPath, "-e", script], {
       cwd: join(import.meta.dir, ".."), env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
-      stdout: "pipe", stderr: "pipe",
     })
-    const [exitCode, stdout, stderr] = await Promise.all([
-      subprocess.exited, Bun.readableStreamToText(subprocess.stdout), Bun.readableStreamToText(subprocess.stderr),
-    ])
     expect(stderr).toBe("")
     expect(exitCode).toBe(0)
     const result = JSON.parse(stdout)

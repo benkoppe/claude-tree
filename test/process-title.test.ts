@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { runSubprocess } from "./subprocess"
 
 test("sets the Bun and OS-visible process titles", async () => {
   const title = "c/t: process title check"
@@ -10,15 +11,7 @@ test("sets the Bun and OS-visible process titles", async () => {
       : undefined
     console.log(JSON.stringify({ title: process.title, comm }))
   `
-  const child = Bun.spawn([process.execPath, "-e", script], {
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
+  const [exitCode, stdout, stderr] = await runSubprocess([process.execPath, "-e", script])
 
   expect(stderr).toBe("")
   expect(exitCode).toBe(0)

@@ -210,12 +210,14 @@ describe("Effect Claude provider", () => {
     })
     expect(executableReads).toBe(0)
 
-    const acquired = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
-    expect(executableReads).toBe(1)
-    expect(acquired.launch.command).toEqual(["/usr/local/bin/claude", "--session-id", NEW, "--settings", expect.any(String)])
-    expect(Object.keys(JSON.parse(acquired.launch.command.at(-1)!))).toEqual(["hooks"])
-    expect(acquired.launch.env).toEqual({ CLAUDE_TREE_HOOK_TOKEN: expect.any(String) })
-    await Effect.runPromise(acquired.close)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquired = yield* prepared.acquireLaunch
+      expect(executableReads).toBe(1)
+      expect(acquired.launch.command).toEqual(["/usr/local/bin/claude", "--session-id", NEW, "--settings", expect.any(String)])
+      expect(Object.keys(JSON.parse(acquired.launch.command.at(-1)!))).toEqual(["hooks"])
+      expect(acquired.launch.env).toEqual({ CLAUDE_TREE_HOOK_TOKEN: expect.any(String) })
+      yield* acquired.close
+    })))
 
     const resumed = await Effect.runPromise(provider.prepareResume({
       id: ROOT,
@@ -247,16 +249,28 @@ describe("Effect Claude provider", () => {
       lastModified: 1,
     }))
 
-    const first = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
-    const second = await Effect.runPromise(Effect.scoped(prepared.acquireLaunch))
-
-    expect(observers).toHaveLength(2)
-    expect(first.launch.observer).toBe(observers[0]!)
-    expect(second.launch.observer).toBe(observers[1]!)
-    expect(first.launch.observer).not.toBe(second.launch.observer)
-    expect(first.launch.env).not.toEqual(second.launch.env)
-    await Effect.runPromise(first.close)
-    await Effect.runPromise(second.close)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const first = yield* prepared.acquireLaunch
+      const second = yield* prepared.acquireLaunch
+      expect(observers).toHaveLength(2)
+      expect(first.launch.observer).toBe(observers[0]!)
+      expect(second.launch.observer).toBe(observers[1]!)
+      expect(first.launch.observer).not.toBe(second.launch.observer)
+      expect(first.launch.env).not.toEqual(second.launch.env)
+      const firstUrl = hookUrl(first.launch.command)
+      const secondUrl = hookUrl(second.launch.command)
+      const firstResponse = yield* Effect.promise(() => fetch(firstUrl))
+      expect(firstResponse.status).toBe(401)
+      yield* Effect.promise(() => firstResponse.arrayBuffer())
+      yield* first.close
+      yield* Effect.promise(async () => { await expect(fetch(firstUrl)).rejects.toThrow() })
+      const secondResponse = yield* Effect.promise(() => fetch(secondUrl))
+      expect(secondResponse.status).toBe(401)
+      yield* Effect.promise(() => secondResponse.arrayBuffer())
+      yield* first.close
+      yield* second.close
+      yield* Effect.promise(async () => { await expect(fetch(secondUrl)).rejects.toThrow() })
+    })))
   })
 
   test("unavailable optional hook binding leaves the ordinary launch and environment unchanged", async () => {
@@ -616,6 +630,7 @@ describe("Effect Claude provider", () => {
 
   test("returns ambiguity when fork creation times out and never retries after late settlement", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    const forkStarted = Deferred.makeUnsafe<void>()
     let forkCalls = 0
     let rejectFork: ((cause: unknown) => void) | undefined
     const unhandled: unknown[] = []
@@ -627,6 +642,7 @@ describe("Effect Claude provider", () => {
       forkSession: () => new Promise((_resolve, reject) => {
         forkCalls += 1
         rejectFork = reject
+        Deferred.doneUnsafe(forkStarted, Effect.void)
       }),
       forkSessionTimeoutMs: 10,
       forkValidationTimeoutMs: 100,
@@ -640,7 +656,7 @@ describe("Effect Claude provider", () => {
             sessionId: ROOT,
             messageId: "parent-1",
           }))
-          yield* Effect.yieldNow
+          yield* Deferred.await(forkStarted)
           yield* TestClock.adjust(10)
           return yield* Fiber.join(fiber)
         }),
@@ -657,7 +673,7 @@ describe("Effect Claude provider", () => {
       })
       expect(forkCalls).toBe(1)
       rejectFork?.(new Error("late fork rejection"))
-      await Bun.sleep(5)
+      await new Promise<void>((resolve) => setImmediate(resolve))
       expect(forkCalls).toBe(1)
       expect(unhandled).toEqual([])
     } finally {
@@ -667,6 +683,7 @@ describe("Effect Claude provider", () => {
 
   test("ignores a late fork success after timeout without retrying or validating it", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    const forkStarted = Deferred.makeUnsafe<void>()
     let forkCalls = 0
     let childReads = 0
     let resolveFork: ((result: { readonly sessionId: string }) => void) | undefined
@@ -682,6 +699,7 @@ describe("Effect Claude provider", () => {
       forkSession: () => new Promise((resolve) => {
         forkCalls += 1
         resolveFork = resolve
+        Deferred.doneUnsafe(forkStarted, Effect.void)
       }),
       forkSessionTimeoutMs: 10,
       forkValidationTimeoutMs: 100,
@@ -694,7 +712,7 @@ describe("Effect Claude provider", () => {
           sessionId: ROOT,
           messageId: "parent-1",
         }))
-        yield* Effect.yieldNow
+        yield* Deferred.await(forkStarted)
         yield* TestClock.adjust(10)
         return yield* Fiber.join(fiber)
       }),
@@ -703,13 +721,14 @@ describe("Effect Claude provider", () => {
 
     expect(outcome._tag).toBe("AmbiguousBranchMutation")
     resolveFork?.({ sessionId: CHILD })
-    await Promise.resolve()
+    await new Promise<void>((resolve) => setImmediate(resolve))
     expect(forkCalls).toBe(1)
     expect(childReads).toBe(0)
   })
 
   test("queues reconciliation and preserves interruption after forkSession invocation", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    const forkStarted = Deferred.makeUnsafe<void>()
     let forkCalls = 0
     let rejectFork: ((cause: unknown) => void) | undefined
     const unhandled: unknown[] = []
@@ -721,6 +740,7 @@ describe("Effect Claude provider", () => {
       forkSession: () => new Promise((_resolve, reject) => {
         forkCalls += 1
         rejectFork = reject
+        Deferred.doneUnsafe(forkStarted, Effect.void)
       }),
     })
 
@@ -729,7 +749,7 @@ describe("Effect Claude provider", () => {
         sessionId: ROOT,
         messageId: "parent-1",
       }))
-      await waitUntil(() => rejectFork !== undefined)
+      await Effect.runPromise(Deferred.await(forkStarted))
       await Effect.runPromise(Fiber.interrupt(fiber))
       const exit = await Effect.runPromise(Fiber.await(fiber))
 
@@ -746,7 +766,7 @@ describe("Effect Claude provider", () => {
       expect(forkCalls).toBe(1)
 
       rejectFork?.(new Error("late interrupted rejection"))
-      await Bun.sleep(5)
+      await new Promise<void>((resolve) => setImmediate(resolve))
       expect(unhandled).toEqual([])
     } finally {
       process.off("unhandledRejection", onUnhandled)
@@ -944,6 +964,9 @@ describe("Effect Claude provider", () => {
     let activeReads = 0
     let maxActiveReads = 0
     const completions: Array<() => void> = []
+    const initialBatchStarted = Deferred.makeUnsafe<void>()
+    const queuedReadStarted = Deferred.makeUnsafe<void>()
+    let startedReads = 0
     const sdk = fakeSdk()
     const provider = new ClaudeProvider(
       "/project",
@@ -957,6 +980,9 @@ describe("Effect Claude provider", () => {
               activeReads -= 1
               resolve([message(sessionId, `message-${sessionId}`, "user", sessionId)])
             })
+            startedReads++
+            if (startedReads === 8) Deferred.doneUnsafe(initialBatchStarted, Effect.void)
+            if (startedReads === 9) Deferred.doneUnsafe(queuedReadStarted, Effect.void)
           }),
         },
         resolveExecutable: () => "/usr/bin/claude",
@@ -965,14 +991,23 @@ describe("Effect Claude provider", () => {
     )
     const sessionIds = Array.from({ length: 9 }, (_, index) => `session-${index}`)
 
-    const fiber = Effect.runFork(provider.readTranscripts(sessionIds))
-    await waitUntil(() => completions.length === 8)
+    const transcripts = await Effect.runPromise(Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(provider.readTranscripts(sessionIds))
+      yield* Deferred.await(initialBatchStarted)
+      expect(maxActiveReads).toBe(8)
+      expect(startedReads).toBe(8)
+      completions.shift()!()
+      yield* Deferred.await(queuedReadStarted)
+      for (const complete of completions.splice(0)) complete()
+      return yield* Fiber.join(fiber)
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => { for (const complete of completions.splice(0)) complete() })),
+      Effect.provide(TestClock.layer()),
+    ))
     expect(maxActiveReads).toBe(8)
-    completions.shift()?.()
-    await waitUntil(() => completions.length === 8)
-    for (const complete of completions) complete()
-    const transcripts = await Effect.runPromise(Fiber.join(fiber))
-    expect(transcripts.size).toBe(9)
+    for (const id of sessionIds) {
+      expect(transcripts.get(id)).toMatchObject({ _tag: "Available", messages: [{ id: `message-${id}` }] })
+    }
 
     let rejectLate: ((cause: unknown) => void) | undefined
     const hungProvider = providerWith({
@@ -1001,6 +1036,7 @@ describe("Effect Claude provider", () => {
   })
 
   test("keeps an interrupted SDK read observed when its promise rejects later", async () => {
+    const readStarted = Deferred.makeUnsafe<void>()
     let rejectLate: ((cause: unknown) => void) | undefined
     let readCalls = 0
     const provider = providerWith({
@@ -1008,6 +1044,7 @@ describe("Effect Claude provider", () => {
         [ROOT]: () => new Promise<never>((_resolve, reject) => {
           readCalls += 1
           rejectLate = reject
+          Deferred.doneUnsafe(readStarted, Effect.void)
         }),
       },
     })
@@ -1017,10 +1054,10 @@ describe("Effect Claude provider", () => {
 
     try {
       const fiber = Effect.runFork(provider.readTranscripts([ROOT]))
-      await waitUntil(() => rejectLate !== undefined)
+      await Effect.runPromise(Deferred.await(readStarted))
       await Effect.runPromise(Fiber.interrupt(fiber))
       rejectLate?.(new Error("late interrupted rejection"))
-      await Bun.sleep(5)
+      await new Promise<void>((resolve) => setImmediate(resolve))
 
       expect(readCalls).toBe(1)
       expect(unhandled).toEqual([])
@@ -1282,6 +1319,13 @@ interface FakeOptions {
   readonly provenanceImportTimeoutMs?: number
 }
 
+function hookUrl(command: readonly string[]): string {
+  const settings = JSON.parse(command[command.indexOf("--settings") + 1]!) as {
+    hooks: { Stop: Array<{ hooks: Array<{ url: string }> }> }
+  }
+  return settings.hooks.Stop[0]!.hooks[0]!.url
+}
+
 function providerWith(options: FakeOptions = {}): ClaudeProvider {
   const sessions: SDKSessionInfo[] = [
     {
@@ -1371,12 +1415,6 @@ async function append(
     { projectKey: "project", sessionId },
     [...entries],
   )
-}
-
-async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = performance.now() + timeoutMs
-  while (!condition() && performance.now() < deadline) await Bun.sleep(1)
-  if (!condition()) throw new Error("Condition was not met before timeout")
 }
 
 function message(
