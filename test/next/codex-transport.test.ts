@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createConnection, type Socket } from "node:net"
 import { Cause, Deferred, Effect, Exit, Fiber, PubSub } from "effect"
 import { TestClock } from "effect/testing"
 
@@ -39,16 +40,18 @@ describe("Effect Codex app-server transport", () => {
   })
 
   test("initializes and correlates split, out-of-order JSONL responses", async () => {
+    const reads = new Map<string, number | string | undefined>()
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") {
         controls.respond(message.id, { userAgent: "test", future: true }, true)
       }
       if (message.method === "thread/read") {
         const params = message.params as { threadId: string }
-        setTimeout(
-          () => controls.respond(message.id, { thread: thread(params.threadId) }, params.threadId === "slow"),
-          params.threadId === "slow" ? 10 : 0,
-        )
+        reads.set(params.threadId, message.id)
+        if (reads.size === 2) {
+          controls.respond(reads.get("fast"), { thread: thread("fast") })
+          controls.respond(reads.get("slow"), { thread: thread("slow") }, true)
+        }
       }
     })
 
@@ -78,11 +81,15 @@ describe("Effect Codex app-server transport", () => {
 
   test("times out one request and ignores its late response", async () => {
     let expiredId: number | undefined
+    const expiredDispatched = Deferred.makeUnsafe<void>()
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/read") {
         const params = message.params as { threadId: string }
-        if (params.threadId === "expired" && typeof message.id === "number") expiredId = message.id
+        if (params.threadId === "expired" && typeof message.id === "number") {
+          expiredId = message.id
+          Deferred.doneUnsafe(expiredDispatched, Effect.void)
+        }
         else controls.respond(message.id, { thread: thread(params.threadId) })
       }
     })
@@ -92,18 +99,21 @@ describe("Effect Codex app-server transport", () => {
         spawn: () => transport.process,
         requestTimeoutMs: 10,
       })
-      const timeout = yield* Effect.flip(client.readThread("expired"))
+      const expired = yield* Effect.forkChild(client.readThread("expired"))
+      yield* Deferred.await(expiredDispatched)
+      yield* TestClock.adjust(10)
+      const timeout = yield* Effect.flip(Fiber.join(expired))
       expect(timeout).toBeInstanceOf(CodexRequestTimeout)
       expect(timeout).toMatchObject({ method: "thread/read", timeoutMs: 10 })
 
       transport.respond(expiredId, { thread: thread("expired") })
-      yield* Effect.sleep(5)
       expect((yield* client.readThread("live")).id).toBe("live")
-    })))
+    })).pipe(Effect.provide(TestClock.layer())))
   })
 
   test("request timeout covers a hung serialized write", async () => {
     let releaseWrite: (() => void) | undefined
+    const writeStarted = Deferred.makeUnsafe<void>()
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") controls.respond(message.id, {})
     }, {
@@ -111,6 +121,7 @@ describe("Effect Codex app-server transport", () => {
         if (!messages.some((message) => message.method === "thread/read")) return data.length
         return new Promise<number>((resolve) => {
           releaseWrite = () => resolve(data.length)
+          Deferred.doneUnsafe(writeStarted, Effect.void)
         })
       },
     })
@@ -120,20 +131,27 @@ describe("Effect Codex app-server transport", () => {
         spawn: () => transport.process,
         requestTimeoutMs: 10,
       })
-      expect(yield* Effect.flip(client.readThread("blocked"))).toBeInstanceOf(CodexRequestTimeout)
+      yield* Effect.addFinalizer(() => Effect.sync(() => releaseWrite?.()))
+      const read = yield* Effect.forkChild(client.readThread("blocked"))
+      yield* Deferred.await(writeStarted)
+      yield* TestClock.adjust(10)
+      expect(yield* Effect.flip(Fiber.join(read))).toBeInstanceOf(CodexRequestTimeout)
       releaseWrite?.()
-    })))
+    })).pipe(Effect.provide(TestClock.layer())))
   })
 
   test("interruption removes a request blocked in serialized write", async () => {
     let blockedId: number | undefined
+    const blockedDispatched = Deferred.makeUnsafe<void>()
     let releaseWrite: (() => void) | undefined
     let blockNextRead = true
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/read") {
         const params = message.params as { threadId: string }
-        if (params.threadId === "blocked" && typeof message.id === "number") blockedId = message.id
+        if (params.threadId === "blocked" && typeof message.id === "number") {
+          blockedId = message.id
+        }
         if (params.threadId === "live") controls.respond(message.id, { thread: thread("live") })
       }
     }, {
@@ -142,25 +160,26 @@ describe("Effect Codex app-server transport", () => {
         blockNextRead = false
         return new Promise<number>((resolve) => {
           releaseWrite = () => resolve(data.length)
+          Deferred.doneUnsafe(blockedDispatched, Effect.void)
         })
       },
     })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      yield* Effect.addFinalizer(() => Effect.sync(() => releaseWrite?.()))
       const fiber = yield* Effect.forkChild(client.readThread("blocked"))
-      yield* Effect.promise(() => waitUntil(() => blockedId !== undefined))
+      yield* Deferred.await(blockedDispatched)
       yield* Fiber.interrupt(fiber)
       releaseWrite?.()
-      yield* Effect.sleep(5)
       transport.respond(blockedId, { thread: thread("blocked") })
-      yield* Effect.sleep(5)
       expect((yield* client.readThread("live")).id).toBe("live")
     })))
   })
 
   test("never sends a queued request after its fiber is cancelled", async () => {
     let releaseBlocker!: () => void
+    const blockerDispatched = Deferred.makeUnsafe<void>()
     const transport = fakeProcess((message, controls) => {
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/read") {
@@ -168,6 +187,7 @@ describe("Effect Codex app-server transport", () => {
         if (params.threadId === "blocker") {
           controls.respond(message.id, { thread: thread("blocker") })
         }
+        if (params.threadId === "live") controls.respond(message.id, { thread: thread("live") })
       }
     }, {
       write(data, messages) {
@@ -177,52 +197,39 @@ describe("Effect Codex app-server transport", () => {
         )) return data.length
         return new Promise<number>((resolve) => {
           releaseBlocker = () => resolve(data.length)
+          Deferred.doneUnsafe(blockerDispatched, Effect.void)
         })
       },
     })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      yield* Effect.addFinalizer(() => Effect.sync(() => releaseBlocker?.()))
       const blocker = yield* Effect.forkChild(client.readThread("blocker"))
-      yield* Effect.promise(() => waitUntil(() => transport.messages.some((message) =>
-        message.method === "thread/read" &&
-        (message.params as { threadId?: string }).threadId === "blocker"
-      )))
+      yield* Deferred.await(blockerDispatched)
       const cancelled = yield* Effect.forkChild(client.readThread("cancelled"))
-      yield* Effect.sleep(5)
+      yield* TestClock.adjust(0)
       yield* Fiber.interrupt(cancelled)
       releaseBlocker()
       expect((yield* Fiber.join(blocker)).id).toBe("blocker")
-      yield* Effect.sleep(5)
+      expect((yield* client.readThread("live")).id).toBe("live")
       expect(transport.messages.some((message) =>
         message.method === "thread/read" &&
         (message.params as { threadId?: string }).threadId === "cancelled"
       )).toBeFalse()
-    })))
+    })).pipe(Effect.provide(TestClock.layer())))
   })
 
-  test("reports a sent fork as ambiguous when its response deadline expires", async () => {
-    const transport = fakeProcess((message, controls) => {
-      if (message.method === "initialize") controls.respond(message.id, {})
-    })
-
-    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const client = yield* makeCodexAppServerClient("codex", {
-        spawn: () => transport.process,
-        requestTimeoutMs: 10,
-      })
-      const error = yield* Effect.flip(client.forkThread("parent", "turn", "/project"))
-      expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
-      expect(error).toMatchObject({ method: "thread/fork" })
-    })))
-  })
-
-  test("uses TestClock to settle a dispatched mutation timeout exactly once", async () => {
+  test("reports a dispatched fork timeout as ambiguous without retrying", async () => {
+    let forkCalls = 0
     const error = await Effect.runPromise(Effect.provide(Effect.scoped(Effect.gen(function*() {
       const forkDispatched = yield* Deferred.make<void>()
       const transport = fakeProcess((message, controls) => {
         if (message.method === "initialize") controls.respond(message.id, {})
-        if (message.method === "thread/fork") Deferred.doneUnsafe(forkDispatched, Effect.void)
+        if (message.method === "thread/fork") {
+          forkCalls++
+          Deferred.doneUnsafe(forkDispatched, Effect.void)
+        }
       })
       const client = yield* makeCodexAppServerClient("codex", {
         spawn: () => transport.process,
@@ -235,6 +242,8 @@ describe("Effect Codex app-server transport", () => {
     })), TestClock.layer()))
 
     expect(error).toBeInstanceOf(CodexMutationAmbiguousError)
+    expect(error).toMatchObject({ method: "thread/fork" })
+    expect(forkCalls).toBe(1)
   })
 
   test("settles a dispatched fork as ambiguous when close drains pending requests", async () => {
@@ -270,6 +279,7 @@ describe("Effect Codex app-server transport", () => {
         },
       })
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      yield* Effect.addFinalizer(() => Effect.sync(() => releaseWrite?.()))
       const mutation = yield* Effect.forkChild(client.forkThread("parent", "turn", "/project"))
       yield* Deferred.await(forkDispatched)
       const closing = yield* Effect.forkChild(client.close())
@@ -367,7 +377,7 @@ describe("Effect Codex app-server transport", () => {
       if (message.method === "thread/read") {
         const params = message.params as { threadId: string }
         const value = thread(params.threadId === "mismatch" ? "other" : params.threadId)
-        value.turns = params.threadId === "good"
+        value.turns = params.threadId !== "bad"
           ? [{
               id: "turn-1",
               status: "completed",
@@ -390,7 +400,9 @@ describe("Effect Codex app-server transport", () => {
       expect(good.turns[0]?.futureTurn).toBeTrue()
       expect(good.turns[0]?.items[0]?.futureItem).toBeTrue()
       expect(yield* Effect.flip(client.readThread("bad"))).toBeInstanceOf(CodexProtocolError)
-      expect(yield* Effect.flip(client.readThread("mismatch"))).toBeInstanceOf(CodexProtocolError)
+      const mismatch = yield* Effect.flip(client.readThread("mismatch"))
+      expect(mismatch).toBeInstanceOf(CodexProtocolError)
+      expect(mismatch.message).toContain('did not match "mismatch"')
     })))
   })
 
@@ -417,7 +429,9 @@ describe("Effect Codex app-server transport", () => {
   })
 
   test("answers unsupported server requests without exposing a raw request API", async () => {
+    const rejectionWritten = Deferred.makeUnsafe<void>()
     const transport = fakeProcess((message, controls) => {
+      if (message.id === "server-1" && message.error) Deferred.doneUnsafe(rejectionWritten, Effect.void)
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/loaded/list") {
         controls.emit(`${JSON.stringify({ id: "server-1", method: "account/login/start", params: {} })}\n`)
@@ -428,7 +442,7 @@ describe("Effect Codex app-server transport", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
       expect(yield* client.listLoadedThreadIds()).toEqual(["loaded"])
-      yield* Effect.sleep(5)
+      yield* Deferred.await(rejectionWritten)
     })))
     expect(transport.messages).toContainEqual({
       id: "server-1",
@@ -441,9 +455,8 @@ describe("Effect Codex app-server transport", () => {
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/read") {
         controls.stderr("x".repeat(20_000))
-        setTimeout(() => controls.exit(17), 5)
       }
-    })
+    }, { onStderrDrained: () => transport.exit(17) })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
@@ -451,7 +464,7 @@ describe("Effect Codex app-server transport", () => {
       expect(error).toBeInstanceOf(CodexProcessError)
       if (error instanceof CodexProcessError) {
         expect(error.exitCode).toBe(17)
-        expect((error.stderr ?? "").length).toBeLessThanOrEqual(8_192)
+        expect(error.stderr).toBe("x".repeat(8_192))
       }
     })))
   })
@@ -481,7 +494,10 @@ describe("Effect Codex app-server transport", () => {
         spawn: () => transport.process,
         shutdownTimeoutMs: 5,
       })
-      return yield* Effect.flip(client.close())
+      const unrefsBeforeClose = transport.unrefs
+      const explicitError = yield* Effect.flip(client.close())
+      expect(explicitError).toBeInstanceOf(CodexCleanupError)
+      expect(transport.unrefs).toBeGreaterThan(unrefsBeforeClose)
     }))))
 
     expect(Exit.isFailure(exit)).toBeTrue()
@@ -489,7 +505,6 @@ describe("Effect Codex app-server transport", () => {
     expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
     expect(transport.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
     expect(transport.readersCancelled.sort()).toEqual(["stderr", "stdout"])
-    expect(transport.unrefs).toBe(3)
   })
 
   test("reports typed scope cleanup failure", async () => {
@@ -525,7 +540,10 @@ describe("Effect Codex app-server transport", () => {
         spawn: () => transport.process,
         shutdownTimeoutMs: 5,
       })
-      return yield* Effect.flip(client.close())
+      const unrefsBeforeClose = transport.unrefs
+      const explicitError = yield* Effect.flip(client.close())
+      expect(explicitError).toBeInstanceOf(CodexCleanupError)
+      expect(transport.unrefs).toBeGreaterThan(unrefsBeforeClose)
     }))))
 
     expect(Exit.isFailure(exit)).toBeTrue()
@@ -533,7 +551,6 @@ describe("Effect Codex app-server transport", () => {
     expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
     expect(transport.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
     expect(transport.readersCancelled.sort()).toEqual(["stderr", "stdout"])
-    expect(transport.unrefs).toBe(3)
   })
 
   test("retries typed cleanup and repeats TERM/KILL escalation", async () => {
@@ -582,7 +599,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
       expect(error).toBeInstanceOf(CodexConnectionError)
       expect(error).toMatchObject({ url: `ws://127.0.0.1:${server.port}` })
     } finally {
-      void server.stop(true)
+      await stopTestServer(server)
     }
   })
 
@@ -619,8 +636,13 @@ describe("Effect Codex sidecar and TUI proxy", () => {
       })))
       expect(authorizations).toEqual(["Bearer sidecar-secret"])
     } finally {
-      for (const socket of sockets) socket.terminate()
-      void server.stop(true)
+      try {
+        for (const socket of sockets) socket.close(1000, "Test complete")
+        await waitUntil(() => sockets.size === 0)
+      } finally {
+        for (const socket of sockets) socket.terminate()
+        await stopTestServer(server)
+      }
     }
   })
 
@@ -651,6 +673,8 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         const client = new WebSocket(proxy.remoteUrl, {
           headers: { Authorization: `Bearer ${token}` },
         })
+        const responses: unknown[] = []
+        client.addEventListener("message", (event) => responses.push(JSON.parse(String(event.data))))
         yield* Effect.promise(() => socketOpened(client))
 
         client.send(JSON.stringify({
@@ -685,16 +709,16 @@ describe("Effect Codex sidecar and TUI proxy", () => {
           forkPointTurnId: "turn-1",
         })
 
-        const noTransition = yield* Effect.forkChild(
-          PubSub.take(subscription).pipe(Effect.timeoutOption(50)),
-        )
+        yield* Effect.promise(() => waitUntil(() => responses.length === 3))
+        const filteredResponse = socketMessage(client)
         client.send(JSON.stringify({ id: 4, method: "thread/fork", params: { threadId: "thread-d" } }))
         yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 4))
         upstream.respond(4, {
           ...topLevelThread("child"),
           parentThreadId: "thread-d",
         })
-        expect((yield* Fiber.join(noTransition))._tag).toBe("None")
+        expect(JSON.parse(yield* Effect.promise(() => filteredResponse))).toMatchObject({ id: 4 })
+        expect(yield* PubSub.size(proxy.transitions)).toBe(0)
         client.close()
       })))
 
@@ -954,11 +978,14 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         })
         yield* Effect.promise(() => socketOpened(client))
         const closed = socketClosed(client)
+        const forwarded: unknown[] = []
+        client.addEventListener("message", (event) => forwarded.push(event.data))
         client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
         yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
         upstream.respond(1, topLevelThread("thread-b"))
         yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
         expect((yield* Effect.promise(() => closed)).code).toBe(1011)
+        expect(forwarded).toEqual([])
       }))))
       expect(Exit.isFailure(exit)).toBeTrue()
       if (Exit.isSuccess(exit)) throw new Error("expected cleanup failure")
@@ -968,7 +995,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }
   })
 
-  test("awaits queued publications and returns typed proxy cleanup failures", async () => {
+  test("returns a typed proxy cleanup failure for an unacknowledged transition", async () => {
     const token = "proxy-secret"
     const upstream = controlledProtocolServer(token)
     let proxyUrl = ""
@@ -982,17 +1009,15 @@ describe("Effect Codex sidecar and TUI proxy", () => {
           cleanupTimeoutMs: 10,
         })
         proxyUrl = proxy.remoteUrl
-        yield* PubSub.subscribe(proxy.transitions)
+        const subscription = yield* PubSub.subscribe(proxy.transitions)
         const client = new WebSocket(proxy.remoteUrl, {
           headers: { Authorization: `Bearer ${token}` },
         })
         yield* Effect.promise(() => socketOpened(client))
         client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
-        client.send(JSON.stringify({ id: 2, method: "thread/start", params: {} }))
-        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 2))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
         upstream.respond(1, topLevelThread("thread-b"))
-        upstream.respond(2, topLevelThread("thread-c"))
-        yield* Effect.sleep(20)
+        yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
         return yield* Effect.flip(proxy.close())
       })))
       expect(error).toBeInstanceOf(CodexTuiProxyError)
@@ -1044,6 +1069,7 @@ function fakeProcess(
     readonly exitOnKillAttempt?: number
     readonly endError?: unknown
     readonly killError?: unknown
+    readonly onStderrDrained?: () => void
     readonly write?: (data: string, messages: readonly WireMessage[]) => number | Promise<number>
   } = {},
 ): FakeProcess {
@@ -1056,6 +1082,7 @@ function fakeProcess(
   const signals: NodeJS.Signals[] = []
   const readersCancelled: string[] = []
   let unrefs = 0
+  let stderrEmitted = false
   const encoder = new TextEncoder()
   const close = (code: number) => {
     if (exited) return
@@ -1067,7 +1094,10 @@ function fakeProcess(
   }
   const controls: FakeControls = {
     emit: (text) => stdoutController.enqueue(encoder.encode(text)),
-    stderr: (text) => stderrController.enqueue(encoder.encode(text)),
+    stderr(text) {
+      stderrEmitted = true
+      stderrController.enqueue(encoder.encode(text))
+    },
     respond(id, result, split = false) {
       const line = `${JSON.stringify({ id, result })}\n`
       if (!split) {
@@ -1105,8 +1135,14 @@ function fakeProcess(
     }),
     stderr: new ReadableStream({
       start: (controller) => { stderrController = controller },
+      pull() {
+        if (stderrEmitted) {
+          stderrEmitted = false
+          options.onStderrDrained?.()
+        }
+      },
       cancel: () => { readersCancelled.push("stderr") },
-    }),
+    }, { highWaterMark: 0 }),
     exited: new Promise((resolve) => { resolveExited = resolve }),
     kill(signal = "SIGTERM") {
       const normalized = typeof signal === "string" ? signal : "SIGTERM"
@@ -1188,8 +1224,13 @@ function controlledProtocolServer(token: string, openDelayMs = 0): {
       request.socket.send(JSON.stringify({ id, result: { thread: value } }))
     },
     async close() {
-      for (const socket of sockets) socket.terminate()
-      void server.stop(true)
+      try {
+        for (const socket of sockets) socket.close(1000, "Test complete")
+        await waitUntil(() => sockets.size === 0)
+      } finally {
+        for (const socket of sockets) socket.terminate()
+        await stopTestServer(server)
+      }
     },
   }
 }
@@ -1203,6 +1244,29 @@ function topLevelThread(id: string): Record<string, unknown> {
     ephemeral: false,
     parentThreadId: null,
     futureField: true,
+  }
+}
+
+async function stopTestServer(server: ReturnType<typeof Bun.serve>): Promise<void> {
+  const port = server.port!
+  let probe: Socket | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const stopped = server.stop(true)
+    // Bun can close the listener without settling stop() after WebSocket use.
+    await Promise.race([stopped, new Promise<void>((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Test server cleanup timed out")), 1_000)
+      probe = createConnection({ host: "127.0.0.1", port })
+      probe.once("connect", () => reject(new Error("Test server listener remained open")))
+      probe.once("error", (error: NodeJS.ErrnoException) => {
+        if (error.code === "ECONNREFUSED") resolve()
+        else reject(error)
+      })
+    })])
+  } finally {
+    clearTimeout(timer)
+    probe?.destroy()
+    server.unref()
   }
 }
 

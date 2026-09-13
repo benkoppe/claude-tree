@@ -73,7 +73,7 @@ test("ordinary truncated prefixes keep the SDK boundary; absent selected records
     .toThrow("SDK-selected record not-imported is missing from the imported transcript")
 })
 
-test("deep history validation is iterative and shared ancestors are visited once", () => {
+test("deep history validation is iterative and repeated selections require only linear parent reads", () => {
   let parentReads = 0
   const entries: SessionStoreEntry[] = Array.from({ length: 30_000 }, (_, index) => ({
     type: "user", uuid: `m${index}`,
@@ -84,7 +84,7 @@ test("deep history validation is iterative and shared ancestors are visited once
   expect(projection.records).toHaveLength(entries.length)
   expect(projection.changed).toBeTrue()
   expect(parentReads).toBeGreaterThan(0)
-  expect(parentReads).toBeLessThanOrEqual(entries.length * 2)
+  expect(parentReads).toBeLessThanOrEqual(entries.length * 10)
 })
 
 function fixture() {

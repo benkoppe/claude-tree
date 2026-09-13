@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { EventEmitter } from "node:events"
@@ -14,6 +14,7 @@ import { makeCliProgram } from "../../src/cli"
 import { HistoryDiagnosticReportSchema, HistoryTrace, MAX_TRACE_EVENTS } from "../../src/diagnostics/history-trace"
 import { runHistoryWorker, HISTORY_DIAGNOSTIC_TIMEOUT_MS } from "../../src/diagnostics/run-history"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
+import { runSubprocess } from "../subprocess"
 
 const SECRET = "PRIVATE_CHAT_CONTENT_AND_FIELD_7c5f39"
 const PRIVATE_PATH = "/private/work/secret-project-7c5f39"
@@ -165,8 +166,7 @@ test.each(["valid", "invalid", "crash"])("worker output and exceptions cannot le
       const result = await Effect.runPromise(runHistoryWorker({projectPath: ${JSON.stringify(PRIVATE_PATH)}, sessionId: ${JSON.stringify(SECRET)}, build: ${JSON.stringify(UNKNOWN_BUILD)}},
         () => fork(${JSON.stringify(workerFile)}, [], {execPath: process.execPath, stdio: ["ignore", "ignore", "ignore", "ipc"]})));
       console.log(JSON.stringify(result));`
-    const process = Bun.spawn([globalThis.process.execPath, "-e", script], { cwd: join(import.meta.dir, "../.."), stdout: "pipe", stderr: "pipe" })
-    const [code, stdout, stderr] = await Promise.all([process.exited, new Response(process.stdout).text(), new Response(process.stderr).text()])
+    const [code, stdout, stderr] = await runSubprocess([process.execPath, "-e", script], { cwd: join(import.meta.dir, "../..") })
     expect(code).toBe(0)
     expect(stderr).toBe("")
     expect(stdout).not.toContain(SECRET)
@@ -187,23 +187,24 @@ test("real headless diagnostics create no app state and disclose no project or t
     await mkdir(project)
     const transcripts = join(config, "projects", "fixture")
     await mkdir(transcripts, { recursive: true })
-    await writeFile(join(transcripts, `${sessionId}.jsonl`), JSON.stringify({
+    const transcriptPath = join(transcripts, `${sessionId}.jsonl`)
+    const transcript = JSON.stringify({
       type: "user", uuid: messageId, sessionId, cwd: project, parentUuid: null,
       message: { role: "user", content: SECRET },
-    }) + "\n")
+    }) + "\n"
+    await writeFile(transcriptPath, transcript)
     const before = (await readdir(root, { recursive: true })).sort()
-    const process = Bun.spawn([globalThis.process.execPath, "src/cli.ts", "--diagnose-history", sessionId, project], {
+    const [code, stdout, stderr] = await runSubprocess([process.execPath, "src/cli.ts", "--diagnose-history", sessionId, project], {
       cwd: join(import.meta.dir, "../.."), env: { ...globalThis.process.env, DEBUG: "*", DEBUG_CLAUDE_AGENT_SDK: "1", CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_PROJECT_DIR_NAME: "fixture", XDG_STATE_HOME: state },
-      stdin: "ignore", stdout: "pipe", stderr: "pipe",
     })
-    const [code, stdout, stderr] = await Promise.all([process.exited, new Response(process.stdout).text(), new Response(process.stderr).text()])
     expect(code).toBe(0)
     expect(stderr).toBe("")
     const report = HistoryDiagnosticReportSchema.parse(JSON.parse(stdout))
     expect(report.outcome).toBe("Available")
     expect(report.message_count).toBe(1)
-    expect(report.build.revision).toMatch(/^[0-9a-f]{40}$/)
+    expect(report.build.version).toBe(UNKNOWN_BUILD.version)
     for (const value of [SECRET, project, root, sessionId, messageId]) expect(stdout).not.toContain(value)
     expect((await readdir(root, { recursive: true })).sort()).toEqual(before)
+    expect(await readFile(transcriptPath, "utf8")).toBe(transcript)
   } finally { await rm(root, { recursive: true, force: true }) }
 })

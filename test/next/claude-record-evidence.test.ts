@@ -228,6 +228,8 @@ test("ancestor acquisition shares the read deadline and never retries a provider
     ...(record.forkedFrom ? { forkedFrom: { ...(record.forkedFrom as object), sessionId: parentId } } : {}),
   }))
   const started = Deferred.makeUnsafe<void>()
+  const childImportStarted = Deferred.makeUnsafe<void>()
+  let releaseChildImport!: () => void
   let parentReads = 0
   let mutations = 0
   const provider = new ClaudeProvider(process.cwd(), { sdk: {
@@ -239,7 +241,13 @@ test("ancestor acquisition shares the read deadline and never retries a provider
     } }),
     forkSession: async () => { mutations++; throw new Error("Unexpected mutation") },
     importSessionToStore: async (id, store, options) => {
-      if (id === childId) return store.append({ projectKey: "fixture", sessionId: id }, entries)
+      if (id === childId) {
+        await new Promise<void>((resolve) => {
+          releaseChildImport = resolve
+          Deferred.doneUnsafe(childImportStarted, Effect.void)
+        })
+        return store.append({ projectKey: "fixture", sessionId: id }, entries)
+      }
       expect(id).toBe(parentId)
       expect(options.dir).toBeUndefined()
       parentReads++
@@ -249,8 +257,11 @@ test("ancestor acquisition shares the read deadline and never retries a provider
   } }, { operationTimeoutMs: 50, transcriptReadTimeoutMs: 50, provenanceImportTimeoutMs: 50 })
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const fiber = yield* Effect.forkChild(provider.readTranscripts([childId]))
+    yield* Deferred.await(childImportStarted)
+    yield* TestClock.adjust(20)
+    releaseChildImport()
     yield* Deferred.await(started)
-    yield* TestClock.adjust(50)
+    yield* TestClock.adjust(30)
     const result = (yield* Fiber.join(fiber)).get(childId)
     expect(result?._tag).toBe("Unavailable")
     if (result?._tag !== "Unavailable") throw new Error("Expected a bounded ancestor-read failure")
