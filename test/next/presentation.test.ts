@@ -223,6 +223,27 @@ test("copies drafts and reports empty nodes and clipboard failures", async () =>
   }
 })
 
+test.each([60, 120])("short error dialogs fit their content at terminal width %i", async (width) => {
+  const setup = await createTestRenderer({ width, height: 40 })
+  const message = "Select a live Draft or Agent to stop"
+  const running = await startPresentation(setup.renderer, { ...rootsView(), modal: { _tag: "Error", message } })
+  try {
+    const initial = await frame(setup, (value) => value.includes(message) && value.includes("Copy  Close"))
+    const header = coordinateOf(initial, "Error")
+    const actions = coordinateOf(initial, "Copy  Close")
+    expect(actions.y - header.y).toBe(4)
+    expect(header.x).toBe(Math.floor((width - Math.min(60, width - 4)) / 2) + 2)
+
+    const wrapped = `${"word ".repeat(50)}FINAL_LINE`
+    await Effect.runPromise(running.harness.update({ ...rootsView(), modal: { _tag: "Error", message: wrapped } }))
+    const expanded = await frame(setup, (value) => value.includes("FINAL_LINE"))
+    const lastLine = coordinateOf(expanded, "FINAL_LINE")
+    const expandedActions = coordinateOf(expanded, "Copy  Close")
+    expect(expandedActions.y - lastLine.y).toBe(2)
+    expect(expandedActions.y - coordinateOf(expanded, "Error").y).toBeGreaterThan(4)
+  } finally { await running.stop() }
+})
+
 test("long errors scroll to their final cause and copy the complete original message", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const message = Array.from({ length: 80 }, (_, index) => `evidence step ${String(index).padStart(3, "0")}`).join("\n") + "\nFINAL_CAUSE"
