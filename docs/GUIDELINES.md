@@ -13,6 +13,7 @@ Follow general code best practices, such as:
 
 ## TypeScript And Effect
 
+- Keep `effect`, `@effect/platform-bun`, and `@effect/platform-node-shared` pinned to the same tested release. The shared adapter needs an explicit runtime dependency because the Bun adapter's prerelease range can resolve an incompatible newer adapter when installing the packed application without the repository lockfile.
 - Model long-lived processes, scopes, subscriptions, temporary files, and terminal surfaces as acquired resources with explicit, idempotent cleanup. Finalizers are mandatory backstops, not substitutes for a lifecycle API that can report incomplete cleanup.
 - Keep application-state mutation behind the application actor. Asynchronous commands and callbacks should return typed events carrying stable owner and sequence identities rather than retaining mutable state references.
 - Make shutdown and rollback uninterruptible only around the ownership transition that must be atomic. Keep external waits individually bounded, verify the resulting state, and preserve ownership when absence cannot be proven.
