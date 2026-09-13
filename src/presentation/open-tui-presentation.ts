@@ -253,6 +253,12 @@ export function makeOpenTuiPresentation(
   })
 }
 
+class ErrorTextRenderable extends TextRenderable {
+  wrappedLineCount(width: number): number {
+    return this.textBufferView.measureForDimensions(Math.max(1, width), 1)?.lineCount ?? 1
+  }
+}
+
 class OpenTuiPresentationController {
   private readonly navigator: BoxRenderable
   private readonly header: TextRenderable
@@ -266,7 +272,7 @@ class OpenTuiPresentationController {
   private readonly dialogEscape: TextRenderable
   private readonly dialogBody: TextRenderable
   private readonly errorScroll: ScrollBoxRenderable
-  private readonly errorText: TextRenderable
+  private readonly errorText: ErrorTextRenderable
   private readonly dialogActions: TextRenderable
 
   private viewModel: ApplicationViewModel | undefined
@@ -441,7 +447,7 @@ class OpenTuiPresentationController {
       backgroundColor: theme.element,
       contentOptions: { flexDirection: "column", backgroundColor: theme.element },
     })
-    this.errorText = new TextRenderable(renderer, {
+    this.errorText = new ErrorTextRenderable(renderer, {
       id: "error-text", width: "100%", flexShrink: 0, wrapMode: "word", selectable: false,
       fg: theme.textMuted, bg: theme.element, content: "",
     })
@@ -1401,21 +1407,28 @@ class OpenTuiPresentationController {
     } else if (modal) {
       const content = modalContent(modal)
       const about = modal._tag === "About"
-      this.dialogPanel.width = Math.min(about ? 76 : modal._tag === "Error" ? 100 : 60, this.renderer.terminalWidth - 4)
+      const error = modal._tag === "Error"
+      if (error && modal.message !== this.errorMessage) {
+        this.errorMessage = modal.message
+        this.errorText.content = modal.message
+      }
+      const errorWidth = error ? Math.min(100, modal.message.split("\n").reduce(
+        (width, line) => Math.max(width, displayWidth(line) + 5), 60,
+      )) : 60
+      const dialogWidth = Math.min(about ? 76 : errorWidth, this.renderer.terminalWidth - 4)
+      this.dialogPanel.width = dialogWidth
       const dialogHeight = Math.min(
-        about ? 18 : modal._tag === "Error" ? Math.max(9, Math.floor(this.renderer.terminalHeight * 0.65)) : 12,
+        about ? 18 : error ? Math.min(
+          this.errorText.wrappedLineCount(dialogWidth - 5) + 6,
+          Math.max(9, Math.floor(this.renderer.terminalHeight * 0.65)),
+        ) : 12,
         this.renderer.terminalHeight - 2,
       )
       this.dialogPanel.height = dialogHeight
       if (modal._tag === "Error") this.dialogOverlay.paddingTop = Math.max(0, Math.floor((this.renderer.terminalHeight - dialogHeight) / 2))
       this.dialogTitle.content = content.title
       this.dialogBody.wrapMode = "word"
-      if (modal._tag === "Error") {
-        if (modal.message !== this.errorMessage) {
-          this.errorMessage = modal.message
-          this.errorText.content = modal.message
-        }
-      } else this.dialogBody.content = content.body
+      if (!error) this.dialogBody.content = content.body
       this.dialogActions.visible = true
       this.dialogActions.content = this.modalActions(modal)
     }
