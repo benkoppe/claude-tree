@@ -188,13 +188,17 @@ test("recognizes native instructions wrapped across more than four bordered rows
 })
 
 for (const action of ["Restore code", "Restore files only", "Never mind", "Summarize from here", "Summarize up to here"]) {
-  test(`${action} cannot emit a rewind on dialog exit`, () => {
+  test(`${action} cannot emit a rewind or mark an ordinary draft after confirmation redraws`, () => {
     const observer = new ClaudeTerminalObserver()
-    const confirmation = dialogScreen(["Rewind", "Confirm you want to restore the conversation", `❯ ${action}`])
+    const confirmation = dialogScreen(["│ Rewind │", "│ Confirm you want to restore the conversation │", `│ ❯ ${action} │`])
     observer.observeScreen(confirmation)
     rewindInput(observer)
     observer.observeScreen(confirmation)
     observer.observeScreen(dialogScreen(["unreadable composer"]))
+    expect(observer.takeObservations()).toEqual([])
+    const composer = { lines: ["❯ unchanged", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
+    observer.observeScreen(composer)
+    expect(observer.observeDraft(composer)).toEqual({ text: "unchanged", exact: false })
     expect(observer.takeObservations()).toEqual([])
   })
 }
@@ -364,27 +368,16 @@ test("hidden-cursor rewind capture requires a complete idle composer after confi
   expect(observer.observeDraft(restored)).toEqual({ text: "restored", exact: false, rewind: true, rewindTarget: "restored" })
 })
 
-test("marks a restored composer as a rewind after Claude's undo command", () => {
-  const observer = new ClaudeTerminalObserver()
-  observer.observeInput(new TextEncoder().encode("/undo\r"))
-
-  expect(observer.observeDraft({
-    lines: ["❯ restored prompt", "────────────────"],
-    cursor: { x: 18, y: 0, visible: true },
-  })).toEqual({
-    text: "restored prompt",
-    exact: false,
-    rewind: true,
-    rewindTarget: "restored prompt",
-  })
-})
-
 test("retains the rewind target when the restored Claude prompt is edited", () => {
   const observer = new ClaudeTerminalObserver()
   observer.observeInput(new TextEncoder().encode("/undo\r"))
-  observer.observeScreen({
+  const restored = {
     lines: ["❯ restored prompt", "────────────────"],
     cursor: { x: 18, y: 0, visible: true },
+  }
+  observer.observeScreen(restored)
+  expect(observer.observeDraft(restored)).toEqual({
+    text: "restored prompt", exact: false, rewind: true, rewindTarget: "restored prompt",
   })
 
   expect(observer.observeDraft({
@@ -398,7 +391,12 @@ test("retains the rewind target when the restored Claude prompt is edited", () =
   })
 })
 
-test("replaces a captured rewind target when Claude is rewound again", () => {
+test.each([
+  ["undo command", "\u0015/undo\r"],
+  ["rewind command after focus and line-clear sequences", "\u001b[Idiscarded\u0015/rewind\r"],
+  ["batched double-Escape", "\u001b\u001b"],
+  ["CSI-u double-Escape", "\u001b[27u\u001b[27u"],
+])("%s invalidates a captured target before a new dialog and captures its replacement", (_label, input) => {
   const observer = new ClaudeTerminalObserver()
   const encoder = new TextEncoder()
   const firstRestored = {
@@ -409,7 +407,7 @@ test("replaces a captured rewind target when Claude is rewound again", () => {
   observer.observeScreen(firstRestored)
   expect(observer.observeDraft(firstRestored)?.rewindTarget).toBe("later historical prompt")
 
-  observer.observeInput(encoder.encode("\u0015/undo\r"))
+  expect(observer.observeInput(encoder.encode(input))).toBeUndefined()
   expect(observer.observeDraft(firstRestored)).toEqual({
     text: "later historical prompt",
     exact: false,
@@ -433,29 +431,6 @@ test("replaces a captured rewind target when Claude is rewound again", () => {
     rewind: true,
     rewindTarget: "earlier historical prompt",
   })
-})
-
-test("replaces a captured rewind target after another double-Escape shortcut", () => {
-  const observer = new ClaudeTerminalObserver()
-  const encoder = new TextEncoder()
-  const firstRestored = {
-    lines: ["❯ later prompt", "────────────────"],
-    cursor: { x: 14, y: 0, visible: true },
-  }
-  observer.observeInput(encoder.encode("/undo\r"))
-  observer.observeScreen(firstRestored)
-  observer.observeInput(encoder.encode("\u001b\u001b"))
-  expect(observer.observeDraft(firstRestored)?.rewind).toBeUndefined()
-  observer.observeScreen({ ...firstRestored, lines: ["Rewind conversation to a message"] })
-  observer.observeInput(encoder.encode("\r"))
-
-  const secondRestored = {
-    ...firstRestored,
-    lines: ["❯ earlier prompt", "────────────────"],
-    cursor: { x: 16, y: 0, visible: true },
-  }
-  observer.observeScreen(secondRestored)
-  expect(observer.observeDraft(secondRestored)?.rewindTarget).toBe("earlier prompt")
 })
 
 test("retains a submitted rewind boundary until Claude finishes the turn", () => {
@@ -487,19 +462,19 @@ test("retains a submitted rewind boundary until Claude finishes the turn", () =>
   })).toEqual({ text: "next prompt", exact: false })
 })
 
-test("keeps rewind pending across picker navigation and selection", () => {
+test("keeps a visible rewind dialog pending across arrow navigation and selection", () => {
   const observer = new ClaudeTerminalObserver()
   const encoder = new TextEncoder()
-  observer.observeInput(encoder.encode("/undo\r"))
   const picker = {
     lines: ["Rewind conversation to a message", "❯ candidate", "────────────────"],
     cursor: { x: 11, y: 1, visible: true },
   }
   observer.observeScreen(picker)
   expect(observer.observeDraft(picker)).toBeUndefined()
-  observer.observeInput(encoder.encode("\u001b[A"))
-  observer.observeInput(encoder.encode("\u001b[A"))
-  observer.observeInput(encoder.encode("\r"))
+  expect(observer.observeInput(encoder.encode("\u001b[A"))).toBeUndefined()
+  expect(observer.observeInput(encoder.encode("\u001b[A"))).toBeUndefined()
+  expect(observer.takeObservations()).toEqual([])
+  expect(observer.observeInput(encoder.encode("\r"))).toBeUndefined()
   const restored = {
     lines: ["❯ selected historical prompt", "────────────────"],
     cursor: { x: 29, y: 0, visible: true },
@@ -530,7 +505,7 @@ test("clears a pending rewind when the picker is cancelled", () => {
   })).toEqual({ text: "ordinary prompt", exact: false })
 })
 
-test("does not arm rewind from ordinary conversation text or expose the picker as a draft", () => {
+test("does not arm rewind from ordinary conversation text", () => {
   const observer = new ClaudeTerminalObserver()
   const screen = {
     lines: ["Please rewind the conversation to a message", "❯ ordinary", "────────────────"],
@@ -541,65 +516,15 @@ test("does not arm rewind from ordinary conversation text or expose the picker a
   expect(observer.observeDraft(screen)).toEqual({ text: "ordinary", exact: false })
 })
 
-test("recognizes rewind commands around terminal control sequences", () => {
+test("distinguishes unknown, empty, and ordinary non-rewind composers", () => {
   const observer = new ClaudeTerminalObserver()
-  const encoder = new TextEncoder()
-  observer.observeInput(encoder.encode("\u001b[I"))
-  observer.observeInput(encoder.encode("discarded\u0015/rewind\r"))
-  observer.observeScreen({ lines: ["Rewind conversation to a message"], cursor: { x: 0, y: 0, visible: false } })
-  observer.observeInput(encoder.encode("\r"))
-
-  expect(observer.observeDraft({
-    lines: ["❯ restored", "────────────────"],
-    cursor: { x: 10, y: 0, visible: true },
-  })?.rewind).toBeTrue()
-})
-
-test("recognizes batched and CSI-u double-Escape rewind shortcuts", () => {
-  const encoder = new TextEncoder()
-  for (const input of ["\u001b\u001b", "\u001b[27u\u001b[27u"]) {
-    const observer = new ClaudeTerminalObserver()
-    observer.observeInput(encoder.encode(input))
-    expect(observer.observeDraft({ lines: ["❯ ordinary", "────────────────"], cursor: { x: 2, y: 0, visible: true } })?.rewind).toBeUndefined()
-    observer.observeScreen({ lines: ["Rewind conversation to a message"], cursor: { x: 0, y: 0, visible: false } })
-    observer.observeInput(encoder.encode("\r"))
-    expect(observer.observeDraft({
-      lines: ["❯ restored", "────────────────"],
-      cursor: { x: 10, y: 0, visible: true },
-    })?.rewind).toBeTrue()
-  }
-})
-
-test("does not mark an ordinary Claude draft as a rewind", () => {
-  const observer = new ClaudeTerminalObserver()
-
+  expect(observer.observeDraft({ lines: ["output"], cursor: { x: 0, y: 0, visible: false } })).toBeUndefined()
+  expect(observer.observeDraft({ lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } })).toBeNull()
   expect(observer.observeDraft({
     lines: ["❯ ordinary draft", "────────────────"],
     cursor: { x: 16, y: 0, visible: true },
   })).toEqual({ text: "ordinary draft", exact: false })
 })
-
-test("distinguishes an unknown screen from a known empty composer", () => {
-  const observer = new ClaudeTerminalObserver()
-  expect(observer.observeDraft({ lines: ["output"], cursor: { x: 0, y: 0, visible: false } })).toBeUndefined()
-  expect(observer.observeDraft({ lines: ["❯ ", "────────────────"], cursor: { x: 2, y: 0, visible: true } })).toBeNull()
-})
-
-for (const choice of ["Restore code", "Restore files only", "Never mind"]) {
-  test(`${choice} and confirmation redraws do not create a conversation rewind`, () => {
-    const observer = new ClaudeTerminalObserver()
-    const confirmation = {
-      lines: ["│ Confirm you want to restore the conversation │", `│ ❯ ${choice} │`],
-      cursor: { x: 0, y: 1, visible: false },
-    }
-    observer.observeScreen(confirmation)
-    observer.observeInput(new TextEncoder().encode("\r"))
-    observer.observeScreen(confirmation)
-    const composer = { lines: ["❯ unchanged", "────────────────"], cursor: { x: 2, y: 0, visible: true } }
-    observer.observeScreen(composer)
-    expect(observer.observeDraft(composer)).toEqual({ text: "unchanged", exact: false })
-  })
-}
 
 test("tracks a bare-Enter restored submission and its next cancelled send", () => {
   const observer = new ClaudeTerminalObserver()

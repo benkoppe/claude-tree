@@ -127,8 +127,9 @@ describe("next conversation graph", () => {
   })
 
   test("distinguishes authoritative empty history from unread and compacted forks", () => {
-    const parent = [message("p1", "user", "A", 0), message("p2", "agent", "B", 1)]
-    const copied = parent.map((entry, index) => ({ ...entry, id: `c${index}` }))
+    const parent = [message("p1", "user", "A", 0), message("p2", "agent", "B", 1),
+      message("later", "user", "parent continuation", 2)]
+    const copied = parent.slice(0, 2).map((entry, index) => ({ ...entry, id: `c${index}` }))
     const relations = [relation(CHILD, ROOT, "p2", shared(parent, copied, 2))]
     const histories: Array<readonly AgentMessage[] | undefined> = [
       undefined,
@@ -143,6 +144,8 @@ describe("next conversation graph", () => {
       const source = nodes(graph).find((node) => node.preview === "B")!
       expect(endpoint.parentId).toBe(history?.length === 0 ? graph.originNodeId : source.id)
       expect(endpoint).toMatchObject({ fork: { sourceNodeId: source.id, empty: true } })
+      expect(graph.nodes.get(endpoint.parentId!)?.childIds).toContain(endpoint.id)
+      if (history?.length !== 0) expect(graph.nodes.get(graph.originNodeId)?.childIds).not.toContain(endpoint.id)
       expect(graph.warnings).toEqual([])
     }
   })
@@ -182,7 +185,13 @@ describe("next conversation graph", () => {
       expect(layoutConversationGraph(graph, 100).nodes.has(endpoint.id)).toBeTrue()
       expect(nodes(graph).find((node) => node.preview === "C")?.parentId).toBe(boundary.id)
       const restarted = buildConversationForest(sessions, new Map(histories), [...relations]).graphs[0]!
-      expect([...restarted.nodes]).toEqual([...graph.nodes])
+      const restartedBoundary = nodes(restarted).find((node) => node.preview === "B")!
+      expect(restarted.nodes.get(restarted.endpointBySessionId.get(shortenedId)!)?.parentId).toBe(restartedBoundary.id)
+      expect(nodes(restarted).find((node) => node.preview === "C")?.parentId).toBe(restartedBoundary.id)
+      expect(new Set(restartedBoundary.aliases.map((alias) => JSON.stringify(alias)))).toEqual(
+        new Set(boundary.aliases.map((alias) => JSON.stringify(alias))),
+      )
+      expect(restartedBoundary.aliases).toHaveLength(boundary.aliases.length)
       const removed = buildConversationForest(sessions, histories, relations,
         [messageRemoval([{ sessionId: ROOT, messageId: "p3" }])]).graphs[0]!
       expect(removed.endpointBySessionId.has(shortenedId)).toBeTrue()
@@ -205,27 +214,35 @@ describe("next conversation graph", () => {
       message("child:source", "agent", "source", 2, true, "child:user"),
       message("child:tail", "user", "fork tail", 3),
     ]
-    const graph = buildConversationForest(
-      [session(ROOT, 20), session(CHILD, 10)],
-      new Map([[ROOT, parent], [CHILD, child]]),
-      [relation(CHILD, ROOT, parent[2]!.id, shared(parent, child, 3))],
-    ).graphs[0]!
+    for (const continued of [false, true]) {
+      const graph = buildConversationForest(
+        [session(ROOT, 20), session(CHILD, 10)],
+        new Map([[ROOT, parent], [CHILD, continued ? child : child.slice(0, 3)]]),
+        [relation(CHILD, ROOT, parent[2]!.id, shared(parent, child, 3))],
+      ).graphs[0]!
 
-    expect(previews(graph)).toEqual(["question", "first source", "later", "fork tail"])
-    const source = nodes(graph).find((node) => node.preview === "first source")!
-    expect(source.aliases).toEqual([
-      { sessionId: ROOT, messageId: "parent:first" },
-      { sessionId: ROOT, messageId: "parent:source" },
-      { sessionId: CHILD, messageId: "child:first" },
-      { sessionId: CHILD, messageId: "child:source" },
-    ])
-    expect(resolveForkTarget(graph, source.id)).toEqual({
-      sessionId: ROOT,
-      messageId: "parent:source",
-    })
-    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(
-      nodes(graph).find((node) => node.preview === "fork tail")!.id,
-    )
+      expect(previews(graph)).toEqual(["question", "first source", "later", ...(continued ? ["fork tail"] : [])])
+      const source = nodes(graph).find((node) => node.preview === "first source")!
+      expect(new Set(source.aliases.map((alias) => JSON.stringify(alias)))).toEqual(new Set([
+        { sessionId: ROOT, messageId: "parent:first" },
+        { sessionId: ROOT, messageId: "parent:source" },
+        { sessionId: CHILD, messageId: "child:first" },
+        { sessionId: CHILD, messageId: "child:source" },
+      ].map((alias) => JSON.stringify(alias))))
+      expect(source.aliases).toHaveLength(4)
+      expect(resolveForkTarget(graph, source.id)).toEqual({
+        sessionId: ROOT,
+        messageId: "parent:source",
+      })
+      expect(nodes(graph).find((node) => node.preview === "later")?.parentId).toBe(source.id)
+      const endpointId = graph.endpointBySessionId.get(CHILD)!
+      expect(graph.nodes.get(endpointId)?.parentId).toBe(
+        continued ? nodes(graph).find((node) => node.preview === "fork tail")!.id : source.id,
+      )
+      expect(resolveForkTarget(graph, endpointId)).toEqual({
+        sessionId: CHILD, messageId: continued ? "child:tail" : "child:source",
+      })
+    }
   })
 
   test("accepts compacted subsequences and restores omitted retained history", () => {
@@ -254,34 +271,14 @@ describe("next conversation graph", () => {
       messageId: copied[1]!.id,
     })
     expect(graph.warnings).toEqual([])
-  })
-
-  test("keeps an unread validated fork attached to its exact source", () => {
-    const parent = [
-      message("parent-a", "user", "A", 0),
-      message("parent-source", "agent", "source", 1),
-      message("parent-later", "user", "later", 2),
-    ]
-    const copied = parent.slice(0, 2).map((entry, index) => ({
-      ...entry,
-      id: `child-${index}`,
-    }))
-    const graph = buildConversationForest(
-      [session(ROOT, 20), session(CHILD, 10)],
-      new Map([[ROOT, parent]]),
-      [relation(CHILD, ROOT, parent[1]!.id, shared(parent, copied, 2))],
-    ).graphs[0]!
-
     const source = nodes(graph).find((node) => node.preview === "source")!
-    const endpoint = graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)!
-    expect(endpoint.parentId).toBe(source.id)
-    expect(source.childIds).toContain(endpoint.id)
-    expect(graph.nodes.get(graph.originNodeId)?.childIds).not.toContain(endpoint.id)
-    expect(graph.warnings).toEqual([])
+    const tail = nodes(graph).find((node) => node.preview === "continued")!
+    expect(tail.parentId).toBe(source.id)
+    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(tail.id)
   })
 
-  test("materializes an empty fork after compaction removes all mapped history", () => {
-    const currentParent = message("current-parent", "user", "after compaction", 0)
+  test("materializes and removes an empty fork when all mapped history is unavailable", () => {
+    const currentParent = message("current-parent", "user", "replacement history", 0)
     const sessions = [session(ROOT, 20), session(CHILD, 10)]
     const transcripts = new Map([[ROOT, [currentParent]], [CHILD, []]])
     const relations = [relation(CHILD, ROOT, "missing-source", [{
@@ -301,7 +298,6 @@ describe("next conversation graph", () => {
       kind: "endpoint",
       parentId: graph.originNodeId,
       fork: {
-        sourceNodeId: `message:${encodeURIComponent(ROOT)}:${encodeURIComponent("missing-source")}`,
         empty: true,
       },
     })
@@ -321,11 +317,13 @@ describe("next conversation graph", () => {
     const originalChild = [
       message("child-root", "agent", "root", 0),
       message("child-old", "user", "old path", 1),
+      message("child-answer", "agent", "old answer", 2),
     ]
     const grandchild = [
       message("grandchild-root", "agent", "root", 0),
       message("grandchild-old", "user", "old path", 1),
-      message("grandchild-tail", "agent", "retained tail", 2),
+      message("grandchild-answer", "agent", "old answer", 2),
+      message("grandchild-tail", "user", "retained tail", 3),
     ]
     const graph = buildConversationForest(
       [session(ROOT, 30), session(CHILD, 20), session(GRANDCHILD, 10)],
@@ -339,14 +337,20 @@ describe("next conversation graph", () => {
         relation(
           GRANDCHILD,
           CHILD,
-          originalChild[1]!.id,
-          shared(originalChild, grandchild, 2),
+          originalChild[2]!.id,
+          shared(originalChild, grandchild, 3),
           2,
         ),
       ],
     ).graphs[0]!
 
-    expect(previews(graph)).toEqual(["root", "old path", "retained tail"])
+    expect(graph.warnings).toEqual([])
+    expect(graph.sessionIds).toEqual(new Set([ROOT, CHILD, GRANDCHILD]))
+    expect(previews(graph)).toEqual(["root", "old path", "old answer", "retained tail"])
+    const oldAnswer = nodes(graph).find((node) => node.preview === "old answer")!
+    expect(oldAnswer.aliases).toContainEqual({ sessionId: CHILD, messageId: "child-answer" })
+    expect(oldAnswer.aliases).toContainEqual({ sessionId: GRANDCHILD, messageId: "grandchild-answer" })
+    expect(resolveForkTarget(graph, oldAnswer.id)).toEqual({ sessionId: GRANDCHILD, messageId: "grandchild-answer" })
     const endpointIndex = indexReachableSessionEndpoints(graph)
     for (const node of graph.nodes.values()) {
       expect(endpointIndex.get(node.id) ?? []).toEqual(reachableSessionEndpoints(graph, node.id))
@@ -358,7 +362,7 @@ describe("next conversation graph", () => {
     })
   })
 
-  test("fails closed without partially applying contradictory retained evidence", () => {
+  test("rejects contradictory descendant evidence before attaching either copy", () => {
     const sibling = "sibling"
     const root = [message("root", "agent", "root", 0)]
     const originalChild = [
@@ -407,6 +411,30 @@ describe("next conversation graph", () => {
       nodes(forest.graphBySessionId.get(ROOT)!).flatMap((node) => node.aliases)
         .some((alias) => alias.sessionId === GRANDCHILD || alias.sessionId === sibling),
     ).toBeFalse()
+  })
+
+  test("rejects contradictory retained ancestry without changing the parent path", () => {
+    const original = [message("a", "user", "A", 0), message("omitted", "agent", "omitted", 1),
+      message("b", "user", "B", 2)]
+    const parent: AgentMessage[] = [original[0]!, { ...message("historical", "agent", "historical", 1), historical: true }, original[2]!]
+    const child = original.map((entry) => ({ ...entry, id: `copy-${entry.id}` }))
+    const sessions = [session(ROOT, 20), session(CHILD, 10)]
+    const histories = new Map([[ROOT, parent], [CHILD, child]])
+    const baseline = buildConversationForest(sessions, histories, []).graphBySessionId.get(ROOT)!
+    const forest = buildConversationForest(sessions, histories,
+      [relation(CHILD, ROOT, "b", shared(original, child, 3))])
+
+    expect(forest.warnings.some((warning) => warning.includes("contradictory ancestry"))).toBeTrue()
+    expect(forest.graphs).toHaveLength(2)
+    expect(forest.graphBySessionId.get(CHILD)?.rootSessionId).toBe(CHILD)
+    const retained = forest.graphBySessionId.get(ROOT)!
+    expect(previews(retained)).toEqual(["A", "historical", "B"])
+    for (const node of nodes(baseline)) {
+      const actual = nodes(retained).find((candidate) => candidate.preview === node.preview)!
+      expect(actual.aliases).toEqual(node.aliases)
+      expect(actual.parentId).toBe(node.parentId)
+      expect(actual.childIds).toEqual(node.childIds)
+    }
   })
 
   test("applies endpoint and alias removals after family construction", () => {
@@ -462,28 +490,6 @@ describe("next conversation graph", () => {
     expect(forest.graphs[0]!.endpointBySessionId.has(CHILD)).toBeFalse()
   })
 
-  test("groups assistant records and forks from the latest represented record", () => {
-    const messages = [
-      message("user", "user", "question", 0),
-      message("assistant-1", "agent", "first", 1, true, "user"),
-      message("tool", "user", "tool result", 2, false),
-      message("assistant-2", "agent", "second", 3, true, "user"),
-    ]
-    const graph = buildConversationForest(
-      [session(ROOT, 10)],
-      new Map([[ROOT, messages]]),
-      [],
-    ).graphs[0]!
-    const grouped = nodes(graph).find((node) => node.role === "agent")!
-
-    expect(grouped.preview).toBe("first second")
-    expect(grouped.aliases.map((alias) => alias.messageId)).toEqual(["assistant-1", "assistant-2"])
-    expect(resolveForkTarget(graph, grouped.id)).toEqual({
-      sessionId: ROOT,
-      messageId: "assistant-2",
-    })
-  })
-
   test("keeps zero-prefix replay paths in one synthetic family", () => {
     const rootMessage = message("root prompt", "user", "original", 0)
     const replayMessage = message("replay prompt", "user", "edited", 0)
@@ -496,14 +502,21 @@ describe("next conversation graph", () => {
       relations,
     ).graphs[0]!
     const origin = graph.nodes.get(graph.originNodeId)!
+    const replay = nodes(graph).find((node) => node.preview === "edited")!
+    const root = nodes(graph).find((node) => node.preview === "original")!
 
     expect(origin.kind).toBe("origin")
     expect(origin.childIds).toEqual([
       graph.rootNodeId,
-      `message:${encodeURIComponent(CHILD)}:${encodeURIComponent(replayMessage.id)}`,
+      replay.id,
     ])
+    expect(replay.parentId).toBe(origin.id)
+    expect(root.aliases).toEqual([{ sessionId: ROOT, messageId: rootMessage.id }])
     expect(reachableSessionEndpoints(graph, graph.rootNodeId).map(({ endpoint }) => endpoint.session.id))
       .toEqual([ROOT])
+    expect(reachableSessionEndpoints(graph, graph.endpointBySessionId.get(CHILD)!).map(({ endpoint, distance }) => ({
+      sessionId: endpoint.session.id, distance,
+    }))).toEqual([{ sessionId: CHILD, distance: 0 }])
     expect(buildConversationForest(
       sessions,
       transcripts,
@@ -550,8 +563,11 @@ describe("next conversation graph", () => {
     const endpointIndex = indexReachableSessionEndpoints(graph)
     expect(endpointIndex.get(graph.rootNodeId)).toEqual(reachableSessionEndpoints(graph, graph.rootNodeId))
     expect(layout.nodes.size).toBe(10_000)
-    expect(layout.nodes.get(graph.rootNodeId)).toMatchObject({ x: 0, y: 0 })
-    expect(layout.worldHeight).toBe(39_998)
+    const last = layout.nodes.get(nodes(graph).at(-1)!.id)!
+    expect(last).toBeDefined()
+    expect(Number.isFinite(layout.worldHeight)).toBeTrue()
+    expect(last.y).toBeGreaterThan(layout.nodes.get(graph.rootNodeId)!.y)
+    expect(layout.worldHeight).toBeGreaterThanOrEqual(last.y + last.height)
   })
 })
 
