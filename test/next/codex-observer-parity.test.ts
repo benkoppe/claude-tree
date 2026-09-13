@@ -100,19 +100,22 @@ test("live working footers override an idle Codex title and composer", () => {
   })).toBe("working")
 })
 
-test("keeps action-required title activity authoritative over a stale status row", () => {
+test("suppresses an unchanged status screen after a blocked title but accepts newer screen evidence", () => {
   const observer = new CodexTerminalObserver()
+  const stale = {
+    lines: ["• Working (12s • esc to interrupt)"],
+    cursor: { x: 0, y: 0, visible: false },
+  }
+  expect(observer.observeScreen(stale)).toBe("working")
   expect(
     observer.observeOutput(
       new TextEncoder().encode("\u001b]0;[ ! ] Action Required | claude-tree-codex\u0007"),
     ),
   ).toEqual(["blocked"])
-  expect(
-    observer.observeScreen({
-      lines: ["• Working (12s • esc to interrupt)"],
-      cursor: { x: 0, y: 0, visible: false },
-    }),
-  ).toBeUndefined()
+  expect(observer.observeScreen(stale)).toBeUndefined()
+  expect(observer.observeScreen({
+    ...stale, lines: ["• Working (13s • esc to interrupt)"],
+  })).toBe("working")
 })
 
 test("uses stock Codex status rows as visible activity fallbacks", () => {
