@@ -57,6 +57,17 @@ export interface CatalogueFamily {
   readonly sessionIds: ReadonlySet<string>
 }
 
+export function selectHistoryDetails(state: ApplicationState, sessionIds: Iterable<string>): readonly string[] {
+  return [...sessionIds].flatMap((id) => {
+    const status = selectHistoryStatus(state, id)
+    const reason = status._tag === "Limited"
+      ? "History gap: showing the last accepted snapshot (SDK context order until history is verified). Open the session to continue; forking awaits verified history."
+      : status._tag === "Unavailable" ? status.reason
+      : status._tag === "Missing" ? "Session history was not found" : undefined
+    return reason ? [`${describeSession(state, id)}\n${reason}`] : []
+  })
+}
+
 export function describeSession(state: ApplicationState, sessionId: string): string {
   const session = state.local.sessions.get(sessionId) ?? state.provider.sessions.get(sessionId)
   const title = session?.title.trim()

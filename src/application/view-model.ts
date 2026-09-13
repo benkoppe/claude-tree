@@ -21,9 +21,10 @@ import {
   type SessionStatus,
 } from "./selectors"
 import type { ApplicationModal, ApplicationState } from "./state"
-import { selectCatalogueFamilies, selectFamilyHistoryStatus, type FamilyHistoryStatus } from "./catalogue"
+import { selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryDetails, type FamilyHistoryStatus } from "./catalogue"
 
 export interface RootViewModel {
+  readonly warnings?: readonly string[]
   readonly history: FamilyHistoryStatus
   readonly sessionId: string
   readonly title: string
@@ -92,6 +93,7 @@ export type SurfaceViewModel =
       readonly selectedNodeId: string | null
       readonly status: SessionStatus
       readonly warnings: readonly string[]
+      readonly history?: FamilyHistoryStatus
       readonly worldWidth: number
       readonly worldHeight: number
     }
@@ -202,6 +204,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
     return {
       ...summary,
       history: selectFamilyHistoryStatus(state, summary.memberSessionIds),
+      warnings: [...selectHistoryDetails(state, summary.memberSessionIds), ...graph.warnings],
       status: selectAggregateStatus(state, summary.memberSessionIds),
     }
   })
@@ -222,6 +225,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       pendingRoots.push({ sessionId: root.id, title: root.title,
         lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest, state.provider.sessions.get(id)?.lastModified ?? 0), root.lastModified),
         memberSessionIds, messageCount: 0, history, status: selectAggregateStatus(state, memberSessionIds),
+        warnings: selectHistoryDetails(state, memberSessionIds),
       })
   }
   const rows = [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
@@ -306,8 +310,8 @@ export function projectGraphViewModel(
     unselectedNodes: nodes,
     selectedNodeId: null,
     status: selectAggregateStatus(state, graph.sessionIds),
-    warnings: [...[...graph.sessionIds].flatMap((id) => state.historyStatus.get(id)?._tag === "Limited"
-      ? ["History gap: showing the last accepted snapshot (SDK context order until history is verified). Open the session to continue; forking awaits verified history."] : []), ...graph.warnings],
+    warnings: [...selectHistoryDetails(state, graph.sessionIds), ...graph.warnings],
+    history: selectFamilyHistoryStatus(state, graph.sessionIds),
     worldWidth: layout.worldWidth,
     worldHeight: layout.worldHeight,
   }
