@@ -115,11 +115,13 @@ describe("application state reducer", () => {
       expect(state.historyStatus.get(ROOT)?._tag).toBe("Limited")
       expect(projectRootsViewModel(state)[0]?.history).toEqual({ _tag: "Limited", contextMessageCount: 1 })
       expect(projectGraphViewModel(state, ROOT).warnings[0]).toContain("History gap")
+      expect(projectRootsViewModel(state)[0]?.warnings?.[0]).toContain("History gap")
       expect(selectConversationForest(state).graphs[0]).toBe(forest.graphs[0])
     }
     state = readCoverage(state, available(original))
     expect(selectProjectedTranscript(state, ROOT)).toEqual(original)
     expect(state.historyStatus.get(ROOT)?._tag).toBe("Ready")
+    expect(projectRootsViewModel(state)[0]?.warnings).toEqual([])
     expect(projectGraphViewModel(state, ROOT).warnings).toEqual([])
     expect(state.unviewedSessionIds.size).toBe(0)
   })

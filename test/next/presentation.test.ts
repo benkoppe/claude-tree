@@ -1200,17 +1200,71 @@ test("renders stopped empty forks with stable numbered labels after a live retur
   }
 })
 
-test("surfaces canonical graph integrity warnings through the runtime", async () => {
-  const setup = await createTestRenderer({ width: 90, height: 24 })
-  const running = await startPresentation(setup.renderer, canonicalWarningGraph())
+test.each(["integrity", "gap"])("graph %s details open on demand and remain available after dismissal", async (kind) => {
+  const setup = await createTestRenderer({ width: 140, height: 24 })
+  const graph = canonicalWarningGraph()
+  if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+  const view = kind === "gap" ? { ...graph, surface: { ...graph.surface,
+    history: { _tag: "Limited" as const, contextMessageCount: 1 }, warnings: ["History gap: forking awaits verified history."],
+  } } : graph
+  const running = await startPresentation(setup.renderer, view)
 
   try {
-    const rendered = await frame(setup, (value) => value.includes("Tree integrity warning"))
-    expect(rendered).toContain("history does not end")
-    expect(rendered).toContain("recorded source message")
+    await frame(setup, (value) => value.includes(kind === "gap" ? "History gap" : "History issues") && value.includes("e details"))
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal).toBeNull()
+    setup.mockInput.pressKey("e")
+    const rendered = await frame(setup, (value) => value.includes("Copy  Close"))
+    if (kind === "gap") expect(rendered).toContain("forking awaits verified history")
+    else {
+      expect(rendered).toContain("history does not end")
+      expect(rendered).toContain("recorded source message")
+    }
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("Copy  Close"))
+    setup.mockInput.pressKey("e")
+    await frame(setup, (value) => value.includes("Copy  Close"))
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("Copy  Close"))
+    await Effect.runPromise(running.harness.update(rootsView()))
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    await Effect.runPromise(running.harness.update(view))
+    await frame(setup, (value) => value.includes("Message tree"))
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal).toBeNull()
   } finally {
     await running.stop()
   }
+})
+
+test("root details hint follows selection and supports mouse reopening", async () => {
+  const setup = await createTestRenderer({ width: 140, height: 24 })
+  const view = rootsView()
+  if (view.surface._tag !== "Roots") throw new Error("Expected roots")
+  const warning = "History gap: verified history is required to fork."
+  const root = view.surface.roots[0]!
+  const warned = { ...view, surface: { ...view.surface, roots: [
+    { ...root, warnings: [warning], history: { _tag: "Limited" as const, contextMessageCount: 1 } },
+    { ...root, sessionId: "healthy", memberSessionIds: ["healthy"], title: "Healthy" },
+  ] } }
+  const running = await startPresentation(setup.renderer, warned)
+  try {
+    const initial = await frame(setup, (value) => value.includes("r refresh e details ? about"))
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal).toBeNull()
+    const hint = coordinateOf(initial, "e details")
+    await setup.mockMouse.click(hint.x, hint.y)
+    await frame(setup, (value) => value.includes(warning))
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("Copy  Close"))
+    setup.mockInput.pressKey("e")
+    await frame(setup, (value) => value.includes(warning))
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("Copy  Close"))
+    setup.mockInput.pressArrow("down")
+    await frame(setup, (value) => !value.includes("e details"))
+    setup.mockInput.pressKey("e")
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal).toBeNull()
+    await Effect.runPromise(running.harness.update(view))
+    await frame(setup, (value) => !value.includes("History gap") && !value.includes("e details"))
+  } finally { await running.stop() }
 })
 
 test("uses shared live, update, working, and blocked picker markers", async () => {

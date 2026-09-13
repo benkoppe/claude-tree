@@ -375,6 +375,26 @@ describe("application actor", () => {
     })))
   })
 
+  test("entering retained history keeps read failures available without reopening an error", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      fixture.snapshot = { ...fixture.snapshot, transcripts: new Map(fixture.snapshot.transcripts).set(ROOT,
+        { _tag: "Unavailable", reason: "history reconstruction failed" }) }
+      yield* runtime.refresh()
+      yield* runtime.closeModal
+      for (let attempt = 0; attempt < 2; attempt++) {
+        yield* runtime.selectRoot(ROOT)
+        yield* runtime.enterRoot(ROOT)
+        const view = yield* runtime.getViewModel
+        expect(view.modal).toBeNull()
+        expect(view.surface._tag).toBe("Graph")
+        if (view.surface._tag === "Graph") expect(view.surface.warnings.join("\n")).toContain("history reconstruction failed")
+      }
+    })))
+  })
+
   test("a provider-interrupted fork settles its caller and leaves later actor requests usable", async () => {
     const fixture = makeFixture()
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {

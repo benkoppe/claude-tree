@@ -100,6 +100,7 @@ type FooterAction =
   | "remove"
   | "roots"
   | "about"
+  | "details"
 
 interface FooterControl {
   readonly key: string
@@ -308,7 +309,6 @@ class OpenTuiPresentationController {
   private pendingStoppedEndpoint: PendingStoppedEndpoint | null = null
   private stopConfirmationSessionId: string | null = null
   private closingStaleStopModalIdentity: string | null = null
-  private readonly shownGraphWarnings = new Set<string>()
   private renderFailurePending = false
 
   get isStopping(): boolean {
@@ -568,7 +568,6 @@ class OpenTuiPresentationController {
       this.pendingStoppedEndpoint = null
     }
     this.reconcileModal(viewModel.modal)
-    this.surfaceGraphWarning()
     const unchangedRoots = previous?.surface._tag === "Roots" && viewModel.surface._tag === "Roots" &&
       previous.surface.roots === viewModel.surface.roots && previousRootSelection === this.selectedRootSessionId &&
       previous.modal === viewModel.modal && previous.refreshing === viewModel.refreshing &&
@@ -658,7 +657,7 @@ class OpenTuiPresentationController {
     const quit = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape") || isExitKey(key)
     if (
       !quit && movement === undefined && !isEnterKey(key) &&
-      !["d", "x", "n", "r"].some((name) => isUnmodifiedKey(key, name))
+      !["d", "x", "n", "r", "e"].some((name) => isUnmodifiedKey(key, name))
     ) return
     key.stopPropagation()
     if (quit) {
@@ -669,6 +668,8 @@ class OpenTuiPresentationController {
       return
     } else if (movement !== undefined) {
       this.moveRoot(movement)
+    } else if (isUnmodifiedKey(key, "e") && !key.repeated) {
+      this.showIssueDetails()
     } else if (isEnterKey(key) && !key.repeated) {
       this.enterSelectedRoot()
     } else if (isUnmodifiedKey(key, "d") && !key.repeated) {
@@ -686,7 +687,7 @@ class OpenTuiPresentationController {
     const jumpToLeaf = isShiftedKey(key, "g")
     const direction = graphDirection(key)
     const recognized = isExitKey(key) || back || jumpToTop || jumpToLeaf || direction !== undefined || isEnterKey(key) ||
-      ["f", "c", "d", "x", "n", "r"].some((name) => isUnmodifiedKey(key, name))
+      ["f", "c", "d", "x", "n", "r", "e"].some((name) => isUnmodifiedKey(key, name))
     if (!recognized) return
     key.stopPropagation()
     if (isExitKey(key)) {
@@ -697,6 +698,8 @@ class OpenTuiPresentationController {
       return
     } else if (back) {
       this.showRoots()
+    } else if (isUnmodifiedKey(key, "e") && !key.repeated) {
+      this.showIssueDetails()
     } else if (jumpToTop && !key.repeated) {
       this.jumpGraphToTop()
     } else if (jumpToLeaf && !key.repeated) {
@@ -1215,17 +1218,19 @@ class OpenTuiPresentationController {
     if (modal?._tag === "ConfirmRemoval") this.modalChoice = "cancel"
   }
 
-  private surfaceGraphWarning(): void {
-    const graph = this.graphSurface()
-    const warning = graph?.warnings[0]
-    if (!graph || !warning || this.viewModel?.modal) return
-    const identity = `${graph.familySessionId}:${warning}`
-    if (this.shownGraphWarnings.has(identity)) return
-    this.shownGraphWarnings.add(identity)
-    this.enqueue(this.appRuntime.openModal({
-      _tag: "Error",
-      message: `Tree integrity warning: ${warning}`,
-    }))
+  private issueDetails(): readonly string[] {
+    return this.viewModel?.surface._tag === "Roots"
+      ? this.selectedRoot()?.warnings ?? [] : this.graphSurface()?.warnings ?? []
+  }
+
+  private showIssueDetails(): void {
+    const details = this.issueDetails()
+    if (details.length) this.enqueue(this.appRuntime.openModal({ _tag: "Error", message: details.join("\n\n") }))
+  }
+
+  private controlsWithDetails(controls: readonly FooterControl[]): readonly FooterControl[] {
+    return this.issueDetails().length ? controls.flatMap((control) => control.action === "about"
+      ? [{ key: "e", description: "details", action: "details" as const }, control] : [control]) : controls
   }
 
   private render(): void {
@@ -1289,7 +1294,7 @@ class OpenTuiPresentationController {
         this.rootViewportStart = rendered.startIndex
         this.content.content = rendered.content
       }
-      const footer = renderControls(ROOT_CONTROLS, this.refreshFrame())
+      const footer = renderControls(this.controlsWithDetails(ROOT_CONTROLS), this.refreshFrame())
       this.footer.content = styledText([
         ...footer.chunks,
         chunk("\n", theme.text),
@@ -1308,7 +1313,7 @@ class OpenTuiPresentationController {
       )
       this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
       this.content.content = rendered.content
-      const footer = renderControls(GRAPH_CONTROLS, this.refreshFrame())
+      const footer = renderControls(this.controlsWithDetails(GRAPH_CONTROLS), this.refreshFrame())
       this.footer.content = styledText([
         ...footer.chunks,
         chunk("\n", theme.text),
@@ -1331,12 +1336,16 @@ class OpenTuiPresentationController {
 
   private renderHeader() {
     const surface = this.viewModel!.surface
+    const notice = surface._tag === "Graph" && surface.warnings.length
+      ? surface.history?._tag === "Limited" ? "History gap"
+      : surface.history?._tag === "Unavailable" ? "History unavailable" : "History issues" : ""
     const secondLine = surface._tag === "Roots"
       ? [chunk("Conversation roots", theme.text, TextAttributes.BOLD)]
       : surface._tag === "Graph"
         ? [
-            chunk(truncateToWidth(surface.title, Math.max(1, this.renderer.terminalWidth - 18)), theme.text, TextAttributes.BOLD),
+            chunk(truncateToWidth(surface.title, Math.max(1, this.renderer.terminalWidth - 18 - (notice ? displayWidth(notice) + 3 : 0))), theme.text, TextAttributes.BOLD),
             chunk("  Message tree", theme.textMuted),
+            ...(notice ? [chunk(` · ${notice}`, theme.warning)] : []),
           ]
         : []
     return styledText([...this.identityChunks(), chunk("\n", theme.text), ...secondLine])
@@ -1701,6 +1710,7 @@ class OpenTuiPresentationController {
     if (action === "enter-root") this.enterSelectedRoot()
     else if (action === "new") this.runTerminalAction(this.appRuntime.newSession)
     else if (action === "refresh") this.refresh()
+    else if (action === "details") this.showIssueDetails()
     else if (action === "quit") this.enqueue(this.stop, true, true)
     else if (action === "open") this.openSelected()
     else if (action === "fork") this.forkSelected()

@@ -1032,7 +1032,6 @@ export function makeAppRuntime(
                 const surface = { _tag: "Graph" as const, familySessionId: graph.familySessionId, target: node.target }
                 yield* publish({ _tag: "Navigated", surface })
                 yield* startNavigation(surface)
-                if (problem) yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: problem } })
                 yield* Deferred.succeed(command.reply, undefined)
               }
             }
