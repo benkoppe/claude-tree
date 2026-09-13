@@ -28,6 +28,15 @@ describe("CLI options", () => {
     expect(() => parseCliArguments(["one", "two"])).toThrow("Unexpected project path: two")
   })
 
+  test("parses a single read-only history diagnostic with an optional project", () => {
+    expect(parseCliArguments(["--diagnose-history", "session"])).toEqual({ command: "diagnose-history", provider: "claude", sessionId: "session", project: "." })
+    expect(parseCliArguments(["project", "--diagnose-history", "session"])).toEqual({ command: "diagnose-history", provider: "claude", sessionId: "session", project: "project" })
+    expect(() => parseCliArguments(["--diagnose-history"])).toThrow("requires a session ID")
+    expect(() => parseCliArguments(["--diagnose-history", "--codex"])).toThrow("requires a session ID")
+    expect(() => parseCliArguments(["--diagnose-history", "session", "--codex"])).toThrow("support Claude Code only")
+    expect(() => parseCliArguments(["--diagnose-history", "one", "--diagnose-history", "two"])).toThrow("only once")
+  })
+
   test("canonicalizes a project directory and rejects files", async () => {
     const root = await mkdtemp(join(tmpdir(), "claude-tree-cli-test-"))
     try {

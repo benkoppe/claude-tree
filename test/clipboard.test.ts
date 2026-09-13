@@ -45,6 +45,31 @@ describe("Osc52Forwarder", () => {
       forwarder.observe(encoder.encode("\x1b]52;c;b25l\x07\x1b]52;c;dHdv\x1b\\")),
     ).toEqual(["one", "two"])
   })
+
+  for (const prefix of [
+    "\x1b]0;unfinished title",
+    "\x1b]52;c;unfinished clipboard",
+    "\x1b]52;c;aGk=\x18ignored\x07",
+    "\x1b]52;c;aGk=\x1aignored\x1b\\",
+    "\x1b]52;c;aGk=\x1b\x18ignored\x07",
+    "\x1b]52;c;aGk=\x1b\x1aignored\x07",
+  ]) {
+    for (const write of [
+      "\x1b]52;c;b2s=\x07",
+      "\x1bPtmux;\x1b\x1b]52;c;b2s=\x1b\x1b\\\x1b\\",
+    ]) {
+      test(`resynchronizes clipboard writes across every chunk boundary: ${JSON.stringify(prefix + write)}`, () => {
+        const bytes = encoder.encode(prefix + write)
+        for (let split = 0; split <= bytes.length; split += 1) {
+          const forwarder = new Osc52Forwarder()
+          expect([
+            ...forwarder.observe(bytes.slice(0, split)),
+            ...forwarder.observe(bytes.slice(split)),
+          ]).toEqual(["ok"])
+        }
+      })
+    }
+  }
 })
 
 test("decodeOsc52Write rejects non-UTF-8 clipboard data", () => {

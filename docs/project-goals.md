@@ -14,6 +14,7 @@ The project exists to add navigation and orchestration around stock coding-agent
 - Return quickly between the navigator and any live conversation without losing its terminal state.
 - Allow a conversation to fork from a selected historical message while leaving the source conversation unchanged.
 - Use one shared working tree for all branches.
+- Keep each application invocation's navigation independent when multiple invocations use the same project and provider.
 
 The navigator and a selected agent terminal are mutually exclusive views. A multipane dashboard is not the intended interface.
 
@@ -29,6 +30,9 @@ Provider-specific session formats, branching rules, launch arguments, and termin
 
 - The provider's own transcripts remain the source of truth for conversation content.
 - Application-owned data should be limited to relationships and UI state that the provider does not persist.
+- Serialize application-state changes through one actor per invocation, even when provider reads and terminal processes run concurrently.
+- Never allow two live terminal owners for the same provider session. Unknown ownership or cleanup state must fail closed rather than being treated as stale.
+- Acquire and release terminal, provider, and persistence resources transactionally. A partially acquired terminal must not become visible, and an incompletely cleaned owner must remain reserved.
 - Exiting `claude-tree` may stop active child processes, but their persisted provider sessions must remain resumable later.
 - Concurrent branches are intentionally allowed to operate on the same files. Avoid hiding this fact or implying worktree isolation.
 - Prefer a small, understandable local application over daemon or distributed infrastructure unless a later requirement justifies that complexity.
@@ -40,5 +44,6 @@ Provider-specific session formats, branching rules, launch arguments, and termin
 - Using tmux as the process or presentation layer.
 - Automatically isolating branches into Git worktrees.
 - Reconstructing or editing provider transcript files by hand.
+- Automatically migrating or deleting incompatible application state. While the persistence format is reset-only, recovery requires an explicit user reset.
 
 Implementation details may evolve when better tools or APIs become available. Preserve the experience and boundaries above rather than treating an early implementation as permanent.

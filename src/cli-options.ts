@@ -4,6 +4,7 @@ import { resolve } from "node:path"
 export type CliOptions =
   | { command: "help" }
   | { command: "version" }
+  | { command: "diagnose-history"; provider: "claude"; sessionId: string; project: string }
   | { command: "run"; provider: "claude" | "codex"; project: string }
 
 export function parseCliArguments(args: readonly string[]): CliOptions {
@@ -13,10 +14,17 @@ export function parseCliArguments(args: readonly string[]): CliOptions {
   let provider: "claude" | "codex" = "claude"
   let project = "."
   let projectSet = false
+  let diagnosticSession: string | undefined
 
-  for (const argument of args) {
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!
     if (argument === "--codex") {
       provider = "codex"
+    } else if (argument === "--diagnose-history") {
+      if (diagnosticSession !== undefined) throw new Error("Specify --diagnose-history only once")
+      const sessionId = args[++index]
+      if (!sessionId || sessionId.startsWith("-")) throw new Error("--diagnose-history requires a session ID")
+      diagnosticSession = sessionId
     } else if (argument.startsWith("-")) {
       throw new Error(`Unknown argument: ${argument}`)
     } else if (projectSet) {
@@ -27,6 +35,10 @@ export function parseCliArguments(args: readonly string[]): CliOptions {
     }
   }
 
+  if (diagnosticSession !== undefined) {
+    if (provider !== "claude") throw new Error("History diagnostics currently support Claude Code only")
+    return { command: "diagnose-history", provider, sessionId: diagnosticSession, project }
+  }
   return { command: "run", provider, project }
 }
 

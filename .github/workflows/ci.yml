@@ -26,10 +26,31 @@ jobs:
       - run: bun pm pack --dry-run
       - name: Test global installation
         shell: bash
+        working-directory: ${{ runner.temp }}
         run: |
-          archive="$(bun pm pack --destination "$RUNNER_TEMP" --quiet)"
+          archive="$(bun pm pack --cwd "$GITHUB_WORKSPACE" --destination "$RUNNER_TEMP" --quiet)"
           export BUN_INSTALL="$RUNNER_TEMP/bun-global"
           bun add --global "$RUNNER_TEMP/${archive##*/}"
+          bun -e '
+            import assert from "node:assert/strict";
+            import { realpathSync } from "node:fs";
+            import { createRequire } from "node:module";
+            const installed = createRequire(realpathSync(`${process.env.BUN_INSTALL}/bin/claude-tree`));
+            const expected = installed("../package.json").dependencies.effect;
+            const platform = createRequire(installed.resolve("@effect/platform-bun/package.json"));
+            const shared = createRequire(platform.resolve("@effect/platform-node-shared/package.json"));
+            const versions = {
+              effect: installed("effect/package.json").version,
+              platformBun: platform("./package.json").version,
+              platformNodeShared: shared("./package.json").version,
+              platformEffect: platform("effect/package.json").version,
+              sharedEffect: shared("effect/package.json").version,
+            };
+            console.log("Installed Effect runtime:", versions);
+            for (const [name, version] of Object.entries(versions)) {
+              assert.equal(version, expected, `${name} must match the pinned Effect release`);
+            }
+          '
           "$BUN_INSTALL/bin/claude-tree" --version
           "$BUN_INSTALL/bin/claude-tree" --help >/dev/null
 
