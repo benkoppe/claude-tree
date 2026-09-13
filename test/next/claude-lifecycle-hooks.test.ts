@@ -34,7 +34,9 @@ test("installs only additive observational Stop and StopFailure HTTP hooks", asy
       method: "POST", headers, body: JSON.stringify({ session_id: "session", hook_event_name: event,
         last_assistant_message: "discard this", error: "discard this too" }),
     }))
-    expect((yield* send("Stop")).status).toBe(200)
+    const beforeSubscription = yield* send("Stop")
+    expect(beforeSubscription.status).toBe(200)
+    yield* Effect.promise(() => beforeSubscription.arrayBuffer())
     const subscription = yield* PubSub.subscribe(hooks.activityHints)
     for (const event of ["Stop", "StopFailure"]) {
       const response = yield* send(event)
@@ -42,8 +44,10 @@ test("installs only additive observational Stop and StopFailure HTTP hooks", asy
       expect(yield* Effect.promise(() => response.json())).toEqual({})
       expect(yield* PubSub.take(subscription)).toBe("reconcile")
     }
-    yield* send("Stop")
-    yield* send("StopFailure")
+    for (const event of ["Stop", "StopFailure"]) {
+      const response = yield* send(event)
+      yield* Effect.promise(() => response.arrayBuffer())
+    }
     expect(yield* PubSub.size(hooks.activityHints)).toBe(1)
     expect(yield* PubSub.take(subscription)).toBe("reconcile")
   })))
@@ -57,6 +61,8 @@ test("authenticates before validating method, path, JSON, session, and subagent 
     const valid = { session_id: "session", hook_event_name: "Stop" }
     const cases: Array<[string, RequestInit, number]> = [
       [url, { method: "POST", body: "not json" }, 401],
+      [url, { method: "GET" }, 401],
+      [url + "/wrong", { method: "POST", body: "{}" }, 401],
       [url, { method: "POST", headers: { Authorization: "Bearer wrong" }, body: JSON.stringify(valid) }, 401],
       [url, { method: "GET", headers }, 405],
       [url + "/wrong", { method: "POST", headers, body: JSON.stringify(valid) }, 404],
@@ -69,7 +75,32 @@ test("authenticates before validating method, path, JSON, session, and subagent 
     for (const [target, init, status] of cases) {
       const response = yield* Effect.promise(() => fetch(target, init))
       expect(response.status).toBe(status)
+      yield* Effect.promise(() => response.arrayBuffer())
       expect(yield* PubSub.size(hooks.activityHints)).toBe(0)
+    }
+  })))
+})
+
+test("unauthenticated requests never acquire a body reader or publish hints", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    let handle!: (request: Request) => Promise<Response>
+    const hooks = (yield* makeClaudeLifecycleHooks("session", (fetch) => {
+      handle = fetch
+      return { port: 1234, stop: async () => {} }
+    }))!
+    yield* PubSub.subscribe(hooks.activityHints)
+    const body = new ReadableStream<Uint8Array>()
+    const reader = spyOn(body, "getReader")
+    try {
+      const response = yield* Effect.promise(() => handle(new Request(connection(hooks).url, {
+        method: "POST", body,
+      })))
+      expect(response.status).toBe(401)
+      expect(reader).not.toHaveBeenCalled()
+      expect(yield* PubSub.size(hooks.activityHints)).toBe(0)
+    } finally {
+      reader.mockRestore()
+      yield* Effect.promise(() => body.cancel())
     }
   })))
 })
@@ -177,22 +208,47 @@ test("request deadline cancels a stalled body without publishing a hint", async 
     const { url, headers } = connection(hooks)
     yield* PubSub.subscribe(hooks.activityHints)
     let cancelled = false
-    const timer = spyOn(globalThis, "setTimeout")
-    let response: Promise<Response>
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    const requestTimer = {} as ReturnType<typeof setTimeout>
+    let capturing = true
+    let deadline: (() => void) | undefined
+    let timerCleared = false
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      if (!capturing) return Reflect.apply(originalSetTimeout, globalThis, args) as ReturnType<typeof setTimeout>
+      expect(deadline).toBeUndefined()
+      expect(args[1]).toBe(750)
+      const callback = args[0]
+      if (typeof callback !== "function") throw new Error("Missing request deadline")
+      deadline = () => callback()
+      return requestTimer
+    }) as typeof setTimeout)
+    const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+      if (handle === requestTimer) timerCleared = true
+      else Reflect.apply(originalClearTimeout, globalThis, [handle])
+    })
     try {
-      response = handle(new Request(url, { method: "POST", headers,
+      const response = handle(new Request(url, { method: "POST", headers,
         body: new ReadableStream({ cancel() { cancelled = true } }),
       }))
-      const [deadline, delay] = timer.mock.calls.at(-1)!
-      expect(delay).toBe(750)
-      if (typeof deadline !== "function") throw new Error("Missing request deadline")
+      capturing = false
+      expect(cancelled).toBeFalse()
+      expect(timerCleared).toBeFalse()
+      if (!deadline) throw new Error("Missing request deadline")
       deadline()
+      expect((yield* Effect.promise(() => response)).status).toBe(408)
+      expect(cancelled).toBeTrue()
+      expect(timerCleared).toBeTrue()
+      expect(yield* PubSub.size(hooks.activityHints)).toBe(0)
     } finally {
-      timer.mockRestore()
+      capturing = false
+      try {
+        yield* hooks.close
+      } finally {
+        timer.mockRestore()
+        clearTimer.mockRestore()
+      }
     }
-    expect((yield* Effect.promise(() => response)).status).toBe(408)
-    expect(cancelled).toBeTrue()
-    expect(yield* PubSub.size(hooks.activityHints)).toBe(0)
   })))
 })
 

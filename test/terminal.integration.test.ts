@@ -1,21 +1,24 @@
 import { expect, test } from "bun:test"
 
-import { EmbeddedTerminalRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
+import { Effect } from "effect"
 import { OpenTuiTerminalRenderer } from "../src/infrastructure/terminal/opentui-terminal-renderer"
 import { ClaudeTerminalObserver } from "../src/infrastructure/providers/claude/terminal-observer"
+import { BunPtyProcessFactory, type TerminalProcess, type TerminalSurface } from "../src/infrastructure/terminal"
+import { NullTerminalObserver } from "../src/domain/model"
+import { cleanupProcessGroup } from "../src/infrastructure/process-group"
 
 test("production snapshots compose fresh text and cursor without publishing screen callbacks", async () => {
   const setup = await createTestRenderer({ width: 60, height: 10 })
   const renderer = new OpenTuiTerminalRenderer(setup.renderer)
   let callbacks = 0
-  const surface = renderer.createSurface("snapshot", {
-    onData() {}, onResize() {}, onScreenChange() {
-      callbacks += 1
-      surface.screen()
-    },
-  })
   try {
+    const surface = renderer.createSurface("snapshot", {
+      onData() {}, onResize() {}, onScreenChange() {
+        callbacks += 1
+        surface.screen()
+      },
+    })
     await setup.renderOnce()
     const before = callbacks
     surface.write(new TextEncoder().encode("\u001b[2J\u001b[Hfresh composer\u001b[1;6H\u001b[?25h"))
@@ -37,10 +40,10 @@ for (const visibleCursor of [true, false]) {
     const setup = await createTestRenderer({ width: 60, height: 10 })
     const observer = new ClaudeTerminalObserver()
     const renderer = new OpenTuiTerminalRenderer(setup.renderer)
-    const surface = renderer.createSurface("rewind", {
-      onData() {}, onResize() {}, onScreenChange() { observer.observeScreen(surface.screen()) },
-    })
     try {
+      const surface = renderer.createSurface("rewind", {
+        onData() {}, onResize() {}, onScreenChange() { observer.observeScreen(surface.screen()) },
+      })
       await setup.renderOnce()
       observer.observeInput(new TextEncoder().encode("/rewind\r"))
       surface.write(new TextEncoder().encode("\u001b[2J\u001b[HRewind\r\nRestore and fork the conversation to the point before…"))
@@ -59,65 +62,97 @@ for (const visibleCursor of [true, false]) {
 
 test("hidden emulators keep processing output from independent Bun PTYs", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8 })
-  const first = new EmbeddedTerminalRenderable(setup.renderer, {
-    id: "first",
-    width: 40,
-    height: 8,
-    visible: false,
-  })
-  const second = new EmbeddedTerminalRenderable(setup.renderer, {
-    id: "second",
-    width: 40,
-    height: 8,
-    visible: false,
-  })
-  setup.renderer.root.add(first)
-  setup.renderer.root.add(second)
-
-  const firstProcess = spawnOutput(first, "first")
-  const secondProcess = spawnOutput(second, "second")
-
+  const processes: TerminalProcess[] = []
   try {
-    await Promise.all([firstProcess.process.exited, secondProcess.process.exited])
-
-    first.visible = true
+    const renderer = new OpenTuiTerminalRenderer(setup.renderer)
+    const hiddenScreens = new Map<string, string>()
+    const createSurface = (name: string) => {
+      const surface = renderer.createSurface(name, {
+        onData() {}, onResize() {},
+        onScreenChange() { hiddenScreens.set(name, surface.screen().lines.join("\n")) },
+      })
+      surface.setActive(false)
+      return surface
+    }
+    const first = createSurface("first")
+    const second = createSurface("second")
+    const firstProcess = spawnOutput(first, "first")
+    processes.push(firstProcess.process)
+    const secondProcess = spawnOutput(second, "second")
+    processes.push(secondProcess.process)
+    await within(Promise.all([firstProcess.ready, secondProcess.ready]), "both PTYs ready")
     await setup.renderOnce()
-    expect(first.screen().text).toContain("first-ready")
-    expect(first.screen().text).toContain("first-finished")
+    expect(hiddenScreens.get("first")).toContain("first-ready")
+    expect(hiddenScreens.get("second")).toContain("second-ready")
+    expect(processes.map((child) => child.exitCode)).toEqual([null, null])
 
-    first.visible = false
-    second.visible = true
+    firstProcess.process.write(new TextEncoder().encode("x"))
+    expect(await within(Promise.all([
+      firstProcess.process.exited, firstProcess.process.ptyDrained,
+    ]), "first PTY exit and drain")).toEqual([0, undefined])
+    expect(secondProcess.process.exitCode).toBeNull()
+    secondProcess.process.write(new TextEncoder().encode("x"))
+    expect(await within(Promise.all([
+      secondProcess.process.exited, secondProcess.process.ptyDrained,
+    ]), "second PTY exit and drain")).toEqual([0, undefined])
+    first.setActive(true)
     await setup.renderOnce()
-    expect(second.screen().text).toContain("second-ready")
-    expect(second.screen().text).toContain("second-finished")
+    expect(first.screen().lines.join("\n")).toContain("first-ready\nfirst-finished")
+    first.setActive(false)
+    second.setActive(true)
+    await setup.renderOnce()
+    expect(second.screen().lines.join("\n")).toContain("second-ready\nsecond-finished")
   } finally {
-    firstProcess.pty?.close()
-    secondProcess.pty?.close()
-    setup.renderer.destroy()
+    try {
+      const cleanup = await Promise.allSettled(processes.map(async (child) => {
+        try {
+          const result = await Effect.runPromise(cleanupProcessGroup(child, { gracePeriodMs: 100, killPeriodMs: 100 }))
+          expect(result.status).toBe("absent")
+          await within(child.exited, "child cleanup exit")
+        } finally {
+          try { child.closePty() } finally { child.unref() }
+        }
+      }))
+      for (const result of cleanup) if (result.status === "rejected") throw result.reason
+    } finally {
+      setup.renderer.destroy()
+    }
   }
 })
 
 function spawnOutput(
-  terminal: EmbeddedTerminalRenderable,
+  terminal: TerminalSurface,
   name: string,
-): { process: Bun.Subprocess; pty: Bun.Terminal | undefined } {
-  let pty: Bun.Terminal | undefined
-  const script = `process.stdout.write("\\x1b[32m${name}-ready\\x1b[0m\\r\\n"); await Bun.sleep(20); process.stdout.write("${name}-finished\\r\\n")`
-  const childProcess = Bun.spawn([globalThis.process.execPath, "-e", script], {
-    terminal: {
-      cols: 40,
-      rows: 8,
-      data(childPty, data) {
-        pty = childPty
-        terminal.write(data)
-      },
+): { process: TerminalProcess; ready: Promise<void> } {
+  let markReady!: () => void
+  const ready = new Promise<void>((resolve) => { markReady = resolve })
+  let output = ""
+  const script = `process.stdin.setRawMode(true); process.stdin.once("data", () => {
+    process.stdout.write("${name}-finished\\r\\n", () => process.exit(0))
+  }); process.stdout.write("${name}-ready\\r\\n")`
+  const child = new BunPtyProcessFactory().spawn({
+    sessionId: name,
+    command: [process.execPath, "-e", script],
+    cwd: process.cwd(),
+    observer: new NullTerminalObserver(),
+  }, { columns: 40, rows: 8 }, {
+    onOutput(data) {
+      terminal.write(data)
+      output += new TextDecoder().decode(data)
+      if (output.includes(`${name}-ready`)) markReady()
     },
+    onPtyClosed() {},
   })
-  pty ??= childProcess.terminal
-  return {
-    process: childProcess,
-    get pty() {
-      return pty
-    },
+  return { process: child, ready }
+}
+
+async function within<A>(promise: Promise<A>, label: string): Promise<A> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 2_000)
+    })])
+  } finally {
+    clearTimeout(timer)
   }
 }

@@ -83,20 +83,26 @@ describe("ProviderStateRepository terminal ownership", () => {
     expect(reclaimed.instanceId).toBe("contender")
   })
 
-  test("retains an owner when process liveness is unknown", async () => {
-    const { project, state } = await fixture()
-    const owner = await openProviderState(project, state, platformWithPid(101, "owner"))
-    await run(owner.reserve("session-one"))
-    const contender = await openProviderState(
-      project,
-      state,
-      platformWithPid(202, "contender", () => "unknown"),
-    )
+  for (const unknown of ["process", "process group"] as const) {
+    test(`retains an owner when ${unknown} liveness is unknown`, async () => {
+      const { project, state } = await fixture()
+      const owner = await openProviderState(project, state, platformWithPid(101, "owner"))
+      const running = await run(owner.attach(await run(owner.reserve("session-one")), 303))
+      const checks: string[] = []
+      const contender = await openProviderState(
+        project,
+        state,
+        platformWithPid(202, "contender", () => {
+          checks.push("process")
+          return unknown === "process" ? "unknown" : "absent"
+        }, () => { checks.push("process group"); return "unknown" }),
+      )
 
-    expect(await rejected(contender.reserve("session-one"))).toBeInstanceOf(
-      SessionOwnedError,
-    )
-  })
+      expect(await rejected(contender.reserve("session-one"))).toBeInstanceOf(SessionOwnedError)
+      expect(checks).toContain(unknown)
+      expect((await run(contender.load)).terminalOwners).toEqual([running])
+    })
+  }
 
   test("does not reclaim a dead reserved owner without a persisted process group", async () => {
     const { project, state } = await fixture()
@@ -205,8 +211,10 @@ describe("ProviderStateRepository terminal ownership", () => {
       state,
       testPlatform({ instanceId: "instance-b" }),
     )
+    const graph = await openProviderState(project, state, testPlatform({ instanceId: "instance-c" }))
+    const endpoint = await openProviderState(project, state, testPlatform({ instanceId: "instance-d" }))
     await run(first.updateMetadata(() => ({
-      relations: [],
+      relations: [relation("descendant", "temporary")],
       removals: [],
       navigation: { view: "terminal", sessionId: "temporary" },
     })))
@@ -214,6 +222,20 @@ describe("ProviderStateRepository terminal ownership", () => {
       ...metadata,
       navigation: { view: "roots", selectedSessionId: "temporary" },
     })))
+    await run(graph.saveNavigation({
+      view: "graph",
+      familySessionId: "temporary",
+      target: {
+        kind: "message",
+        preferred: { sessionId: "temporary", messageId: "draft-boundary" },
+        aliases: [{ sessionId: "temporary", messageId: "draft-boundary" }],
+      },
+    }))
+    await run(endpoint.saveNavigation({
+      view: "graph",
+      familySessionId: "temporary",
+      target: { kind: "endpoint", sessionId: "temporary" },
+    }))
     const owner = await run(first.reserve("temporary"))
     const running = await run(first.attach(owner, 505))
     const branch = relation("provider-id", "parent")
@@ -231,11 +253,27 @@ describe("ProviderStateRepository terminal ownership", () => {
       ownerToken: running.ownerToken,
       processGroupId: 505,
     })
-    expect(committed.metadata.relations[0]?.childSessionId).toBe("provider-id")
+    expect(committed.metadata.relations).toEqual([
+      relation("descendant", "provider-id"), branch,
+    ])
     expect(JSON.stringify(committed.metadata)).not.toContain("temporary")
     expect((await run(second.loadMetadata)).navigation).toEqual({
       view: "roots",
       selectedSessionId: "provider-id",
+    })
+    expect((await run(graph.loadMetadata)).navigation).toEqual({
+      view: "graph",
+      familySessionId: "provider-id",
+      target: {
+        kind: "message",
+        preferred: { sessionId: "provider-id", messageId: "draft-boundary" },
+        aliases: [{ sessionId: "provider-id", messageId: "draft-boundary" }],
+      },
+    })
+    expect((await run(endpoint.loadMetadata)).navigation).toEqual({
+      view: "graph",
+      familySessionId: "provider-id",
+      target: { kind: "endpoint", sessionId: "provider-id" },
     })
 
     const unified = await run(first.load)
@@ -280,6 +318,7 @@ describe("ProviderStateRepository terminal ownership", () => {
       removals: [],
       navigation: { view: "terminal", sessionId: "temporary" },
     })))
+    const before = await readFile(repository.statePath, "utf8")
     failCommit = true
 
     const error = await rejected(repository.commitIdentity({
@@ -301,6 +340,28 @@ describe("ProviderStateRepository terminal ownership", () => {
       sessionId: "temporary",
     })
     expect(unchanged.pendingIdentityAdoptions).toEqual([])
+    expect(await readFile(repository.statePath, "utf8")).toBe(before)
+  })
+
+  test("rejects a contradictory identity candidate without partially moving its owner or metadata", async () => {
+    const { project, state } = await fixture()
+    const repository = await openProviderState(project, state)
+    await run(repository.updateMetadata(() => ({
+      relations: [relation("source", "child")],
+      removals: [],
+      navigation: { view: "terminal", sessionId: "source" },
+    })))
+    const running = await run(repository.attach(await run(repository.reserve("source")), 808))
+    const before = await readFile(repository.statePath, "utf8")
+    const error = await rejected(repository.commitIdentity({
+      owner: running,
+      sessionId: "child",
+      kind: "native-fork",
+      relation: relation("child", "source"),
+    }))
+    expect(error).toBeInstanceOf(PersistenceError)
+    expect((error as PersistenceError).message).toContain("cycle")
+    expect(await readFile(repository.statePath, "utf8")).toBe(before)
   })
 
   test("rejects identity adoption onto a live destination owner", async () => {
@@ -309,6 +370,7 @@ describe("ProviderStateRepository terminal ownership", () => {
     const source = await run(repository.reserve("temporary"))
     const running = await run(repository.attach(source, 808))
     await run(repository.reserve("occupied"))
+    const before = await readFile(repository.statePath, "utf8")
 
     expect(await rejected(repository.commitIdentity({
       owner: running,
@@ -319,6 +381,7 @@ describe("ProviderStateRepository terminal ownership", () => {
       "occupied",
       "temporary",
     ])
+    expect(await readFile(repository.statePath, "utf8")).toBe(before)
   })
 
   test("never automatically reclaims cleanup-incomplete ownership", async () => {
@@ -657,7 +720,7 @@ describe("ProviderStateRepository terminal ownership", () => {
       const contender = await openProviderState(
         project,
         state,
-        platformWithPid(202, "contender"),
+        contendingPlatform(202, "contender", barrier),
       )
       await run(remover.updateMetadata((metadata) => ({
         ...metadata,
@@ -666,13 +729,11 @@ describe("ProviderStateRepository terminal ownership", () => {
       const removal = removalAtRoot(kind)
       barrier.blockNextStateWrite()
 
-      const removing = run(remover.commitRemoval(removal, ["root"], `remove-${kind}`))
-      await barrier.entered.promise
-      const reserving = rejected(contender.reserve("child"))
-      barrier.release.resolve()
-
-      await removing
-      expect(await reserving).toBeInstanceOf(SessionRemovedError)
+      const [, reservationError] = await raceStateWrite(barrier,
+        () => run(remover.commitRemoval(removal, ["root"], `remove-${kind}`)),
+        () => rejected(contender.reserve("child")),
+      )
+      expect(reservationError).toBeInstanceOf(SessionRemovedError)
       expect((await run(contender.load)).terminalOwners).toEqual([])
     })
 
@@ -683,7 +744,7 @@ describe("ProviderStateRepository terminal ownership", () => {
       const remover = await openProviderState(
         project,
         state,
-        platformWithPid(202, "remover"),
+        contendingPlatform(202, "remover", barrier),
       )
       await run(ownerRepository.updateMetadata((metadata) => ({
         ...metadata,
@@ -692,13 +753,11 @@ describe("ProviderStateRepository terminal ownership", () => {
       const removal = removalAtRoot(kind)
       barrier.blockNextStateWrite()
 
-      const reserving = run(ownerRepository.reserve("child"))
-      await barrier.entered.promise
-      const removing = rejected(remover.commitRemoval(removal, ["root"], `remove-${kind}`))
-      barrier.release.resolve()
-
-      const owner = await reserving
-      expect(await removing).toMatchObject({
+      const [owner, removalError] = await raceStateWrite(barrier,
+        () => run(ownerRepository.reserve("child")),
+        () => rejected(remover.commitRemoval(removal, ["root"], `remove-${kind}`)),
+      )
+      expect(removalError).toMatchObject({
         _tag: "SessionOwnedError",
         sessionId: "child",
         ownerPid: 101,
@@ -714,26 +773,24 @@ describe("ProviderStateRepository terminal ownership", () => {
       const remover = await openProviderState(
         project,
         state,
-        platformWithPid(202, "remover"),
+        contendingPlatform(202, "remover", barrier),
       )
       const reserved = await run(ownerRepository.reserve("root"))
       const running = await run(ownerRepository.attach(reserved, 303))
       const removal = removalAtRoot(kind)
       barrier.blockNextStateWrite()
 
-      const transitioning = run(ownerRepository.commitIdentity({
-        owner: running,
-        sessionId: "child",
-        kind: "native-fork",
-        relation: relation("child", "root"),
-        mutationToken: `transition-${kind}`,
-      }))
-      await barrier.entered.promise
-      const removing = rejected(remover.commitRemoval(removal, ["root"], `remove-${kind}`))
-      barrier.release.resolve()
-
-      const committed = await transitioning
-      expect(await removing).toMatchObject({
+      const [committed, removalError] = await raceStateWrite(barrier,
+        () => run(ownerRepository.commitIdentity({
+          owner: running,
+          sessionId: "child",
+          kind: "native-fork",
+          relation: relation("child", "root"),
+          mutationToken: `transition-${kind}`,
+        })),
+        () => rejected(remover.commitRemoval(removal, ["root"], `remove-${kind}`)),
+      )
+      expect(removalError).toMatchObject({
         _tag: "SessionOwnedError",
         sessionId: "child",
         ownerPid: 101,
@@ -749,26 +806,24 @@ describe("ProviderStateRepository terminal ownership", () => {
       const ownerRepository = await openProviderState(
         project,
         state,
-        platformWithPid(101, "owner"),
+        contendingPlatform(101, "owner", barrier),
       )
       const reserved = await run(ownerRepository.reserve("source"))
       const running = await run(ownerRepository.attach(reserved, 303))
       const removal = removalAtDestination(kind)
       barrier.blockNextStateWrite()
 
-      const removing = run(remover.commitRemoval(removal, ["child"], `remove-${kind}`))
-      await barrier.entered.promise
-      const transitioning = rejected(ownerRepository.commitIdentity({
-        owner: running,
-        sessionId: "child",
-        kind: "native-fork",
-        relation: relation("child", "source"),
-        mutationToken: `transition-${kind}`,
-      }))
-      barrier.release.resolve()
-
-      await removing
-      expect(await transitioning).toBeInstanceOf(SessionRemovedError)
+      const [, transitionError] = await raceStateWrite(barrier,
+        () => run(remover.commitRemoval(removal, ["child"], `remove-${kind}`)),
+        () => rejected(ownerRepository.commitIdentity({
+          owner: running,
+          sessionId: "child",
+          kind: "native-fork",
+          relation: relation("child", "source"),
+          mutationToken: `transition-${kind}`,
+        })),
+      )
+      expect(transitionError).toBeInstanceOf(SessionRemovedError)
       expect((await run(remover.load)).terminalOwners.map((owner) => owner.sessionId)).toEqual([
         "source",
       ])
@@ -907,6 +962,12 @@ describe("ProviderStateRepository terminal ownership", () => {
         aliases: [{ sessionId: "child", messageId: "source" }],
       },
     })
+    expect(temporary.relations).toEqual([{ ...sourceRelation, childSessionId: "child" }])
+    expect(temporary.removals).toEqual([{
+      kind: "subtree",
+      createdAt: timestamp(1),
+      target: { kind: "endpoint", sessionId: "child", afterMessageId: null },
+    }])
   })
 
   test("rejects a native-fork relation without a usable shared prefix", async () => {
@@ -915,6 +976,7 @@ describe("ProviderStateRepository terminal ownership", () => {
     const reserved = await run(repository.reserve("source"))
     const running = await run(repository.attach(reserved, 808))
 
+    const before = await readFile(repository.statePath, "utf8")
     const error = await rejected(repository.commitIdentity({
       owner: running,
       sessionId: "child",
@@ -925,6 +987,7 @@ describe("ProviderStateRepository terminal ownership", () => {
     expect(error).toBeInstanceOf(PersistenceError)
     expect((error as PersistenceError).message).toContain("must contain shared message mappings")
     expect((await run(repository.load)).relations).toEqual([])
+    expect(await readFile(repository.statePath, "utf8")).toBe(before)
   })
 
   test("rejects a journal whose relation does not match provider metadata", async () => {
@@ -1011,8 +1074,7 @@ async function fixture(): Promise<{ project: string; state: string }> {
 function platformWithPid(
   pid: number,
   instanceId: string,
-  processLiveness: (pid: number) => ProcessLiveness = (candidate) =>
-    candidate === pid ? "alive" : "absent",
+  processLiveness: (pid: number) => ProcessLiveness = () => "alive",
   processGroupLiveness: (processGroupId: number) => ProcessLiveness = () => "absent",
 ): PersistencePlatformApi {
   return testPlatform({
@@ -1031,12 +1093,15 @@ function stateWriteBarrier(overrides: Partial<PersistencePlatformApi>): {
   readonly platform: PersistencePlatformApi
   readonly entered: ReturnType<typeof deferred>
   readonly release: ReturnType<typeof deferred>
+  readonly contended: ReturnType<typeof deferred>
   readonly blockNextStateWrite: () => void
 } {
   const entered = deferred()
   const release = deferred()
+  const contended = deferred()
   let blockNext = false
   const platform = testPlatform({
+    processLiveness: async () => "alive",
     ...overrides,
     rename: async (oldPath, newPath) => {
       if (blockNext && newPath.endsWith("state.json")) {
@@ -1051,6 +1116,7 @@ function stateWriteBarrier(overrides: Partial<PersistencePlatformApi>): {
     platform,
     entered,
     release,
+    contended,
     blockNextStateWrite: () => {
       blockNext = true
     },
@@ -1066,6 +1132,50 @@ function deferred(): {
     resolve = complete
   })
   return { promise, resolve }
+}
+
+function contendingPlatform(
+  pid: number,
+  instanceId: string,
+  barrier: ReturnType<typeof stateWriteBarrier>,
+): PersistencePlatformApi {
+  return platformWithPid(pid, instanceId, (ownerPid) => {
+    expect(ownerPid).toBe(barrier.platform.pid)
+    barrier.contended.resolve()
+    return "alive"
+  })
+}
+
+async function raceStateWrite<A, B>(
+  barrier: ReturnType<typeof stateWriteBarrier>,
+  first: () => Promise<A>,
+  second: () => Promise<B>,
+): Promise<readonly [A, B]> {
+  const writing = first()
+  void writing.catch(() => undefined)
+  let contending: Promise<B> | undefined
+  try {
+    await boundedBarrier(barrier.entered.promise, "state write")
+    contending = second()
+    void contending.catch(() => undefined)
+    await boundedBarrier(barrier.contended.promise, "live lock contention")
+    barrier.release.resolve()
+    return await Promise.all([writing, contending])
+  } finally {
+    barrier.release.resolve()
+    await Promise.allSettled([writing, ...(contending ? [contending] : [])])
+  }
+}
+
+async function boundedBarrier(promise: Promise<void>, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 2_000)
+    })])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function openProviderState(

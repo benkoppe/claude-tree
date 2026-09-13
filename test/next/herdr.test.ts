@@ -109,7 +109,7 @@ test("coalesces queued reports to the latest state", async () => {
       reportCommand("working"),
       reportCommand("idle"),
     ])
-  })))
+  })).pipe(Effect.provide(TestClock.layer())))
 })
 
 test("reasserts at 250ms and 1500ms from the latest transition", async () => {
@@ -126,17 +126,29 @@ test("reasserts at 250ms and 1500ms from the latest transition", async () => {
       yield* TestClock.adjust(1)
       yield* waitFor(() => calls.length === 2)
 
-      yield* TestClock.adjust(1_249)
-      expect(calls).toHaveLength(2)
-      yield* TestClock.adjust(1)
+      yield* TestClock.adjust(750)
+      reporter.report("blocked")
       yield* waitFor(() => calls.length === 3)
+      yield* TestClock.adjust(249)
+      expect(calls).toHaveLength(3)
+      yield* TestClock.adjust(1)
+      yield* waitFor(() => calls.length === 4)
+      yield* TestClock.adjust(250)
+      // The original Working transition's 1500ms deadline is now obsolete.
+      expect(calls).toHaveLength(4)
+      yield* TestClock.adjust(999)
+      expect(calls).toHaveLength(4)
+      yield* TestClock.adjust(1)
+      yield* waitFor(() => calls.length === 5)
     }),
   )
 
-  expect(calls.slice(0, 3)).toEqual([
+  expect(calls.slice(0, 5)).toEqual([
     reportCommand("working"),
     reportCommand("working"),
-    reportCommand("working"),
+    reportCommand("blocked"),
+    reportCommand("blocked"),
+    reportCommand("blocked"),
   ])
 })
 
@@ -256,7 +268,7 @@ test("the terminal adapter releases once and ignores reports after shutdown", as
     yield* adapter.shutdown
     adapter.report("blocked")
     yield* adapter.shutdown
-  })))
+  })).pipe(Effect.provide(TestClock.layer())))
 
   expect(calls).toEqual([
     reportCommand("working"),
@@ -271,7 +283,7 @@ function runWithReporter(
   return Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const reporter = yield* makeLiveHerdrReporter({ env: HERDR_ENV, execute })
     yield* use(reporter)
-  })))
+  })).pipe(Effect.provide(TestClock.layer())))
 }
 
 function runWithTestClock(
@@ -291,7 +303,11 @@ function runWithTestClock(
 
 function waitFor(condition: () => boolean): Effect.Effect<void> {
   return Effect.gen(function*() {
-    while (!condition()) yield* Effect.yieldNow
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (condition()) return
+      yield* Effect.yieldNow
+    }
+    return yield* Effect.die(new Error("Herdr condition did not become true"))
   })
 }
 

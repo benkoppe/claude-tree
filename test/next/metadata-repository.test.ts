@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
-import { Cause, Effect, Exit, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import { PersistenceError } from "../../src/domain/errors"
@@ -54,11 +54,19 @@ describe("ProviderStateRepository schema v3", () => {
   test("durably creates every missing state directory boundary", async () => {
     const { project, state } = await fixture()
     const syncedDirectories: string[] = []
+    const openHandles = new Set<object>()
     const platform = testPlatform({
       open: async (path, flags, mode) => {
         const handle = await nativePersistencePlatform.open(path, flags, mode)
-        if (flags === "r") syncedDirectories.push(path)
-        return handle
+        openHandles.add(handle)
+        return {
+          ...handle,
+          sync: async () => {
+            await handle.sync()
+            if (flags === "r") syncedDirectories.push(path)
+          },
+          close: async () => { await handle.close(); openHandles.delete(handle) },
+        }
       },
     })
     const repository = await openRepository(project, state, platform)
@@ -66,6 +74,7 @@ describe("ProviderStateRepository schema v3", () => {
     const projectDirectory = dirname(dirname(providerDirectory))
 
     expect(syncedDirectories).toEqual(expect.arrayContaining([
+      dirname(state),
       state,
       join(state, "claude-tree"),
       join(state, "claude-tree", "v2"),
@@ -74,6 +83,7 @@ describe("ProviderStateRepository schema v3", () => {
       join(projectDirectory, "providers"),
       providerDirectory,
     ]))
+    expect(openHandles.size).toBe(0)
   })
 
   test("strictly rejects v2 state in place without changing or deleting it", async () => {
@@ -214,16 +224,26 @@ describe("ProviderStateRepository schema v3", () => {
     interceptRace = true
 
     const firstWrite = run(saveRelationEffect(first, relation("first-child", "root")))
-    await claimCreated.promise
-    const secondWrite = run(saveRelationEffect(second, relation("second-child", "root")))
-    allowStaleRemoval.resolve()
-    await replacementCreated.promise
-    await winnerCleanedClaim.promise
+    void firstWrite.catch(() => undefined)
+    let secondWrite: Promise<unknown> | undefined
+    try {
+      await boundedBarrier(claimCreated.promise, "reclaim claim")
+      secondWrite = run(saveRelationEffect(second, relation("second-child", "root")))
+      void secondWrite.catch(() => undefined)
+      allowStaleRemoval.resolve()
+      await boundedBarrier(replacementCreated.promise, "replacement lock")
+      await boundedBarrier(winnerCleanedClaim.promise, "reclaim cleanup")
 
-    expect(JSON.parse(await readFile(lockPath, "utf8")).ownerPid).toBe(9003)
-    expect(winnerRemovedReplacement).toBeFalse()
-    allowReplacementRelease.resolve()
-    await Promise.all([firstWrite, secondWrite])
+      expect(JSON.parse(await readFile(lockPath, "utf8")).ownerPid).toBe(9003)
+      expect(winnerRemovedReplacement).toBeFalse()
+      allowReplacementRelease.resolve()
+      await Promise.all([firstWrite, secondWrite])
+    } finally {
+      allowStaleRemoval.resolve()
+      replacementCreated.resolve()
+      allowReplacementRelease.resolve()
+      await Promise.allSettled([firstWrite, ...(secondWrite ? [secondWrite] : [])])
+    }
     expect((await run(first.loadMetadata)).relations).toHaveLength(2)
   })
 
@@ -295,9 +315,13 @@ describe("ProviderStateRepository schema v3", () => {
 
   test("waiting for a live lock is interruptible", async () => {
     const { project, state } = await fixture()
+    const checkingLiveness = Deferred.makeUnsafe<void>()
     const platform = testPlatform({
       pid: 9002,
-      processLiveness: async () => "alive",
+      processLiveness: async () => {
+        Effect.runSync(Deferred.succeed(checkingLiveness, undefined))
+        return "alive"
+      },
     })
     const repository = await openRepository(project, state, platform)
     const lockPath = join(dirname(repository.statePath), "state.lock")
@@ -308,20 +332,30 @@ describe("ProviderStateRepository schema v3", () => {
       createdAt: timestamp(0),
     })}\n`)
 
+    const before = await readFile(lockPath, "utf8")
     await run(Effect.gen(function*() {
       const fiber = yield* Effect.forkChild(saveRelationEffect(repository, relation("child", "root")))
-      yield* Effect.sleep(20)
+      yield* Deferred.await(checkingLiveness)
       yield* Fiber.interrupt(fiber)
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
     }))
+    expect(await readFile(lockPath, "utf8")).toBe(before)
     await rm(lockPath, { force: true })
     expect((await run(repository.loadMetadata)).relations).toEqual([])
   })
 
   test("public reads lock and can interrupt a blocked liveness check", async () => {
     const { project, state } = await fixture()
+    const checkingLiveness = Deferred.makeUnsafe<void>()
+    const releaseLiveness = deferred()
     const platform = testPlatform({
       pid: 9002,
-      processLiveness: () => new Promise(() => undefined),
+      processLiveness: async () => {
+        Effect.runSync(Deferred.succeed(checkingLiveness, undefined))
+        await releaseLiveness.promise
+        return "unknown"
+      },
     })
     const repository = await openRepository(project, state, platform)
     const lockPath = join(dirname(repository.statePath), "state.lock")
@@ -332,12 +366,19 @@ describe("ProviderStateRepository schema v3", () => {
       createdAt: timestamp(0),
     })}\n`)
 
-    await run(Effect.gen(function*() {
-      const fiber = yield* Effect.forkChild(repository.loadMetadata)
-      yield* Effect.sleep(20)
-      yield* Fiber.interrupt(fiber)
-    }))
-    expect(await exists(lockPath)).toBeTrue()
+    const before = await readFile(lockPath, "utf8")
+    try {
+      await run(Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(repository.loadMetadata)
+        yield* Deferred.await(checkingLiveness)
+        yield* Fiber.interrupt(fiber)
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+      }))
+      expect(await readFile(lockPath, "utf8")).toBe(before)
+    } finally {
+      releaseLiveness.resolve()
+    }
     await rm(lockPath)
   })
 
@@ -366,6 +407,7 @@ describe("ProviderStateRepository schema v3", () => {
     const { project, state } = await fixture()
     let failure: "file" | "directory" | undefined
     let stateRenamed = false
+    const openHandles = new Set<object>()
     const platform = testPlatform({
       rename: async (oldPath, newPath) => {
         await nativePersistencePlatform.rename(oldPath, newPath)
@@ -374,11 +416,13 @@ describe("ProviderStateRepository schema v3", () => {
       open: async (path, flags, mode) => {
         const handle = await nativePersistencePlatform.open(path, flags, mode)
         const isDirectory = flags === "r"
+        openHandles.add(handle)
         return {
           ...handle,
+          close: async () => { await handle.close(); openHandles.delete(handle) },
           sync: async () => {
             if (
-              (failure === "file" && path.endsWith(".tmp")) ||
+              (failure === "file" && path.includes("/state.json.") && path.endsWith(".tmp")) ||
               (failure === "directory" && stateRenamed && isDirectory && path.endsWith("test-provider"))
             ) {
               throw Object.assign(new Error(`injected ${failure} fsync failure`), { code: "EIO" })
@@ -394,6 +438,7 @@ describe("ProviderStateRepository schema v3", () => {
     failure = "file"
     const fileError = await rejected(saveRelationEffect(repository, relation("file", "root")))
     expect(fileError).toBeInstanceOf(PersistenceError)
+    expect(openHandles.size).toBe(0)
     failure = undefined
     expect((await run(repository.loadMetadata)).relations).toEqual([])
 
@@ -401,6 +446,7 @@ describe("ProviderStateRepository schema v3", () => {
     failure = "directory"
     const directoryError = await rejected(saveRelationEffect(repository, relation("directory", "root")))
     expect(directoryError).toBeInstanceOf(PersistenceError)
+    expect(openHandles.size).toBe(0)
     failure = undefined
     expect((await run(repository.loadMetadata)).relations.map((item) => item.childSessionId)).toEqual([
       "directory",
@@ -435,32 +481,36 @@ describe("ProviderStateRepository schema v3", () => {
     expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
   })
 
-  test("rejects strict and semantic corruption before another write", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const original = JSON.parse(await readFile(repository.statePath, "utf8"))
-    await writeFile(repository.statePath, `${JSON.stringify({ ...original, extra: true })}\n`)
-    expect(await rejected(repository.loadMetadata)).toBeInstanceOf(PersistenceError)
-
-    await writeFile(repository.statePath, `${JSON.stringify({
-      ...original,
-      relations: [relation("one", "two"), relation("two", "one")],
-    })}\n`)
-    const cycle = await rejected(repository.loadMetadata)
-    expect(cycle).toBeInstanceOf(PersistenceError)
-    expect((cycle as PersistenceError).message).toContain("cycle")
-
-    await writeFile(repository.statePath, `${JSON.stringify({
-      ...original,
-      relations: [{
-        ...relation("child", "root"),
-        sourceMessageId: "later-source",
-      }],
-    })}\n`)
-    const contradictory = await rejected(repository.loadMetadata)
-    expect(contradictory).toBeInstanceOf(PersistenceError)
-    expect((contradictory as PersistenceError).message).toContain("must end at the source message")
-  })
+  for (const corruption of ["extra field", "cycle", "source mismatch", "noncanonical", "v1", "v2", "unknown version"] as const) {
+    test(`rejects ${corruption} in place before another write`, async () => {
+      const { project, state } = await fixture()
+      const repository = await openRepository(project, state)
+      const original = JSON.parse(await readFile(repository.statePath, "utf8"))
+      const mutations = {
+        "extra field": { extra: true },
+        cycle: { relations: [relation("one", "two"), relation("two", "one")] },
+        "source mismatch": { relations: [{ ...relation("child", "root"), sourceMessageId: "later-source" }] },
+        noncanonical: { relations: [relation("z", "root"), relation("a", "root")] },
+        v1: { schemaVersion: 1 },
+        v2: { schemaVersion: 2 },
+        "unknown version": { schemaVersion: 99 },
+      }
+      const contents = `${JSON.stringify({ ...original, ...mutations[corruption] })}\n`
+      await writeFile(repository.statePath, contents)
+      const error = await rejected(repository.loadMetadata)
+      expect(error).toBeInstanceOf(PersistenceError)
+      if (corruption === "cycle") expect((error as PersistenceError).message).toContain("cycle")
+      if (corruption === "source mismatch") expect((error as PersistenceError).message).toContain("must end at the source message")
+      if (corruption === "noncanonical") expect((error as PersistenceError).message).toContain("canonically ordered")
+      let transformed = false
+      expect(await rejected(repository.updateMetadata((metadata) => {
+        transformed = true
+        return { ...metadata, relations: [...metadata.relations, relation("new", "root")] }
+      }))).toBeInstanceOf(PersistenceError)
+      expect(transformed).toBeFalse()
+      expect(await readFile(repository.statePath, "utf8")).toBe(contents)
+    })
+  }
 
   test("accepts the documented zero-prefix replay relation", async () => {
     const { project, state } = await fixture()
@@ -536,6 +586,17 @@ function deferred(): {
     resolve = complete
   })
   return { promise, resolve }
+}
+
+async function boundedBarrier(promise: Promise<void>, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 2_000)
+    })])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function openRepositoryEffect(
