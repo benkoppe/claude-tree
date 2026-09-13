@@ -737,9 +737,12 @@ test("one unbounded semantic queue preserves transition order and sequence IDs u
       observer: new OutputObserver(),
     }))
     const process = fixture.processes.processes[0]!
-    const working = bytes("working")
-    for (let index = 0; index < 20_000; index += 1) process.output(working)
-    yield* eventually(() => observed.length >= 1)
+    const queuedActivities = Array.from({ length: 2_048 }, (_, index) => index % 2 === 0 ? "working" : "idle")
+    // No yield between callbacks: every distinct transition must survive the backlog.
+    for (const activity of queuedActivities) {
+      process.output(bytes(activity))
+      process.output(bytes(activity))
+    }
 
     const acknowledgment = yield* publishTransition(transitions, {
       _tag: "SessionChanged",
@@ -747,6 +750,7 @@ test("one unbounded semantic queue preserves transition order and sequence IDs u
       session: session("real"),
     })
     yield* Deferred.await(acknowledgment)
+    process.output(bytes("working"))
     process.output(bytes("idle"))
     process.finish(0)
     yield* eventually(() => observed.some((event) => "exitCode" in event))
@@ -756,7 +760,11 @@ test("one unbounded semantic queue preserves transition order and sequence IDs u
       [...observed.map((event) => event.sequenceId)].sort((left, right) => left - right),
     )
     expect(new Set(observed.map((event) => event.sequenceId)).size).toBe(observed.length)
-    expect(observed.map(eventName)).toEqual(["activity:working", "session:real", "activity:idle", "exit:real"])
+    expect(observed.map(eventName)).toEqual([
+      ...queuedActivities.map((activity) => `activity:${activity}`),
+      "session:real", "activity:working", "activity:idle", "exit:real",
+    ])
+    expect(observed.slice(-3).every((event) => "sessionId" in event && event.sessionId === "real")).toBeTrue()
   }))
 })
 
@@ -858,22 +866,28 @@ test("a transition enqueue defect settles the request and cleans the owner", asy
 })
 
 test("exit, stop, and shutdown converge on one idempotent cleanup", async () => {
-  const fixture = makeFixture({ waitDelayMs: 20 })
+  const waitBarrier = Deferred.makeUnsafe<void>()
+  const fixture = makeFixture({ waitBarrier })
 
-  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
     yield* supervisor.show(prepared("race", fixture))
     const stopFiber = yield* Effect.forkChild(supervisor.stopSession("race"))
     yield* eventually(() => fixture.log.includes("wait:race:10"))
     fixture.processes.processes[0]!.finish(0)
     const shutdownFiber = yield* Effect.forkChild(supervisor.shutdown())
+    yield* eventually(() => fixture.log.includes("selection-unsubscribe"))
+    expect(fixture.leases.current("race")).toBeDefined()
+    yield* Deferred.succeed(waitBarrier, undefined)
     yield* Fiber.join(stopFiber)
     yield* Fiber.join(shutdownFiber)
 
     expect(fixture.log.filter((entry) => entry === "provider-close:race")).toHaveLength(1)
     expect(fixture.log.filter((entry) => entry === "pty-close:race")).toHaveLength(1)
     expect(fixture.log.filter((entry) => entry === "lease-release:race")).toHaveLength(1)
+    expect(fixture.log.filter((entry) => entry === "unref:race")).toHaveLength(1)
+    expect(fixture.processes.processes[0]!.signals).toEqual([{ signal: "SIGTERM", ptyOpen: true }])
     expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
-  }))
+  }).pipe(Effect.ensuring(Deferred.succeed(waitBarrier, undefined))))
 })
 
 test("provider cleanup is bounded, retryable, and releases the lease only after success", async () => {
@@ -881,11 +895,26 @@ test("provider cleanup is bounded, retryable, and releases the lease only after 
   fixture.providerCloseFailures = 2
 
   await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
-    yield* supervisor.show(prepared("provider-retry", fixture))
+    yield* supervisor.show({
+      session: session("provider-retry"),
+      acquireLaunch: Effect.gen(function*() {
+        yield* Effect.addFinalizer(() => Effect.sync(() => { fixture.log.push("provider-scope-close:provider-retry") }))
+        return acquiredLaunch("provider-retry", fixture)
+      }),
+    })
     yield* supervisor.stopSession("provider-retry")
 
     expect(fixture.providerCloseAttempts).toBe(3)
     expect(fixture.leases.current("provider-retry")).toBeUndefined()
+    expect(fixture.processes.processes[0]!.signals).toEqual([
+      { signal: "SIGTERM", ptyOpen: true }, { signal: "SIGKILL", ptyOpen: true },
+    ])
+    const stages = [
+      "group-absent:provider-retry", "provider-close:provider-retry", "provider-scope-close:provider-retry",
+      "pty-close:provider-retry", "unref:provider-retry", "lease-release:provider-retry",
+    ].map((stage) => fixture.log.indexOf(stage))
+    expect(stages.every((index) => index >= 0)).toBeTrue()
+    expect(stages).toEqual([...stages].sort((a, b) => a - b))
   }))
 })
 
@@ -1284,24 +1313,6 @@ test("a first Codex fork adopts its temporary owner with exact ancestry for fami
   }))
 })
 
-test("temporary owners commit a temporary adoption and acknowledge the journal", async () => {
-  const fixture = makeFixture()
-  const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
-  fixture.dependencies.events = { onSessionChanged: acknowledge }
-
-  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
-    yield* supervisor.show(prepared("temporary", fixture, { transitions, transient: true }))
-    const providerAcknowledgment = yield* publishTransition(transitions, {
-      _tag: "SessionChanged",
-      kind: "temporary-adoption",
-      session: session("provider-id"),
-    })
-    yield* Deferred.await(providerAcknowledgment)
-    expect(fixture.leases.identityCalls[0]?.kind).toBe("temporary-adoption")
-    expect(fixture.log.some((entry) => entry.startsWith("lease-ack:"))).toBeTrue()
-  }))
-})
-
 test("rejects a transition kind that disagrees with the owner's adoption state", async () => {
   const fixture = makeFixture()
   const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
@@ -1378,6 +1389,9 @@ test("a temporary Codex owner adopts once and treats every later transition as a
       "native-fork",
       "native-fork",
     ])
+    expect(fixture.log.filter((entry) => entry.startsWith("lease-ack:"))).toEqual(
+      fixture.leases.identityCalls.map((call) => `lease-ack:${call.mutationToken}`),
+    )
     expect(fixture.leases.replaceCalls).toEqual([
       "temporary:real",
       "real:fork-one",
@@ -1713,6 +1727,7 @@ test("a late reserve is compensated before retry and can never recreate released
 
 test("a timed-out provider scope close remains uncertain and never releases its lease", async () => {
   const fixture = makeFixture()
+  const finishScopeClose = Deferred.makeUnsafe<void>()
   const dependencies = {
     ...fixture.dependencies,
     providerCleanupTimeoutMs: 10,
@@ -1722,7 +1737,7 @@ test("a timed-out provider scope close remains uncertain and never releases its 
     acquireLaunch: Effect.gen(function*() {
       yield* Effect.addFinalizer(() => Effect.gen(function*() {
         fixture.log.push("provider-scope-close:uncertain-scope")
-        yield* Effect.never
+        yield* Deferred.await(finishScopeClose)
       }))
       return acquiredLaunch("uncertain-scope", fixture)
     }),
@@ -1747,7 +1762,12 @@ test("a timed-out provider scope close remains uncertain and never releases its 
       entry === "provider-scope-close:uncertain-scope")).toHaveLength(1)
     expect(fixture.log).not.toContain("lease-release:uncertain-scope")
     expect(fixture.leases.current("uncertain-scope")).toBeDefined()
-  }).pipe(Effect.provide(TestClock.layer()))))
+    yield* Deferred.succeed(finishScopeClose, undefined)
+    expect(fixture.leases.current("uncertain-scope")).toBeDefined()
+  }).pipe(
+    Effect.ensuring(Deferred.succeed(finishScopeClose, undefined)),
+    Effect.provide(TestClock.layer()),
+  )))
 })
 
 test("reserve, provider acquisition, surface creation, and spawn failures roll back transactionally", async () => {
@@ -1847,6 +1867,20 @@ test("a UI release exception is retryable and does not permanently poison owners
   }))
 })
 
+test("a detach failure retains ownership until a later stop detaches the child", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(prepared("detach-retry", fixture))
+    fixture.processes.processes[0]!.unrefFailures = 1
+    expect(Exit.isFailure(yield* Effect.exit(supervisor.stopSession("detach-retry")))).toBeTrue()
+    expect(fixture.leases.current("detach-retry")?.status).toBe("cleanup-incomplete")
+    expect(fixture.log).not.toContain("lease-release:detach-retry")
+    yield* supervisor.stopSession("detach-retry")
+    expect(fixture.log.filter((entry) => entry === "unref:detach-retry")).toHaveLength(2)
+    expect(fixture.leases.current("detach-retry")).toBeUndefined()
+  }))
+})
+
 test("a resolved signal exception does not retain the session lease", async () => {
   const fixture = makeFixture()
 
@@ -1930,7 +1964,7 @@ interface Fixture {
 
 interface ProcessOptions {
   unknownLiveness: boolean
-  readonly waitDelayMs: number
+  readonly waitBarrier?: Deferred.Deferred<void>
   waitConstructionFailures: number
 }
 
@@ -1938,7 +1972,7 @@ function makeFixture(options: Partial<ProcessOptions> = {}): Fixture {
   const log: string[] = []
   const processOptions: ProcessOptions = {
     unknownLiveness: options.unknownLiveness ?? false,
-    waitDelayMs: options.waitDelayMs ?? 0,
+    ...(options.waitBarrier === undefined ? {} : { waitBarrier: options.waitBarrier }),
     waitConstructionFailures: options.waitConstructionFailures ?? 0,
   }
   const renderer = new FakeRenderer(log)
@@ -2285,7 +2319,7 @@ class FakeRenderer implements TerminalRenderer {
 
   clearSelection(): void {}
   copyToClipboard(): void {}
-  onSelection(): () => void { return () => {} }
+  onSelection(): () => void { return () => { this.log.push("selection-unsubscribe") } }
 }
 
 class FakeSurface implements TerminalSurface {
@@ -2365,6 +2399,8 @@ class FakeProcess implements TerminalProcess {
   exitCode: number | null = null
   ptyOpen = true
   signalFailures = 0
+  unrefFailures = 0
+  readonly signals: Array<{ signal: NodeJS.Signals; ptyOpen: boolean }> = []
   private alive = true
   private resolveExit!: (code: number) => void
   private resolveDrain!: () => void
@@ -2386,6 +2422,7 @@ class FakeProcess implements TerminalProcess {
 
   signalGroup(signal: NodeJS.Signals): void {
     this.log.push(`signal:${this.sessionId}:${signal}`)
+    this.signals.push({ signal, ptyOpen: this.ptyOpen })
     if (this.signalFailures-- > 0) throw new Error("signal failed")
     if (signal === "SIGKILL" && !this.options.unknownLiveness) this.finish(137)
   }
@@ -2397,11 +2434,12 @@ class FakeProcess implements TerminalProcess {
 
   waitForGroupExit(timeoutMs: number): Effect.Effect<boolean> {
     if (this.options.waitConstructionFailures-- > 0) throw new Error("wait construction failed")
-    return Effect.promise(async () => {
+    return Effect.gen(function* (this: FakeProcess) {
       this.log.push(`wait:${this.sessionId}:${timeoutMs}`)
-      if (this.options.waitDelayMs > 0) await Bun.sleep(this.options.waitDelayMs)
+      if (this.options.waitBarrier) yield* Deferred.await(this.options.waitBarrier)
+      if (!this.alive) this.log.push(`group-absent:${this.sessionId}`)
       return !this.alive
-    })
+    }.bind(this))
   }
 
   closePty(): void {
@@ -2412,7 +2450,10 @@ class FakeProcess implements TerminalProcess {
     this.callbacks.onPtyClosed()
   }
 
-  unref(): void {}
+  unref(): void {
+    this.log.push(`unref:${this.sessionId}`)
+    if (this.unrefFailures-- > 0) throw new Error("detach failed")
+  }
   output(data: Uint8Array): void { this.callbacks.onOutput(data) }
 
   finish(code: number): void {
@@ -2450,12 +2491,15 @@ async function readProcessIds(path: string): Promise<number[]> {
   await waitUntil(async () => {
     try {
       contents = await readFile(path, "utf8")
-      return contents.length > 0
+      return /^\d+ \d+\n$/.test(contents)
     } catch {
       return false
     }
   })
-  return contents.trim().split(/\s+/).map(Number)
+  const pids = contents.trim().split(/\s+/).map(Number)
+  expect(pids).toHaveLength(2)
+  expect(pids.every((pid) => Number.isSafeInteger(pid) && pid > 0)).toBeTrue()
+  return pids
 }
 
 async function waitUntil(condition: () => boolean | Promise<boolean>): Promise<void> {
@@ -2468,7 +2512,8 @@ function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
-  } catch {
-    return false
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false
+    throw error
   }
 }

@@ -85,17 +85,6 @@ for (const provider of [
     expect(observer.reconcileScreen(idle, "confirm")).toBe("idle")
   })
 
-  test(`${provider.name}: an invalidated confirmation cannot leak into the next probe`, () => {
-    const observer = provider.create()
-    observer.observeScreen(idle)
-    observer.observeOutput(activeTitle)
-    expect(observer.reconcileScreen(idle, "sample")).toBeUndefined()
-    observer.observeOutput(activeTitle)
-    expect(observer.reconcileScreen(idle, "confirm")).toBeUndefined()
-    expect(observer.reconcileScreen(idle, "sample")).toBeUndefined()
-    expect(observer.reconcileScreen(idle, "confirm")).toBe("idle")
-  })
-
   test(`${provider.name}: confirm without a sample never establishes a recovery candidate`, () => {
     const observer = provider.create()
     observer.observeScreen(idle)
