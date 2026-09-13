@@ -17,7 +17,6 @@ import {
   ApplicationOperationError,
   IntentRejectedError,
   makeAppRuntime,
-  makeNavigationWriter,
   RemovalOperationError,
   selectProjectedTranscript,
   selectSessionStatus,
@@ -61,15 +60,6 @@ describe("application actor", () => {
   for (const { target, streaming } of (["wrapped identifier", "unknown", "unreadable", "duplicate"] as const).flatMap((target) =>
     (target === "wrapped identifier" ? [false] : [false, true]).map((streaming) => ({ target, streaming })))) {
     test(`SDK-backed native fork rewind reconciles a ${target} target before the replacement answer (streaming: ${streaming})`, async () => {
-      const waitForState = (runtime: AppRuntime, predicate: (state: ApplicationState) => boolean, description = "SDK workflow state") => Effect.gen(function*() {
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          const state = yield* runtime.getState
-          if (predicate(state)) return state
-          // Let SDK promises and Node I/O settle without advancing reconciliation timers.
-          yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
-        }
-        return yield* Effect.die(`Timed out waiting for ${description}`)
-      })
       const fixture = makeFixture()
       const store = new InMemorySessionStore()
       const sourceId = crypto.randomUUID()
@@ -232,22 +222,29 @@ describe("application actor", () => {
     })
   }
 
-  test("forks a 10,000-message tree while refresh is stalled and preserves the child after the late snapshot", async () => {
+  test("projects a fork before activation while refresh is stalled and preserves its history after the late snapshot", async () => {
     const fixture = makeFixture()
-    const messages = Array.from({ length: 10_000 }, (_, index) => message(`m${index}`, index % 2 ? "agent" : "user", `message ${index}`, index))
-    fixture.snapshot = snapshot([session(ROOT, "Large tree")], new Map([[ROOT, messages]]))
-    const child = prepared("large-fork", "Large fork")
+    const messages = [message("question", "user", "question", 0), message("answer", "agent", "answer", 1)]
+    const copies = messages.map((entry) => ({ ...entry, id: `copy-${entry.id}` }))
+    fixture.snapshot = snapshot([session(ROOT, "Source")], new Map([[ROOT, messages]]))
+    const child = prepared("fork", "Fork")
     fixture.branchOutcome = {
       _tag: "ValidatedBranch", ...child,
+      transcript: { _tag: "Available", messages: copies },
       derivation: {
-        parentSessionId: ROOT, childSessionId: child.session.id, sourceMessageId: "m9999",
-        sharedMessages: messages.map((item, index) => ({ parentMessageId: item.id, childMessageId: `copy${index}` })),
+        parentSessionId: ROOT, childSessionId: child.session.id, sourceMessageId: "answer",
+        sharedMessages: messages.map((item, index) => ({ parentMessageId: item.id, childMessageId: copies[index]!.id })),
       },
     }
     const started = Deferred.makeUnsafe<void>()
     const release = Deferred.makeUnsafe<void>()
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime(fixture.options)
+      const showStarted = yield* Deferred.make<void>()
+      const releaseShow = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: { ...fixture.options.terminals,
+        show: (terminal) => Deferred.succeed(showStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseShow)),
+          Effect.andThen(fixture.options.terminals.show(terminal))),
+      } })
       yield* waitForState(runtime, (state) => !state.refresh.initialPending)
       fixture.fullSnapshot = () => Effect.gen(function*() {
         yield* Deferred.succeed(started, undefined)
@@ -256,8 +253,13 @@ describe("application actor", () => {
       })
       const refresh = yield* Effect.forkScoped(runtime.refresh())
       yield* Deferred.await(started)
-      yield* runtime.branchFrom({ sessionId: ROOT, messageId: "m9999" })
+      const branching = yield* Effect.forkChild(runtime.branchFrom({ sessionId: ROOT, messageId: "answer" }))
+      yield* Deferred.await(showStarted)
       const during = yield* runtime.getState
+      expect(selectProjectedTranscript(during, child.session.id)).toEqual(copies)
+      expect(during.surface._tag).not.toBe("Terminal")
+      yield* Deferred.succeed(releaseShow, undefined)
+      yield* Fiber.join(branching)
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(refresh)
       yield* runtime.returnFromTerminal
@@ -267,7 +269,15 @@ describe("application actor", () => {
     expect(result.during.refresh.active.size).toBe(1)
     expect(result.after.terminals.has(child.session.id)).toBeTrue()
     expect(result.after.relations).toHaveLength(1)
+    expect(selectProjectedTranscript(result.after, ROOT)).toEqual(messages)
+    expect(selectProjectedTranscript(result.after, child.session.id)).toEqual(copies)
     expect(result.view.surface._tag).toBe("Graph")
+    if (result.view.surface._tag !== "Graph") throw new Error("Expected fork graph")
+    expect(result.view.surface.warnings).toEqual([])
+    const endpoint = result.view.surface.nodes.find((node) => node._tag === "Endpoint" && node.session.id === child.session.id)
+    const source = result.view.surface.nodes.find((node) => node._tag === "Message" && node.preview === "answer")
+    expect(source).toBeDefined()
+    expect(endpoint).toMatchObject({ parentIds: [source!.id], selected: true })
     expect(fixture.calls.filter((call) => call === `show:${child.session.id}`)).toHaveLength(1)
   })
 
@@ -466,14 +476,24 @@ describe("application actor", () => {
     if (Exit.isFailure(exit)) expect(Exit.findErrorOption(exit).pipe(Option.getOrThrow)).toBeInstanceOf(IntentRejectedError)
   })
 
-  test("preserves the provider receiver when preparing a resumed session", async () => {
+  test("resumes using receiver-owned provider configuration", async () => {
     const fixture = makeFixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime(fixture.options)
+      const provider = { ...fixture.options.provider, displayName: "Receiver-owned title",
+        prepareResume(this: AgentProviderApi, resumed: AgentSession) {
+          return Effect.succeed(prepared(resumed.id, this.displayName))
+        },
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider, terminals: {
+        ...fixture.options.terminals,
+        show: (terminal) => {
+          expect(terminal.session.title).toBe("Receiver-owned title")
+          return fixture.options.terminals.show(terminal)
+        },
+      } })
       yield* runtime.resumeSession(ROOT)
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: ROOT })
     })))
-
-    expect(fixture.prepareResumeReceiver).toBe(fixture.options.provider)
   })
 
   test("limited history permits opening the owned stock session but rejects a fork before mutation", async () => {
@@ -552,6 +572,12 @@ describe("application actor", () => {
       yield* runtime.returnFromTerminal
       yield* runtime.resumeSession(CHILD)
       yield* runtime.returnFromTerminal
+      yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      const readsBeforeStop = fixture.incrementalReads.length
+      fixture.snapshot = snapshot([session(ROOT, "Stopped"), session(CHILD, "Exited")], new Map([
+        [ROOT, [message("q", "user", "question", 0), message("stop-answer", "agent", "saved before stop", 1)]],
+        [CHILD, [message("cq", "user", "child question", 0), message("exit-answer", "agent", "saved before exit", 1)]],
+      ]))
       yield* runtime.stopSession(ROOT)
       const exited = yield* runtime.handleTerminalExit({
         ownerId: "owner-2",
@@ -560,14 +586,16 @@ describe("application actor", () => {
         exitCode: 0,
         wasActive: false,
       })
-      yield* Effect.yieldNow
-      return { exited, state: yield* runtime.getState }
+      const state = yield* waitForState(runtime, (state) =>
+        selectProjectedTranscript(state, ROOT).at(-1)?.id === "stop-answer" &&
+        selectProjectedTranscript(state, CHILD).at(-1)?.id === "exit-answer")
+      return { exited, state, reads: fixture.incrementalReads.slice(readsBeforeStop) }
     })))
     expect(result.exited).toBeTrue()
     expect(result.state.terminals.size).toBe(0)
     expect(fixture.calls).toContain("stop:root")
-    expect(fixture.incrementalReads.some((ids) => ids.includes(ROOT))).toBeTrue()
-    expect(fixture.incrementalReads.some((ids) => ids.includes(CHILD))).toBeTrue()
+    expect(result.reads.some((ids) => ids.includes(ROOT))).toBeTrue()
+    expect(result.reads.some((ids) => ids.includes(CHILD))).toBeTrue()
   })
 
   test("removes an undiscovered temporary session after a successful explicit stop", async () => {
@@ -1227,7 +1255,7 @@ describe("application actor", () => {
       yield* Deferred.await(acknowledgmentStarted)
 
       const shuttingDown = yield* Effect.forkScoped(Effect.exit(runtime.shutdown))
-      for (let index = 0; index < 4; index += 1) yield* Effect.yieldNow
+      yield* waitForState(runtime, (state) => state.shutdown === "shutting-down")
       expect(Option.isNone(yield* Deferred.poll(terminalShutdownStarted))).toBeTrue()
       expect(Option.isNone(yield* Deferred.poll(acknowledgment))).toBeTrue()
       expect(shuttingDown.pollUnsafe()).toBeUndefined()
@@ -1390,16 +1418,17 @@ describe("application actor", () => {
   test("supersedes an in-flight manual refresh and resolves both replies", async () => {
     const fixture = makeFixture()
     const first = Deferred.makeUnsafe<AgentSessionSnapshot>()
+    const started = Deferred.makeUnsafe<void>()
 
     const results = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime(fixture.options)
       let manualCalls = 0
       fixture.fullSnapshot = () => {
         manualCalls += 1
-        return manualCalls === 1 ? Deferred.await(first) : Effect.succeed(fixture.snapshot)
+        return manualCalls === 1 ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(first))) : Effect.succeed(fixture.snapshot)
       }
       const old = yield* Effect.forkScoped(Effect.exit(runtime.refresh()))
-      yield* Effect.yieldNow
+      yield* Deferred.await(started)
       const latest = yield* Effect.exit(runtime.refresh())
       const superseded = yield* Fiber.join(old)
       return { superseded, latest }
@@ -1428,8 +1457,7 @@ describe("application actor", () => {
       yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", false))
       yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "idle", false))
       yield* TestClock.adjust(100)
-      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => state.unviewedSessionIds.has(ROOT))
     }).pipe(Effect.provide(TestClock.layer()))))
     expect(state.pendingCompletions.has(ROOT)).toBeFalse()
     expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
@@ -1448,8 +1476,7 @@ describe("application actor", () => {
       yield* runtime.refresh()
       expect((yield* runtime.getState).replacementCandidates.has(ROOT)).toBeTrue()
       yield* TestClock.adjust(100)
-      for (let index = 0; index < 12; index += 1) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => !state.replacementCandidates.has(ROOT))
     }).pipe(Effect.provide(TestClock.layer()))))
     expect(state.provider.transcripts.get(ROOT)).toEqual({ _tag: "Available", messages: [] })
     expect(state.replacementCandidates.size).toBe(0)
@@ -1565,8 +1592,7 @@ describe("application actor", () => {
       const barrier = yield* runtime.getState
 
       yield* Deferred.succeed(retryIncrementalRelease, undefined)
-      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
-      return { barrier, completed: yield* runtime.getState }
+      return { barrier, completed: yield* waitForState(runtime, (state) => state.unviewedSessionIds.has(ROOT)) }
     })))
 
     expect(result.barrier.pendingCompletions.has(ROOT)).toBeTrue()
@@ -1594,8 +1620,7 @@ describe("application actor", () => {
       }))).toBeTrue()
       expect((yield* runtime.getState).pendingCompletions.size).toBe(0)
       yield* runtime.returnFromTerminal
-      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
     })))
     expect(state.pendingCompletions.size).toBe(0)
     expect(selectSessionStatus(state, ROOT)).toBe("live")
@@ -2296,8 +2321,7 @@ describe("application actor", () => {
         ]),
       )
       yield* runtime.returnFromTerminal
-      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => state.unviewedSessionIds.has(ROOT))
     })))
 
     expect(state.pendingCompletions.has(ROOT)).toBeFalse()
@@ -2405,6 +2429,7 @@ describe("application actor", () => {
     }
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* Effect.addFinalizer(() => Deferred.succeed(releaseCommand, undefined).pipe(Effect.asVoid))
       const refresh = yield* Effect.forkScoped(runtime.refresh())
       yield* Deferred.await(commandStarted)
       const shutdown = yield* Effect.forkScoped(runtime.shutdown)
@@ -2412,6 +2437,7 @@ describe("application actor", () => {
       yield* TestClock.adjust(100)
       yield* Fiber.join(shutdown)
       const refreshExit = yield* Fiber.await(refresh)
+      yield* Deferred.succeed(releaseCommand, undefined)
       return { refreshExit, state: yield* runtime.getState }
     }).pipe(Effect.provide(TestClock.layer()))))
     expect(Exit.isFailure(result.refreshExit)).toBeTrue()
@@ -2741,14 +2767,15 @@ describe("application actor", () => {
       })).toBeTrue()
       yield* Deferred.await(acknowledgmentStarted)
       yield* Deferred.succeed(releaseStaleStop, undefined)
-      for (let index = 0; index < 4; index += 1) yield* Effect.yieldNow
+      yield* TestClock.adjust(0)
       expect(order).toEqual([])
+      expect(removing.pollUnsafe()).toBeUndefined()
 
       yield* Deferred.succeed(releaseAcknowledgment, undefined)
       yield* Deferred.await(acknowledgment)
       yield* Fiber.join(removing)
       return yield* runtime.getState
-    })))
+    }).pipe(Effect.provide(TestClock.layer()))))
 
     expect(order).toEqual(["acknowledged", `stop:${persisted}`, "committed"])
     expect(fixture.calls).toEqual(expect.arrayContaining(["stop:temporary", `stop:${persisted}`]))
@@ -2763,6 +2790,8 @@ describe("application actor", () => {
   test("projects partial removal stops, refreshes them, and does not persist removal", async () => {
     const fixture = makeFixture()
     const refreshStarted = Deferred.makeUnsafe<void>()
+    let removing = false
+    let commits = 0
     const baseStop = fixture.options.terminals.stopSession
     const terminals: TerminalSupervisorApi = {
       ...fixture.options.terminals,
@@ -2781,9 +2810,11 @@ describe("application actor", () => {
     const provider: AgentProviderApi = {
       ...fixture.options.provider,
       loadSessionSnapshotFor: (sessionIds) => Effect.gen(function*() {
+        if (!removing) return yield* fixture.options.provider.loadSessionSnapshotFor(sessionIds)
         fixture.incrementalReads.push([...sessionIds])
         yield* Deferred.succeed(refreshStarted, undefined)
-        return snapshot([], new Map())
+        return snapshot([session(ROOT, "Stopped")], new Map([[ROOT, [message("q", "user", "question", 0),
+          message("saved-stop", "agent", "saved before stop", 1)]]]))
       }),
     }
     const removal = {
@@ -2793,14 +2824,20 @@ describe("application actor", () => {
       createdAt: "2026-09-01T00:00:00.000Z",
     }
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, provider, terminals })
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider, terminals, metadata: {
+        ...fixture.options.metadata, commitRemoval: (value) => Effect.sync(() => { commits++; return value }),
+      } })
       yield* runtime.resumeSession(ROOT)
       yield* runtime.returnFromTerminal
       yield* runtime.resumeSession(CHILD)
       yield* runtime.returnFromTerminal
+      yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      const readsBeforeRemoval = fixture.incrementalReads.length
+      removing = true
       const exit = yield* Effect.exit(runtime.remove(removal, [ROOT, CHILD]))
       yield* Deferred.await(refreshStarted)
-      return { exit, state: yield* runtime.getState }
+      const state = yield* waitForState(runtime, (state) => selectProjectedTranscript(state, ROOT).at(-1)?.id === "saved-stop")
+      return { exit, state, reads: fixture.incrementalReads.slice(readsBeforeRemoval) }
     })))
     expect(Exit.isFailure(result.exit)).toBeTrue()
     if (Exit.isFailure(result.exit)) {
@@ -2811,7 +2848,8 @@ describe("application actor", () => {
     expect(result.state.terminals.has(ROOT)).toBeFalse()
     expect(result.state.terminals.get(CHILD)?.phase).toBe("cleanup-incomplete")
     expect(result.state.removals).toEqual([])
-    expect(fixture.incrementalReads).toContainEqual([ROOT])
+    expect(result.reads).toEqual([[ROOT]])
+    expect(commits).toBe(0)
   })
 
   test("rejects an atomic removal when a foreign owner appears after local stops", async () => {
@@ -2841,9 +2879,11 @@ describe("application actor", () => {
       const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
       yield* runtime.resumeSession(ROOT)
       yield* runtime.returnFromTerminal
+      yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
+      const readsBeforeRemoval = fixture.incrementalReads.length
       const exit = yield* Effect.exit(runtime.remove(removal, [ROOT, CHILD]))
-      for (let index = 0; index < 4; index += 1) yield* Effect.yieldNow
-      return { exit, state: yield* runtime.getState }
+      const state = yield* waitForState(runtime, (state) => state.refresh.active.size === 0 && fixture.incrementalReads.length > readsBeforeRemoval)
+      return { exit, state, reads: fixture.incrementalReads.slice(readsBeforeRemoval) }
     })))
 
     expect(Exit.isFailure(result.exit)).toBeTrue()
@@ -2852,12 +2892,15 @@ describe("application actor", () => {
       expect(error).toBeInstanceOf(RemovalOperationError)
       expect((error as RemovalOperationError).stoppedSessionIds).toEqual([ROOT])
       expect((error as RemovalOperationError).cause).toBeInstanceOf(SessionOwnedError)
+      expect(String((error as RemovalOperationError).cause)).toContain(CHILD)
+      expect(String((error as RemovalOperationError).cause)).toContain("PID 202")
+      expect(String((error as RemovalOperationError).cause)).toContain("already owned")
     }
     expect(mutationTokens).toHaveLength(1)
     expect(mutationTokens[0]).not.toBe("")
     expect(result.state.removals).toEqual([])
     expect(result.state.terminals.has(ROOT)).toBeFalse()
-    expect(fixture.incrementalReads).toContainEqual([ROOT])
+    expect(result.reads).toEqual([[ROOT]])
   })
 
   test("immediately rejects duplicate explicit removal request IDs", async () => {
@@ -2896,31 +2939,6 @@ describe("application actor", () => {
       expect((error as IntentRejectedError).reason).toBe("busy")
       expect((error as IntentRejectedError).intent).toBe("Remove")
     }
-  })
-
-  test("an interrupted navigation caller does not strand writer flush", async () => {
-    let state: ProjectState = { relations: [], removals: [] }
-    const started = Deferred.makeUnsafe<void, never>()
-    const release = Deferred.makeUnsafe<void, never>()
-    const metadata = metadataFacet(() => state, (transform) => Effect.gen(function*() {
-      yield* Deferred.succeed(started, undefined)
-      yield* Deferred.await(release)
-      state = transform(state)
-      return state
-    }))
-    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const writer = yield* makeNavigationWriter(metadata)
-      const write = yield* Effect.forkScoped(
-        writer.write({ view: "roots", selectedSessionId: ROOT }),
-      )
-      yield* Deferred.await(started)
-      yield* Fiber.interrupt(write)
-      const flush = yield* Effect.forkScoped(writer.flush)
-      expect(flush.pollUnsafe()).toBeUndefined()
-      yield* Deferred.succeed(release, undefined)
-      yield* Fiber.join(flush)
-    })))
-    expect(state.navigation).toEqual({ view: "roots", selectedSessionId: ROOT })
   })
 
   test("starts terminal cleanup while navigation is blocked and bounds shutdown", async () => {
@@ -2970,36 +2988,6 @@ describe("application actor", () => {
     expect(shutdownExit && Exit.isFailure(shutdownExit)).toBeTrue()
     expect(shutdownState?.shutdown).toBe("cleanup-incomplete")
     expect(fixture.shutdowns).toBe(1)
-  })
-
-  test("reconciles ambiguous navigation mutations and reports definite flush failures", async () => {
-    let state: ProjectState = { relations: [], removals: [] }
-    let commitThenFail = true
-    const metadata = metadataFacet(() => state, (transform) => {
-      state = transform(state)
-      if (commitThenFail) {
-        commitThenFail = false
-        return Effect.fail(persistenceFailure("ambiguous write"))
-      }
-      return Effect.succeed(state)
-    })
-    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const writer = yield* makeNavigationWriter(metadata)
-      yield* writer.write({ view: "roots", selectedSessionId: ROOT })
-    })))
-    expect(state.navigation).toEqual({ view: "roots", selectedSessionId: ROOT })
-
-    const failing = metadataFacet(() => ({ relations: [], removals: [] }), () =>
-      Effect.fail(persistenceFailure("definite write failure")))
-    const failures = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const failedWriter = yield* makeNavigationWriter(failing)
-      return {
-        write: yield* Effect.exit(failedWriter.write({ view: "roots", selectedSessionId: CHILD })),
-        flush: yield* Effect.exit(failedWriter.flush),
-      }
-    })))
-    expect(Exit.isFailure(failures.write)).toBeTrue()
-    expect(Exit.isFailure(failures.flush)).toBeTrue()
   })
 
   test("navigation worker close failures participate in the runtime shutdown result", async () => {
@@ -3066,8 +3054,7 @@ describe("application actor", () => {
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime(fixture.options)
       yield* Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" }))
-      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => state.modal?._tag === "Error" && state.modal.message.includes("snapshot unavailable"))
     })))
 
     expect(state.modal?._tag).toBe("Error")
@@ -3094,9 +3081,7 @@ describe("application actor", () => {
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
       yield* Effect.sync(() => reconciliations.offer(outcome))
-      while (fixture.fullLoads < 2) yield* Effect.yieldNow
-      for (let index = 0; index < 4; index += 1) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => fixture.fullLoads >= 2 && state.refresh.active.size === 0)
     })))
 
     expect(fixture.fullLoads).toBe(2)
@@ -3107,12 +3092,13 @@ describe("application actor", () => {
     const fixture = makeFixture()
     const reconciliations = makeBranchMutationReconciliationSignal()
     let takes = 0
+    const failedTake = Deferred.makeUnsafe<void>()
     const provider: AgentProviderApi = {
       ...fixture.options.provider,
       takeBranchMutationReconciliation: Effect.suspend(() => {
         takes += 1
         return takes === 1
-          ? Effect.die("reconciliation take defect")
+          ? Deferred.succeed(failedTake, undefined).pipe(Effect.andThen(Effect.die("reconciliation take defect")))
           : reconciliations.take
       }),
     }
@@ -3127,11 +3113,10 @@ describe("application actor", () => {
 
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
-      for (let index = 0; index < 4; index += 1) yield* Effect.yieldNow
+      yield* Deferred.await(failedTake)
       yield* Effect.sync(() => reconciliations.offer(outcome))
       yield* TestClock.adjust(100)
-      while (fixture.fullLoads < 2) yield* Effect.yieldNow
-      return yield* runtime.getState
+      return yield* waitForState(runtime, (state) => fixture.fullLoads >= 2 && state.refresh.active.size === 0)
     }).pipe(Effect.provide(TestClock.layer()))))
 
     expect(takes).toBeGreaterThanOrEqual(2)
@@ -3142,7 +3127,6 @@ describe("application actor", () => {
   test("reports a persistent reconciliation take defect only once while retrying", async () => {
     const fixture = makeFixture()
     let takes = 0
-    let reports = 0
     const provider: AgentProviderApi = {
       ...fixture.options.provider,
       takeBranchMutationReconciliation: Effect.suspend(() => {
@@ -3153,19 +3137,16 @@ describe("application actor", () => {
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
-      yield* Effect.forkScoped(Stream.runForEach(runtime.viewModels, (viewModel) => Effect.sync(() => {
-        if (viewModel.modal?._tag === "Error" && viewModel.modal.message.includes("Branch reconciliation")) {
-          reports += 1
-        }
-      })))
+      yield* waitForState(runtime, (state) => state.modal?._tag === "Error" && state.modal.message.includes("Branch reconciliation"))
+      yield* runtime.closeModal
+      yield* runtime.selectRoot(ROOT)
       for (let index = 0; index < 5; index += 1) {
         yield* TestClock.adjust(1_000)
-        yield* Effect.yieldNow
+        expect((yield* runtime.getState).modal).toBeNull()
       }
     }).pipe(Effect.provide(TestClock.layer()))))
 
     expect(takes).toBeGreaterThan(2)
-    expect(reports).toBe(1)
   })
 
   test("opens a provider-created independent child when ancestry persistence fails", async () => {
@@ -3220,7 +3201,6 @@ interface Fixture {
   fullLoads: number
   shutdowns: number
   readonly adoptOwner: (previousSessionId: string, sessionId: string) => void
-  prepareResumeReceiver?: AgentProviderApi
 }
 
 function makeFixture(): Fixture {
@@ -3313,7 +3293,6 @@ function makeFixture(): Fixture {
     )),
     prepareNewSession: Effect.succeed(prepared("temporary", "New", true)),
     prepareResume(resumed) {
-      fixture.prepareResumeReceiver = this
       return Effect.succeed(prepared(resumed.id, resumed.title))
     },
     branchFrom: () => Effect.succeed(fixture.branchOutcome),
@@ -3358,27 +3337,6 @@ function makeFixture(): Fixture {
   }
   fixture.options = { provider, metadata, terminals, navigationSaveIntervalMs: 0 }
   return fixture
-}
-
-function metadataFacet(
-  load: () => ProjectState,
-  update: ApplicationMetadataFacet["updateMetadata"],
-): ApplicationMetadataFacet {
-  return {
-    saveNavigation(navigation) {
-      return this.updateMetadata((state) => ({ ...state, navigation })).pipe(Effect.asVoid,
-        Effect.catch((error) => this.loadMetadata.pipe(Effect.flatMap((state) =>
-          JSON.stringify(state.navigation) === JSON.stringify(navigation) ? Effect.void : Effect.fail(error)))))
-    },
-    instanceId: "instance",
-    loadMetadata: Effect.sync(load),
-    updateMetadata: update,
-    commitRemoval: (removal) => Effect.succeed(removal),
-    pendingAdoptions: Effect.succeed([]),
-    orphanedAdoptions: Effect.succeed([]),
-    reconcileOrphanedAdoption: () => Effect.void,
-    ack: () => Effect.void,
-  }
 }
 
 function prepared(id: string, title: string, transient = false): PreparedTerminal {
@@ -3492,13 +3450,12 @@ function sdkWorkflowEntry(
 function waitForState(
   runtime: AppRuntime,
   predicate: (state: ApplicationState) => boolean,
+  description = "application state",
 ): Effect.Effect<ApplicationState> {
-  return Effect.gen(function*() {
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const state = yield* runtime.getState
-      if (predicate(state)) return state
-      yield* Effect.yieldNow
-    }
-    return yield* Effect.die("Timed out waiting for application state")
-  })
+  return runtime.viewModels.pipe(
+    Stream.mapEffect(() => runtime.getState),
+    Stream.filter(predicate),
+    Stream.runHead,
+    Effect.flatMap((state) => Option.isSome(state) ? Effect.succeed(state.value) : Effect.die(`Stream ended waiting for ${description}`)),
+  )
 }

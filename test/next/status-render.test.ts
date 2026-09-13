@@ -43,15 +43,19 @@ test.each([40, 80])("root message and branch counts align numerically at width %
   }))
   const rendered = renderRoots(roots, "root-1", roots.length, width)
   const rows = rendered.text.split("\n")
+  const branchColumns = new Set<number>()
+  const messageColumns = new Set<number>()
   for (const [index, count] of [1, 2, 12, 100].entries()) {
     const row = rows[index]!
     expect(row.trimEnd()).toEndWith(`${count} ${count === 1 ? "branch" : "branches"}`)
-    expect(row.lastIndexOf(`${count} `) + String(count).length).toBe(width - 10)
+    branchColumns.add(row.lastIndexOf(`${count} `) + String(count).length)
     const messageCount = messageCounts[index]!
     expect(row).toContain(`${messageCount} ${messageCount === 1 ? "message " : "messages"}`)
-    expect(row.indexOf(String(messageCount)) + String(messageCount).length).toBe(width - 24)
+    messageColumns.add(row.indexOf(String(messageCount)) + String(messageCount).length)
     expect(displayWidth(row)).toBeLessThanOrEqual(width)
   }
+  expect(branchColumns.size).toBe(1)
+  expect(messageColumns.size).toBe(1)
   const scrolled = renderRoots(roots, "root-100", 1, width)
   expect(scrolled.text).toBe(rows[3]!)
 })

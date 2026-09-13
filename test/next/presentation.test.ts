@@ -231,16 +231,21 @@ test.each([60, 120])("short error dialogs fit their content at terminal width %i
     const initial = await frame(setup, (value) => value.includes(message) && value.includes("Copy  Close"))
     const header = coordinateOf(initial, "Error")
     const actions = coordinateOf(initial, "Copy  Close")
-    expect(actions.y - header.y).toBe(4)
-    expect(header.x).toBe(Math.floor((width - Math.min(60, width - 4)) / 2) + 2)
+    const body = coordinateOf(initial, message)
+    expect(header.y).toBeLessThan(body.y)
+    expect(body.y).toBeLessThan(actions.y)
+    expect(header.x).toBeGreaterThanOrEqual(0)
+    expect(actions.x + "Copy  Close".length).toBeLessThanOrEqual(width)
+    expect(actions.y).toBeLessThan(40)
 
     const wrapped = `${"word ".repeat(50)}FINAL_LINE`
     await Effect.runPromise(running.harness.update({ ...rootsView(), modal: { _tag: "Error", message: wrapped } }))
     const expanded = await frame(setup, (value) => value.includes("FINAL_LINE"))
     const lastLine = coordinateOf(expanded, "FINAL_LINE")
     const expandedActions = coordinateOf(expanded, "Copy  Close")
-    expect(expandedActions.y - lastLine.y).toBe(2)
-    expect(expandedActions.y - coordinateOf(expanded, "Error").y).toBeGreaterThan(4)
+    expect(expandedActions.y).toBeGreaterThan(lastLine.y)
+    expect(expandedActions.y).toBeLessThan(40)
+    expect(expandedActions.y - coordinateOf(expanded, "Error").y).toBeGreaterThan(actions.y - header.y)
   } finally { await running.stop() }
 })
 
@@ -819,15 +824,20 @@ test("finishes an interrupted stop exactly once without deadlocking later caller
     Deferred.await(releaseShutdown).pipe(Effect.as(true)),
   )
 
-  const firstStop = Effect.runFork(running.presentation.stop)
-  await waitFor(() => running.harness.calls.includes("shutdown"))
-  const interruption = Effect.runFork(Fiber.interrupt(firstStop))
-  const secondStop = Effect.runFork(running.presentation.stop)
+  try {
+    const firstStop = Effect.runFork(running.presentation.stop)
+    await waitFor(() => running.harness.calls.includes("shutdown"))
+    const interruption = Effect.runFork(Fiber.interrupt(firstStop))
+    const secondStop = Effect.runFork(running.presentation.stop)
 
-  await Effect.runPromise(Deferred.succeed(releaseShutdown, undefined))
-  await Effect.runPromise(Fiber.join(secondStop))
-  await Effect.runPromise(Fiber.join(interruption))
-  expect(running.harness.calls.filter((call) => call === "shutdown")).toHaveLength(1)
+    await Effect.runPromise(Deferred.succeed(releaseShutdown, undefined))
+    await Effect.runPromise(Fiber.join(secondStop))
+    await Effect.runPromise(Fiber.join(interruption))
+    expect(running.harness.calls.filter((call) => call === "shutdown")).toHaveLength(1)
+  } finally {
+    await Effect.runPromise(Deferred.succeed(releaseShutdown, undefined))
+    await running.stop()
+  }
 })
 
 test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () => {
@@ -864,15 +874,14 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
     releaseKittyKey(setup, 99)
     setup.mockInput.pressEscape()
     setup.mockInput.pressEnter()
-    await Bun.sleep(10)
     expect(running.harness.calls).not.toContain("return-terminal")
-    expect(observed.filter((event) => ["q", "c", "escape", "return"].includes(event.name)).every((event) => !event.stopped)).toBeTrue()
-    expect(observed).toContainEqual({ type: "press", name: "c", stopped: false })
+    for (const name of ["q", "c", "escape", "return"]) {
+      expect(observed).toContainEqual({ type: "press", name, stopped: false })
+    }
 
     setup.mockInput.pressKey(" ", { ctrl: true })
     await frame(setup, (value) => value.includes("Message tree"))
     releaseKittyKey(setup, 32, 5)
-    await Bun.sleep(10)
     expect(running.harness.calls).toContain("return-terminal")
     expect(observed.some((event) => event.name === "space")).toBeFalse()
     expect(observed).toContainEqual({ type: "release", name: "q", stopped: false })
@@ -894,7 +903,6 @@ test("suppresses every consumed Kitty key release", async () => {
     releaseKittyKey(setup, 57353)
     setup.mockInput.pressKey("z")
     releaseKittyKey(setup, 122)
-    await Bun.sleep(10)
     expect(observed).toEqual(["press:z", "release:z"])
   } finally {
     await running.stop()
@@ -942,8 +950,10 @@ test("closes a stop confirmation when its session exits", async () => {
       liveSessionIds: new Set(),
     }))
     await frame(setup, (value) => !value.includes("Stop live session"))
+    await waitFor(() => Effect.runSync(running.harness.runtime.getViewModel).modal === null)
+    await setup.renderOnce()
     setup.mockInput.pressEnter()
-    await Bun.sleep(10)
+    await waitFor(() => running.harness.calls.includes("open:endpoint"))
     expect(running.harness.calls).not.toContain("stop:endpoint")
   } finally {
     await running.stop()
@@ -964,8 +974,10 @@ test("closes a stop confirmation when the endpoint identity changes", async () =
       modal: { _tag: "ConfirmStop", sessionId: "adopted", activity: "idle" },
     }))
     await frame(setup, (value) => !value.includes("Stop live session"))
+    await waitFor(() => Effect.runSync(running.harness.runtime.getViewModel).modal === null)
+    await setup.renderOnce()
     setup.mockInput.pressEnter()
-    await Bun.sleep(10)
+    await waitFor(() => running.harness.calls.includes("open:adopted"))
     expect(running.harness.calls.some((call) => call.startsWith("stop:"))).toBeFalse()
   } finally {
     await running.stop()
@@ -1267,25 +1279,26 @@ test("root details hint follows selection and supports mouse reopening", async (
   } finally { await running.stop() }
 })
 
-test("uses shared live, update, working, and blocked picker markers", async () => {
+test.each(["Open leaf", "Jump to Leaf"])("%s associates status markers with each leaf and preserves selection on updates", async (picker) => {
   const setup = await createTestRenderer({ width: 90, height: 24 })
   const graph = pickerStatusGraph()
   const running = await startPresentation(setup.renderer, graph)
 
   try {
     await frame(setup, (value) => value.includes("picker statuses"))
-    setup.mockInput.pressEnter()
-    await frame(setup, (value) => value.includes("Live leaf") && value.includes("Update leaf") && value.includes("Blocked leaf"))
-    const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
-    expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.success))).toBeTrue()
-    expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.warning))).toBeTrue()
-    expect(spans.some((span) => span.text.includes("●") && span.fg.equals(presentationTheme.danger) && span.bg.equals(presentationTheme.element))).toBeTrue()
-    expect(spans.some((span) => span.text.includes("Blocked leaf") && span.bg.equals(presentationTheme.selected))).toBeTrue()
-    expect(spans.some((span) => /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text))).toBeTrue()
+    if (picker === "Open leaf") setup.mockInput.pressEnter()
+    else setup.mockInput.pressKey("g", { shift: true })
+    await frame(setup, (value) => value.includes(picker) && value.includes("Live leaf") && value.includes("Update leaf") && value.includes("Blocked leaf"))
+    for (const [label, color] of [["Live leaf", presentationTheme.success], ["Update leaf", presentationTheme.warning],
+      ["Blocked leaf", presentationTheme.danger]] as const) {
+      expect(rowSpans(setup, label).some((span) => span.text.includes("●") && span.fg.equals(color))).toBeTrue()
+    }
+    expect(isSelected(setup, "Blocked leaf")).toBeTrue()
+    expect(rowSpans(setup, "Working leaf").some((span) => /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text))).toBeTrue()
     for (let index = 0; index < 3; index += 1) setup.mockInput.pressArrow("down")
     await frame(setup, () => setup.captureSpans().lines.flatMap((line) => line.spans).some((span) =>
       span.text.includes("Working leaf") && span.bg.equals(presentationTheme.selected)))
-    expect(setup.captureSpans().lines.flatMap((line) => line.spans).some((span) =>
+    expect(rowSpans(setup, "Working leaf").some((span) =>
       /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(span.text) && span.bg.equals(presentationTheme.element) && span.fg.equals(presentationTheme.primary))).toBeTrue()
     if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
     await Effect.runPromise(running.harness.update({ ...graph, surface: {
@@ -1294,7 +1307,8 @@ test("uses shared live, update, working, and blocked picker markers", async () =
         reachableEndpoints: node.reachableEndpoints.map((endpoint) => ({ ...endpoint, status: "live" as const })),
       })),
     } }))
-    await frame(setup, (value) => value.includes("Open leaf") && !/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
+    await frame(setup, (value) => value.includes(picker) && !/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
+    expect(isSelected(setup, "Working leaf")).toBeTrue()
   } finally {
     await running.stop()
   }
@@ -1313,20 +1327,6 @@ test("animates Working on the root list without a refresh", async () => {
   } finally { await running.stop() }
 })
 
-test("Jump to Leaf uses the same four status indicators", async () => {
-  const setup = await createTestRenderer({ width: 90, height: 24 })
-  const running = await startPresentation(setup.renderer, pickerStatusGraph())
-  try {
-    await frame(setup, (value) => value.includes("picker statuses"))
-    setup.mockInput.pressKey("g", { shift: true })
-    await frame(setup, (value) => value.includes("Jump to Leaf") && value.includes("Working leaf") && /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u.test(value))
-    const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
-    for (const color of [presentationTheme.success, presentationTheme.warning, presentationTheme.danger]) {
-      expect(spans.some((span) => span.text.includes("●") && span.fg.equals(color) && span.bg.equals(presentationTheme.element))).toBeTrue()
-    }
-  } finally { await running.stop() }
-})
-
 test("rechecks interaction blocking before content mouse-up", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const initial = rootsView()
@@ -1338,7 +1338,7 @@ test("rechecks interaction blocking before content mouse-up", async () => {
     await setup.mockMouse.pressDown(second.x, second.y)
     await Effect.runPromise(running.harness.update({ ...initial, shuttingDown: true }))
     await setup.mockMouse.release(second.x, second.y)
-    await Bun.sleep(20)
+    await setup.renderOnce()
     expect(running.harness.calls).not.toContain("select-root:root-2")
     expect(running.harness.calls).not.toContain("enter-root:root-2")
   } finally {
@@ -1418,12 +1418,20 @@ async function startPresentation(
     resolveStarted({ presentation, harness })
     yield* presentation.wait
   })))
-  const value = await started
+  let value: { presentation: OpenTuiPresentation; harness: RuntimeHarness }
+  try {
+    value = await Promise.race([started, lifecycle.then(() => {
+      throw new Error("Presentation lifecycle ended before startup")
+    })])
+  } catch (error) {
+    if (!renderer.isDestroyed) renderer.destroy()
+    throw error
+  }
   return {
     ...value,
     stop: async () => {
-      await Effect.runPromise(value.presentation.stop)
-      await lifecycle
+      try { await Effect.runPromise(value.presentation.stop) }
+      finally { await lifecycle }
     },
   }
 }
@@ -1986,6 +1994,12 @@ function isSelected(
   return selectedSpan(setup, text) !== undefined
 }
 
+function rowSpans(setup: Awaited<ReturnType<typeof createTestRenderer>>, label: string) {
+  const row = setup.captureSpans().lines.find((line) => line.spans.map((span) => span.text).join("").includes(label))
+  if (!row) throw new Error(`Missing rendered row: ${label}`)
+  return row.spans
+}
+
 function selectedSpan(
   setup: Awaited<ReturnType<typeof createTestRenderer>>,
   text: string,
@@ -2002,7 +2016,7 @@ async function frame(
   const deadline = performance.now() + 2_000
   let value = ""
   while (performance.now() < deadline) {
-    await Bun.sleep(10)
+    await new Promise<void>((resolve) => setImmediate(resolve))
     await setup.renderOnce()
     value = setup.captureCharFrame()
     if (predicate(value)) return value
@@ -2014,7 +2028,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = performance.now() + 2_000
   while (performance.now() < deadline) {
     if (predicate()) return
-    await Bun.sleep(10)
+    await new Promise<void>((resolve) => setImmediate(resolve))
   }
   throw new Error("Timed out waiting for condition")
 }

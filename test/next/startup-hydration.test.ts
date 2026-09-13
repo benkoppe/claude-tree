@@ -109,19 +109,31 @@ test("missing, empty, and intentionally removed sessions are distinct from loadi
   expect(projectRootsViewModel(removed)).toEqual([])
 })
 
-test("a newer targeted read wins over staged and final initial history", () => {
-  let state = progress(initial(), new Map([[child.id, { _tag: "Unavailable", reason: "old failure" }]]))
+test.each(["staged", "published"])("a newer targeted read wins over %s and final initial history", (phase) => {
+  let state = initial()
+  state = reduceApplicationState(state, { _tag: "Navigated", surface: { _tag: "Roots", selectedSessionId: other.id } })
+  state = progress(state, phase === "staged"
+    ? new Map([[child.id, { _tag: "Unavailable", reason: "old failure" }]])
+    : new Map([[parent.id, parentRead], [child.id, childRead]]))
+  expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: other.id })
+  expect(state.refresh.initialPending).toBeTrue()
+  const newerChildRead = available([message("cq", "user", "question", 0), message("ca", "agent", "child answer", 1),
+    message("new-user", "user", "new question", 2)])
   state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: {
     key: "targeted", generation: 2, mode: "incremental", reason: "terminal-return", sessionIds: new Set([parent.id, child.id]),
   } })
   state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: "targeted", generation: 2,
-    snapshot: { sessions: [], transcripts: new Map([[parent.id, parentRead], [child.id, childRead]]) } })
+    snapshot: { sessions: [], transcripts: new Map([[parent.id, parentRead], [child.id, newerChildRead]]) } })
   state = progress(state, new Map([[parent.id, { _tag: "Unavailable", reason: "old parent failure" }]]))
   state = finish(state, new Map([[parent.id, { _tag: "Unavailable", reason: "old parent failure" }],
     [child.id, { _tag: "Unavailable", reason: "old failure" }], [other.id, otherRead]]))
   expect(selectHistoryStatus(state, parent.id)._tag).toBe("Ready")
   expect(selectHistoryStatus(state, child.id)._tag).toBe("Ready")
-  expect(state.provider.transcripts.get(child.id)).toBe(childRead)
+  expect(state.provider.transcripts.get(child.id)).toBe(newerChildRead)
+  expect(state.provider.transcripts.get(other.id)).toEqual(otherRead)
+  expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: other.id })
+  expect(state.refresh.initialPending).toBeFalse()
+  expect(state.refresh.active.size).toBe(0)
 })
 
 test("an incomplete final provider snapshot settles unread catalogue entries as errors", () => {
