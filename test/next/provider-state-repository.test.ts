@@ -62,7 +62,7 @@ describe("ProviderStateRepository terminal ownership", () => {
       platformWithPid(101, "owner"),
     )
     const reserved = await run(ownerRepository.reserve("session-one"))
-    await run(ownerRepository.attach(reserved, 303))
+    await run(ownerRepository.attach(reserved, 303, { resources: { kind: "local" } }))
 
     const liveGroup = await openProviderState(
       project,
@@ -87,7 +87,7 @@ describe("ProviderStateRepository terminal ownership", () => {
     test(`retains an owner when ${unknown} liveness is unknown`, async () => {
       const { project, state } = await fixture()
       const owner = await openProviderState(project, state, platformWithPid(101, "owner"))
-      const running = await run(owner.attach(await run(owner.reserve("session-one")), 303))
+      const running = await run(owner.attach(await run(owner.reserve("session-one")), 303, { resources: { kind: "local" } }))
       const checks: string[] = []
       const contender = await openProviderState(
         project,
@@ -384,7 +384,7 @@ describe("ProviderStateRepository terminal ownership", () => {
     expect(await readFile(repository.statePath, "utf8")).toBe(before)
   })
 
-  test("never automatically reclaims cleanup-incomplete ownership", async () => {
+  test("never reclaims incompletely recorded acquisition, even with an absent registered group", async () => {
     const { project, state } = await fixture()
     const original = await openProviderState(
       project,
@@ -582,7 +582,7 @@ describe("ProviderStateRepository terminal ownership", () => {
       platformWithPid(101, "origin"),
     )
     const reserved = await run(origin.reserve("temporary"))
-    const running = await run(origin.attach(reserved, 606))
+    const running = await run(origin.attach(reserved, 606, { resources: { kind: "local" } }))
     const committed = await run(origin.commitIdentity({
       owner: running,
       sessionId: "provider-id",

@@ -44,6 +44,8 @@ import type {
   TerminalSurfaceCallbacks,
 } from "../../src/infrastructure/terminal"
 import { BunPtyProcessFactory } from "../../src/infrastructure/terminal"
+import { nativePersistencePlatform, PersistencePlatform } from "../../src/infrastructure/metadata/platform"
+import { makeProviderStateRepository } from "../../src/services/provider-state-repository"
 import type {
   CodexAppServerClient,
   CodexThread,
@@ -1867,6 +1869,57 @@ test("a UI release exception is retryable and does not permanently poison owners
   }))
 })
 
+test("reports a selection error without reserving an otherwise fully released terminal", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(prepared("selection-error", fixture))
+    fixture.renderer.clearSelection = () => { throw new Error("selection clear failed") }
+    const exit = yield* Effect.exit(supervisor.stopSession("selection-error"))
+    expect(Exit.isFailure(exit)).toBeTrue()
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toMatchObject({ ownershipReleased: true })
+    expect(fixture.renderer.surfaces[0]?.released).toBeTrue()
+    expect(fixture.leases.current("selection-error")).toBeUndefined()
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
+  }))
+})
+
+test("supervisor cleanup followed by failed persisted release is recoverable after restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-tree-shutdown-recovery-"))
+  temporaryDirectories.push(root)
+  const originalPlatform = { ...nativePersistencePlatform, pid: 101 }
+  const options = { projectDirectory: root, providerId: "test-provider", stateHome: join(root, "state") }
+  const original = await Effect.runPromise(makeProviderStateRepository(options).pipe(
+    Effect.provideService(PersistencePlatform, originalPlatform),
+  ))
+  const fixture = makeFixture()
+  const dependencies = {
+    ...fixture.dependencies,
+    ownership: {
+      ...original,
+      release: () => Effect.fail(new PersistenceError({
+        operation: "release", path: original.statePath, message: "injected release failure",
+      })),
+    },
+  }
+  await withSupervisor(dependencies, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(prepared("persisted-release", fixture))
+    expect((yield* original.load).terminalOwners[0]?.resources).toEqual({ kind: "local" })
+    expect(Exit.isFailure(yield* Effect.exit(supervisor.shutdown()))).toBeTrue()
+    expect(fixture.processes.processes[0]?.isGroupAlive()).toBeFalse()
+    expect(fixture.renderer.surfaces[0]?.released).toBeTrue()
+    expect((yield* original.load).terminalOwners[0]?.status).toBe("cleanup-incomplete")
+  }))
+  const next = await Effect.runPromise(makeProviderStateRepository({ ...options, instanceId: "restart" }).pipe(
+    Effect.provideService(PersistencePlatform, {
+      ...nativePersistencePlatform,
+      processLiveness: async (pid) => pid === 101 ? "absent" : "alive",
+      processGroupLiveness: async () => "absent",
+    }),
+  ))
+  const replacement = await Effect.runPromise(next.reserve("persisted-release"))
+  expect(replacement.instanceId).toBe("restart")
+})
+
 test("a detach failure retains ownership until a later stop detaches the child", async () => {
   const fixture = makeFixture()
   await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
@@ -2040,6 +2093,7 @@ function acquiredLaunch(
   }
   return {
     launch,
+    resources: { kind: "local" as const },
     close: Effect.suspend(() => {
       fixture.providerCloseAttempts += 1
       fixture.log.push(`provider-close:${sessionId}`)
@@ -2088,6 +2142,7 @@ function eventName(event: TerminalActivityEvent | TerminalSessionChangedEvent | 
 }
 
 class FakeOwnershipRepository implements TerminalOwnershipRepository {
+  readonly launchDirectory = (owner: PersistedTerminalOwner) => `/unused-launches/${owner.ownerToken}`
   reserveFailures = 0
   attachFailures = 0
   markFailures = 0
@@ -2279,6 +2334,7 @@ class FakeOwnershipRepository implements TerminalOwnershipRepository {
       lastMutationToken: mutationToken,
       ownerPid: process.pid,
       status,
+      resources: { kind: "acquiring" },
       ...(processGroupId === undefined ? {} : { processGroupId }),
       reservedAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:01.000Z",

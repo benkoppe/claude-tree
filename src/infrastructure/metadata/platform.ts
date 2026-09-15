@@ -38,7 +38,7 @@ export interface PersistencePlatformApi {
   readonly open: (path: string, flags: string, mode?: number) => Promise<PersistenceFileHandle>
   readonly link: (existingPath: string, newPath: string) => Promise<void>
   readonly rename: (oldPath: string, newPath: string) => Promise<void>
-  readonly remove: (path: string, options?: { readonly force?: boolean }) => Promise<void>
+  readonly remove: (path: string, options?: { readonly force?: boolean; readonly recursive?: boolean }) => Promise<void>
   readonly processLiveness: (pid: number) => Promise<ProcessLiveness>
   readonly processGroupLiveness: (processGroupId: number) => Promise<ProcessLiveness>
 }
@@ -90,7 +90,7 @@ export const nativePersistencePlatform: PersistencePlatformApi = {
   link,
   rename,
   remove: async (path, options) => {
-    await rm(path, { force: options?.force ?? false })
+    await rm(path, { force: options?.force ?? false, recursive: options?.recursive ?? false })
   },
   processLiveness: async (pid) => livenessFromSignal(pid),
   processGroupLiveness: async (processGroupId) => livenessFromSignal(-processGroupId),
