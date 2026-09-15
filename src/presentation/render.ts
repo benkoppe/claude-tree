@@ -43,6 +43,7 @@ interface PreparedRootRow {
   readonly text: string
   readonly normal: readonly TextChunk[]
   readonly selected: readonly TextChunk[]
+  readonly loadingMarker: { readonly chunkIndex: number; readonly textOffset: number } | undefined
 }
 const rootRows = new WeakMap<RootViewModel, PreparedRootRow>()
 
@@ -50,8 +51,9 @@ function prepareRootRow(root: RootViewModel, width: number, messageWidth: number
   const key = `${width}:${messageWidth}:${branchWidth}`
   const cached = rootRows.get(root)
   if (cached?.key === key) return cached
-  const counts = root.history._tag === "Loading" ? "Loading history…"
-    : root.history._tag === "Unavailable" ? "History unavailable · Enter to retry"
+  const counts = root.activation === "loading" ? `${BRAILLE_SPINNER_FRAMES[0]} Loading`
+    : root.activation === "retry" ? "History unavailable · Enter to retry"
+    : root.history._tag === "Unavailable" ? "History unavailable"
     : `${root.history._tag === "Limited" ? "History gap  " : ""}${String(root.messageCount).padStart(messageWidth)} ${(root.messageCount === 1 ? "message" : "messages").padEnd(8)}  ${String(root.memberSessionIds.length).padStart(branchWidth)} ${(root.memberSessionIds.length === 1 ? "branch" : "branches").padEnd(8)}`
   const titleX = 4
   const metadataX = Math.max(titleX, width - displayWidth(counts) - 1)
@@ -59,18 +61,26 @@ function prepareRootRow(root: RootViewModel, width: number, messageWidth: number
   const metadata = metadataX > titleX ? truncateToWidth(counts, width - metadataX - 1) : ""
   const gap = " ".repeat(Math.max(0, metadataX - titleX - displayWidth(title)))
   const ending = " ".repeat(Math.max(0, width - metadataX - displayWidth(metadata)))
+  let loadingMarker: PreparedRootRow["loadingMarker"]
   const makeChunks = (selected: boolean) => {
     const bg = selected ? theme.selected : theme.background
     const fg = selected ? theme.selectedText : theme.text
-    return [
+    const chunks = [
       chunk(" ", fg, TextAttributes.NONE, bg),
       chunk(title, fg, selected ? TextAttributes.BOLD : TextAttributes.NONE, bg),
       chunk(gap, fg, TextAttributes.NONE, bg),
-      chunk(metadata, root.history._tag === "Unavailable" ? theme.danger : selected ? theme.selectedText : theme.textMuted, TextAttributes.NONE, bg),
-      chunk(ending, fg, TextAttributes.NONE, bg),
     ]
+    if (root.activation === "loading" && metadata) {
+      loadingMarker = { chunkIndex: chunks.length, textOffset: 1 + title.length + gap.length }
+      chunks.push(chunk(metadata[0]!, selected ? theme.selectedText : theme.textMuted, TextAttributes.NONE, bg))
+    }
+    chunks.push(
+      chunk(loadingMarker ? metadata.slice(1) : metadata, root.activation !== "loading" && root.history._tag === "Unavailable" ? theme.danger : selected ? theme.selectedText : theme.textMuted, TextAttributes.NONE, bg),
+      chunk(ending, fg, TextAttributes.NONE, bg),
+    )
+    return chunks
   }
-  const row = { key, text: ` ${title}${gap}${metadata}${ending}`, normal: makeChunks(false), selected: makeChunks(true) }
+  const row = { key, text: ` ${title}${gap}${metadata}${ending}`, normal: makeChunks(false), selected: makeChunks(true), loadingMarker }
   rootRows.set(root, row)
   return row
 }
@@ -201,8 +211,13 @@ export function renderRoots(
     let body = ""
     if (safeWidth > 3) {
       const row = prepareRootRow(root, safeWidth, index.messageCountWidth, index.branchCountWidth)
-      for (const item of selected ? row.selected : row.normal) chunks.push({ ...item })
-      body = row.text
+      const marker = BRAILLE_SPINNER_FRAMES[spinnerFrame % BRAILLE_SPINNER_FRAMES.length]!
+      for (const [index, item] of (selected ? row.selected : row.normal).entries()) {
+        chunks.push({ ...item, ...(index === row.loadingMarker?.chunkIndex ? { text: marker } : {}) })
+      }
+      body = row.loadingMarker
+        ? row.text.slice(0, row.loadingMarker.textOffset) + marker + row.text.slice(row.loadingMarker.textOffset + 1)
+        : row.text
     }
     lines.push((` ${status} `.slice(0, Math.min(3, safeWidth)) + body).trimEnd())
     if (lines.length < safeHeight) chunks.push(chunk("\n", theme.text))

@@ -24,6 +24,7 @@ import type {
   RootViewModel,
 } from "../application"
 import { indexRootViews } from "../application/view-model"
+import { IntentRejectedError } from "../application/protocol"
 import {
   directionalMove,
   topVisibleGraphNodeId,
@@ -58,7 +59,7 @@ const SEPARATOR_HEIGHT = 1
 const CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
-const HISTORY_LOADING_MESSAGE = "This tree's history is still loading. Open it to prioritize loading."
+const HISTORY_LOADING_MESSAGE = "This tree is still loading. You can open it when loading finishes."
 
 export interface OpenTuiProviderIdentity {
   readonly id: string
@@ -85,7 +86,13 @@ export interface OpenTuiPresentation {
 interface QueuedAction {
   readonly effect: Effect.Effect<unknown, unknown, never>
   readonly reportFailure: boolean
-  readonly background: boolean
+  readonly execution: ActionExecution
+}
+
+type ActionExecution = "foreground" | "background" | "navigation"
+
+interface SelectionBatch {
+  latest: Effect.Effect<unknown, unknown> | undefined
 }
 
 type FooterAction =
@@ -194,8 +201,8 @@ export function makeOpenTuiPresentation(
       appRuntime,
       provider,
       options,
-      (action, reportFailure = true, background = false) => Queue.offerUnsafe(
-        background ? backgroundActions : actions, { effect: action, reportFailure, background },
+      (action, reportFailure = true, execution = "foreground") => Queue.offerUnsafe(
+        execution === "background" ? backgroundActions : actions, { effect: action, reportFailure, execution },
       ),
       stopped,
     )
@@ -222,8 +229,9 @@ export function makeOpenTuiPresentation(
             })
             // Isolate action interruption from the consumer so cancellation cannot
             // permanently strand all later keyboard and mouse actions.
-            return Effect.forkScoped(handled).pipe(
-              Effect.flatMap((fiber) => action.background ? Effect.void : Fiber.await(fiber).pipe(Effect.asVoid)),
+            // Navigation starts in input order but a history retry must not hold this queue.
+            return Effect.forkScoped(handled, { startImmediately: action.execution === "navigation" }).pipe(
+              Effect.flatMap((fiber) => action.execution === "foreground" ? Fiber.await(fiber).pipe(Effect.asVoid) : Effect.void),
             )
           }),
         ),
@@ -280,8 +288,7 @@ class OpenTuiPresentationController {
   private selectedRootSessionId: string | null = null
   private pendingRootSelection: { sessionId: string; selectionId: string; completed: boolean } | undefined
   private nextSelectionId = 1
-  private latestSelection: Effect.Effect<unknown, unknown> | undefined
-  private selectionQueued = false
+  private selectionBatch: SelectionBatch | undefined
   private rootViewportStart = 0
   private graphViewportOffset: ViewportOffset | null = null
   private graphNavigationIntent: GraphNavigationIntent | null = null
@@ -320,7 +327,7 @@ class OpenTuiPresentationController {
     private readonly appRuntime: AppRuntime,
     private readonly provider: OpenTuiProviderIdentity,
     private readonly options: OpenTuiPresentationOptions,
-    private readonly enqueue: (action: Effect.Effect<unknown, unknown>, reportFailure?: boolean, background?: boolean) => void,
+    private readonly enqueue: (action: Effect.Effect<unknown, unknown>, reportFailure?: boolean, execution?: ActionExecution) => void,
     private readonly stopped: Deferred.Deferred<void, ApplicationShutdownError>,
   ) {
     this.navigator = new BoxRenderable(renderer, {
@@ -661,7 +668,7 @@ class OpenTuiPresentationController {
     ) return
     key.stopPropagation()
     if (quit) {
-      this.enqueue(this.stop, true, true)
+      this.enqueue(this.stop, true, "background")
     } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
       this.refresh()
     } else if (this.interactionBlocked()) {
@@ -691,7 +698,7 @@ class OpenTuiPresentationController {
     if (!recognized) return
     key.stopPropagation()
     if (isExitKey(key)) {
-      this.enqueue(this.stop, true, true)
+      this.enqueue(this.stop, true, "background")
     } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
       this.refresh()
     } else if (this.interactionBlocked()) {
@@ -723,7 +730,7 @@ class OpenTuiPresentationController {
 
   private handleLeafPickerKey(key: KeyEvent): void {
     if (isExitKey(key)) {
-      this.enqueue(this.stop, true, true)
+      this.enqueue(this.stop, true, "background")
       return
     }
     if (isUnmodifiedKey(key, "escape") || isUnmodifiedKey(key, "q")) {
@@ -743,7 +750,7 @@ class OpenTuiPresentationController {
     const modal = this.viewModel?.modal
     if (!modal) return
     if (isExitKey(key)) {
-      this.enqueue(this.stop, true, true)
+      this.enqueue(this.stop, true, "background")
       return
     }
     if (modal._tag === "About" || modal._tag === "Error") {
@@ -813,20 +820,24 @@ class OpenTuiPresentationController {
   }
 
   private enqueueSelection(effect: Effect.Effect<unknown, unknown>): void {
-    this.latestSelection = effect
-    if (this.selectionQueued) return
-    this.selectionQueued = true
-    const self = this
+    if (this.selectionBatch) {
+      this.selectionBatch.latest = effect
+      return
+    }
+    const batch: SelectionBatch = { latest: effect }
+    this.selectionBatch = batch
     this.enqueue(Effect.gen(function*() {
       let failure: Cause.Cause<unknown> | undefined
-      while (self.latestSelection) {
-        const next = self.latestSelection
-        self.latestSelection = undefined
+      while (batch.latest) {
+        const next = batch.latest
+        batch.latest = undefined
         const exit = yield* Effect.exit(next)
         if (Exit.isFailure(exit)) failure = exit.cause
       }
       if (failure) return yield* Effect.failCause(failure)
-    }).pipe(Effect.ensuring(Effect.sync(() => { self.selectionQueued = false }))))
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      if (this.selectionBatch === batch) this.selectionBatch = undefined
+    }))))
   }
 
   private queueRootSelection(sessionId: string): void {
@@ -854,7 +865,12 @@ class OpenTuiPresentationController {
 
   private enterSelectedRoot(): void {
     const root = this.selectedRoot()
-    if (root) this.runAction(this.appRuntime.enterRoot(root.sessionId))
+    if (!root || root.activation === "loading") return
+    // Later cursor input belongs after this activation, not in its preceding selection batch.
+    this.selectionBatch = undefined
+    this.enqueue(this.appRuntime.enterRoot(root.sessionId).pipe(Effect.catch((error) =>
+      error instanceof IntentRejectedError && (error.reason === "busy" || error.reason === "superseded")
+        ? Effect.void : Effect.fail(error))), true, "navigation")
   }
 
   private showRoots(): void {
@@ -1186,7 +1202,7 @@ class OpenTuiPresentationController {
     if (this.stopping) return
     const action = this.appRuntime.refresh()
     this.renderSafely("Render refresh request")
-    this.enqueue(action, true, true)
+    this.enqueue(action, true, "background")
   }
 
   private reconcileModal(modal: ApplicationModal | null): void {
@@ -1294,7 +1310,11 @@ class OpenTuiPresentationController {
         this.rootViewportStart = rendered.startIndex
         this.content.content = rendered.content
       }
-      const footer = renderControls(this.controlsWithDetails(ROOT_CONTROLS), this.refreshFrame())
+      const activation = this.selectedRoot()?.activation
+      const controls = ROOT_CONTROLS.flatMap((control) => control.action !== "enter-root" ? [control]
+        : !activation || activation === "loading" ? []
+        : [{ ...control, description: activation === "retry" ? "retry" : "open" }])
+      const footer = renderControls(this.controlsWithDetails(controls), this.refreshFrame())
       this.footer.content = styledText([
         ...footer.chunks,
         chunk("\n", theme.text),
@@ -1514,10 +1534,11 @@ class OpenTuiPresentationController {
     const graphWorking = this.graphSurface()?.nodes.some((node) =>
       node._tag === "Endpoint" && node.status === "working"
     ) ?? false
-    const rootsWorking = this.viewModel?.surface._tag === "Roots" &&
-      indexRootViews(this.viewModel.surface.roots).working
+    const roots = this.rootsSurface()
+    const rootsIndex = roots ? indexRootViews(roots.roots) : undefined
+    const rootsAnimating = rootsIndex?.working || rootsIndex?.loading
     const pickerWorking = this.leafPicker?.options.some((option) => option.status === "working")
-    const animate = !this.tooSmall() && Boolean(this.viewModel?.refreshing || graphWorking || rootsWorking || pickerWorking)
+    const animate = !this.tooSmall() && Boolean(this.viewModel?.initialLoadPending || this.viewModel?.refreshing || graphWorking || rootsAnimating || pickerWorking)
     if (!animate) {
       this.stopSpinner()
       return
@@ -1711,7 +1732,7 @@ class OpenTuiPresentationController {
     else if (action === "new") this.runTerminalAction(this.appRuntime.newSession)
     else if (action === "refresh") this.refresh()
     else if (action === "details") this.showIssueDetails()
-    else if (action === "quit") this.enqueue(this.stop, true, true)
+    else if (action === "quit") this.enqueue(this.stop, true, "background")
     else if (action === "open") this.openSelected()
     else if (action === "fork") this.forkSelected()
     else if (action === "copy") this.copySelected()

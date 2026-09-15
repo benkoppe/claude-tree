@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import type { EndpointNodeViewModel, RootViewModel } from "../../src/application/view-model"
-import { renderGraph, renderRoots, statusMarker, statusLabel, statusColor } from "../../src/presentation/render"
+import { BRAILLE_SPINNER_FRAMES, renderGraph, renderRoots, statusMarker, statusLabel, statusColor } from "../../src/presentation/render"
 import { presentationTheme as theme } from "../../src/presentation/theme"
 import type { RGBA } from "@opentui/core"
 import { displayWidth } from "../../src/presentation/text"
@@ -33,6 +33,7 @@ test.each([40, 80])("root message and branch counts align numerically at width %
   const messageCounts = [0, 1, 123, 12]
   const roots = [1, 2, 12, 100].map((count, index) => ({
     history: { _tag: "Ready" as const },
+    activation: "open" as const,
     sessionId: `root-${count}`,
     title: "A long conversation title",
     memberSessionIds: Array.from({ length: count }, (_, index) => `session-${count}-${index}`),
@@ -60,9 +61,28 @@ test.each([40, 80])("root message and branch counts align numerically at width %
   expect(scrolled.text).toBe(rows[3]!)
 })
 
+test.each([16, 40, 80])("loading braille advances without reformatting cached root titles at width %i", (width) => {
+  let titleReads = 0
+  const root: RootViewModel = {
+    sessionId: "loading", get title() { titleReads++; return "Loading 界 conversation" },
+    history: { _tag: "Loading" }, activation: "loading", memberSessionIds: ["loading"],
+    messageCount: 0, lastModified: 0, status: "blocked",
+  }
+  for (const [index, marker] of BRAILLE_SPINNER_FRAMES.entries()) {
+    const rendered = renderRoots([root], index % 2 ? null : root.sessionId, 1, width, 0, index)
+    expect(rendered.text).toContain(`${marker} Loading`)
+    expect(rendered.text).not.toContain("Loading history")
+    expect(rendered.text).toContain(statusMarker("blocked", index))
+    expect(rendered.content.chunks.map((chunk) => chunk.text).join("").trimEnd()).toBe(rendered.text)
+    expect(displayWidth(rendered.text)).toBeLessThanOrEqual(width)
+  }
+  expect(titleReads).toBe(1)
+})
+
 test.each([60, 80, 120])("history gaps precede aligned root counts at width %i", (width) => {
   const roots: RootViewModel[] = ["Ready", "Limited"].map((status, index) => ({
     sessionId: `root-${index}`, title: `Session ${index}`, lastModified: 0, status: "idle",
+    activation: "open",
     memberSessionIds: [`root-${index}`], messageCount: 12,
     history: status === "Ready" ? { _tag: "Ready" } : { _tag: "Limited", contextMessageCount: 99 },
   }))
@@ -86,7 +106,7 @@ test("highlighted status colors have readable contrast but root markers stay unh
     const foreground = luminance(statusColor(status, true))
     const background = luminance(theme.selected)
     expect((Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05)).toBeGreaterThanOrEqual(4.5)
-    const rendered = renderRoots([{ history: { _tag: "Ready" }, sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, status }], "root", 1, 40)
+    const rendered = renderRoots([{ activation: "open", history: { _tag: "Ready" }, sessionId: "root", title: "Root", memberSessionIds: ["root"], messageCount: 0, lastModified: 0, status }], "root", 1, 40)
     const marker = rendered.content.chunks.find((chunk) => chunk.text.includes(statusMarker(status, 0)))
     expect(marker?.fg?.equals(statusColor(status, false))).toBeTrue()
     expect(marker?.bg?.equals(theme.background)).toBeTrue()

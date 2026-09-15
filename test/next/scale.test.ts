@@ -115,7 +115,7 @@ test("root rows reuse formatted content during movement and invalidate it on res
   const roots: RootViewModel[] = Array.from({ length: 100 }, (_, index) => ({
     sessionId: `root-${index}`, get title() { titleReads++; return `Root ${index} — 界 é `.repeat(10) },
     lastModified: index, memberSessionIds: [`root-${index}`], messageCount: index,
-    history: { _tag: "Ready" }, status: "idle",
+    history: { _tag: "Ready" }, activation: "open", status: "idle",
   }))
   renderRoots(roots, "root-0", 24, 120)
   expect(titleReads).toBe(24)

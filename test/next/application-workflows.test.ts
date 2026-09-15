@@ -303,14 +303,14 @@ describe("application actor", () => {
     })))
   })
 
-  test("the catalogue is usable during hydration and entering a root reads only its family", async () => {
+  test("loading roots reject Enter without another read while ready roots remain usable", async () => {
     const fixture = makeFixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const listed = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const provider = { ...fixture.options.provider,
         loadSessionSnapshotProgressively: (publish: (value: AgentSessionSnapshot) => Effect.Effect<void>) => Effect.gen(function*() {
-          yield* publish({ sessions: fixture.snapshot.sessions, transcripts: new Map() })
+          yield* publish({ sessions: fixture.snapshot.sessions, transcripts: new Map([[CHILD, fixture.snapshot.transcripts.get(CHILD)!]]) })
           yield* Deferred.succeed(listed, undefined)
           yield* Deferred.await(release)
           return fixture.snapshot
@@ -325,30 +325,44 @@ describe("application actor", () => {
       expect(catalogue.surface._tag).toBe("Roots")
       if (catalogue.surface._tag !== "Roots") throw new Error("Expected roots")
       expect(catalogue.surface.roots).toHaveLength(2)
-      expect(catalogue.surface.roots.every((root) => root.history._tag === "Loading")).toBeTrue()
+      expect(catalogue.surface.roots.find((root) => root.sessionId === ROOT)?.activation).toBe("loading")
+      expect(catalogue.surface.roots.find((root) => root.sessionId === CHILD)?.activation).toBe("open")
       yield* runtime.selectRoot(ROOT)
-      yield* runtime.enterRoot(ROOT)
-      expect(fixture.incrementalReads).toEqual([[ROOT]])
+      for (let i = 0; i < 2; i++) {
+        const rejected = yield* Effect.flip(runtime.enterRoot(ROOT))
+        expect(rejected).toBeInstanceOf(IntentRejectedError)
+        if (!(rejected instanceof IntentRejectedError)) throw new Error("Expected rejection")
+        expect(rejected.reason).toBe("busy")
+      }
+      expect((yield* runtime.getState).surface).toEqual({ _tag: "Roots", selectedSessionId: ROOT })
+      yield* runtime.selectRoot(CHILD)
+      yield* runtime.enterRoot(CHILD)
+      expect(fixture.incrementalReads).toEqual([])
       expect((yield* runtime.getState).surface._tag).toBe("Graph")
       expect((yield* runtime.getState).refresh.initialPending).toBeTrue()
+      yield* runtime.selectRoot(ROOT)
       yield* Deferred.succeed(release, undefined)
       const completed = yield* waitForState(runtime, (state) => state.refresh.active.size === 0)
-      expect(completed.surface._tag).toBe("Graph")
+      expect(completed.surface).toEqual({ _tag: "Roots", selectedSessionId: ROOT })
+      yield* runtime.enterRoot(ROOT)
+      expect((yield* runtime.getState).surface._tag).toBe("Graph")
+      expect(fixture.incrementalReads).toEqual([])
     })))
   })
 
-  test("a late family load cannot take focus from a newer navigation", async () => {
+  test("a late family retry cannot take focus from a newer navigation", async () => {
     const fixture = makeFixture()
+    const readable = fixture.snapshot
+    fixture.snapshot = { ...readable, transcripts: new Map(readable.transcripts).set(ROOT, { _tag: "Unavailable", reason: "read failed" }) }
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const release = yield* Deferred.make<void>()
       const provider = { ...fixture.options.provider,
-        loadSessionSnapshotProgressively: (publish: (value: AgentSessionSnapshot) => Effect.Effect<void>) =>
-          publish({ sessions: fixture.snapshot.sessions, transcripts: new Map() }).pipe(Effect.andThen(Effect.never)),
         loadSessionSnapshotFor: (ids: readonly string[]) => Deferred.await(release).pipe(
           Effect.andThen(fixture.options.provider.loadSessionSnapshotFor(ids))),
       }
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
-      yield* waitForState(runtime, (state) => state.provider.sessions.size === 2)
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      fixture.snapshot = readable
       const entering = yield* Effect.forkChild(Effect.flip(runtime.enterRoot(ROOT)))
       yield* waitForState(runtime, (state) => state.refresh.active.has("refresh:navigation"))
       yield* runtime.selectRoot(CHILD, "newer-selection")
@@ -358,6 +372,35 @@ describe("application actor", () => {
       const state = yield* runtime.getState
       expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
       expect(state.selectionId).toBe("newer-selection")
+    })))
+  })
+
+  test("duplicate Enter during a retry neither restarts it nor supersedes its navigation", async () => {
+    const fixture = makeFixture()
+    const readable = fixture.snapshot
+    fixture.snapshot = { ...readable, transcripts: new Map(readable.transcripts).set(ROOT, { _tag: "Unavailable", reason: "read failed" }) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const release = yield* Deferred.make<void>()
+      const provider = { ...fixture.options.provider,
+        loadSessionSnapshotFor: (ids: readonly string[]) => Deferred.await(release).pipe(
+          Effect.andThen(fixture.options.provider.loadSessionSnapshotFor(ids))),
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      fixture.snapshot = readable
+      const entering = yield* Effect.forkChild(runtime.enterRoot(ROOT))
+      yield* waitForState(runtime, (state) => state.refresh.active.has("refresh:navigation"))
+      const pending = yield* runtime.getViewModel
+      if (pending.surface._tag !== "Roots") throw new Error("Expected roots")
+      expect(pending.surface.roots.find((root) => root.sessionId === ROOT)?.activation).toBe("loading")
+      const duplicate = yield* Effect.flip(runtime.enterRoot(ROOT))
+      expect(duplicate).toBeInstanceOf(IntentRejectedError)
+      expect(duplicate).toMatchObject({ reason: "busy" })
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(entering)
+      expect(fixture.incrementalReads).toEqual([[ROOT]])
+      expect((yield* runtime.getState).surface._tag).toBe("Graph")
+      expect((yield* runtime.getState).refresh.active.size).toBe(0)
     })))
   })
 
@@ -402,6 +445,7 @@ describe("application actor", () => {
         expect(view.surface._tag).toBe("Graph")
         if (view.surface._tag === "Graph") expect(view.surface.warnings.join("\n")).toContain("history reconstruction failed")
       }
+      expect(fixture.incrementalReads).toEqual([])
     })))
   })
 
