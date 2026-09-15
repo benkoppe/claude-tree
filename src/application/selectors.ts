@@ -70,6 +70,20 @@ export function selectTranscriptRead(
   return state.local.transcripts.get(sessionId) ?? state.provider.transcripts.get(sessionId)
 }
 
+export type RootActivation = "open" | "loading" | "retry"
+
+/** Read diagnostics do not make an already accepted family unavailable. */
+export function selectRootActivation(state: ApplicationState, sessionIds: Iterable<string>): RootActivation {
+  const unread = [...sessionIds].filter((id) =>
+    selectTranscriptRead(state, id)?._tag !== "Available" && !state.local.sessions.has(id))
+  if (unread.length === 0) return "open"
+  if (unread.some((id) => selectHistoryStatus(state, id)._tag === "Pending" ||
+    [...state.refresh.active.values()].some((refresh) => refresh.mode === "full"
+      ? !refresh.progressSessionIds?.has(id)
+      : refresh.sessionIds.has(id)))) return "loading"
+  return "retry"
+}
+
 export function selectProjectedTranscript(
   state: ApplicationState,
   sessionId: string,

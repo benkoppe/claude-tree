@@ -71,7 +71,7 @@ import {
   reduceApplicationState,
   type StateEvent,
 } from "./reducer"
-import { selectConversationForest, selectProjectedData } from "./selectors"
+import { selectConversationForest, selectProjectedData, selectRootActivation } from "./selectors"
 import {
   invalidatedRefreshSessionIds,
   makeInitialApplicationState,
@@ -1398,6 +1398,13 @@ export function makeAppRuntime(
           yield* reject(envelope.reply, intent._tag, "shutting-down", "Application is shutting down")
           return
         }
+        if (intent._tag === "EnterRoot") {
+          const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
+          if (family && selectRootActivation(state, family.sessionIds) === "loading") {
+            yield* reject(envelope.reply, intent._tag, "busy", "Conversation is loading")
+            return
+          }
+        }
         if (
           intent._tag === "SelectRoot" || intent._tag === "EnterRoot" ||
           intent._tag === "SelectGraph" || intent._tag === "NewSession" ||
@@ -1420,8 +1427,7 @@ export function makeAppRuntime(
           }
           case "EnterRoot": {
             const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
-            const history = family && selectFamilyHistoryStatus(state, family.sessionIds)
-            if (family && (history?._tag === "Loading" || history?._tag === "Unavailable")) {
+            if (family && selectRootActivation(state, family.sessionIds) === "retry") {
               const refresh: ActiveRefresh = { key: "refresh:navigation", generation: state.refresh.generation + 1,
                 reason: "terminal-return", mode: "incremental", sessionIds: family.sessionIds }
               yield* supersede(refresh.key)

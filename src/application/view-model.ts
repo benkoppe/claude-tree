@@ -15,15 +15,18 @@ import {
   selectAggregateStatus,
   selectConversationForest,
   selectProjectedData,
+  selectRootActivation,
   selectSessionStatus,
   selectVisibleConversationForest,
   selectVisibleEndpointSessionIds,
+  type RootActivation,
   type SessionStatus,
 } from "./selectors"
 import type { ApplicationModal, ApplicationState } from "./state"
 import { selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryDetails, type FamilyHistoryStatus } from "./catalogue"
 
 export interface RootViewModel {
+  readonly activation: RootActivation
   readonly warnings?: readonly string[]
   readonly history: FamilyHistoryStatus
   readonly sessionId: string
@@ -131,8 +134,9 @@ const graphViewCache = new WeakMap<ConversationGraph, {
   unviewed: ApplicationState["unviewedSessionIds"]
   view: GraphView
 }>()
-const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history">>()
+const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history" | "activation">>()
 const rootViewCache = new WeakMap<ReturnType<typeof selectVisibleConversationForest>, {
+  refresh: ApplicationState["refresh"]["active"]
   provider: ApplicationState["provider"]
   terminals: ApplicationState["terminals"]
   historyStatus: ApplicationState["historyStatus"]
@@ -145,6 +149,7 @@ export interface RootViewIndex {
   readonly bySessionId: ReadonlyMap<string, RootViewModel>
   readonly positions: ReadonlyMap<string, number>
   readonly working: boolean
+  readonly loading: boolean
   readonly messageCountWidth: number
   readonly branchCountWidth: number
 }
@@ -155,17 +160,18 @@ export function indexRootViews(roots: readonly RootViewModel[]): RootViewIndex {
   if (cached) return cached
   const bySessionId = new Map<string, RootViewModel>()
   const positions = new Map<string, number>()
-  let working = false, messageCountWidth = 1, branchCountWidth = 1
+  let working = false, loading = false, messageCountWidth = 1, branchCountWidth = 1
   roots.forEach((root, index) => {
     for (const id of [root.sessionId, ...root.memberSessionIds]) {
       bySessionId.set(id, root)
       positions.set(id, index)
     }
     working ||= root.status === "working"
+    loading ||= root.activation === "loading"
     messageCountWidth = Math.max(messageCountWidth, String(root.messageCount).length)
     branchCountWidth = Math.max(branchCountWidth, String(root.memberSessionIds.length).length)
   })
-  const indexed = { bySessionId, positions, working, messageCountWidth, branchCountWidth }
+  const indexed = { bySessionId, positions, working, loading, messageCountWidth, branchCountWidth }
   rootIndexes.set(roots, indexed)
   return indexed
 }
@@ -186,7 +192,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   const data = selectProjectedData(state)
   const forest = selectVisibleConversationForest(state)
   const cached = rootViewCache.get(forest)
-  if (cached && cached.provider === state.provider && cached.terminals === state.terminals && cached.historyStatus === state.historyStatus &&
+  if (cached && cached.refresh === state.refresh.active && cached.provider === state.provider && cached.terminals === state.terminals && cached.historyStatus === state.historyStatus &&
     cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds) return cached.roots
   const roots = forest.graphs.map((graph): RootViewModel => {
     let summary = rootSummaryCache.get(graph)
@@ -203,6 +209,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
     }
     return {
       ...summary,
+      activation: selectRootActivation(state, summary.memberSessionIds),
       history: selectFamilyHistoryStatus(state, summary.memberSessionIds),
       warnings: [...selectHistoryDetails(state, summary.memberSessionIds), ...graph.warnings],
       status: selectAggregateStatus(state, summary.memberSessionIds),
@@ -222,7 +229,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
         (state.local.transcripts.get(id) ?? state.provider.transcripts.get(id))?._tag === "Available")
       if (accepted) continue
       for (const id of memberSessionIds) pendingIds.add(id)
-      pendingRoots.push({ sessionId: root.id, title: root.title,
+      pendingRoots.push({ sessionId: root.id, title: root.title, activation: selectRootActivation(state, memberSessionIds),
         lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest, state.provider.sessions.get(id)?.lastModified ?? 0), root.lastModified),
         memberSessionIds, messageCount: 0, history, status: selectAggregateStatus(state, memberSessionIds),
         warnings: selectHistoryDetails(state, memberSessionIds),
@@ -231,7 +238,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   const rows = [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
     (left, right) => right.lastModified - left.lastModified || left.sessionId.localeCompare(right.sessionId),
   )
-  rootViewCache.set(forest, { provider: state.provider, terminals: state.terminals, historyStatus: state.historyStatus,
+  rootViewCache.set(forest, { refresh: state.refresh.active, provider: state.provider, terminals: state.terminals, historyStatus: state.historyStatus,
     completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, roots: rows })
   return rows
 }

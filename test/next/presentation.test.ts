@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 
 import { createTestRenderer } from "@opentui/core/testing"
 import { Deferred, Effect, Fiber, SubscriptionRef } from "effect"
@@ -13,6 +13,7 @@ import type {
 } from "../../src/application"
 import {
   ApplicationOperationError,
+  IntentRejectedError,
   available,
   makeInitialApplicationState,
   projectApplicationViewModel,
@@ -63,6 +64,122 @@ test("renders roots and preserves directional graph navigation intent", async ()
     await frame(setup, () => isSelected(setup, "right branch"))
   } finally {
     await running.stop()
+  }
+})
+
+test("loading root activation is ignored without blocking movement or queuing a future open", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const ready = rootsView()
+  if (ready.surface._tag !== "Roots") throw new Error("Expected roots")
+  const loading: ApplicationViewModel = { ...ready, surface: { ...ready.surface,
+    roots: ready.surface.roots.map((root) => root.sessionId === "root-1"
+      ? { ...root, activation: "loading", history: { _tag: "Loading" } } : root),
+  } }
+  const running = await startPresentation(setup.renderer, loading, new Map([
+    ["root-1", linearGraph("root-1", "First conversation", "ready question")],
+  ]))
+  try {
+    const initial = await frame(setup, (value) => value.includes("Loading"))
+    expect(initial).not.toContain("Enter open")
+    setup.mockInput.pressEnter()
+    setup.mockInput.pressEnter()
+    const row = coordinateOf(initial, "First conversation")
+    await setup.mockMouse.click(row.x, row.y)
+    setup.mockInput.pressArrow("down")
+    await frame(setup, () => isSelected(setup, "Second conversation"))
+    expect(running.harness.calls.filter((call) => call.startsWith("enter-root:"))).toEqual([])
+    setup.mockInput.pressArrow("up")
+    await frame(setup, () => isSelected(setup, "First conversation"))
+    await Effect.runPromise(running.harness.update(ready))
+    const completed = await frame(setup, (value) => value.includes("Enter open"))
+    expect(completed).toContain("Conversation roots")
+    expect(running.harness.calls.filter((call) => call.startsWith("enter-root:"))).toEqual([])
+    const open = coordinateOf(completed, "Enter open")
+    await setup.mockMouse.click(open.x, open.y)
+    await frame(setup, (value) => value.includes("ready question"))
+  } finally { await running.stop() }
+})
+
+test("a deferred root retry preserves dispatch order and leaves navigation responsive", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const release = await Effect.runPromise(Deferred.make<void>())
+  const ready = rootsView()
+  if (ready.surface._tag !== "Roots") throw new Error("Expected roots")
+  const roots: ApplicationViewModel = { ...ready, surface: { ...ready.surface,
+    roots: ready.surface.roots.map((root) => ({ ...root, activation: "retry",
+      history: { _tag: "Unavailable", issues: [{ sessionId: root.sessionId, kind: "unavailable", reason: "read failed" }] } })),
+  } }
+  const order: string[] = []
+  const running = await startPresentation(setup.renderer, roots, new Map(), undefined, Effect.succeed(true), {
+    selectRoot: (id, publish) => Effect.sync(() => { order.push(`select:${id}`) }).pipe(Effect.andThen(publish)),
+    enterRoot: (id) => Effect.sync(() => { order.push(`enter:${id}`) }).pipe(Effect.andThen(Deferred.await(release))),
+  })
+  try {
+    await frame(setup, (value) => value.includes("Enter retry"))
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    setup.mockInput.pressArrow("up")
+    await waitFor(() => order.length === 3)
+    expect(order).toEqual(["select:root-2", "enter:root-2", "select:root-1"])
+    await frame(setup, () => isSelected(setup, "First conversation"))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.includes("refresh"))
+  } finally {
+    await Effect.runPromise(Deferred.succeed(release, undefined))
+    await running.stop()
+  }
+})
+
+test.each(["busy", "superseded"] as const)("root activation %s races do not open error dialogs", async (reason) => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const running = await startPresentation(setup.renderer, rootsView(), new Map(), undefined, Effect.succeed(true), {
+    enterRoot: () => Effect.fail(new IntentRejectedError({ intent: "EnterRoot", reason, message: "Loading race" })),
+  })
+  try {
+    await frame(setup, (value) => value.includes("Enter open"))
+    setup.mockInput.pressEnter()
+    setup.mockInput.pressArrow("down")
+    await frame(setup, () => isSelected(setup, "Second conversation"))
+    expect(running.harness.modalUpdates).toEqual([])
+  } finally { await running.stop() }
+})
+
+test("loading rows animate without a global refresh or a working terminal and stop when ready", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const ready = rootsView()
+  if (ready.surface._tag !== "Roots") throw new Error("Expected roots")
+  const roots: ApplicationViewModel = { ...ready, refreshing: false, surface: { ...ready.surface,
+    roots: [{ ...ready.surface.roots[0]!, activation: "loading", history: { _tag: "Loading" } }],
+  } }
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  const handle = {} as ReturnType<typeof setTimeout>
+  let tick: (() => void) | undefined
+  let cleared = false
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+    if (args[1] !== 80) return Reflect.apply(originalSetTimeout, globalThis, args)
+    const callback = args[0]
+    if (typeof callback !== "function") throw new Error("Expected animation callback")
+    tick = () => callback()
+    return handle
+  }) as typeof setTimeout)
+  const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((value) => {
+    if (value === handle) cleared = true
+    else Reflect.apply(originalClearTimeout, globalThis, [value])
+  })
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, roots)
+    await frame(setup, (value) => value.includes("⠋ Loading"))
+    expect(tick).toBeDefined()
+    tick!()
+    await frame(setup, (value) => value.includes("⠙ Loading"))
+    await Effect.runPromise(running.harness.update({ ...ready, surface: { ...ready.surface, roots: [ready.surface.roots[0]!] } }))
+    await frame(setup, (value) => value.includes("Enter open") && !value.includes("Loading"))
+    expect(cleared).toBeTrue()
+  } finally {
+    try { await running?.stop() }
+    finally { timer.mockRestore(); clearTimer.mockRestore() }
   }
 })
 
@@ -1377,6 +1494,7 @@ interface RuntimeHarness {
 }
 
 interface RuntimeActionOverrides {
+  readonly enterRoot?: (sessionId: string) => Effect.Effect<unknown, unknown>
   readonly selectRoot?: (sessionId: string | null, publishSelection: () => Effect.Effect<boolean>) => Effect.Effect<unknown, unknown>
   readonly newSession?: Effect.Effect<boolean>
   readonly openEndpoint?: (sessionId: string) => Effect.Effect<boolean>
@@ -1507,11 +1625,12 @@ function makeHarness(
         }
         return actionOverrides.selectRoot?.(sessionId, publishSelection) ?? publishSelection()
       }),
-      enterRoot: (sessionId: string) => {
+      enterRoot: (sessionId: string) => Effect.suspend(() => {
         calls.push(`enter-root:${sessionId}`)
+        if (actionOverrides.enterRoot) return actionOverrides.enterRoot(sessionId)
         const graph = graphs.get(sessionId)
         return graph ? update(graph).pipe(Effect.as(true)) : Effect.succeed(false)
-      },
+      }),
       selectGraph: (familySessionId: string, target: NavigationTarget, selectionId?: string) => {
         calls.push(`select-graph:${targetKey(target)}`)
         const publishSelection = () => {
@@ -1593,6 +1712,7 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
       roots: [
         {
           sessionId: "root-1",
+          activation: "open",
           history: { _tag: "Ready" },
           title: firstTitle,
           lastModified: 2,
@@ -1602,6 +1722,7 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
         },
         {
           sessionId: "root-2",
+          activation: "open",
           history: { _tag: "Ready" },
           title: "Second conversation",
           lastModified: 1,

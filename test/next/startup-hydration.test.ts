@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 
 import { selectHistoryStatus } from "../../src/application/catalogue"
 import { reduceApplicationState } from "../../src/application/reducer"
-import { selectConversationForest } from "../../src/application/selectors"
+import { selectConversationForest, selectRootActivation } from "../../src/application/selectors"
 import { available, makeInitialApplicationState, type ApplicationState } from "../../src/application/state"
 import { projectRootsViewModel } from "../../src/application/view-model"
 import type { AgentMessage, AgentSessionSnapshot, TranscriptRead } from "../../src/domain/model"
@@ -51,6 +51,7 @@ test("an early child batch cannot publish an orphan graph or move selection to a
   expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: parent.id })
   expect(state.selectionId).toBe("cursor")
   expect(projectRootsViewModel(state)[0]?.history._tag).toBe("Ready")
+  expect(projectRootsViewModel(state)[0]?.activation).toBe("open")
 })
 
 test("failed recent history stays visible after startup, with its reason and retry action", () => {
@@ -68,6 +69,7 @@ test("failed recent history stays visible after startup, with its reason and ret
   ] })
   expect(renderRoots(roots, parent.id, 5, 100).text).toContain("Enter to retry")
   expect(selectHistoryStatus(state, parent.id)._tag).toBe("Unavailable")
+  expect(roots[0]?.activation).toBe("retry")
   expect(state.refresh.initialPending).toBeFalse()
 })
 
@@ -83,11 +85,44 @@ test("a failed family refresh retains accepted topology and a successful retry c
   expect(state.provider.transcripts.get(child.id)).toBe(childRead)
   expect(selectConversationForest(state).graphBySessionId.get(parent.id)).toBe(forest.graphBySessionId.get(parent.id))
   expect(projectRootsViewModel(state)[0]?.history._tag).toBe("Unavailable")
+  expect(projectRootsViewModel(state)[0]?.activation).toBe("open")
   state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: {
     key: "retry", generation: 3, mode: "incremental", reason: "terminal-return", sessionIds: new Set([child.id]),
   } })
   state = reduceApplicationState(state, { _tag: "RefreshSucceeded", key: "retry", generation: 3, snapshot: { sessions: [], transcripts: new Map([[child.id, childRead]]) } })
   expect(projectRootsViewModel(state)[0]?.history._tag).toBe("Ready")
+})
+
+test("mixed failures and pending family members stay loading while diagnostics remain available", () => {
+  const state = { ...initial(), historyStatus: new Map([
+    [parent.id, { _tag: "Unavailable" as const, reason: "read failed" }],
+  ]) }
+  const root = projectRootsViewModel(state)[0]!
+  expect(root.history._tag).toBe("Unavailable")
+  expect(root.activation).toBe("loading")
+  expect(root.warnings?.join("\n")).toContain("read failed")
+  expect(renderRoots([root], root.sessionId, 1, 100).text).toContain("⠋ Loading")
+})
+
+test.each(["RefreshFailed", "RefreshSuperseded"] as const)("%s releases retry admission without replacing history diagnostics", (_tag) => {
+  let state = finish(initial(), new Map([[parent.id, { _tag: "Unavailable", reason: "read failed" }], [child.id, childRead], [other.id, otherRead]]))
+  const ids = [parent.id, child.id]
+  expect(selectRootActivation(state, ids)).toBe("retry")
+  state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: {
+    key: "retry", generation: 2, mode: "incremental", reason: "terminal-return", sessionIds: new Set(ids),
+  } })
+  expect(selectRootActivation(state, ids)).toBe("loading")
+  expect(projectRootsViewModel(state)[0]?.activation).toBe("loading")
+  state = reduceApplicationState(state, { _tag, key: "retry", generation: 2, message: "transport failed" })
+  expect(selectRootActivation(state, ids)).toBe("retry")
+  expect(projectRootsViewModel(state)[0]?.activation).toBe("retry")
+})
+
+test("a published family failure can retry before unrelated initial hydration finishes", () => {
+  const state = progress(initial(), new Map([[parent.id, { _tag: "Unavailable", reason: "read failed" }], [child.id, childRead]]))
+  expect(state.refresh.initialPending).toBeTrue()
+  expect(selectRootActivation(state, [parent.id, child.id])).toBe("retry")
+  expect(selectRootActivation(state, [other.id])).toBe("loading")
 })
 
 test("transport failure settles incomplete families without discarding their staged successful reads", () => {
