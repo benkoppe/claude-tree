@@ -124,6 +124,7 @@ export function composeProductionApplication(
     const repository = yield* makeProviderStateRepository(persistenceOptions).pipe(
       Effect.provideService(PersistencePlatform, nativePersistencePlatform),
     )
+    yield* repository.recoverOrphanedOwners()
     const navigation = yield* makeNavigationPersistenceWorker({ ...persistenceOptions,
       projectDirectory: repository.projectPath,
       instanceId: repository.instanceId,

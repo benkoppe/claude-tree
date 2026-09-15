@@ -46,6 +46,16 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
+## Shutdown and recovery
+
+Quitting stops the owned agent processes and restores the host terminal. Provider conversations remain available to resume later.
+
+After an interrupted shutdown, `claude-tree` checks previous terminal ownership at startup and when opening a session. It releases an orphaned reservation once the old application, its terminal process group, and any recorded Codex sidecar group are definitely gone and its launch artifacts are removed. A saved `stopping` or `cleanup-incomplete` status alone does not block reopening.
+
+If cleanup cannot be verified, the error identifies the remaining condition: a surviving process group, unknown liveness, failed artifact cleanup, or an acquisition interrupted before all process identities were recorded. Resolve that condition and retry. Recovery does not signal unidentified processes or guess that an incompletely recorded launch was harmless.
+
+Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (default `~/.local/state`). Older terminal-owner records without a resource inventory are rejected in place, rather than automatically upgraded or deleted. Any reset is explicit and affects application-owned relationships and UI metadata, not provider transcripts.
+
 ## Development
 
 The development shell includes Bun and the validated provider CLIs available for the platform:

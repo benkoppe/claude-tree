@@ -1,10 +1,12 @@
 import { randomUUID as nodeRandomUUID } from "node:crypto"
-import { chmod, mkdtemp, open, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
-import { Cause, Data, Effect, Exit, FiberSet, Scope } from "effect"
+import { Cause, Data, Effect, Exit, FiberSet, Option, Scope } from "effect"
+import { TerminalLaunchDirectory } from "../../../services/provider"
+import type { TerminalLaunchResources } from "../../../domain/persistence"
 
 import { cleanupProcessGroup, type ProcessGroupHandle } from "../../process-group"
 
@@ -28,6 +30,7 @@ export interface CodexSidecarProcess {
 }
 
 export interface CodexSidecar {
+  readonly resources?: Extract<TerminalLaunchResources, { readonly kind: "codex" }>
   readonly remoteUrl: string
   readonly bearerToken: string
   readonly process: CodexSidecarProcess
@@ -80,6 +83,7 @@ export function makeCodexSidecar(
     durablySyncToken(path, parent, syncSignal, dependencies.openFile))
 
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+    const ownerDirectory = yield* Effect.serviceOption(TerminalLaunchDirectory)
     const runPromise = yield* FiberSet.makeRuntimePromise<never>()
     let directoryRemoved = false
     let directory: string | undefined
@@ -97,9 +101,9 @@ export function makeCodexSidecar(
     const acquisition = yield* Effect.exit(restore(Effect.gen(function*() {
       directory = yield* boundedAcquisitionPhase(Effect.tryPromise({
         try: () => {
-          const creation = (dependencies.makeTemporaryDirectory ?? mkdtemp)(
-            join(tmpdir(), "claude-tree-codex-"),
-          )
+          const creation = Option.isSome(ownerDirectory)
+            ? createOwnerDirectory(ownerDirectory.value)
+            : (dependencies.makeTemporaryDirectory ?? mkdtemp)(join(tmpdir(), "claude-tree-codex-"))
           lateDirectoryTask = creation.then(async (path) => {
             directory = path
             if (!rollbackStarted || directoryRemoved) return
@@ -221,10 +225,19 @@ export function makeCodexSidecar(
       remoteUrl,
       bearerToken,
       process: process!,
+      ...(Option.isSome(ownerDirectory)
+        ? { resources: { kind: "codex" as const, sidecarProcessGroupId: process!.pid } }
+        : {}),
       stderr: Effect.sync(() => stderr!.snapshot()),
       close,
     }
   }))
+}
+
+async function createOwnerDirectory(path: string): Promise<string> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  await mkdir(path, { mode: 0o700 })
+  return path
 }
 
 interface SidecarCleanupResources {
