@@ -44,6 +44,21 @@ export type TerminalOwnerStatus =
   | "stopping"
   | "cleanup-incomplete"
 
+/** Complete only after both provider acquisition and PTY registration succeed. */
+export type TerminalLaunchResources =
+  | { readonly kind: "acquiring" }
+  | { readonly kind: "local" }
+  | { readonly kind: "codex"; readonly sidecarProcessGroupId: number }
+
+export type OwnershipBlockReason =
+  | "application-present"
+  | "liveness-unknown"
+  | "acquisition-incomplete"
+  | "terminal-present"
+  | "sidecar-present"
+  | "artifact-cleanup-failed"
+  | "owner-changed"
+
 export interface TerminalOwner {
   readonly instanceId: string
   readonly sessionId: string
@@ -51,6 +66,7 @@ export interface TerminalOwner {
   readonly lastMutationToken?: string
   readonly ownerPid: number
   readonly status: TerminalOwnerStatus
+  readonly resources: TerminalLaunchResources
   readonly processGroupId?: number
   readonly reservedAt: string
   readonly updatedAt: string

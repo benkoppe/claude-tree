@@ -24,6 +24,7 @@ Follow general code best practices, such as:
 - Provider state schema v3 is strict and reset-only. Do not add implicit migration, deletion, quarantine, fallback parsing, or automatic recreation for incompatible persisted state.
 - Write related metadata, per-instance navigation, terminal ownership, and identity-adoption changes through the unified provider-state transaction when they must remain atomic.
 - Treat provider mutations as ambiguous after they may have been sent and their response is unavailable. Do not retry or infer success; reconcile from a full provider snapshot.
+- Provider launches must report their externally surviving resources and use the owner-scoped launch directory for capability artifacts. Keep acquisition incomplete until that inventory and the PTY group are recorded together. Never recover an owner from its status or a missing application PID alone; use the shared resource-liveness checks and exact-owner transaction revalidation.
 
 ## Agents
 

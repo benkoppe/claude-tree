@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+import { join } from "node:path"
 import { isDeepStrictEqual } from "node:util"
 
 import { Context, Effect, Layer, Schema } from "effect"
@@ -17,18 +19,20 @@ import type {
   ProviderState,
   TerminalOwner,
   TerminalOwnerStatus,
+  TerminalLaunchResources,
 } from "../domain/persistence"
+import { inspectOrphan, type OwnerRecoveryOutcome } from "./terminal-owner-recovery"
 import {
   PersistencePlatform,
   PersistencePlatformLive,
   type PersistencePlatformApi,
-  type ProcessLiveness,
 } from "../infrastructure/metadata/platform"
 import {
   PERSISTENCE_SCHEMA_VERSION,
   decodeStrict,
   prepareProjectStorage,
   readJsonIfPresent,
+  removeDirectoryDurably,
   requireSchemaVersion,
   withTransactionLock,
   writeJsonAtomically,
@@ -108,6 +112,11 @@ const TerminalOwnerSchema = Schema.Struct({
   lastMutationToken: Schema.NonEmptyString,
   ownerPid: Schema.Int,
   status: Schema.Literals(["reserved", "running", "stopping", "cleanup-incomplete"]),
+  resources: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("acquiring") }),
+    Schema.Struct({ kind: Schema.Literal("local") }),
+    Schema.Struct({ kind: Schema.Literal("codex"), sidecarProcessGroupId: Schema.Int }),
+  ]),
   processGroupId: Schema.optionalKey(Schema.Int),
   reservedAt: Schema.NonEmptyString,
   updatedAt: Schema.NonEmptyString,
@@ -138,7 +147,7 @@ const PersistedProviderStateSchema = Schema.Struct({
   pendingIdentityAdoptions: Schema.Array(PendingIdentityAdoptionSchema),
 })
 
-const LIVENESS_TIMEOUT_MILLISECONDS = 250
+const ARTIFACT_CLEANUP_TIMEOUT_MILLISECONDS = 1_000
 
 interface PersistedProviderState extends ProviderState {
   readonly schemaVersion: typeof PERSISTENCE_SCHEMA_VERSION
@@ -174,7 +183,11 @@ export interface MutationOptions {
   readonly mutationToken?: string
 }
 
-export interface MarkTerminalOwnerOptions extends MutationOptions {
+export interface AttachTerminalOptions extends MutationOptions {
+  readonly resources?: Exclude<TerminalLaunchResources, { readonly kind: "acquiring" }>
+}
+
+export interface MarkTerminalOwnerOptions extends AttachTerminalOptions {
   readonly processGroupId?: number | null
 }
 
@@ -195,6 +208,8 @@ export interface ProviderStateRepositoryApi {
   readonly instanceId: string
   readonly load: Effect.Effect<ProviderState, PersistenceError>
   readonly loadMetadata: Effect.Effect<ProjectState, PersistenceError>
+  readonly launchDirectory: (owner: TerminalOwner) => string
+  readonly recoverOrphanedOwners: (sessionIds?: readonly string[]) => Effect.Effect<readonly OwnerRecoveryOutcome[], PersistenceError>
   readonly saveNavigation: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly updateMetadata: (
     transform: (state: ProjectState) => ProjectState,
@@ -214,7 +229,7 @@ export interface ProviderStateRepositoryApi {
   readonly attach: (
     owner: TerminalOwner,
     processGroupId: number,
-    options?: MutationOptions,
+    options?: AttachTerminalOptions,
   ) => Effect.Effect<TerminalOwner, PersistenceError>
   readonly mark: (
     owner: TerminalOwner,
@@ -361,6 +376,52 @@ function providerStateApi(
       Effect.catch(() => Effect.fail(error)),
     ))) as Effect.Effect<A, E>
 
+  const launchDirectory = (owner: TerminalOwner): string => join(
+    paths.providerDirectory,
+    "launches",
+    createHash("sha256").update(owner.ownerToken).digest("hex"),
+  )
+
+  const recoverOrphanedOwners: ProviderStateRepositoryApi["recoverOrphanedOwners"] = (sessionIds) =>
+    Effect.gen(function*() {
+      const snapshot = yield* load
+      const outcomes: OwnerRecoveryOutcome[] = []
+      for (const owner of snapshot.terminalOwners) {
+        if (sessionIds !== undefined && !sessionIds.includes(owner.sessionId)) continue
+        let reason = yield* inspectOrphan(platform, owner)
+        if (reason === undefined) {
+          // Immutable owner directories make concurrent, repeated deletion safe. No new
+          // owner can acquire this directory; never clean by mutable session identity.
+          const removed = yield* Effect.exit(Effect.interruptible(removeDirectoryDurably(platform, launchDirectory(owner)).pipe(
+            Effect.timeoutOrElse({
+              duration: ARTIFACT_CLEANUP_TIMEOUT_MILLISECONDS,
+              orElse: () => Effect.fail(new Error("Launch artifact cleanup timed out")),
+            }),
+          )))
+          if (removed._tag === "Failure") reason = "artifact-cleanup-failed"
+          else {
+            reason = yield* persistenceTransaction("recover orphaned terminal owner", (state) =>
+              Effect.gen(function*() {
+                const current = state.terminalOwners.find((candidate) => candidate.ownerToken === owner.ownerToken)
+                if (current === undefined) return [state, undefined] as const
+                if (!jsonEqual(current, owner)) return [state, "owner-changed" as const] as const
+                const blocked = yield* inspectOrphan(platform, current)
+                if (blocked !== undefined) return [state, blocked] as const
+                // Identity commits already moved metadata atomically. Only their
+                // now-orphaned acknowledgment journals remain to be removed.
+                return [{
+                  ...state,
+                  terminalOwners: state.terminalOwners.filter((candidate) => candidate.ownerToken !== owner.ownerToken),
+                  pendingIdentityAdoptions: state.pendingIdentityAdoptions.filter((adoption) => adoption.ownerToken !== owner.ownerToken),
+                }, undefined] as const
+              }))
+          }
+        }
+        outcomes.push({ sessionId: owner.sessionId, ownerToken: owner.ownerToken, ...(reason === undefined ? {} : { reason }) })
+      }
+      return outcomes
+    })
+
   const updateMetadata: ProviderStateRepositoryApi["updateMetadata"] = (transform) =>
     persistenceTransaction("update project metadata", (state) =>
       syncAttempt(() => {
@@ -412,36 +473,36 @@ function providerStateApi(
         }
         return [{ ...state, removals: [...state.removals, canonicalRemoval] }, canonicalRemoval] as const
       }))
-    return reconcileWrite("commit conversation removal", attempted, (state) =>
-      state.removals.find((candidate) => sameRemoval(
-        candidate,
-        applyPendingTemporaryAdoptionsToRemoval(state, removal),
-      )))
+    return recoverOrphanedOwners(affectedSessionIds).pipe(
+      Effect.andThen(reconcileWrite("commit conversation removal", attempted, (state) =>
+        state.removals.find((candidate) => sameRemoval(
+          candidate,
+          applyPendingTemporaryAdoptionsToRemoval(state, removal),
+        )))),
+    )
   }
 
   const reserve: ProviderStateRepositoryApi["reserve"] = (sessionId, options) => {
     const mutationToken = options?.mutationToken ?? platform.randomToken()
-    const attempted = transaction("reserve terminal owner", (state) =>
+    const attempted = (recovery: readonly OwnerRecoveryOutcome[]) => transaction("reserve terminal owner", (state) =>
       Effect.gen(function*() {
         yield* syncAttempt(() => requireNonEmpty(sessionId, "Session ID"))
         yield* syncAttempt(() => requireNonEmpty(mutationToken, "Mutation token"))
         if (isSessionRemoved(state, sessionId)) {
           return yield* Effect.fail(sessionRemovedError(providerId, sessionId))
         }
-        let owners = state.terminalOwners
+        const owners = state.terminalOwners
         const existing = owners.find((owner) => owner.sessionId === sessionId)
         if (existing !== undefined) {
           if (isCommittedReserve(existing, instanceId, platform.pid, mutationToken)) {
             return [state, existing] as const
           }
-          if (!(yield* ownerCanBeAutomaticallyReclaimed(platform, state, existing))) {
-            return yield* Effect.fail(new SessionOwnedError({
-              providerId,
-              sessionId,
-              ownerPid: existing.ownerPid,
-            }))
-          }
-          owners = owners.filter((owner) => owner.sessionId !== sessionId)
+          return yield* Effect.fail(new SessionOwnedError({
+            providerId,
+            sessionId,
+            ownerPid: existing.ownerPid,
+            reason: recovery.find((outcome) => outcome.ownerToken === existing.ownerToken)?.reason ?? "owner-changed",
+          }))
         }
 
         const now = platform.now()
@@ -452,18 +513,21 @@ function providerStateApi(
           lastMutationToken: mutationToken,
           ownerPid: platform.pid,
           status: "reserved",
+          resources: { kind: "acquiring" },
           reservedAt: now,
           updatedAt: now,
         }
         return [{ ...state, terminalOwners: [...owners, owner] }, owner] as const
       }))
-    return reconcileWrite("reserve terminal owner", attempted, (state) =>
-      state.terminalOwners.find((owner) =>
-        owner.sessionId === sessionId &&
-        owner.ownerToken === mutationToken &&
-        owner.lastMutationToken === mutationToken &&
-        owner.instanceId === instanceId &&
-        owner.ownerPid === platform.pid))
+    return recoverOrphanedOwners([sessionId]).pipe(Effect.flatMap((outcomes) => {
+      return reconcileWrite("reserve terminal owner", attempted(outcomes), (state) =>
+        state.terminalOwners.find((owner) =>
+          owner.sessionId === sessionId &&
+          owner.ownerToken === mutationToken &&
+          owner.lastMutationToken === mutationToken &&
+          owner.instanceId === instanceId &&
+          owner.ownerPid === platform.pid))
+    }))
   }
 
   const mutateOwner = (
@@ -497,6 +561,8 @@ function providerStateApi(
     statePath: paths.statePath,
     instanceId,
     load,
+    launchDirectory,
+    recoverOrphanedOwners,
     loadMetadata: load.pipe(Effect.map((state) => projectStateForInstance(state, instanceId))),
     updateMetadata,
     saveNavigation,
@@ -506,6 +572,7 @@ function providerStateApi(
       const mutationToken = options?.mutationToken ?? platform.randomToken()
       return mutateOwner("attach terminal process", owner, mutationToken, (current, state) => {
         requireProcessGroup(processGroupId)
+        requireStableLaunchResources(current, processGroupId, options?.resources)
         const adoption = state.pendingIdentityAdoptions.find((candidate) =>
           candidate.ownerToken === current.ownerToken)
         if (adoption !== undefined && adoption.processGroupId !== processGroupId) {
@@ -515,20 +582,24 @@ function providerStateApi(
           ...current,
           status: "running",
           processGroupId,
+          resources: options?.resources ?? current.resources,
           updatedAt: platform.now(),
         }
-      }, (current) => current.status === "running" && current.processGroupId === processGroupId)
+      }, (current) => current.status === "running" && current.processGroupId === processGroupId &&
+        (options?.resources === undefined || jsonEqual(current.resources, options.resources)))
     },
     mark: (owner, status, options) => {
       const mutationToken = options?.mutationToken ?? platform.randomToken()
       return mutateOwner("mark terminal owner", owner, mutationToken, (current, state) => {
         requireProcessGroup(options?.processGroupId ?? undefined)
+        requireStableLaunchResources(current, options?.processGroupId, options?.resources)
         requirePendingAdoptionProcessGroup(state, current, options)
         const base = options?.processGroupId === null
           ? withoutProcessGroup(current)
           : current
         const updated = {
           ...base,
+          resources: options?.resources ?? current.resources,
           ...(options?.processGroupId === undefined || options.processGroupId === null
             ? {}
             : { processGroupId: options.processGroupId }),
@@ -541,6 +612,7 @@ function providerStateApi(
         return updated
       }, (current) =>
         current.status === status &&
+        (options?.resources === undefined || jsonEqual(current.resources, options.resources)) &&
         (options?.processGroupId === undefined ||
           current.processGroupId === (options.processGroupId === null
             ? undefined
@@ -629,17 +701,14 @@ function providerStateApi(
               throw new Error("Terminal owner already has an unacknowledged identity adoption")
             }
           })
-          let owners = state.terminalOwners
+          const owners = state.terminalOwners
           const destination = owners.find((owner) => owner.sessionId === options.sessionId)
           if (destination !== undefined && destination.ownerToken !== source.ownerToken) {
-            if (!(yield* ownerCanBeAutomaticallyReclaimed(platform, state, destination))) {
-              return yield* Effect.fail(new SessionOwnedError({
-                providerId,
-                sessionId: options.sessionId,
-                ownerPid: destination.ownerPid,
-              }))
-            }
-            owners = owners.filter((owner) => owner.sessionId !== options.sessionId)
+            return yield* Effect.fail(new SessionOwnedError({
+              providerId,
+              sessionId: options.sessionId,
+              ownerPid: destination.ownerPid,
+            }))
           }
 
           return yield* syncAttempt(() => {
@@ -702,7 +771,7 @@ function providerStateApi(
             }] as const
           })
         }))
-      return reconcileWrite("commit session identity", attempted, (state) => {
+      return recoverOrphanedOwners([options.sessionId]).pipe(Effect.andThen(reconcileWrite("commit session identity", attempted, (state) => {
         const recovered = findCommittedIdentity(state, options, kind, mutationToken)
         return recovered === undefined
           ? undefined
@@ -711,7 +780,7 @@ function providerStateApi(
               adoption: recovered.adoption,
               metadata: projectStateForInstance(state, instanceId),
             }
-      })
+      })))
     },
     ack: (adoptionToken) => {
       const attempted = persistenceTransaction("acknowledge session identity", (state) =>
@@ -749,7 +818,7 @@ function providerStateApi(
             ))
           }
           const owner = yield* syncAttempt(() => requireAdoptionOwner(state, adoption))
-          if (!(yield* ownerIsDefinitelyAbsent(platform, owner, adoption.processGroupId))) {
+          if ((yield* inspectOrphan(platform, owner)) !== undefined) {
             return yield* Effect.fail(new Error(
               "Identity adoption origin is not definitely absent",
             ))
@@ -956,6 +1025,10 @@ function validatePublicOwner(owner: TerminalOwner): void {
     throw new Error("Terminal owner PID must be a positive integer")
   }
   requireProcessGroup(owner.processGroupId)
+  if (owner.resources.kind === "codex") requireProcessGroup(owner.resources.sidecarProcessGroupId)
+  if (owner.resources.kind !== "acquiring" && owner.processGroupId === undefined) {
+    throw new Error("Complete launch resources require a registered terminal process group")
+  }
   if (owner.status === "running" && owner.processGroupId === undefined) {
     throw new Error("A running terminal owner must have a process group")
   }
@@ -963,6 +1036,21 @@ function validatePublicOwner(owner: TerminalOwner): void {
   requireCanonicalDate(owner.updatedAt)
   if (owner.updatedAt < owner.reservedAt) {
     throw new Error("Terminal owner update cannot predate its reservation")
+  }
+}
+
+function requireStableLaunchResources(
+  owner: TerminalOwner,
+  processGroupId: number | null | undefined,
+  resources: AttachTerminalOptions["resources"],
+): void {
+  if (owner.processGroupId !== undefined && processGroupId !== undefined &&
+      owner.processGroupId !== processGroupId) {
+    throw new Error("An acquired terminal process group cannot be replaced or cleared")
+  }
+  if (owner.resources.kind !== "acquiring" && resources !== undefined &&
+      !jsonEqual(owner.resources, resources)) {
+    throw new Error("Acquired provider resource identities cannot be replaced")
   }
 }
 
@@ -1065,41 +1153,6 @@ function withoutProcessGroup(owner: TerminalOwner): Omit<TerminalOwner, "process
   return without
 }
 
-function ownerIsDefinitelyAbsent(
-  platform: PersistencePlatformApi,
-  owner: TerminalOwner,
-  processGroupId: number | undefined = owner.processGroupId,
-): Effect.Effect<boolean, unknown> {
-  return Effect.gen(function*() {
-    const ownerLiveness = yield* boundedLiveness(
-      () => platform.processLiveness(owner.ownerPid),
-      `check owner PID ${owner.ownerPid}`,
-    )
-    if (ownerLiveness !== "absent") return false
-    if (processGroupId === undefined) return true
-    return (yield* boundedLiveness(
-      () => platform.processGroupLiveness(processGroupId),
-      `check process group ${processGroupId}`,
-    )) === "absent"
-  })
-}
-
-function ownerCanBeAutomaticallyReclaimed(
-  platform: PersistencePlatformApi,
-  state: ProviderState,
-  owner: TerminalOwner,
-): Effect.Effect<boolean, unknown> {
-  if (owner.status === "stopping" || owner.status === "cleanup-incomplete") {
-    return Effect.succeed(false)
-  }
-  if (owner.status === "reserved" && owner.processGroupId === undefined) {
-    return Effect.succeed(false)
-  }
-  if (state.pendingIdentityAdoptions.some((adoption) =>
-    adoption.ownerToken === owner.ownerToken)) return Effect.succeed(false)
-  return ownerIsDefinitelyAbsent(platform, owner)
-}
-
 function orphanedAdoptions(
   platform: PersistencePlatformApi,
   paths: ProjectStoragePaths,
@@ -1116,7 +1169,7 @@ function orphanedAdoptions(
       for (const adoption of state.pendingIdentityAdoptions) {
         if (adoption.instanceId === instanceId) continue
         const owner = yield* syncAttempt(() => requireAdoptionOwner(state, adoption))
-        if (yield* ownerIsDefinitelyAbsent(platform, owner, adoption.processGroupId)) {
+        if ((yield* inspectOrphan(platform, owner)) === undefined) {
           orphaned.push(adoption)
         }
       }
@@ -1125,16 +1178,6 @@ function orphanedAdoptions(
     { interruptibleUse: true },
   ).pipe(Effect.mapError((cause) =>
     persistenceError("load orphaned identity adoptions", paths.statePath, cause)))
-}
-
-function boundedLiveness(
-  run: () => Promise<ProcessLiveness>,
-  operation: string,
-): Effect.Effect<ProcessLiveness, unknown> {
-  return Effect.interruptible(promiseEffect(run).pipe(Effect.timeoutOrElse({
-    duration: LIVENESS_TIMEOUT_MILLISECONDS,
-    orElse: () => Effect.fail(new Error(`Timed out while attempting to ${operation}`)),
-  })))
 }
 
 function findCommittedIdentity(
@@ -1693,10 +1736,6 @@ function requireCanonicalDate(value: string): void {
 
 function syncAttempt<A>(run: () => A): Effect.Effect<A, unknown> {
   return Effect.try({ try: run, catch: (cause) => cause })
-}
-
-function promiseEffect<A>(run: () => Promise<A>): Effect.Effect<A, unknown> {
-  return Effect.tryPromise({ try: run, catch: (cause) => cause })
 }
 
 function persistenceError(operation: string, path: string, cause: unknown): PersistenceError {

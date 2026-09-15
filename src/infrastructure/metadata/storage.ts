@@ -231,6 +231,21 @@ export function removeDurably(
   })
 }
 
+export function removeDirectoryDurably(
+  platform: PersistencePlatformApi,
+  path: string,
+): Effect.Effect<void, unknown> {
+  return promiseEffect(async () => {
+    await platform.remove(path, { recursive: true, force: true })
+    try {
+      await syncParentDirectory(platform, path)
+    } catch (error) {
+      // No launch directory was ever created, or a concurrent cleanup removed its parent.
+      if (!isErrorCode(error, "ENOENT")) throw error
+    }
+  })
+}
+
 export function withTransactionLock<A, E, R>(
   platform: PersistencePlatformApi,
   lockPath: string,
