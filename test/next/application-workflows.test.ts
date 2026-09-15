@@ -642,6 +642,42 @@ describe("application actor", () => {
     expect(result.reads.some((ids) => ids.includes(CHILD))).toBeTrue()
   })
 
+  for (const mode of ["stop", "natural-exit", "removal"] as const) {
+    test(`reports ${mode} errors without retaining a terminal whose ownership was released`, async () => {
+      const fixture = makeFixture()
+      const cleanupError = new TerminalCleanupError({
+        operation: "stop", ownershipReleased: true,
+        issues: [{ ownerId: "owner-1", sessionId: ROOT, stage: "ui", message: "selection clear failed" }],
+      })
+      const terminals: TerminalSupervisorApi = {
+        ...fixture.options.terminals,
+        stopSession: (sessionId) => fixture.options.terminals.stopSession(sessionId).pipe(
+          Effect.andThen(Effect.fail(cleanupError)),
+        ),
+      }
+      const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const runtime = yield* makeAppRuntime({ ...fixture.options, terminals })
+        yield* runtime.resumeSession(ROOT)
+        if (mode === "natural-exit") {
+          expect(yield* runtime.handleTerminalExit({
+            ownerId: "owner-1", sequenceId: 1, sessionId: ROOT, exitCode: 0, wasActive: true,
+            cleanupError, ownershipReleased: true,
+          })).toBeTrue()
+        } else {
+          const operation = mode === "stop" ? runtime.stopSession(ROOT) : runtime.remove({
+            kind: "tree", rootSessionId: ROOT, memberSessionIds: [ROOT, CHILD],
+            createdAt: "2026-09-01T00:00:00.000Z",
+          }, [ROOT, CHILD])
+          expect(Exit.isFailure(yield* Effect.exit(operation))).toBeTrue()
+        }
+        return yield* runtime.getState
+      })))
+      expect(state.terminals.has(ROOT)).toBeFalse()
+      expect(state.modal?._tag).toBe("Error")
+      expect(state.removals).toEqual([])
+    })
+  }
+
   test("removes an undiscovered temporary session after a successful explicit stop", async () => {
     const fixture = makeFixture()
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {

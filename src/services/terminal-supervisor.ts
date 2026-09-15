@@ -45,6 +45,7 @@ import type {
   TerminalLaunch,
   TerminalTransitionRequest,
 } from "./provider"
+import { TerminalLaunchDirectory } from "./provider"
 import type {
   TerminalProcess,
   TerminalProcessFactory,
@@ -80,6 +81,7 @@ export interface TerminalCleanupIssue {
 export class TerminalCleanupError extends Data.TaggedError("TerminalCleanupError")<{
   readonly operation: "stop" | "shutdown" | "natural-exit" | "acquire-rollback"
   readonly issues: readonly TerminalCleanupIssue[]
+  readonly ownershipReleased?: true
 }> {}
 
 interface SequencedTerminalEvent {
@@ -93,6 +95,7 @@ export interface TerminalExitEvent extends SequencedTerminalEvent {
   readonly wasActive: boolean
   readonly draftPreview?: DraftPreview
   readonly cleanupError?: TerminalCleanupError
+  readonly ownershipReleased?: true
 }
 
 export interface TerminalActivityEvent extends SequencedTerminalEvent {
@@ -156,7 +159,7 @@ export const NULL_TERMINAL_HERDR_REPORTER: TerminalHerdrReporter = {
 
 export interface TerminalOwnershipRepository extends Pick<
   ProviderStateRepositoryApi,
-  "reserve" | "attach" | "mark" | "release" | "commitIdentity" | "ack"
+  "reserve" | "attach" | "mark" | "release" | "commitIdentity" | "ack" | "launchDirectory"
 > {}
 
 export interface TerminalSupervisorDependencies {
@@ -273,6 +276,7 @@ interface TerminalOwner {
   sessionId: string
   readonly providerScope: Scope.Closeable
   readonly providerClose: AcquiredTerminalLaunch["close"]
+  readonly launchResources: AcquiredTerminalLaunch["resources"]
   readonly eventQueue: Queue.Queue<SemanticEvent>
   readonly pendingTransitions: Set<TerminalTransitionRequest>
   readonly sequence: SequenceAllocator
@@ -476,7 +480,9 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           const ownership = reserveExit.value
           const providerScope = yield* Scope.make("sequential")
           const acquiredExit = yield* Effect.exit(
-            restore(Scope.provide(prepared.acquireLaunch, providerScope)),
+            restore(Scope.provide(prepared.acquireLaunch.pipe(Effect.provideService(
+              TerminalLaunchDirectory, this.dependencies.ownership.launchDirectory(ownership),
+            )), providerScope)),
           )
           if (Exit.isFailure(acquiredExit)) {
             const issues = yield* this.rollbackBeforeOwner(
@@ -593,6 +599,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             this.boundedPersistence(Effect.suspend(() =>
               this.dependencies.ownership.attach(owner.ownership, owner.processGroupId, {
                 mutationToken: owner.mutationTokens.attach,
+                ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
               })), "attach terminal process group", owner.sessionId, {
               ownerId: owner.ownerId,
               mutationToken: owner.mutationTokens.attach,
@@ -916,6 +923,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         sessionId: launch.sessionId,
         providerScope,
         providerClose: acquired.close,
+        launchResources: acquired.resources,
         eventQueue,
         pendingTransitions: new Set(),
         sequence,
@@ -1525,7 +1533,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             Cause.squash(cleanupExit.cause),
           )]
 
-      if (issues.length > 0) {
+      if (issues.length > 0 && !plan.owner.leaseReleased) {
         const persistExit = yield* Effect.exit(Effect.suspend(() =>
           this.persistCleanupIncomplete(plan.owner)))
         if (Exit.isSuccess(persistExit)) {
@@ -1555,7 +1563,9 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           error?.issues,
         )
       }
-      return error
+      return error !== undefined && plan.owner.leaseReleased && !this.owners.has(plan.owner.ownerId)
+        ? new TerminalCleanupError({ operation: error.operation, issues: error.issues, ownershipReleased: true })
+        : error
     }.bind(this))
   }
 
@@ -1564,7 +1574,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     error: TerminalCleanupError | undefined,
   ): void {
     this.settlePendingTransitions(plan.owner)
-    if (error) {
+    if (error && !plan.owner.leaseReleased) {
       this.markLocalCleanupIncomplete(plan.owner)
     } else {
       this.deleteOwner(plan.owner)
@@ -1579,7 +1589,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     this.settlePendingTransitions(plan.owner)
     this.emitCleanupExit(plan, error)
     if (error) {
-      this.markLocalCleanupIncomplete(plan.owner)
+      if (this.owners.has(plan.owner.ownerId)) this.markLocalCleanupIncomplete(plan.owner)
       this.reportOwnerCleanupError(plan.owner, error)
       Deferred.doneUnsafe(plan.result, Effect.fail(error))
       return
@@ -1654,6 +1664,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         ? {}
         : { draftPreview: plan.owner.draftPreview }),
       ...(error === undefined ? {} : { cleanupError: error }),
+      ...(plan.owner.leaseReleased && !this.owners.has(plan.owner.ownerId) ? { ownershipReleased: true as const } : {}),
     }))
   }
 
@@ -1703,8 +1714,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         owner.pendingIdentity === undefined &&
         owner.pendingAdoptionToken === undefined &&
         !owner.processRegistrationUncertain &&
-        owner.stoppingPersisted &&
-        issues.length === 0
+        owner.stoppingPersisted
       ) {
         issues.push(...yield* this.releaseOwnerLease(owner))
       }
@@ -1728,7 +1738,10 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           Effect.suspend(() => this.dependencies.ownership.attach(
             owner.ownership,
             owner.processGroupId,
-            { mutationToken: owner.mutationTokens.attach },
+            {
+              mutationToken: owner.mutationTokens.attach,
+              ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
+            },
           )),
           "reconcile terminal process group",
           owner.sessionId,
@@ -1750,6 +1763,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           {
             processGroupId: owner.processGroupId,
             mutationToken: owner.mutationTokens.stopping,
+            ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
           },
         )),
         "persist stopping terminal ownership",
@@ -1822,6 +1836,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             Effect.suspend(() =>
               this.dependencies.ownership.attach(owner.ownership, owner.processGroupId, {
                 mutationToken: owner.mutationTokens.attach,
+                ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
               })),
             "confirm terminal process group",
             owner.sessionId,

@@ -18,7 +18,12 @@ import type {
   SessionRemovedError,
   TerminalError,
 } from "../domain/errors"
-import type { IdentityTransitionKind } from "../domain/persistence"
+import type { IdentityTransitionKind, TerminalLaunchResources } from "../domain/persistence"
+
+/** Owner-derived artifact location, reserved before provider acquisition starts. */
+export class TerminalLaunchDirectory extends Context.Service<TerminalLaunchDirectory, string>()(
+  "claude-tree/TerminalLaunchDirectory",
+) {}
 
 export const SESSION_SNAPSHOT_BATCH_SIZE = 16
 
@@ -68,6 +73,7 @@ export interface TerminalLaunch {
 export interface AcquiredTerminalLaunch {
   readonly launch: TerminalLaunch
   readonly close: Effect.Effect<void, ProviderCleanupError>
+  readonly resources?: Exclude<TerminalLaunchResources, { readonly kind: "acquiring" }>
 }
 
 export interface PreparedTerminal {

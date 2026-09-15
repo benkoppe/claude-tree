@@ -41,10 +41,10 @@ import type {
   TerminalExitEvent,
   TerminalSessionChangedEvent,
   TerminalSessionTransitionErrorEvent,
-  TerminalCleanupError,
   TerminalSupervisorApi,
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
+import { TerminalCleanupError } from "../services/terminal-supervisor"
 import { makeNavigationWriter } from "./navigation-writer"
 import { describeSession, selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
@@ -828,7 +828,7 @@ export function makeAppRuntime(
           _tag: "TerminalStopped",
           sessionId: event.sessionId,
           focusExitedSession,
-          ...(event.cleanupError === undefined ? {} : { cleanupIncomplete: true }),
+          ...(event.cleanupError === undefined || event.ownershipReleased ? {} : { cleanupIncomplete: true }),
         })
         preparedTerminals.delete(event.sessionId)
         owners.delete(ownerId)
@@ -1235,8 +1235,16 @@ export function makeAppRuntime(
       if (command._tag === "Stop") {
         const sessionId = currentSessionId(command.sessionId, command.identityGeneration)
         if (Exit.isFailure(exit)) {
-          yield* publish({ _tag: "TerminalStopped", sessionId, cleanupIncomplete: true })
-          yield* failReply(command.reply, "StopSession", "Stop session", Cause.squash(exit.cause))
+          const cause = Cause.squash(exit.cause)
+          const cleanupIncomplete = !(cause instanceof TerminalCleanupError && cause.ownershipReleased)
+          const ownerId = state.terminals.get(sessionId)?.ownerId
+          yield* publish({ _tag: "TerminalStopped", sessionId, cleanupIncomplete })
+          if (!cleanupIncomplete) {
+            preparedTerminals.delete(sessionId)
+            if (ownerId) owners.delete(ownerId)
+            yield* startRefresh("stop", new Set([sessionId]), ownerId)
+          }
+          yield* failReply(command.reply, "StopSession", "Stop session", cause)
           return
         }
         const terminal = state.terminals.get(sessionId)
@@ -1261,11 +1269,18 @@ export function makeAppRuntime(
             ? currentSessionId(command.step.sessionId, workflow.identityGeneration)
             : undefined
           if (failedSessionId !== undefined) {
+            const cleanupIncomplete = !(cause instanceof TerminalCleanupError && cause.ownershipReleased)
+            const ownerId = state.terminals.get(failedSessionId)?.ownerId
             yield* publish({
               _tag: "TerminalStopped",
               sessionId: failedSessionId,
-              cleanupIncomplete: true,
+              cleanupIncomplete,
             })
+            if (!cleanupIncomplete) {
+              if (ownerId) owners.delete(ownerId)
+              preparedTerminals.delete(failedSessionId)
+              stoppedSessionIds.push(failedSessionId)
+            }
           }
           if (stoppedSessionIds.length > 0) {
             yield* startRefresh("stop", new Set(stoppedSessionIds))

@@ -557,6 +557,7 @@ describe("Effect Codex provider", () => {
       return {
         remoteUrl: "ws://127.0.0.1:12345",
         bearerToken: "secret",
+        resources: { kind: "codex" as const, sidecarProcessGroupId: 404 },
         transitions: source,
         close: () => Effect.void,
       }
@@ -574,6 +575,7 @@ describe("Effect Codex provider", () => {
 
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const acquired = yield* prepared.acquireLaunch
+      expect(acquired.resources).toEqual({ kind: "codex", sidecarProcessGroupId: 404 })
       expect(acquired.launch.command).toEqual([
         "/usr/bin/codex",
         "--remote",

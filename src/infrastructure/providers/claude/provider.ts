@@ -1032,7 +1032,7 @@ export class ClaudeProvider implements AgentProviderApi {
     return Effect.gen({ self: this }, function*() {
       const launch = yield* this.resolveLaunch(kind, sessionId, draft)
       const hooks = yield* makeClaudeLifecycleHooks(sessionId)
-      if (hooks === undefined) return { launch, close: Effect.void }
+      if (hooks === undefined) return { launch, close: Effect.void, resources: { kind: "local" as const } }
       return {
         launch: {
           ...launch,
@@ -1041,6 +1041,7 @@ export class ClaudeProvider implements AgentProviderApi {
           activityHints: hooks.activityHints,
         },
         close: hooks.close,
+        resources: { kind: "local" as const },
       }
     })
   }
