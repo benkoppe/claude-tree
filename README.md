@@ -50,6 +50,8 @@ nix run github:benkoppe/claude-tree#unwrapped
 
 Quitting stops the owned agent processes and restores the host terminal. Provider conversations remain available to resume later.
 
+If shutdown fails, the error lists the affected sessions, cleanup stages, and underlying causes. Simultaneous terminal and navigation-persistence failures are reported together.
+
 After an interrupted shutdown, `claude-tree` checks previous terminal ownership at startup and when opening a session. It releases an orphaned reservation once the old application, its terminal process group, and any recorded Codex sidecar group are definitely gone and its launch artifacts are removed. A saved `stopping` or `cleanup-incomplete` status alone does not block reopening.
 
 If cleanup cannot be verified, the error identifies the remaining condition: a surviving process group, unknown liveness, failed artifact cleanup, or an acquisition interrupted before all process identities were recorded. Resolve that condition and retry. Recovery does not signal unidentified processes or guess that an incompletely recorded launch was harmless.

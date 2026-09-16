@@ -15,6 +15,7 @@ import {
 } from "effect"
 
 import { Osc52Forwarder } from "../clipboard"
+import { describeError, errorDetails, type ErrorDescription } from "../error-format"
 import type {
   AgentActivity,
   AgentSession,
@@ -84,7 +85,21 @@ export class TerminalCleanupError extends Data.TaggedError("TerminalCleanupError
   readonly operation: "stop" | "shutdown" | "natural-exit" | "acquire-rollback"
   readonly issues: readonly TerminalCleanupIssue[]
   readonly ownershipReleased?: true
-}> {}
+}> {
+  override get message(): string {
+    return errorDetails(this)
+  }
+
+  [describeError](): ErrorDescription {
+    return {
+      message: `Terminal ${this.operation} cleanup failed${this.issues.length === 0 ? " (no issue details available)" : ":"}`,
+      children: this.issues.map((issue) => ({
+        label: `${issue.sessionId ? `session ${issue.sessionId}` : issue.ownerId} [${issue.stage}]`,
+        error: { message: issue.message || "Cleanup issue (no message)", cause: issue.cause },
+      })),
+    }
+  }
+}
 
 interface SequencedTerminalEvent {
   readonly ownerId: string

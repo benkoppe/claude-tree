@@ -15,7 +15,7 @@ import {
   type ShutdownSignalTarget,
 } from "../../src/cli"
 import { PROGRAM_NAME, PROGRAM_VERSION } from "../../src/program"
-import type { TerminalActivityEvent } from "../../src/services/terminal-supervisor"
+import { TerminalCleanupError, type TerminalActivityEvent } from "../../src/services/terminal-supervisor"
 
 test("help and version bypass TTY and interactive composition", async () => {
   const output: string[] = []
@@ -91,6 +91,7 @@ test("terminal callback bridge preserves events emitted during runtime startup",
 
 test("all shutdown signals interrupt the scoped application and remove listeners", async () => {
   for (const signal of SHUTDOWN_SIGNALS) {
+    const stderr: string[] = []
     const emitter = new EventEmitter()
     let acquired = 0
     let released = 0
@@ -105,7 +106,7 @@ test("all shutdown signals interrupt the scoped application and remove listeners
       }),
     ).pipe(Effect.andThen(Effect.never))
     const running = Effect.runPromiseExit(
-      runScopedApplication(application, makeShutdownSignals(emitter as ShutdownSignalTarget)),
+      reportCliFailures(runScopedApplication(application, makeShutdownSignals(emitter as ShutdownSignalTarget)), (text) => stderr.push(text)),
     )
     await Effect.runPromise(Deferred.await(ready))
 
@@ -115,6 +116,7 @@ test("all shutdown signals interrupt the scoped application and remove listeners
     expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
     expect(released).toBe(1)
     expect(emitter.eventNames()).toEqual([])
+    expect(stderr).toEqual([])
   }
 })
 
@@ -208,4 +210,55 @@ test("failure reporting emits one concise line and preserves failure", async () 
 
   expect(Exit.isFailure(exit)).toBeTrue()
   expect(output).toEqual([`${PROGRAM_NAME}: broken startup\n`])
+})
+
+test("successful CLI completion stays silent and blank errors get a fallback", async () => {
+  const output: string[] = []
+  await Effect.runPromise(reportCliFailures(Effect.void, (text) => output.push(text)))
+  expect(output).toEqual([])
+  const error = new Error(" \n ")
+  const exit = await Effect.runPromiseExit(reportCliFailures(Effect.fail(error), (text) => output.push(text)))
+  expect(Exit.findErrorOption(exit).pipe(Option.getOrThrow)).toBe(error)
+  expect(output).toEqual([`${PROGRAM_NAME}: Error\n`])
+})
+
+test("CLI reporting retains compound failures and prints a repeated backstop error only once", async () => {
+  const first = new Error("application failed")
+  const second = new Error("scope cleanup failed")
+  for (const finalizerError of [first, second]) {
+    const output: string[] = []
+    const failure = Effect.fail(first).pipe(Effect.ensuring(Effect.die(finalizerError)))
+    const exit = await Effect.runPromiseExit(reportCliFailures(failure, (text) => output.push(text)))
+    expect(Exit.isFailure(exit)).toBeTrue()
+    if (Exit.isFailure(exit)) expect(exit.cause.reasons).toHaveLength(2)
+    expect(output).toEqual([finalizerError === first
+      ? `${PROGRAM_NAME}: application failed\n`
+      : `${PROGRAM_NAME}: application failed\nscope cleanup failed\n`])
+  }
+})
+
+test("signal interruption accompanied by scoped cleanup failure reports the failure", async () => {
+  const emitter = new EventEmitter()
+  const ready = Deferred.makeUnsafe<void>()
+  const output: string[] = []
+  const cleanup = new TerminalCleanupError({ operation: "shutdown", issues: [{
+    ownerId: "owner", sessionId: "signal-session", stage: "verify", message: "Process group 123 did not stop",
+  }] })
+  const lifecycle = Effect.gen(function*() {
+    yield* Effect.addFinalizer(() => Effect.die(cleanup))
+    yield* Deferred.succeed(ready, undefined)
+    yield* Effect.never
+  })
+  const running = Effect.runPromiseExit(reportCliFailures(
+    runScopedApplication(lifecycle, makeShutdownSignals(emitter as ShutdownSignalTarget)),
+    (text) => output.push(text),
+  ))
+  await Effect.runPromise(Deferred.await(ready))
+  emitter.emit("SIGTERM")
+  const exit = await running
+  expect(Exit.isFailure(exit)).toBeTrue()
+  expect(output).toHaveLength(1)
+  expect(output[0]).toContain("signal-session [verify]")
+  expect(output[0]).toContain("Process group 123 did not stop")
+  expect(emitter.eventNames()).toEqual([])
 })

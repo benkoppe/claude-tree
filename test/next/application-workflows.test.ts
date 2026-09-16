@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { EventEmitter } from "node:events"
 import { forkSession, getSessionMessages, InMemorySessionStore, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
 import {
   Deferred,
@@ -9,6 +10,8 @@ import {
   Stream,
 } from "effect"
 import { TestClock } from "effect/testing"
+import { makeShutdownSignals, reportCliFailures, runPresentationLifecycle, runScopedApplication, type ShutdownSignalTarget } from "../../src/cli"
+import { PROGRAM_NAME } from "../../src/program"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
 
@@ -3068,6 +3071,107 @@ describe("application actor", () => {
     expect(shutdownExit && Exit.isFailure(shutdownExit)).toBeTrue()
     expect(shutdownState?.shutdown).toBe("cleanup-incomplete")
     expect(fixture.shutdowns).toBe(1)
+  })
+
+  for (const navigationAlsoFails of [false, true]) {
+    test(`shutdown stderr retains terminal issue details and causes (navigation failure: ${navigationAlsoFails})`, async () => {
+      const fixture = makeFixture()
+      const lockFailure = new Error("state lock timed out")
+      const terminalFailure = new TerminalCleanupError({ operation: "shutdown", issues: [
+        { ownerId: "owner-1", sessionId: ROOT, stage: "lease", message: "Unable to release ownership", cause: lockFailure },
+        { ownerId: "owner-2", sessionId: CHILD, stage: "verify", message: "Process group 123 did not stop" },
+      ] })
+      const navigationFailure = new PersistenceError({ operation: "save navigation", path: "/state", message: "navigation save failed" })
+      const workerFailure = new Error("navigation worker did not close", { cause: new Error("worker acknowledgment missing") })
+      const terminalFinalizerFailure = new Error("terminal finalizer also failed")
+      const terminalShutdown = navigationAlsoFails
+        ? Effect.fail(terminalFailure).pipe(Effect.ensuring(Effect.die(terminalFinalizerFailure)))
+        : Effect.fail(terminalFailure)
+      const output: string[] = []
+      let failure: ApplicationShutdownError | undefined
+      const scoped = await Effect.runPromiseExit(Effect.scoped(Effect.gen(function*() {
+        const runtime = yield* makeAppRuntime({
+          ...fixture.options,
+          metadata: navigationAlsoFails ? {
+            ...fixture.options.metadata, saveNavigation: () => Effect.fail(navigationFailure),
+          } : fixture.options.metadata,
+          terminals: { ...fixture.options.terminals, shutdown: () => Effect.sync(() => { fixture.shutdowns++ }).pipe(Effect.andThen(terminalShutdown)) },
+          ...(navigationAlsoFails ? { closeNavigationPersistence: Effect.fail(workerFailure) } : {}),
+        })
+        if (navigationAlsoFails) {
+          yield* runtime.selectRoot(ROOT)
+          yield* TestClock.adjust(200)
+        }
+        failure = yield* Effect.flip(reportCliFailures(runtime.shutdown, (text) => output.push(text)))
+        expect((yield* runtime.getState).shutdown).toBe("cleanup-incomplete")
+      }).pipe(Effect.provide(TestClock.layer()))))
+      expect(Exit.isFailure(scoped)).toBeTrue()
+      expect(failure).toBeInstanceOf(ApplicationShutdownError)
+      expect(output).toHaveLength(1)
+      expect(output[0]).toStartWith(`${PROGRAM_NAME}: Application shutdown failed: `)
+      expect(output[0]).toContain(`session ${ROOT} [lease]: Unable to release ownership`)
+      expect(output[0]).toContain(`session ${CHILD} [verify]: Process group 123 did not stop`)
+      expect(output[0]?.split("state lock timed out")).toHaveLength(2)
+      expect(terminalFailure.issues[0]?.cause).toBe(lockFailure)
+      if (navigationAlsoFails) {
+        expect(output[0]).toContain("navigation save failed")
+        expect(output[0]).toContain("navigation worker did not close")
+        expect(output[0]).toContain("worker acknowledgment missing")
+        const causes = failure!.cause as readonly unknown[]
+        expect(causes[0]).toBeInstanceOf(AggregateError)
+        expect((causes[0] as AggregateError).errors).toEqual([navigationFailure, workerFailure])
+        expect(causes[1]).toBe(terminalFailure)
+        expect(causes[2]).toBe(terminalFinalizerFailure)
+        expect(output[0]).toContain("terminal finalizer also failed")
+      } else expect(failure!.cause).toBe(terminalFailure)
+      expect(fixture.shutdowns).toBe(1)
+    })
+  }
+
+  test("terminal cleanup notifications retain the same issue details in the navigator", async () => {
+    const fixture = makeFixture()
+    const error = new TerminalCleanupError({ operation: "stop", issues: [{
+      ownerId: "owner", sessionId: ROOT, stage: "provider", message: "Provider resources did not close",
+      cause: new Error("sidecar survived"),
+    }] })
+    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* Effect.sync(() => runtime.terminalEvents.onCleanupError?.(error))
+      return yield* waitForState(runtime, (state) => state.modal?._tag === "Error")
+    })))
+    expect(state.modal?._tag === "Error" ? state.modal.message : "").toContain(`session ${ROOT} [provider]`)
+    expect(state.modal?._tag === "Error" ? state.modal.message : "").toContain("sidecar survived")
+  })
+
+  test("signal-driven runtime shutdown reports cleanup details once after scope finalization", async () => {
+    const fixture = makeFixture()
+    const ready = Deferred.makeUnsafe<void>()
+    const emitter = new EventEmitter()
+    const output: string[] = []
+    const cleanup = new TerminalCleanupError({ operation: "shutdown", issues: [{
+      ownerId: "owner", sessionId: ROOT, stage: "provider", message: "Provider cleanup failed",
+      cause: new Error("sidecar survived"),
+    }] })
+    const application = Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({
+        ...fixture.options,
+        terminals: { ...fixture.options.terminals, shutdown: () => Effect.sync(() => { fixture.shutdowns++ }).pipe(Effect.andThen(Effect.fail(cleanup))) },
+      })
+      yield* runPresentationLifecycle(Deferred.succeed(ready, undefined), Effect.never, runtime.shutdown)
+    })
+    const running = Effect.runPromiseExit(reportCliFailures(
+      runScopedApplication(application, makeShutdownSignals(emitter as ShutdownSignalTarget)),
+      (text) => output.push(text),
+    ))
+    await Effect.runPromise(Deferred.await(ready))
+    emitter.emit("SIGTERM")
+    expect(Exit.isFailure(await running)).toBeTrue()
+    expect(output).toHaveLength(1)
+    expect(output[0]).toContain("Application shutdown failed:")
+    expect(output[0]).toContain(`session ${ROOT} [provider]: Provider cleanup failed`)
+    expect(output[0]?.split("sidecar survived")).toHaveLength(2)
+    expect(fixture.shutdowns).toBe(1)
+    expect(emitter.eventNames()).toEqual([])
   })
 
   test("navigation worker close failures participate in the runtime shutdown result", async () => {
