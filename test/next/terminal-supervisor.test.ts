@@ -1682,6 +1682,7 @@ test("a late reserve is compensated before retry and can never recreate released
   const dependencies = {
     ...fixture.dependencies,
     persistenceTimeoutMs: 10,
+    launchPersistenceTimeoutMs: 10,
     events: { onCleanupError: (error: TerminalCleanupError) => cleanupErrors.push(error) },
   }
 
@@ -1724,6 +1725,110 @@ test("a late reserve is compensated before retry and can never recreate released
     expect(releases[0]?.token).toBe(releases[1]?.token)
     expect(releases[2]?.token).not.toBe(releases[0]?.token)
     expect(releases.every((call) => call.token !== undefined)).toBeTrue()
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+for (const [operation, phase] of [
+  ["reserve", "waiting-for-lock"],
+  ["reserve", "cleaning-orphan-artifacts"],
+  ["attach", "committing-state"],
+] as const) {
+  test(`healthy launch ${operation} survives a slow ${phase} phase`, async () => {
+    const fixture = makeFixture()
+    const entered = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    const wait = Effect.gen(function*() {
+      yield* Deferred.succeed(entered, undefined)
+      yield* Deferred.await(release)
+    })
+    const ownership: TerminalOwnershipRepository = {
+      reserve: (id, options) => operation === "reserve"
+        ? Effect.sync(() => options?.onPhase?.(phase)).pipe(
+            Effect.andThen(wait), Effect.andThen(fixture.leases.reserve(id, options)),
+          )
+        : fixture.leases.reserve(id, options),
+      attach: (owner, group, options) => operation === "attach"
+        ? Effect.sync(() => options?.onPhase?.(phase)).pipe(
+            Effect.andThen(wait), Effect.andThen(fixture.leases.attach(owner, group, options)),
+          )
+        : fixture.leases.attach(owner, group, options),
+      mark: fixture.leases.mark,
+      release: fixture.leases.release,
+      commitIdentity: fixture.leases.commitIdentity,
+      ack: fixture.leases.ack,
+      launchDirectory: fixture.leases.launchDirectory,
+    }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const supervisor = yield* makeTerminalSupervisor({ ...fixture.dependencies, ownership })
+      const opening = yield* Effect.forkScoped(supervisor.show(prepared("slow-launch", fixture)))
+      yield* Deferred.await(entered)
+      yield* TestClock.adjust(750)
+      expect(opening.pollUnsafe()).toBeUndefined()
+      expect(yield* supervisor.activeSessionId).toBeNull()
+      expect(fixture.renderer.surfaces.some((surface) => surface.active)).toBeFalse()
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(opening)
+      expect(yield* supervisor.activeSessionId).toBe("slow-launch")
+      expect(fixture.processes.processes).toHaveLength(1)
+      expect(fixture.log).not.toContain("lease-release:slow-launch")
+      yield* supervisor.stopSession("slow-launch")
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+}
+
+test("launch timeout reports its budget and phase while preserving late-reserve compensation", async () => {
+  const fixture = makeFixture()
+  const barrier = Deferred.makeUnsafe<void>()
+  fixture.leases.reserveBarriers.push(barrier)
+  const reserve = fixture.leases.reserve
+  const ownership: TerminalOwnershipRepository = {
+    ...fixture.dependencies.ownership,
+    reserve: (id, options) => {
+      options?.onPhase?.("reading-state")
+      return reserve(id, options)
+    },
+  }
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor({ ...fixture.dependencies, ownership, launchPersistenceTimeoutMs: 1_000 })
+    const opening = yield* Effect.forkScoped(supervisor.show(prepared("timeout-details", fixture)))
+    yield* eventually(() => fixture.log.includes("lease-acquire:timeout-details"))
+    yield* TestClock.adjust(1_000)
+    const exit = yield* Fiber.await(opening)
+    expect(Exit.isFailure(exit)).toBeTrue()
+    if (Exit.isFailure(exit)) {
+      expect(Cause.squash(exit.cause)).toMatchObject({
+        message: "reserve terminal ownership timed out after 1000ms for timeout-details (phase: reading-state)",
+      })
+    }
+    expect(fixture.processes.processes).toHaveLength(0)
+    yield* Deferred.succeed(barrier, undefined)
+    yield* eventually(() => fixture.log.includes("lease-release:timeout-details"))
+    yield* supervisor.shutdown()
+    expect(fixture.leases.current("timeout-details")).toBeUndefined()
+    expect(fixture.processes.processes).toHaveLength(0)
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("shutdown cancels the long launch wait and compensates a later reservation without spawning", async () => {
+  const fixture = makeFixture()
+  const barrier = Deferred.makeUnsafe<void>()
+  fixture.leases.reserveBarriers.push(barrier)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor({ ...fixture.dependencies, persistenceTimeoutMs: 10 })
+    const opening = yield* Effect.forkScoped(supervisor.show(prepared("quit-during-reserve", fixture)))
+    yield* eventually(() => fixture.log.includes("lease-acquire:quit-during-reserve"))
+    const shutdown = yield* Effect.forkScoped(supervisor.shutdown())
+    const openingExit = yield* Fiber.await(opening)
+    expect(Exit.isFailure(openingExit)).toBeTrue()
+    if (Exit.isFailure(openingExit)) expect(String(Cause.squash(openingExit.cause))).toContain("cancelled during shutdown")
+    yield* TestClock.adjust(10)
+    expect(Exit.isFailure(yield* Fiber.await(shutdown))).toBeTrue()
+    expect(fixture.processes.processes).toHaveLength(0)
+    yield* Deferred.succeed(barrier, undefined)
+    yield* eventually(() => fixture.log.includes("lease-release:quit-during-reserve"))
+    yield* supervisor.shutdown()
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
+    expect(fixture.processes.processes).toHaveLength(0)
   }).pipe(Effect.provide(TestClock.layer()))))
 })
 

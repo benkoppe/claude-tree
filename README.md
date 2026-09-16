@@ -54,6 +54,8 @@ After an interrupted shutdown, `claude-tree` checks previous terminal ownership 
 
 If cleanup cannot be verified, the error identifies the remaining condition: a surviving process group, unknown liveness, failed artifact cleanup, or an acquisition interrupted before all process identities were recorded. Resolve that condition and retry. Recovery does not signal unidentified processes or guess that an incompletely recorded launch was harmless.
 
+Opening a terminal allows up to ten seconds for each launch persistence operation, including normal contention with navigation saves. Persistence timeout errors include the time budget and last operation phase. Such a timeout means the application stopped waiting; it is not evidence that another terminal is running. Late reservations are released without starting a provider process.
+
 Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (default `~/.local/state`). Older terminal-owner records without a resource inventory are rejected in place, rather than automatically upgraded or deleted. Any reset is explicit and affects application-owned relationships and UI metadata, not provider transcripts.
 
 ## Development

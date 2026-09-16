@@ -33,6 +33,8 @@ import {
   prepareProjectStorage,
   readJsonIfPresent,
   removeDirectoryDurably,
+  reportPersistencePhase,
+  type PersistenceProgress,
   requireSchemaVersion,
   withTransactionLock,
   writeJsonAtomically,
@@ -179,7 +181,7 @@ export type CommitIdentityOptions = CommitIdentityBase & (
     }
 )
 
-export interface MutationOptions {
+export interface MutationOptions extends PersistenceProgress {
   readonly mutationToken?: string
 }
 
@@ -209,7 +211,7 @@ export interface ProviderStateRepositoryApi {
   readonly load: Effect.Effect<ProviderState, PersistenceError>
   readonly loadMetadata: Effect.Effect<ProjectState, PersistenceError>
   readonly launchDirectory: (owner: TerminalOwner) => string
-  readonly recoverOrphanedOwners: (sessionIds?: readonly string[]) => Effect.Effect<readonly OwnerRecoveryOutcome[], PersistenceError>
+  readonly recoverOrphanedOwners: (sessionIds?: readonly string[], progress?: PersistenceProgress) => Effect.Effect<readonly OwnerRecoveryOutcome[], PersistenceError>
   readonly saveNavigation: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly updateMetadata: (
     transform: (state: ProjectState) => ProjectState,
@@ -312,18 +314,20 @@ function providerStateApi(
   providerId: string,
   instanceId: string,
 ): ProviderStateRepositoryApi {
-  const readStateUnlocked = Effect.gen(function*() {
+  const readStateUnlocked = (progress?: PersistenceProgress) => Effect.gen(function*() {
+    reportPersistencePhase(progress, "reading-state")
     const value = yield* readJsonIfPresent(platform, paths.statePath)
     if (value === undefined) return yield* Effect.fail(new Error("Provider state is missing"))
+    reportPersistencePhase(progress, "validating-state")
     return yield* syncAttempt(() => decodeProviderState(value, paths))
   })
 
-  const readState = (operation: string): Effect.Effect<ProviderState, PersistenceError> =>
+  const readState = (operation: string, progress?: PersistenceProgress): Effect.Effect<ProviderState, PersistenceError> =>
     withTransactionLock(
       platform,
       paths.stateLockPath,
-      readStateUnlocked.pipe(Effect.map(domainState)),
-      { interruptibleUse: true },
+      readStateUnlocked(progress).pipe(Effect.map(domainState)),
+      { ...progress, interruptibleUse: true },
     ).pipe(Effect.mapError((cause) => persistenceError(operation, paths.statePath, cause)))
 
   const load = readState("load provider state")
@@ -331,19 +335,24 @@ function providerStateApi(
   const transaction = <A>(
     operation: string,
     transform: (state: ProviderState) => Effect.Effect<readonly [ProviderState, A], unknown>,
+    progress?: PersistenceProgress,
   ): Effect.Effect<A, PersistenceError | SessionOwnedError | SessionRemovedError> =>
     withTransactionLock(
       platform,
       paths.stateLockPath,
       Effect.gen(function*() {
-        const current = domainState(yield* readStateUnlocked)
+        const current = domainState(yield* readStateUnlocked(progress))
+        reportPersistencePhase(progress, "checking-ownership")
         const [candidate, result] = yield* transform(current)
+        reportPersistencePhase(progress, "validating-state")
         const next = yield* syncAttempt(() => canonicalizeAndValidate(candidate))
         if (!jsonEqual(current, next)) {
+          reportPersistencePhase(progress, "committing-state")
           yield* writeJsonAtomically(platform, paths.statePath, persistedState(next))
         }
         return result
       }),
+      progress,
     ).pipe(Effect.mapError((cause) =>
       cause instanceof SessionOwnedError ||
           cause instanceof SessionRemovedError ||
@@ -354,8 +363,9 @@ function providerStateApi(
   const persistenceTransaction = <A>(
     operation: string,
     transform: (state: ProviderState) => Effect.Effect<readonly [ProviderState, A], unknown>,
+    progress?: PersistenceProgress,
   ): Effect.Effect<A, PersistenceError> =>
-    transaction(operation, transform).pipe(Effect.mapError((cause) =>
+    transaction(operation, transform, progress).pipe(Effect.mapError((cause) =>
       cause instanceof PersistenceError
         ? cause
         : persistenceError(operation, paths.statePath, cause)))
@@ -367,8 +377,9 @@ function providerStateApi(
     operation: string,
     attempted: Effect.Effect<A, E>,
     recover: (state: ProviderState) => A | undefined,
+    progress?: PersistenceProgress,
   ): Effect.Effect<A, E> => attempted.pipe(Effect.catch((error) =>
-    readState(`reconcile ${operation}`).pipe(
+    readState(`reconcile ${operation}`, progress).pipe(
       Effect.flatMap((state) => syncAttempt(() => recover(state))),
       Effect.flatMap((recovered) => recovered === undefined
         ? Effect.fail(error)
@@ -382,16 +393,18 @@ function providerStateApi(
     createHash("sha256").update(owner.ownerToken).digest("hex"),
   )
 
-  const recoverOrphanedOwners: ProviderStateRepositoryApi["recoverOrphanedOwners"] = (sessionIds) =>
+  const recoverOrphanedOwners: ProviderStateRepositoryApi["recoverOrphanedOwners"] = (sessionIds, progress) =>
     Effect.gen(function*() {
-      const snapshot = yield* load
+      const snapshot = yield* readState("load owners for recovery", progress)
       const outcomes: OwnerRecoveryOutcome[] = []
       for (const owner of snapshot.terminalOwners) {
         if (sessionIds !== undefined && !sessionIds.includes(owner.sessionId)) continue
+        reportPersistencePhase(progress, "checking-orphan-processes")
         let reason = yield* inspectOrphan(platform, owner)
         if (reason === undefined) {
           // Immutable owner directories make concurrent, repeated deletion safe. No new
           // owner can acquire this directory; never clean by mutable session identity.
+          reportPersistencePhase(progress, "cleaning-orphan-artifacts")
           const removed = yield* Effect.exit(Effect.interruptible(removeDirectoryDurably(platform, launchDirectory(owner)).pipe(
             Effect.timeoutOrElse({
               duration: ARTIFACT_CLEANUP_TIMEOUT_MILLISECONDS,
@@ -405,6 +418,7 @@ function providerStateApi(
                 const current = state.terminalOwners.find((candidate) => candidate.ownerToken === owner.ownerToken)
                 if (current === undefined) return [state, undefined] as const
                 if (!jsonEqual(current, owner)) return [state, "owner-changed" as const] as const
+                reportPersistencePhase(progress, "checking-orphan-processes")
                 const blocked = yield* inspectOrphan(platform, current)
                 if (blocked !== undefined) return [state, blocked] as const
                 // Identity commits already moved metadata atomically. Only their
@@ -414,7 +428,7 @@ function providerStateApi(
                   terminalOwners: state.terminalOwners.filter((candidate) => candidate.ownerToken !== owner.ownerToken),
                   pendingIdentityAdoptions: state.pendingIdentityAdoptions.filter((adoption) => adoption.ownerToken !== owner.ownerToken),
                 }, undefined] as const
-              }))
+              }), progress)
           }
         }
         outcomes.push({ sessionId: owner.sessionId, ownerToken: owner.ownerToken, ...(reason === undefined ? {} : { reason }) })
@@ -484,7 +498,7 @@ function providerStateApi(
 
   const reserve: ProviderStateRepositoryApi["reserve"] = (sessionId, options) => {
     const mutationToken = options?.mutationToken ?? platform.randomToken()
-    const attempted = (recovery: readonly OwnerRecoveryOutcome[]) => transaction("reserve terminal owner", (state) =>
+    const attempted = (recovery: readonly OwnerRecoveryOutcome[] = []) => transaction("reserve terminal owner", (state) =>
       Effect.gen(function*() {
         yield* syncAttempt(() => requireNonEmpty(sessionId, "Session ID"))
         yield* syncAttempt(() => requireNonEmpty(mutationToken, "Mutation token"))
@@ -518,16 +532,18 @@ function providerStateApi(
           updatedAt: now,
         }
         return [{ ...state, terminalOwners: [...owners, owner] }, owner] as const
-      }))
-    return recoverOrphanedOwners([sessionId]).pipe(Effect.flatMap((outcomes) => {
-      return reconcileWrite("reserve terminal owner", attempted(outcomes), (state) =>
+      }), options)
+    const reserveOrRecover = attempted().pipe(Effect.catch((error) => {
+      if (!(error instanceof SessionOwnedError)) return Effect.fail(error)
+      return recoverOrphanedOwners([sessionId], options).pipe(Effect.flatMap((outcomes) => attempted(outcomes)))
+    }))
+    return reconcileWrite("reserve terminal owner", reserveOrRecover, (state) =>
         state.terminalOwners.find((owner) =>
           owner.sessionId === sessionId &&
           owner.ownerToken === mutationToken &&
           owner.lastMutationToken === mutationToken &&
           owner.instanceId === instanceId &&
-          owner.ownerPid === platform.pid))
-    }))
+          owner.ownerPid === platform.pid), options)
   }
 
   const mutateOwner = (
@@ -536,6 +552,7 @@ function providerStateApi(
     mutationToken: string,
     mutate: (current: TerminalOwner, state: ProviderState) => TerminalOwner,
     matches: (current: TerminalOwner) => boolean,
+    progress?: PersistenceProgress,
   ): Effect.Effect<TerminalOwner, PersistenceError> =>
     reconcileWrite(operation, persistenceTransaction(operation, (state) =>
       syncAttempt(() => {
@@ -551,10 +568,10 @@ function providerStateApi(
           },
           updated,
         ] as const
-      })), (state) => state.terminalOwners.find((candidate) =>
+      }), progress), (state) => state.terminalOwners.find((candidate) =>
         candidate.ownerToken === owner.ownerToken &&
         candidate.lastMutationToken === mutationToken &&
-        matches(candidate)))
+        matches(candidate)), progress)
 
   return {
     projectPath: paths.projectPath,
@@ -586,7 +603,7 @@ function providerStateApi(
           updatedAt: platform.now(),
         }
       }, (current) => current.status === "running" && current.processGroupId === processGroupId &&
-        (options?.resources === undefined || jsonEqual(current.resources, options.resources)))
+        (options?.resources === undefined || jsonEqual(current.resources, options.resources)), options)
     },
     mark: (owner, status, options) => {
       const mutationToken = options?.mutationToken ?? platform.randomToken()

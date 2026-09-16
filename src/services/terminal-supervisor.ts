@@ -54,6 +54,7 @@ import type {
 } from "../infrastructure/terminal"
 import { TerminalSpawnCleanupError } from "../infrastructure/terminal"
 import type { ProviderStateRepositoryApi } from "./provider-state-repository"
+import type { PersistencePhase } from "../infrastructure/metadata/storage"
 
 const DEFAULT_GRACE_PERIOD_MS = 200
 const DEFAULT_KILL_PERIOD_MS = 200
@@ -63,6 +64,7 @@ const PROVIDER_CLEANUP_ATTEMPTS = 3
 const PROVIDER_CLEANUP_RETRY_DELAY_MS = 10
 const PROVIDER_CLEANUP_TIMEOUT_MS = 500
 const PERSISTENCE_TIMEOUT_MS = 500
+export const TERMINAL_LAUNCH_PERSISTENCE_TIMEOUT_MS = 10_000
 const TRANSITION_DERIVATION_TIMEOUT_MS = 2_000
 const APPLICATION_ACKNOWLEDGMENT_TIMEOUT_MS = 10_000
 const ACTIVITY_PROBE_INTERVAL_MS = 2_000
@@ -174,6 +176,7 @@ export interface TerminalSupervisorDependencies {
   readonly providerCleanupRetryDelayMs?: number
   readonly providerCleanupTimeoutMs?: number
   readonly persistenceTimeoutMs?: number
+  readonly launchPersistenceTimeoutMs?: number
   readonly transitionDerivationTimeoutMs?: number
   readonly applicationAcknowledgmentTimeoutMs?: number
 }
@@ -330,12 +333,14 @@ interface TrackedPersistence {
   observedByCaller: boolean
   reported: boolean
   exit?: Exit.Exit<unknown, unknown>
+  readonly progress?: { phase?: PersistencePhase }
 }
 
 interface PersistenceTracking {
   readonly ownerId?: string
   readonly mutationToken?: string
   readonly mutationStage?: string
+  readonly progress?: { phase?: PersistencePhase }
 }
 
 interface PendingReservation {
@@ -384,12 +389,14 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
   private readonly providerCleanupRetryDelayMs: number
   private readonly providerCleanupTimeoutMs: number
   private readonly persistenceTimeoutMs: number
+  private readonly launchPersistenceTimeoutMs: number
   private readonly transitionDerivationTimeoutMs: number
   private readonly applicationAcknowledgmentTimeoutMs: number
   private nextOwnerId = 1
   private activeOwnerId: string | null = null
   private shuttingDown = false
   private shutdownResult: Deferred.Deferred<void, TerminalCleanupError> | undefined
+  private readonly shutdownRequested = Deferred.makeUnsafe<void>()
   private runtimeScopeClosed = false
   private runtimeScopeCloseUncertain = false
   private runtimeScopeCloseCause: unknown
@@ -412,6 +419,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     this.providerCleanupTimeoutMs = dependencies.providerCleanupTimeoutMs ??
       PROVIDER_CLEANUP_TIMEOUT_MS
     this.persistenceTimeoutMs = dependencies.persistenceTimeoutMs ?? PERSISTENCE_TIMEOUT_MS
+    this.launchPersistenceTimeoutMs = dependencies.launchPersistenceTimeoutMs ?? TERMINAL_LAUNCH_PERSISTENCE_TIMEOUT_MS
     this.transitionDerivationTimeoutMs = dependencies.transitionDerivationTimeoutMs ??
       TRANSITION_DERIVATION_TIMEOUT_MS
     this.applicationAcknowledgmentTimeoutMs = dependencies.applicationAcknowledgmentTimeoutMs ??
@@ -595,16 +603,19 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
             )
           }
 
+          const registrationProgress: { phase?: PersistencePhase } = {}
           const registrationExit = yield* Effect.exit(
             this.boundedPersistence(Effect.suspend(() =>
               this.dependencies.ownership.attach(owner.ownership, owner.processGroupId, {
                 mutationToken: owner.mutationTokens.attach,
+                onPhase: (phase) => { registrationProgress.phase = phase },
                 ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
               })), "attach terminal process group", owner.sessionId, {
               ownerId: owner.ownerId,
               mutationToken: owner.mutationTokens.attach,
               mutationStage: "attach",
-            }),
+              progress: registrationProgress,
+            }, "launch"),
           )
           if (Exit.isFailure(registrationExit)) {
             const registrationError = Cause.squash(registrationExit.cause) as PersistenceError
@@ -663,6 +674,8 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     gracePeriodMs = this.gracePeriodMs,
   ) => Effect.uninterruptible(Effect.suspend(() => {
     if (this.shutdownResult) return Deferred.await(this.shutdownResult)
+    this.shuttingDown = true
+    Deferred.doneUnsafe(this.shutdownRequested, Effect.void)
     const result = Deferred.makeUnsafe<void, TerminalCleanupError>()
     this.shutdownResult = result
     return Effect.gen(function* (this: TerminalSupervisorImpl) {
@@ -2290,6 +2303,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
 
   private activate(owner: TerminalOwner): Effect.Effect<void, TerminalError> {
     return this.attempt("focus", owner.sessionId, () => {
+      if (this.shuttingDown) throw new Error("Cannot focus an agent terminal during shutdown")
       const previous = this.activeOwner()
       this.dependencies.renderer.clearSelection()
       try {
@@ -2525,18 +2539,20 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     PersistenceError | SessionOwnedError | SessionRemovedError
   > {
     return Effect.gen(function* (this: TerminalSupervisorImpl) {
+      const progress: { phase?: PersistencePhase } = {}
       const tracked = yield* this.trackPersistence(
         Effect.suspend(() => this.dependencies.ownership.reserve(sessionId, {
           mutationToken: reserveMutationToken,
+          onPhase: (phase) => { progress.phase = phase },
         })),
         "reserve terminal ownership",
         sessionId,
-        { ownerId, mutationToken: reserveMutationToken, mutationStage: "reserve" },
+        { ownerId, mutationToken: reserveMutationToken, mutationStage: "reserve", progress },
       )
       const exit = yield* Effect.exit(this.awaitPersistence<
         PersistedTerminalOwner,
         PersistenceError | SessionOwnedError | SessionRemovedError
-      >(tracked))
+      >(tracked, "launch"))
       if (Exit.isSuccess(exit)) return exit.value
       if (!tracked.observedByCaller) {
         const pending: PendingReservation = {
@@ -2712,10 +2728,11 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     operation: string,
     sessionId: string,
     tracking: PersistenceTracking = {},
+    mode: "launch" | "cleanup" = "cleanup",
   ): Effect.Effect<A, E | PersistenceError> {
     return Effect.gen(function* (this: TerminalSupervisorImpl) {
       const tracked = yield* this.trackPersistence(effect, operation, sessionId, tracking)
-      return yield* this.awaitPersistence<A, E>(tracked)
+      return yield* this.awaitPersistence<A, E>(tracked, mode)
     }.bind(this))
   }
 
@@ -2769,23 +2786,38 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
 
   private awaitPersistence<A, E = unknown>(
     tracked: TrackedPersistence,
+    mode: "launch" | "cleanup" = "cleanup",
   ): Effect.Effect<A, E | PersistenceError> {
+    const timeoutMs = mode === "launch" ? this.launchPersistenceTimeoutMs : this.persistenceTimeoutMs
+    const shutdownStarted = () => mode === "launch" && this.shuttingDown
     const awaited = tracked.exit === undefined
       ? Effect.interruptible(Fiber.await(tracked.fiber)).pipe(
         Effect.map((exit) => ({ _tag: "Completed" as const, exit })),
         Effect.timeoutOrElse({
-          duration: this.persistenceTimeoutMs,
+          duration: timeoutMs,
           orElse: () => Effect.succeed({ _tag: "TimedOut" as const }),
         }),
       )
       : Effect.succeed({ _tag: "Completed" as const, exit: tracked.exit })
-    return Effect.gen(function*() {
-        const result = yield* awaited
+    return Effect.gen(function* (this: TerminalSupervisorImpl) {
+        const result = yield* (mode === "launch"
+          ? Effect.raceFirst(awaited, Deferred.await(this.shutdownRequested).pipe(
+              Effect.as({ _tag: "Shutdown" as const }),
+            ))
+          : awaited)
+        if (result._tag === "Shutdown" || shutdownStarted()) {
+          return yield* Effect.fail(new PersistenceError({
+            operation: tracked.operation,
+            path: tracked.sessionId,
+            message: `${tracked.operation} cancelled during shutdown for ${tracked.sessionId}`,
+          }))
+        }
         if (result._tag === "TimedOut") {
           return yield* Effect.fail(new PersistenceError({
             operation: tracked.operation,
             path: tracked.sessionId,
-            message: `${tracked.operation} timed out for ${tracked.sessionId}`,
+            message: `${tracked.operation} timed out after ${timeoutMs}ms for ${tracked.sessionId}` +
+              (tracked.progress?.phase === undefined ? "" : ` (phase: ${tracked.progress.phase})`),
           }))
         }
         tracked.observedByCaller = true
@@ -2793,7 +2825,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           return yield* Effect.failCause(result.exit.cause as Cause.Cause<E>)
         }
         return result.exit.value as A
-      }).pipe(Effect.onExit((exit) => Effect.sync(() => {
+      }.bind(this)).pipe(Effect.onExit((exit) => Effect.sync(() => {
         if (Exit.isFailure(exit) && !tracked.observedByCaller) {
           tracked.abandoned = true
           this.reportAbandonedPersistenceFailure(tracked)

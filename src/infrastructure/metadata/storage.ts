@@ -15,6 +15,24 @@ const LOCK_WAIT_IO_TIMEOUT_MILLISECONDS = 250
 
 const recoverableLockOwners = new Set<string>()
 
+export type PersistencePhase =
+  | "waiting-for-lock"
+  | "reading-state"
+  | "validating-state"
+  | "checking-ownership"
+  | "checking-orphan-processes"
+  | "cleaning-orphan-artifacts"
+  | "committing-state"
+  | "releasing-lock"
+
+export interface PersistenceProgress {
+  readonly onPhase?: (phase: PersistencePhase) => void
+}
+
+export function reportPersistencePhase(progress: PersistenceProgress | undefined, phase: PersistencePhase): void {
+  try { progress?.onPhase?.(phase) } catch { /* Diagnostics cannot change transaction outcomes. */ }
+}
+
 const LockOwnerSchema = Schema.Struct({
   schemaVersion: Schema.Literal(PERSISTENCE_SCHEMA_VERSION),
   ownerToken: Schema.NonEmptyString,
@@ -250,7 +268,7 @@ export function withTransactionLock<A, E, R>(
   platform: PersistencePlatformApi,
   lockPath: string,
   use: Effect.Effect<A, E, R>,
-  options?: { readonly interruptibleUse?: boolean },
+  options?: PersistenceProgress & { readonly interruptibleUse?: boolean },
 ): Effect.Effect<A, E | unknown, R> {
   const owner: LockOwner = {
     schemaVersion: PERSISTENCE_SCHEMA_VERSION,
@@ -261,9 +279,13 @@ export function withTransactionLock<A, E, R>(
 
   return Effect.uninterruptibleMask((restore) =>
     Effect.acquireUseRelease(
-      acquireTransactionLock(platform, lockPath, owner, restore),
+      Effect.sync(() => reportPersistencePhase(options, "waiting-for-lock")).pipe(
+        Effect.andThen(acquireTransactionLock(platform, lockPath, owner, restore)),
+      ),
       () => options?.interruptibleUse === true ? restore(use) : use,
-      () => releaseTransactionLock(platform, lockPath, owner),
+      () => Effect.sync(() => reportPersistencePhase(options, "releasing-lock")).pipe(
+        Effect.andThen(releaseTransactionLock(platform, lockPath, owner)),
+      ),
     ))
 }
 
