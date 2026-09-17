@@ -31,6 +31,62 @@ afterEach(async () => {
 })
 
 describe("ProviderStateRepository terminal ownership", () => {
+  test("reserves an unowned session in one transaction without a recovery preflight", async () => {
+    const { project, state } = await fixture()
+    let reads = 0
+    let locks = 0
+    const repository = await openProviderState(project, state, testPlatform({
+      readFile: async (path) => {
+        if (path.endsWith("state.json")) reads++
+        return nativePersistencePlatform.readFile(path)
+      },
+      link: async (from, to) => {
+        if (to.endsWith("state.lock")) locks++
+        return nativePersistencePlatform.link(from, to)
+      },
+    }))
+    reads = 0
+    locks = 0
+    const phases: string[] = []
+    const owner = await run(repository.reserve("fresh", {
+      mutationToken: "fresh-reservation", onPhase: (phase) => phases.push(phase),
+    }))
+    expect(reads).toBe(1)
+    expect(locks).toBe(1)
+    expect(phases).toEqual([
+      "waiting-for-lock", "reading-state", "validating-state", "checking-ownership",
+      "validating-state", "committing-state", "releasing-lock",
+    ])
+    reads = 0
+    locks = 0
+    expect(await run(repository.reserve("fresh", { mutationToken: "fresh-reservation" }))).toEqual(owner)
+    expect(reads).toBe(1)
+    expect(locks).toBe(1)
+  })
+
+  test("reservation waits for a concurrent navigation save and preserves its result", async () => {
+    const { project, state } = await fixture()
+    const barrier = stateWriteBarrier({ pid: 101, instanceId: "navigation" })
+    const navigation = await openProviderState(project, state, barrier.platform)
+    const contender = await openProviderState(project, state, contendingPlatform(202, "terminal", barrier))
+    barrier.blockNextStateWrite()
+    const [, owner] = await raceStateWrite(barrier,
+      () => run(navigation.saveNavigation({ view: "roots", selectedSessionId: "selected" })),
+      () => run(contender.reserve("session")),
+    )
+    expect(owner.sessionId).toBe("session")
+    expect((await run(navigation.loadMetadata)).navigation).toEqual({ view: "roots", selectedSessionId: "selected" })
+    expect((await run(contender.load)).terminalOwners).toEqual([owner])
+  })
+
+  test("diagnostic observer failures cannot strand the state lock or change reservation outcomes", async () => {
+    const { project, state } = await fixture()
+    const repository = await openProviderState(project, state)
+    const first = await run(repository.reserve("first", { onPhase: () => { throw new Error("observer failed") } }))
+    const second = await run(repository.reserve("second"))
+    expect((await run(repository.load)).terminalOwners).toEqual([first, second])
+  })
+
   test("allows only one concurrent reservation", async () => {
     const { project, state } = await fixture()
     const first = await openProviderState(
