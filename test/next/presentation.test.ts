@@ -985,6 +985,13 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
   })
 
   try {
+    const terminalFrame = await frame(setup, (value) => value.includes("Ctrl+Space"))
+    expect(terminalFrame).toContain("back")
+    expect(terminalFrame).not.toContain("Message tree")
+    const returnRow = setup.captureSpans().lines[23]!
+    expect(returnRow.spans.every((span) => span.bg.equals(presentationTheme.background))).toBeTrue()
+    expect(returnRow.spans.map((span) => span.text).join("")).toHaveLength(80)
+    expect(returnRow.spans.map((span) => span.text).join("").endsWith("c/t ")).toBeTrue()
     setup.mockInput.pressKey("q")
     releaseKittyKey(setup, 113)
     setup.mockInput.pressKey("c")
@@ -997,11 +1004,23 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
     }
 
     setup.mockInput.pressKey(" ", { ctrl: true })
-    await frame(setup, (value) => value.includes("Message tree"))
+    const returnedFrame = await frame(setup, (value) => value.includes("Message tree"))
+    expect(returnedFrame).not.toContain("Ctrl+Space")
     releaseKittyKey(setup, 32, 5)
     expect(running.harness.calls).toContain("return-terminal")
     expect(observed.some((event) => event.name === "space")).toBeFalse()
     expect(observed).toContainEqual({ type: "release", name: "q", stopped: false })
+
+    await Effect.runPromise(running.harness.update(terminal))
+    await frame(setup, (value) => value.includes("Ctrl+Space"))
+    setup.resize(24, 8)
+    await frame(setup, (value) => value.includes("Ctrl+Space back"))
+    const resizedReturnRow = setup.captureSpans().lines[7]!
+    expect(resizedReturnRow.spans.every((span) => span.bg.equals(presentationTheme.background))).toBeTrue()
+    expect(resizedReturnRow.spans.map((span) => span.text).join("")).toHaveLength(24)
+    expect(resizedReturnRow.spans.map((span) => span.text).join("").endsWith("c/t ")).toBeTrue()
+    await setup.mockMouse.click(13, 7)
+    await waitFor(() => running.harness.calls.filter((call) => call === "return-terminal").length === 2)
   } finally {
     await running.stop()
   }
