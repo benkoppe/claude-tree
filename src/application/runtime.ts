@@ -45,6 +45,7 @@ import type {
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
 import { TerminalCleanupError } from "../services/terminal-supervisor"
+import { causeFailures, errorDetails, errorSummary as errorMessage } from "../error-format"
 import { makeNavigationWriter } from "./navigation-writer"
 import { describeSession, selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
@@ -2115,7 +2116,7 @@ export function makeAppRuntime(
         )
         const closeExit = yield* Effect.exit(options.closeNavigationPersistence ?? Effect.void)
         if (Exit.isFailure(navigationExit) && Exit.isFailure(closeExit)) return yield* Effect.fail(new AggregateError([
-          Cause.squash(navigationExit.cause), Cause.squash(closeExit.cause),
+          ...causeFailures(navigationExit.cause), ...causeFailures(closeExit.cause),
         ], "Navigation persistence could not be flushed and closed"))
         if (Exit.isFailure(navigationExit)) yield* Effect.failCause(navigationExit.cause)
         if (Exit.isFailure(closeExit)) yield* Effect.failCause(closeExit.cause)
@@ -2125,15 +2126,12 @@ export function makeAppRuntime(
         Effect.exit(Effect.suspend(() => options.terminals.shutdown())),
       ], { concurrency: "unbounded" })
       const failures = [lifecycleExit, terminalExit].flatMap((exit) =>
-        Exit.isFailure(exit) ? [Cause.squash(exit.cause)] : [])
-      if (Exit.isFailure(transitionExit)) failures.unshift(Cause.squash(transitionExit.cause))
+        Exit.isFailure(exit) ? causeFailures(exit.cause) : [])
+      if (Exit.isFailure(transitionExit)) failures.unshift(...causeFailures(transitionExit.cause))
       if (transitionAbortError) failures.unshift(transitionAbortError)
       const error = failures.length === 0
         ? undefined
-        : new ApplicationShutdownError({
-            message: `Application shutdown failed: ${failures.map(errorMessage).join("; ")}`,
-            cause: failures.length === 1 ? failures[0] : failures,
-          })
+        : shutdownFailure(failures)
       const finished = yield* sendControl((reply) => ({
         _tag: "FinishShutdown",
         ...(error === undefined ? {} : { error }),
@@ -2149,10 +2147,7 @@ export function makeAppRuntime(
       if (error) yield* Deferred.fail(result, error)
       else yield* Deferred.succeed(result, undefined)
     }).pipe(Effect.catchCause((cause) => {
-      const error = new ApplicationShutdownError({
-        message: `Application shutdown failed: ${errorMessage(Cause.squash(cause))}`,
-        cause: Cause.squash(cause),
-      })
+      const error = shutdownFailure(causeFailures(cause))
       return Deferred.fail(result, error).pipe(Effect.asVoid)
     }))
 
@@ -2556,12 +2551,9 @@ function restoreNavigatorSurface(
   }
 }
 
-function errorMessage(error: unknown): string {
-  try {
-    return typeof error === "object" && error !== null && "message" in error
-      ? String(error.message)
-      : String(error)
-  } catch {
-    return "Unknown application error"
-  }
+function shutdownFailure(failures: readonly unknown[]): ApplicationShutdownError {
+  return new ApplicationShutdownError({
+    message: `Application shutdown failed: ${failures.map(errorDetails).join("\n") || "Unknown shutdown error"}`,
+    cause: failures.length === 1 ? failures[0] : failures,
+  })
 }

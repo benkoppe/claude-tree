@@ -13,6 +13,7 @@ import {
 } from "@opentui/core"
 import { Cause, Deferred, Effect, Exit, Fiber, Queue, Scope, Stream } from "effect"
 
+import { errorSummary as errorMessage } from "../error-format"
 import type {
   AppRuntime,
   ApplicationShutdownError,
@@ -2234,14 +2235,4 @@ function clamp(value: number, minimum: number, maximum: number): number {
 function isReportedApplicationFailure(value: unknown): boolean {
   if (typeof value !== "object" || value === null || !("_tag" in value)) return false
   return value._tag === "ApplicationOperationError" || value._tag === "RemovalOperationError"
-}
-
-function errorMessage(error: unknown): string {
-  try {
-    return typeof error === "object" && error !== null && "message" in error
-      ? String(error.message)
-      : String(error)
-  } catch {
-    return "Unknown presentation error"
-  }
 }

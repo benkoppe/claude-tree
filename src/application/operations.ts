@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util"
 
 import { Cause, Clock, Effect, Exit } from "effect"
 
+import { errorSummary as errorMessage } from "../error-format"
 import type { PersistenceError } from "../domain/errors"
 import type { AgentSessionSnapshot } from "../domain/model"
 import type {
@@ -162,14 +163,4 @@ export function rollbackPersistedBranch(
     (state) => !state.relations.some((candidate) => isDeepStrictEqual(candidate, relation)),
     undefined,
   ))
-}
-
-function errorMessage(error: unknown): string {
-  try {
-    return typeof error === "object" && error !== null && "message" in error
-      ? String(error.message)
-      : String(error)
-  } catch {
-    return "Unknown application error"
-  }
 }

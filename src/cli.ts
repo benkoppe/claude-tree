@@ -5,6 +5,7 @@ import { BunRuntime } from "@effect/platform-bun"
 import { Cause, Deferred, Effect, Scope } from "effect"
 
 import { CLI_HELP } from "./cli-help"
+import { causeFailures, errorSummary as failureMessage } from "./error-format"
 import { parseCliArguments, resolveProjectDirectory, type CliOptions } from "./cli-options"
 import { setProcessTitle } from "./process-title"
 import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
@@ -267,7 +268,8 @@ export function reportCliFailures<E, A>(
   return Effect.catchCause(effect, (cause) => {
     if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
     return Effect.sync(() => {
-      writeStderr(`${PROGRAM_NAME}: ${failureMessage(Cause.squash(cause))}\n`)
+      const failures = [...new Set(causeFailures(cause))]
+      writeStderr(`${PROGRAM_NAME}: ${failures.map(failureMessage).join("\n")}\n`)
     }).pipe(Effect.andThen(Effect.failCause(cause)))
   })
 }
@@ -304,14 +306,6 @@ function makeOpenTuiRenderer(): Effect.Effect<CliRenderer, Error, Scope.Scope> {
       if (!renderer.isDestroyed) renderer.destroy()
     }),
   )
-}
-
-function failureMessage(error: unknown): string {
-  if (error instanceof Error) return error.message || error.name
-  if (typeof error === "object" && error !== null && "message" in error) {
-    return String(error.message)
-  }
-  return String(error)
 }
 
 function toError(cause: unknown): Error {
