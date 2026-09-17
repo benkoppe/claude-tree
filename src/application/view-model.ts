@@ -134,10 +134,11 @@ const graphViewCache = new WeakMap<ConversationGraph, {
   unviewed: ApplicationState["unviewedSessionIds"]
   view: GraphView
 }>()
-const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history" | "activation">>()
+const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history" | "activation" | "lastModified">>()
 const rootViewCache = new WeakMap<ReturnType<typeof selectVisibleConversationForest>, {
   refresh: ApplicationState["refresh"]["active"]
   provider: ApplicationState["provider"]
+  conversationActivity: ApplicationState["conversationActivity"]
   terminals: ApplicationState["terminals"]
   historyStatus: ApplicationState["historyStatus"]
   completions: ApplicationState["pendingCompletions"]
@@ -193,7 +194,8 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   const forest = selectVisibleConversationForest(state)
   const cached = rootViewCache.get(forest)
   if (cached && cached.refresh === state.refresh.active && cached.provider === state.provider && cached.terminals === state.terminals && cached.historyStatus === state.historyStatus &&
-    cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds) return cached.roots
+    cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds &&
+    cached.conversationActivity === state.conversationActivity) return cached.roots
   const roots = forest.graphs.map((graph): RootViewModel => {
     let summary = rootSummaryCache.get(graph)
     if (!summary) {
@@ -201,7 +203,6 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       summary = {
         sessionId: graph.rootSessionId,
         title: graph.rootSession.title,
-        lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest, data.sessions.get(id)?.lastModified ?? 0), graph.rootSession.lastModified),
         memberSessionIds,
         messageCount: [...graph.nodes.values()].filter((node) => node.kind === "message").length,
       }
@@ -209,6 +210,8 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
     }
     return {
       ...summary,
+      lastModified: summary.memberSessionIds.reduce((latest, id) => Math.max(latest,
+        state.conversationActivity.get(id) ?? data.sessions.get(id)?.lastModified ?? 0), 0),
       activation: selectRootActivation(state, summary.memberSessionIds),
       history: selectFamilyHistoryStatus(state, summary.memberSessionIds),
       warnings: [...selectHistoryDetails(state, summary.memberSessionIds), ...graph.warnings],
@@ -230,7 +233,8 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       if (accepted) continue
       for (const id of memberSessionIds) pendingIds.add(id)
       pendingRoots.push({ sessionId: root.id, title: root.title, activation: selectRootActivation(state, memberSessionIds),
-        lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest, state.provider.sessions.get(id)?.lastModified ?? 0), root.lastModified),
+        lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest,
+          state.conversationActivity.get(id) ?? state.provider.sessions.get(id)?.lastModified ?? 0), 0),
         memberSessionIds, messageCount: 0, history, status: selectAggregateStatus(state, memberSessionIds),
         warnings: selectHistoryDetails(state, memberSessionIds),
       })
@@ -238,7 +242,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   const rows = [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
     (left, right) => right.lastModified - left.lastModified || left.sessionId.localeCompare(right.sessionId),
   )
-  rootViewCache.set(forest, { refresh: state.refresh.active, provider: state.provider, terminals: state.terminals, historyStatus: state.historyStatus,
+  rootViewCache.set(forest, { refresh: state.refresh.active, provider: state.provider, conversationActivity: state.conversationActivity, terminals: state.terminals, historyStatus: state.historyStatus,
     completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, roots: rows })
   return rows
 }

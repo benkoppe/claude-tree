@@ -123,6 +123,8 @@ export interface LocalOverlayState {
 }
 
 export interface ApplicationState {
+  /** Invocation-local recency; metadata-only writes do not count as conversation activity. */
+  readonly conversationActivity: ReadonlyMap<string, number>
   /** Latest read outcome, independent of retained accepted history. */
   readonly historyStatus: ReadonlyMap<string, SessionHistoryStatus>
   readonly selectionId: string | null
@@ -162,6 +164,7 @@ export function makeInitialApplicationState(
   initial: InitialApplicationState = {},
 ): ApplicationState {
   return {
+    conversationActivity: new Map(),
     historyStatus: new Map(),
     selectionId: null,
     provider: { sessions: new Map(), transcripts: new Map() },

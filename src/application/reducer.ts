@@ -525,6 +525,20 @@ function refreshSucceeded(
   }
 
   const without = removeRefresh(state, key, generation)
+  const conversationActivity = new Map(state.conversationActivity)
+  for (const [id, session] of sessions) {
+    const previousSession = state.local.sessions.get(id) ?? state.provider.sessions.get(id)
+    const baseline = conversationActivity.get(id) ?? previousSession?.lastModified ?? session.lastModified
+    const previous = selectTranscriptRead(state, id)
+    const read = transcripts.get(id)
+    const changed = !staleSessionIds.has(id) && previous?._tag === "Available" && !previous.coverage &&
+      read?._tag === "Available" && !read.coverage &&
+      !sameConversationContent(previous.messages, read.messages)
+    conversationActivity.set(id, changed ? Math.max(baseline, session.lastModified) : baseline)
+  }
+  for (const id of conversationActivity.keys()) {
+    if (!sessions.has(id) && !localSessions.has(id)) conversationActivity.delete(id)
+  }
   for (const [id, session] of sessions) {
     const previous = state.provider.sessions.get(id)
     if (previous && isDeepStrictEqual(previous, session)) sessions.set(id, previous)
@@ -543,6 +557,7 @@ function refreshSucceeded(
   const retainedTemporaryIds = reuseSet(state.local.temporarySessionIds, temporarySessionIds)
   return repairNavigatorSurface({
     ...without,
+    conversationActivity: reuseMap(state.conversationActivity, conversationActivity),
     historyStatus: reuseMap(state.historyStatus, historyStatus),
     provider: providerSessions === state.provider.sessions && providerTranscripts === state.provider.transcripts
       ? state.provider : { sessions: providerSessions, transcripts: providerTranscripts },
@@ -571,6 +586,17 @@ function reuseMap<K, V>(previous: ReadonlyMap<K, V>, next: ReadonlyMap<K, V>): R
     ? previous : next
 }
 
+function sameConversationContent(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
+  if (left === right) return true
+  const visibleLeft = left.filter((message) => message.visible)
+  const visibleRight = right.filter((message) => message.visible)
+  return visibleLeft.length === visibleRight.length && visibleLeft.every((message, index) => {
+    const other = visibleRight[index]!
+    return message.id === other.id && message.role === other.role &&
+      message.preview === other.preview && message.text === other.text && message.copyIdentity === other.copyIdentity
+  })
+}
+
 function reuseSet<A>(previous: ReadonlySet<A>, next: ReadonlySet<A>): ReadonlySet<A> {
   return previous.size === next.size && [...next].every((value) => previous.has(value)) ? previous : next
 }
@@ -586,7 +612,9 @@ function projectLocalSession(
   if (transcript !== undefined) transcripts.set(session.id, transcript)
   const temporarySessionIds = new Set(state.local.temporarySessionIds)
   if (temporary ?? session.transient) temporarySessionIds.add(session.id)
-  return { ...state, historyStatus: new Map(state.historyStatus).set(session.id, transcript ? historyStatusForRead(transcript) : { _tag: "Ready" }),
+  return { ...state,
+    conversationActivity: new Map(state.conversationActivity).set(session.id, state.conversationActivity.get(session.id) ?? session.lastModified),
+    historyStatus: new Map(state.historyStatus).set(session.id, transcript ? historyStatusForRead(transcript) : { _tag: "Ready" }),
     local: { sessions, transcripts, temporarySessionIds } }
 }
 
@@ -817,6 +845,7 @@ function rollbackTransient(
   return {
     ...state,
     historyStatus: withoutMap(state.historyStatus, sessionId),
+    conversationActivity: withoutMap(state.conversationActivity, sessionId),
     local: {
       sessions: withoutMap(state.local.sessions, sessionId),
       transcripts: withoutMap(state.local.transcripts, sessionId),
@@ -853,6 +882,7 @@ function adoptSessionIdentity(
     return {
       ...state,
       historyStatus: new Map(state.historyStatus).set(sessionId, { _tag: "Ready" }),
+      conversationActivity: new Map(state.conversationActivity).set(sessionId, session.lastModified),
       local: {
         sessions: localSessions,
         transcripts: state.local.transcripts,
@@ -898,6 +928,7 @@ function adoptSessionIdentity(
   return {
     ...state,
     historyStatus: migrateMapKey(state.historyStatus, previousSessionId, sessionId),
+    conversationActivity: migrateMapKey(state.conversationActivity, previousSessionId, sessionId),
     provider: {
       sessions: migrateMapKey(state.provider.sessions, previousSessionId, sessionId),
       transcripts: migrateMapKey(state.provider.transcripts, previousSessionId, sessionId),

@@ -154,6 +154,8 @@ Codex titles cannot permanently veto newer screen evidence. Recognize structural
 
 ## Graph Navigation Preserves Cursor Intent
 
+Root-list recency follows accepted conversation content during an invocation. Seed each session's ordering timestamp from provider metadata on discovery, then advance it only when verified visible message identities or content change. Metadata-only writes, including terminal shutdown, resume, and manual refresh, do not move a tree. A family's recency is the latest activity of its members. Initial hydration and history-coverage expansion establish history rather than new activity; unavailable, limited, and stale reads cannot advance recency. Keep ordering timestamps ephemeral and carry them across session-identity replacement. A new invocation seeds ordering from the provider again.
+
 Vertical navigation follows visible graph edges: up selects the parent and down selects a child. It never falls diagonally into a neighboring branch. Horizontal navigation uses the same world-space node layout as rendering and may cross branches, root chains, and viewport boundaries.
 
 Navigation retains a preferred world-space column for vertical movement and depth for horizontal movement, plus the exact source of the latest transition. This mirrors a text-editor cursor: moving through an ambiguous parent or a shorter neighboring branch and then reversing returns to the node that was left. Blocked movement does not discard that intent. Rebuilding or resizing the graph resets it. The synthetic family origin does not participate in navigation.
