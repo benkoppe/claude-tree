@@ -49,6 +49,7 @@ import {
 } from "./render"
 import { displayWidth, truncateToWidth } from "./text"
 import { presentationTheme as theme } from "./theme"
+import { TERMINAL_RETURN_BAR_HEIGHT } from "../terminal-layout"
 
 export const MINIMUM_PRESENTATION_WIDTH = 50
 export const MINIMUM_PRESENTATION_HEIGHT = 12
@@ -61,6 +62,7 @@ const CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
 const HISTORY_LOADING_MESSAGE = "This tree is still loading. You can open it when loading finishes."
+const TERMINAL_RETURN_CONTROL = { key: "Ctrl+Space", description: "back" }
 
 export interface OpenTuiProviderIdentity {
   readonly id: string
@@ -276,6 +278,8 @@ class OpenTuiPresentationController {
   private readonly content: TextRenderable
   private readonly footerSeparator: TextRenderable
   private readonly footer: TextRenderable
+  private readonly terminalReturnBar: BoxRenderable
+  private terminalReturnPressed = false
   private readonly dialogOverlay: BoxRenderable
   private readonly dialogPanel: BoxRenderable
   private readonly dialogTitle: TextRenderable
@@ -385,6 +389,60 @@ class OpenTuiPresentationController {
     this.navigator.add(this.footerSeparator)
     this.navigator.add(this.footer)
     renderer.root.add(this.navigator)
+
+    this.terminalReturnBar = new BoxRenderable(renderer, {
+      id: "terminal-return-bar",
+      flexDirection: "row",
+      position: "absolute",
+      bottom: 0,
+      left: 0,
+      width: "100%",
+      height: TERMINAL_RETURN_BAR_HEIGHT,
+      zIndex: 11,
+      visible: false,
+      backgroundColor: theme.background,
+      onMouseDown: (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        this.terminalReturnPressed = event.button === 0 && this.isTerminalReturnHit(event)
+      },
+      onMouseUp: this.guardCallback("Return from terminal", (event: MouseEvent) => {
+        event.preventDefault()
+        event.stopPropagation()
+        const pressed = this.terminalReturnPressed
+        this.terminalReturnPressed = false
+        if (pressed && event.button === 0 && this.isTerminalReturnHit(event) && this.viewModel?.surface._tag === "Terminal") {
+          this.runAction(this.appRuntime.returnFromTerminal)
+        }
+      }),
+    })
+    this.terminalReturnBar.add(new TextRenderable(renderer, {
+      id: "terminal-return-label",
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 0,
+      height: TERMINAL_RETURN_BAR_HEIGHT,
+      fg: theme.textMuted,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
+      content: styledText([
+        chunk(" ", theme.textMuted),
+        ...renderControls([TERMINAL_RETURN_CONTROL]).chunks,
+      ]),
+    }))
+    this.terminalReturnBar.add(new TextRenderable(renderer, {
+      id: "terminal-session-label",
+      width: 4,
+      flexShrink: 0,
+      height: TERMINAL_RETURN_BAR_HEIGHT,
+      fg: theme.textMuted,
+      bg: theme.background,
+      selectable: false,
+      wrapMode: "none",
+      content: "c/t ",
+    }))
+    renderer.root.add(this.terminalReturnBar)
 
     this.dialogOverlay = new BoxRenderable(renderer, {
       id: "next-dialog-overlay",
@@ -1269,6 +1327,7 @@ class OpenTuiPresentationController {
     const surface = this.viewModel.surface
     const terminal = surface._tag === "Terminal" || this.terminalOpening
     this.navigator.visible = !terminal
+    this.terminalReturnBar.visible = surface._tag === "Terminal"
     this.dialogOverlay.visible = false
     if (terminal) {
       this.stopSpinner()
@@ -1707,6 +1766,12 @@ class OpenTuiPresentationController {
     event.preventDefault()
     event.stopPropagation()
     this.pendingMouseAction = { kind: "footer", action }
+  }
+
+  private isTerminalReturnHit(event: MouseEvent): boolean {
+    const x = event.x - this.terminalReturnBar.screenX
+    return event.y === this.terminalReturnBar.screenY && x >= 0 &&
+      x < displayWidth(` ${TERMINAL_RETURN_CONTROL.key} ${TERMINAL_RETURN_CONTROL.description}`)
   }
 
   private readonly onFooterMouseUp = (event: MouseEvent) => {

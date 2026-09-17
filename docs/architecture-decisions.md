@@ -230,6 +230,8 @@ The application has two modes: navigator and embedded terminal. In terminal mode
 
 Avoid intercepting ordinary agent keys. Host shortcuts should be mode-specific, visible to the user, and configurable when practical.
 
+Terminal mode keeps a persistent, clickable `Ctrl+Space back` bar on the bottom row, using the navigator footer's text styling and full-width background. Reserve that row in the emulator and PTY dimensions, including for hidden terminals and on resize, so the control never covers provider output.
+
 ## Shared Working Tree Is Deliberate
 
 Every agent process starts in the same project directory. This allows branches to observe and build on the same filesystem state, but it also permits simultaneous edits and conflicts. The application should communicate status accurately and must not claim branch-level file isolation or silently create worktrees.
