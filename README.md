@@ -60,8 +60,6 @@ Normal discovery, history reads, fork operations, terminal acquisition, and pers
 
 Shutdown, resource cleanup, and conservative liveness checks still have finite safety bounds. A cleanup timeout reports unresolved ownership, never proof that a process exited. Waiting longer does not make history reconstruction faster or eliminate genuine SDK, filesystem, or protocol failures.
 
-See [`docs/timeout-policy.md`](docs/timeout-policy.md) for the slow-work policy and validation boundaries.
-
 Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (default `~/.local/state`). Older terminal-owner records without a resource inventory are rejected in place, rather than automatically upgraded or deleted. Any reset is explicit and affects application-owned relationships and UI metadata, not provider transcripts.
 
 ## Development
@@ -72,10 +70,9 @@ preserving stock agent TUIs. Codex lifecycle events are observed through a
 transparent proxy; Claude uses supported session APIs and conservative terminal
 observation. Ownership and cleanup remain local to this application.
 
-The pinned upstream source, MIT notice, update instructions, and local adaptations
-are documented in [`src/vendor/t3/README.md`](src/vendor/t3/README.md).
-The adversarial review findings, regression coverage, and remaining live-provider
-validation limits are recorded in [`docs/agent-management-review-plan.md`](docs/agent-management-review-plan.md).
+The vendored MIT notice is retained in [`src/vendor/t3/LICENSE`](src/vendor/t3/LICENSE).
+Regenerate the pinned sources with `bun scripts/update-t3-vendor.ts`; verify
+reproducibility with `bun scripts/update-t3-vendor.ts --check`.
 
 The development shell includes Bun and the validated provider CLIs available for the platform:
 
