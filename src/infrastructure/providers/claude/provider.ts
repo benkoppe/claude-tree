@@ -124,7 +124,7 @@ interface OperationDeadline {
 
 interface TimeoutBudget {
   readonly durationMs: number | undefined
-  readonly error: ProviderError
+  readonly error: () => ProviderError
 }
 
 type ForkValidation =
@@ -516,7 +516,7 @@ export class ClaudeProvider implements AgentProviderApi {
           () => Effect.succeed(this.ambiguousBranchMutation(
             parentSessionId,
             sourceMessageId,
-            `${budget.error.message}; Claude may have created a child session`,
+            `${budget.error().message}; Claude may have created a child session`,
           )),
       )
       return result
@@ -1122,7 +1122,7 @@ export class ClaudeProvider implements AgentProviderApi {
           `Claude ${operation} failed: ${errorMessage(cause)}`,
           cause,
         ),
-      }), budget.durationMs, () => Effect.fail(budget.error))
+      }), budget.durationMs, () => Effect.fail(budget.error()))
     })
   }
 
@@ -1151,12 +1151,12 @@ export class ClaudeProvider implements AgentProviderApi {
     return Effect.gen({ self: this }, function*() {
       const remaining = yield* this.remainingMillis(deadline)
       if (remaining <= 0) return yield* Effect.fail(this.deadlineError(deadline))
-      if (timeoutMs === undefined && deadline.expiresAt === undefined) {
-        return { durationMs: undefined, error: this.providerError(operation, "Operation has no deadline") }
-      }
       return timeoutMs !== undefined && timeoutMs <= remaining
-        ? { durationMs: timeoutMs, error: this.timeoutError(operation, timeoutMs) }
-        : { durationMs: remaining, error: this.deadlineError(deadline) }
+        ? { durationMs: timeoutMs, error: () => this.timeoutError(operation, timeoutMs) }
+        : {
+            durationMs: deadline.expiresAt === undefined ? undefined : remaining,
+            error: () => this.deadlineError(deadline),
+          }
     })
   }
 
