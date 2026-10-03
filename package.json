@@ -16,6 +16,7 @@
   "files": [
     "src",
     "LICENSE",
+    "THIRD_PARTY_LICENSES",
     "README.md"
   ],
   "bin": {
