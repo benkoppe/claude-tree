@@ -817,8 +817,9 @@ export function makeAppRuntime(
         if (event.exitCode !== 0 || event.cleanupError) {
           const details = [
             event.exitCode === 0 ? undefined : `Agent session exited with code ${event.exitCode}`,
+            event.exitCode !== 0 && event.outputTail ? `Terminal output:\n${event.outputTail}` : undefined,
             event.cleanupError ? errorMessage(event.cleanupError) : undefined,
-          ].filter((value): value is string => value !== undefined).join("; ")
+          ].filter((value): value is string => value !== undefined).join("\n\n")
           yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: details } })
         }
         if (focusExitedSession) yield* startNavigation(state.surface)

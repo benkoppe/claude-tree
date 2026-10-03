@@ -734,6 +734,24 @@ describe("application actor", () => {
     expect(result.reads.some((ids) => ids.includes(CHILD))).toBeTrue()
   })
 
+  test("a failed natural exit displays the provider's terminal error", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalExit({
+        ownerId: "owner-1", sequenceId: 1, sessionId: ROOT, exitCode: 1,
+        wasActive: true, ownershipReleased: true,
+        outputTail: "ERROR: No saved session found with ID isolated-session.",
+      })
+      const state = yield* runtime.getState
+      expect(state.modal).toMatchObject({
+        _tag: "Error", message: "Agent session exited with code 1\n\nTerminal output:\nERROR: No saved session found with ID isolated-session.",
+      })
+      expect(state.terminals.has(ROOT)).toBeFalse()
+    })))
+  })
+
   for (const mode of ["stop", "natural-exit", "removal"] as const) {
     test(`reports ${mode} errors without retaining a terminal whose ownership was released`, async () => {
       const fixture = makeFixture()
