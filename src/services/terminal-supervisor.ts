@@ -703,11 +703,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           }))))
           if (Exit.isFailure(registrationExit)) {
             const registrationError = Cause.squash(registrationExit.cause) as PersistenceError
-            const decision = yield* this.gate.withPermit(Effect.sync(() =>
-              this.cleanupDecision(owner.sessionId, "acquire-rollback", this.gracePeriodMs)))
-            if (decision._tag === "Start") yield* this.runCleanupPlan(decision.plan)
-            else if (decision._tag === "Wait") yield* Deferred.await(decision.owner.cleanupResult)
-            return yield* Effect.fail(registrationError)
+            return yield* this.failAcquisition(owner, registrationError)
           }
 
           const activationExit = yield* Effect.exit(this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
@@ -720,13 +716,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           }.bind(this))))
           if (Exit.isFailure(activationExit)) {
             const error = Cause.squash(activationExit.cause) as TerminalError
-            const decision = yield* this.gate.withPermit(Effect.sync(() =>
-              this.cleanupDecision(owner.sessionId, "acquire-rollback", this.gracePeriodMs)))
-            const rollbackExit = yield* Effect.exit(decision._tag === "Start"
-              ? this.runCleanupPlan(decision.plan)
-              : decision._tag === "Wait" ? Deferred.await(decision.owner.cleanupResult) : Effect.void)
-            if (Exit.isFailure(rollbackExit)) return yield* Effect.failCause(rollbackExit.cause)
-            return yield* Effect.fail(error)
+            return yield* this.failAcquisition(owner, error)
           }
           Deferred.doneUnsafe(owner.launchRegistered, Effect.void)
           return owner.ownerId
@@ -1687,6 +1677,40 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     return { _tag: "Start", plan: this.beginCleanup(owner, operation, gracePeriodMs) }
   }
 
+  private failAcquisition(
+    owner: TerminalOwner,
+    error: TerminalError | PersistenceError,
+  ): Effect.Effect<never, TerminalError | PersistenceError | TerminalCleanupError> {
+    return Effect.gen({ self: this }, function*() {
+      const exitCode = owner.process.exitCode
+      const failedExit = exitCode !== null && exitCode !== 0
+      const details = failedExit ? this.captureFailureDetails(owner) : undefined
+      const decision = yield* this.gate.withPermit(Effect.sync(() =>
+        this.cleanupDecision(owner.sessionId, "acquire-rollback", this.gracePeriodMs)))
+      if (decision._tag === "Start") yield* this.runCleanupPlan(decision.plan)
+      else if (decision._tag === "Wait") yield* Deferred.await(decision.owner.cleanupResult)
+      if (!failedExit) return yield* Effect.fail(error)
+      const output = this.failureOutput(owner, details)
+      return yield* Effect.fail(new TerminalError({
+        operation: "acquire", sessionId: owner.sessionId, cause: error,
+        message: [`Agent session exited with code ${exitCode}`, error.message,
+          output ? `Terminal output:\n${output}` : undefined].filter(Boolean).join("\n\n"),
+      }))
+    })
+  }
+
+  private captureFailureDetails(owner: TerminalOwner): string | undefined {
+    let details: string | undefined
+    this.ignoreCallback(() => { details = owner.failureDetails?.()?.slice(-8 * 1_024) })
+    return details
+  }
+
+  private failureOutput(owner: TerminalOwner, details?: string): string {
+    let output: string | undefined
+    this.ignoreCallback(() => { output = owner.process.outputTail })
+    return [output, details].filter(Boolean).join("\n\n")
+  }
+
   private beginCleanup(
     owner: TerminalOwner,
     operation: TerminalCleanupError["operation"],
@@ -1694,10 +1718,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     naturalExit?: CleanupPlan["naturalExit"],
     forcedExit = false,
   ): CleanupPlan {
-    let failureDetails: string | undefined
-    if (naturalExit && naturalExit.exitCode !== 0) {
-      this.ignoreCallback(() => { failureDetails = owner.failureDetails?.()?.slice(-8 * 1_024) })
-    }
+    const failureDetails = naturalExit && naturalExit.exitCode !== 0 ? this.captureFailureDetails(owner) : undefined
     Deferred.doneUnsafe(owner.cleanupRequested, Effect.void)
     owner.cleanupStarted = true
     owner.cleanupInProgress = true
@@ -1870,12 +1891,8 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       ? undefined
       : { ...plan.forcedExit, sequenceId: plan.owner.sequence.next++ })
     if (!exitNotification) return
-    let outputTail: string | undefined
-    if (plan.naturalExit && plan.naturalExit.exitCode !== 0) {
-      let terminalOutput: string | undefined
-      this.ignoreCallback(() => { terminalOutput = plan.owner.process.outputTail })
-      outputTail = [terminalOutput, plan.failureDetails].filter(Boolean).join("\n\n")
-    }
+    const outputTail = plan.naturalExit && plan.naturalExit.exitCode !== 0
+      ? this.failureOutput(plan.owner, plan.failureDetails) : undefined
     plan.owner.exitNotificationSent = true
     this.ignoreCallback(() => this.events.onProcessExited?.({
       ownerId: plan.owner.ownerId,

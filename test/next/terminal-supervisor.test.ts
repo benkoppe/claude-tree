@@ -130,26 +130,79 @@ for (const late of [false, true]) {
   })
 }
 
-test("a child that exits during registration is rolled back without receiving focus", async () => {
+test.each(["activation", "registration", "diagnostics-throw", "cleanup-failure"] as const)("an early child exit is safely reported (%s)", async (mode) => {
   const fixture = makeFixture()
+  const diagnosticsThrow = mode === "diagnostics-throw"
+  if (mode === "cleanup-failure") fixture.providerCloseFailures = 99
   const entered = Deferred.makeUnsafe<void>()
   const release = Deferred.makeUnsafe<void>()
   const attach = fixture.leases.attach
   const ownership = new Proxy(fixture.leases, {
     get(target, key) {
       if (key === "attach") return (...args: Parameters<typeof attach>) =>
-        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(attach(...args)))
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(
+          mode === "registration" ? Effect.fail(new PersistenceError({
+            operation: "attach", path: "/state", message: "Registration failed",
+          })) : attach(...args)))
       return Reflect.get(target, key)
     },
   })
+  const exits: TerminalExitEvent[] = []
+  fixture.dependencies.events = { onProcessExited: (event) => exits.push(event) }
   await withSupervisor({ ...fixture.dependencies, ownership }, (supervisor) => Effect.scoped(Effect.gen(function*() {
-    const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show(prepared("already-exited", fixture))))
+    const acquired = acquiredLaunch("already-exited", fixture)
+    let capturedBeforeCleanup = false
+    let readAfterCleanup = false
+    const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+      session: session("already-exited"),
+      acquireLaunch: Effect.succeed({ ...acquired, launch: { ...acquired.launch,
+        failureDetails: () => {
+          capturedBeforeCleanup = !fixture.log.includes("provider-close:already-exited")
+          if (diagnosticsThrow) throw new Error("provider diagnostics unavailable")
+          return "Provider failed before cleanup."
+        },
+      } }),
+    })))
     yield* Deferred.await(entered)
-    fixture.processes.processes[0]!.finish(1)
+    const process = fixture.processes.processes[0]!
+    Object.defineProperty(process, "outputTail", { get() {
+      readAfterCleanup = fixture.log.includes("unref:already-exited")
+      if (diagnosticsThrow) throw new Error("terminal diagnostics unavailable")
+      return "ERROR: startup failed."
+    } })
+    process.finish(1)
     yield* Deferred.succeed(release, undefined)
-    expect(Exit.isFailure(yield* Fiber.join(opening))).toBeTrue()
+    const result = yield* Fiber.join(opening)
+    expect(Exit.isFailure(result)).toBeTrue()
+    expect(capturedBeforeCleanup).toBeTrue()
+    expect(exits).toHaveLength(0)
     expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+    if (mode === "cleanup-failure") {
+      if (Exit.isFailure(result)) expect(Cause.squash(result.cause)).toBeInstanceOf(TerminalCleanupError)
+      expect(fixture.leases.current("already-exited")).toBeDefined()
+      expect([...yield* supervisor.ownedSessionIds]).toEqual(["already-exited"])
+      const reopening = yield* Effect.exit(supervisor.show(prepared("already-exited", fixture)))
+      expect(Exit.isFailure(reopening)).toBeTrue()
+      expect(fixture.processes.processes).toHaveLength(1)
+      fixture.providerCloseFailures = 0
+      expect(yield* supervisor.stopSession("already-exited")).toBeTrue()
+      expect(fixture.leases.current("already-exited")).toBeUndefined()
+      return
+    }
+    if (Exit.isFailure(result)) {
+      const error = Cause.squash(result.cause) as TerminalError
+      expect(error._tag).toBe("TerminalError")
+      expect(error.message).toContain("Agent session exited with code 1")
+      if (!diagnosticsThrow) {
+        expect(error.message).toContain("ERROR: startup failed.")
+        expect(error.message).toContain("Provider failed before cleanup.")
+      }
+      expect(error.cause).toBeDefined()
+      if (mode === "registration") expect(error.cause).toBeInstanceOf(PersistenceError)
+    }
+    expect(readAfterCleanup).toBeTrue()
     expect(fixture.leases.current("already-exited")).toBeUndefined()
+    expect([...yield* supervisor.ownedSessionIds]).toEqual([])
     expect(fixture.renderer.surfaces[0]!.released).toBeTrue()
   })))
 })
