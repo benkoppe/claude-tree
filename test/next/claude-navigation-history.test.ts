@@ -263,16 +263,6 @@ test.each(["messages", "segment"])("re-emitted preserved %s restore history and 
   expect(JSON.stringify(entries)).toBe(before)
 })
 
-test("SDK-only preservation rewiring still requires reconnecting a persisted continuation", async () => {
-  const f = fixture()
-  const compact = { ...f.compact, compactMetadata: { preservedMessages: { uuids: [f.ids[1]], anchorUuid: f.ids[3] } } }
-  const { provider } = await providerFor(f.sessionId, [f.question, f.answer, compact, f.summary,
-    { ...f.current, parentUuid: f.ids[1] }, f.response])
-  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
-  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
-  expect(read.messages.map((message) => message.id)).toEqual([f.ids[0]!, f.ids[1]!, f.ids[3]!, f.ids[4]!, f.ids[5]!])
-})
-
 test("missing or contradictory original preserved ancestry fails with an evidence error", () => {
   for (const original of [[], [record("answer", "one"), record("answer", "two")]]) {
     const compact = { ...boundary("compact", "answer"), compactMetadata: {
@@ -309,6 +299,9 @@ test.each([false, true])("preservation survives SDK forks and forks of forks (re
   for (let depth = 0; depth < 2; depth++) {
     const source = (await Effect.runPromise(provider.readTranscripts([sessionId]))).get(sessionId)
     if (source?._tag !== "Available") throw new Error(JSON.stringify(source))
+    if (depth === 0) {
+      expect(source.messages.map((message) => message.id)).toEqual([f.ids[0]!, f.ids[1]!, f.ids[3]!, f.ids[4]!, f.ids[5]!])
+    }
     const branch = await Effect.runPromise(provider.branchFrom({ sessionId, messageId: targetId }))
     if (branch._tag !== "ValidatedBranch") throw new Error(`repeated=${repeated}, depth=${depth}: ${branch.reason}`)
     expect(branch.derivation.sharedMessages.map((pair) => pair.parentMessageId)).toEqual(source.messages.map((message) => message.id))

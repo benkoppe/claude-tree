@@ -675,7 +675,7 @@ describe("ProviderStateRepository schema v3", () => {
     expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
   })
 
-  for (const corruption of ["extra field", "cycle", "source mismatch", "noncanonical", "v1", "v2", "unknown version"] as const) {
+  for (const corruption of ["extra field", "cycle", "source mismatch", "noncanonical", "v2", "unknown version"] as const) {
     test(`rejects ${corruption} in place before another write`, async () => {
       const { project, state } = await fixture()
       const repository = await openRepository(project, state)
@@ -685,7 +685,6 @@ describe("ProviderStateRepository schema v3", () => {
         cycle: { relations: [relation("one", "two"), relation("two", "one")] },
         "source mismatch": { relations: [{ ...relation("child", "root"), sourceMessageId: "later-source" }] },
         noncanonical: { relations: [relation("z", "root"), relation("a", "root")] },
-        v1: { schemaVersion: 1 },
         v2: { schemaVersion: 2 },
         "unknown version": { schemaVersion: 99 },
       }

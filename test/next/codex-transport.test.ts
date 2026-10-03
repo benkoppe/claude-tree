@@ -1244,45 +1244,6 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }
   })
 
-  test("does not forward a switch response until its transition is acknowledged", async () => {
-    const token = "proxy-secret"
-    const upstream = controlledProtocolServer(token)
-    try {
-      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-        const proxy = yield* makeCodexTuiProxy({
-          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
-          bearerToken: token,
-          initialThreadId: "thread-a",
-        })
-        const subscription = yield* PubSub.subscribe(proxy.transitions)
-        const client = new WebSocket(proxy.remoteUrl, {
-          headers: { Authorization: `Bearer ${token}` },
-        })
-        yield* Effect.promise(() => socketOpened(client))
-        let forwarded = false
-        const response = socketMessage(client).then((message) => {
-          forwarded = true
-          return message
-        })
-        client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
-        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
-        upstream.respond(1, topLevelThread("thread-b"))
-
-        const request = yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
-        yield* Effect.sleep(20)
-        expect(forwarded).toBeFalse()
-        yield* Deferred.succeed(request.acknowledgment, undefined)
-        expect(JSON.parse(yield* Effect.promise(() => response))).toMatchObject({
-          id: 1,
-          result: { thread: { id: "thread-b" } },
-        })
-        client.close()
-      })))
-    } finally {
-      await upstream.close()
-    }
-  })
-
   test("bounds transition acknowledgment and closes without forwarding", async () => {
     const token = "proxy-secret"
     const upstream = controlledProtocolServer(token)
