@@ -353,6 +353,44 @@ describe("Effect Codex app-server transport", () => {
     })).pipe(Effect.provide(TestClock.layer())))
   })
 
+  test.each([0, -1, Infinity, NaN])("rejects invalid request patience before spawning (%s)", (value) => {
+    let spawned = false
+    expect(() => makeCodexAppServerClient("codex", {
+      requestTimeoutMs: value,
+      spawn: () => { spawned = true; throw new Error("must not spawn") },
+    })).toThrow(RangeError)
+    expect(spawned).toBeFalse()
+  })
+
+  test("default initialization and requests wait beyond former deadlines", async () => {
+    const initialized = Deferred.makeUnsafe<void>()
+    const dispatched = Deferred.makeUnsafe<void>()
+    let initializeId: number | undefined
+    let readId: number | undefined
+    const transport = fakeProcess((message) => {
+      if (message.method === "initialize") {
+        initializeId = typeof message.id === "number" ? message.id : undefined
+        Deferred.doneUnsafe(initialized, Effect.void)
+      }
+      if (message.method === "thread/read") {
+        readId = typeof message.id === "number" ? message.id : undefined
+        Deferred.doneUnsafe(dispatched, Effect.void)
+      }
+    })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquisition = yield* Effect.forkChild(makeCodexAppServerClient("codex", { spawn: () => transport.process }))
+      yield* Deferred.await(initialized)
+      yield* TestClock.adjust(60_000)
+      transport.respond(initializeId, {})
+      const client = yield* Fiber.join(acquisition)
+      const read = yield* Effect.forkChild(client.readThread("slow"))
+      yield* Deferred.await(dispatched)
+      yield* TestClock.adjust(60_000)
+      transport.respond(readId, { thread: thread("slow") })
+      expect((yield* Fiber.join(read)).id).toBe("slow")
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
   test("request timeout covers a hung serialized write", async () => {
     let releaseWrite: (() => void) | undefined
     const writeStarted = Deferred.makeUnsafe<void>()

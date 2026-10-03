@@ -10,8 +10,8 @@ import { isErrorCode } from "./platform"
 export const PERSISTENCE_SCHEMA_VERSION = 3 as const
 const STATE_LAYOUT_DIRECTORY = "v2"
 const LOCK_RETRY_MILLISECONDS = 10
-const LOCK_TIMEOUT_MILLISECONDS = 2_000
-const LOCK_WAIT_IO_TIMEOUT_MILLISECONDS = 250
+const STALE_RECLAIM_TIMEOUT_MILLISECONDS = 2_000
+const LOCK_LIVENESS_TIMEOUT_MILLISECONDS = 250
 
 const recoverableLockOwners = new Set<string>()
 
@@ -221,6 +221,9 @@ export function writeJsonExclusively(
         await platform.link(temporaryPath, path)
         committed = true
       } catch (error) {
+        // EEXIST proves exclusive acquisition was rejected. Leave ordinary
+        // contention reads to the interruptible waiting path below.
+        if (isErrorCode(error, "EEXIST")) throw error
         if (!(await jsonFileEquals(platform, path, value))) throw error
         committed = true
       }
@@ -270,23 +273,25 @@ export function withTransactionLock<A, E, R>(
   use: Effect.Effect<A, E, R>,
   options?: PersistenceProgress & { readonly interruptibleUse?: boolean },
 ): Effect.Effect<A, E | unknown, R> {
-  const owner: LockOwner = {
-    schemaVersion: PERSISTENCE_SCHEMA_VERSION,
-    ownerToken: platform.randomToken(),
-    ownerPid: platform.pid,
-    createdAt: platform.now(),
-  }
+  return Effect.suspend(() => {
+    const owner: LockOwner = {
+      schemaVersion: PERSISTENCE_SCHEMA_VERSION,
+      ownerToken: platform.randomToken(),
+      ownerPid: platform.pid,
+      createdAt: platform.now(),
+    }
 
-  return Effect.uninterruptibleMask((restore) =>
-    Effect.acquireUseRelease(
-      Effect.sync(() => reportPersistencePhase(options, "waiting-for-lock")).pipe(
-        Effect.andThen(acquireTransactionLock(platform, lockPath, owner, restore)),
-      ),
-      () => options?.interruptibleUse === true ? restore(use) : use,
-      () => Effect.sync(() => reportPersistencePhase(options, "releasing-lock")).pipe(
-        Effect.andThen(releaseTransactionLock(platform, lockPath, owner)),
-      ),
-    ))
+    return Effect.uninterruptibleMask((restore) =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => reportPersistencePhase(options, "waiting-for-lock")).pipe(
+          Effect.andThen(acquireTransactionLock(platform, lockPath, owner, restore)),
+        ),
+        () => options?.interruptibleUse === true ? restore(use) : use,
+        () => Effect.sync(() => reportPersistencePhase(options, "releasing-lock")).pipe(
+          Effect.andThen(releaseTransactionLock(platform, lockPath, owner)),
+        ),
+      ))
+  })
 }
 
 function acquireTransactionLock(
@@ -297,17 +302,16 @@ function acquireTransactionLock(
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function*() {
     const startedAt = yield* Clock.currentTimeMillis
-    const deadline = startedAt + LOCK_TIMEOUT_MILLISECONDS
+    const reclaimDeadline = startedAt + STALE_RECLAIM_TIMEOUT_MILLISECONDS
 
     while (true) {
       const acquired = yield* Effect.exit(writeJsonExclusively(platform, lockPath, owner))
       if (Exit.isSuccess(acquired)) return
       const acquisitionError = failureFromExit(acquired)
       if (!isErrorCode(acquisitionError, "EEXIST")) {
-        const possibleOwner = yield* restore(lockWaitEffect(
-          readJsonIfPresent(platform, lockPath),
-          `read transaction lock ${lockPath}`,
-        ))
+        // A failed acknowledgment may still have acquired the lock. Resolve and
+        // release our exact token before honoring interruption.
+        const possibleOwner = yield* readJsonIfPresent(platform, lockPath)
         const acquiredBeforeFailure = possibleOwner === undefined
           ? false
           : yield* syncEffect(() =>
@@ -318,25 +322,20 @@ function acquireTransactionLock(
         return yield* Effect.fail(acquisitionError)
       }
 
-      const existingValue = yield* restore(lockWaitEffect(
-        readJsonIfPresent(platform, lockPath),
-        `read transaction lock ${lockPath}`,
-      ))
+      const existingValue = yield* restore(readJsonIfPresent(platform, lockPath))
       if (existingValue === undefined) continue
       const existing = yield* syncEffect(() => decodeLockOwner(existingValue, lockPath))
-      if (recoverableLockOwners.has(existing.ownerToken)) {
-        yield* reclaimRecoverableLock(platform, lockPath, existing)
-        continue
-      }
-      const liveness = yield* restore(lockWaitEffect(
+      // A completed local release failure permits recovery, not uncoordinated unlinking.
+      const reclaimable = recoverableLockOwners.has(existing.ownerToken) || (yield* restore(lockLivenessEffect(
         promiseEffect(() => platform.processLiveness(existing.ownerPid)),
         `check transaction lock owner PID ${existing.ownerPid}`,
-      ))
-      if (liveness === "absent") {
-        const reclaim = yield* reclaimStaleLock(platform, lockPath, existing)
+      ))) === "absent"
+      if (reclaimable) {
+        const reclaim = yield* reclaimStaleLock(platform, lockPath, existing, restore)
+        if (reclaim === "reclaimed") recoverableLockOwners.delete(existing.ownerToken)
         if (reclaim === "contended") {
           const now = yield* Clock.currentTimeMillis
-          if (now >= deadline) {
+          if (now >= reclaimDeadline) {
             const reclaimPath = staleLockReclaimPath(lockPath, existing)
             return yield* Effect.fail(new Error(
               `Timed out waiting for stale transaction lock reclaim owned by PID ${existing.ownerPid}. ` +
@@ -351,12 +350,6 @@ function acquireTransactionLock(
         continue
       }
 
-      const now = yield* Clock.currentTimeMillis
-      if (now >= deadline) {
-        return yield* Effect.fail(new Error(
-          `Timed out waiting for transaction lock owned by PID ${existing.ownerPid}`,
-        ))
-      }
       yield* restore(Effect.sleep(LOCK_RETRY_MILLISECONDS))
     }
   })
@@ -366,6 +359,7 @@ function reclaimStaleLock(
   platform: PersistencePlatformApi,
   lockPath: string,
   existing: LockOwner,
+  restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>,
 ): Effect.Effect<StaleLockReclaimOutcome, unknown> {
   return Effect.gen(function*() {
     const reclaimPath = staleLockReclaimPath(lockPath, existing)
@@ -377,13 +371,13 @@ function reclaimStaleLock(
 
       // Only the process that atomically created the claim may unlink lockPath. If
       // that winner already moved past the unlink, this orphan is no longer a lock.
-      const claimedValue = yield* readJsonIfPresent(platform, reclaimPath)
+      const claimedValue = yield* restore(readJsonIfPresent(platform, reclaimPath))
       if (claimedValue === undefined) return "changed"
       const claimedOwner = yield* syncEffect(() => decodeLockOwner(claimedValue, reclaimPath))
       if (claimedOwner.ownerToken !== existing.ownerToken) {
         return yield* Effect.fail(new Error("Stale-lock reclaim path belongs to another owner"))
       }
-      const latestValue = yield* readJsonIfPresent(platform, lockPath)
+      const latestValue = yield* restore(readJsonIfPresent(platform, lockPath))
       const latestOwner = latestValue === undefined
         ? undefined
         : yield* syncEffect(() => decodeLockOwner(latestValue, lockPath))
@@ -445,26 +439,6 @@ function releaseTransactionLock(
   })
 }
 
-function reclaimRecoverableLock(
-  platform: PersistencePlatformApi,
-  lockPath: string,
-  owner: LockOwner,
-): Effect.Effect<void, unknown> {
-  return Effect.gen(function*() {
-    const latest = yield* readJsonIfPresent(platform, lockPath)
-    if (latest === undefined) {
-      recoverableLockOwners.delete(owner.ownerToken)
-      return
-    }
-    if ((yield* syncEffect(() => decodeLockOwner(latest, lockPath))).ownerToken !== owner.ownerToken) {
-      recoverableLockOwners.delete(owner.ownerToken)
-      return
-    }
-    yield* removeDurably(platform, lockPath)
-    recoverableLockOwners.delete(owner.ownerToken)
-  })
-}
-
 function decodeLockOwner(input: unknown, path: string): LockOwner {
   requireSchemaVersion(input, "transaction lock", dirname(path))
   const owner = decodeStrict(LockOwnerSchema, input) as LockOwner
@@ -504,12 +478,12 @@ function promiseEffect<A>(run: () => Promise<A>): Effect.Effect<A, unknown> {
   return Effect.tryPromise({ try: run, catch: (cause) => cause })
 }
 
-function lockWaitEffect<A>(
+function lockLivenessEffect<A>(
   effect: Effect.Effect<A, unknown>,
   operation: string,
 ): Effect.Effect<A, unknown> {
   return effect.pipe(Effect.timeoutOrElse({
-    duration: LOCK_WAIT_IO_TIMEOUT_MILLISECONDS,
+    duration: LOCK_LIVENESS_TIMEOUT_MILLISECONDS,
     orElse: () => Effect.fail(new Error(`Timed out while attempting to ${operation}`)),
   }))
 }

@@ -6,8 +6,8 @@ import type { IdentityTransitionKind } from "../../../domain/persistence"
 import type { ProviderTerminalEvent } from "../../../services/provider"
 import { CodexLifecycleObserver } from "./lifecycle"
 import { PROVIDER_RESOURCE_STAGE_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 
-const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
 const DEFAULT_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
 const DEFAULT_PREOPEN_MESSAGES = 64
 const DEFAULT_PREOPEN_BYTES = 256 * 1_024
@@ -16,7 +16,6 @@ const DEFAULT_TRANSITION_CAPACITY = 64
 const DEFAULT_CLIENTS = 8
 const DEFAULT_SERVER_MESSAGES = 256
 const DEFAULT_SERVER_MESSAGE_BYTES = 8 * 1_024 * 1_024
-const DEFAULT_TRANSITION_ACKNOWLEDGMENT_TIMEOUT_MS = 15_000
 
 export type CodexThreadOperation = "start" | "resume" | "fork"
 
@@ -176,17 +175,14 @@ function createProxyState(
       const maxPreOpenMessages = positiveInteger(options.maxPreOpenMessages, DEFAULT_PREOPEN_MESSAGES)
       const maxPreOpenBytes = positiveInteger(options.maxPreOpenBytes, DEFAULT_PREOPEN_BYTES)
       const maxPendingRequests = positiveInteger(options.maxPendingRequests, DEFAULT_PENDING_REQUESTS)
-      const connectTimeoutMs = positiveInteger(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS)
+      const connectTimeoutMs = optionalOperationTimeout(options.connectTimeoutMs)
       const maxClients = positiveInteger(options.maxClients, DEFAULT_CLIENTS)
       const maxServerMessages = positiveInteger(options.maxServerMessages, DEFAULT_SERVER_MESSAGES)
       const maxServerMessageBytes = positiveInteger(
         options.maxServerMessageBytes,
         DEFAULT_SERVER_MESSAGE_BYTES,
       )
-      const transitionAcknowledgmentTimeoutMs = positiveInteger(
-        options.transitionAcknowledgmentTimeoutMs,
-        DEFAULT_TRANSITION_ACKNOWLEDGMENT_TIMEOUT_MS,
-      )
+      const transitionAcknowledgmentTimeoutMs = optionalOperationTimeout(options.transitionAcknowledgmentTimeoutMs)
 
       const server = Bun.serve<ProxySocketData>({
         hostname: "127.0.0.1",
@@ -232,7 +228,7 @@ function createProxyState(
               return
             }
             socket.data.upstream = upstream
-            socket.data.connectTimer = setTimeout(() => {
+            if (connectTimeoutMs !== undefined) socket.data.connectTimer = setTimeout(() => {
               terminateQuietly(upstream)
               closeQuietly(socket, 1013, "Upstream connect timeout")
             }, connectTimeoutMs)
@@ -583,7 +579,7 @@ async function publishTransition(
   state: ProxyState,
   transition: ObservedCodexTuiProxyTransition,
   capacity: number,
-  acknowledgmentTimeoutMs: number,
+  acknowledgmentTimeoutMs: number | undefined,
   socket: Bun.ServerWebSocket<ProxySocketData>,
 ): Promise<boolean> {
   if (state.pendingPublications >= capacity) {
@@ -613,13 +609,11 @@ async function publishTransition(
       })
     }
     if (published) {
-      await state.runPromise(Deferred.await(acknowledgment).pipe(Effect.timeoutOrElse({
-        duration: acknowledgmentTimeoutMs,
-        orElse: () => Effect.fail(new CodexTuiProxyError({
+      await state.runPromise(withOperationTimeout(Deferred.await(acknowledgment), acknowledgmentTimeoutMs,
+        () => Effect.fail(new CodexTuiProxyError({
           operation: "publish-transition",
           message: `Codex TUI transition was not acknowledged within ${acknowledgmentTimeoutMs}ms`,
-        })),
-      })))
+        }))))
       if (publishedTransition._tag === "CodexThreadTransition") {
         state.awaitingTemporaryAdoption = false
       }
