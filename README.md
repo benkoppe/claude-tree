@@ -46,21 +46,28 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
-## Shutdown and recovery
+## Resume a workspace
 
-Quitting stops the owned agent processes and restores the host terminal. Provider conversations remain available to resume later.
+Press `?` to find the current workspace's resume command in About:
 
-If shutdown fails, the error lists the affected sessions, cleanup stages, and underlying causes. Simultaneous terminal and navigation-persistence failures are reported together.
+```sh
+claude-tree --resume WORKSPACE_ID /path/to/project
+claude-tree --codex --resume WORKSPACE_ID /path/to/project
+```
 
-After an interrupted shutdown, `claude-tree` checks previous terminal ownership at startup and when opening a session. It releases an orphaned reservation once the old application, its terminal process group, and any recorded Codex sidecar group are definitely gone and its launch artifacts are removed. A saved `stopping` or `cleanup-incomplete` status alone does not block reopening.
+Resume restores the saved roots selection or tree cursor, and reopens the visible provider session if you left a terminal open. It starts a fresh runtime: hidden agents, terminal scrollback, and unsent drafts are not restored. Each invocation has independent navigation, even when resuming the same saved workspace.
 
-If cleanup cannot be verified, the error identifies the remaining condition: a surviving process group, unknown liveness, failed artifact cleanup, or an acquisition interrupted before all process identities were recorded. Resolve that condition and retry. Recovery does not signal unidentified processes or guess that an incompletely recorded launch was harmless.
+Quitting stops child agents and restores the host terminal. A live session open in another invocation produces a **Cancel / Open anyway** warning; Cancel is selected by default. Opening anyway does not stop the other invocation and may cause conflicting conversation writes.
 
-Normal discovery, history reads, fork operations, terminal acquisition, and persistence wait for completion or cancellation rather than failing after a fixed number of milliseconds. Slow machines and long transcripts may take longer without exhausting a default work deadline. Quit cancels pending work; already admitted durable writes remain tracked and late reservations are compensated without launching a terminal.
+There is no automatic crash recovery. Session guards are OS locks released when the application dies, so stale reservations cannot block future opens. Detached agents or Codex sidecars may survive an abrupt crash; stop any leftovers yourself before resuming.
 
-Shutdown, resource cleanup, and conservative liveness checks still have finite safety bounds. A cleanup timeout reports unresolved ownership, never proof that a process exited. Waiting longer does not make history reconstruction faster or eliminate genuine SDK, filesystem, or protocol failures.
+Workspace navigation and tree relationships are stored under `$XDG_STATE_HOME` (default `~/.local/state`). Incompatible metadata—including the older ownership/recovery format—is rejected without migration or deletion. Reset it explicitly by moving or removing the affected project state directory; this does not delete provider conversations, but does remove saved tree relationships and workspace destinations.
 
-Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (default `~/.local/state`). Older terminal-owner records without a resource inventory are rejected in place, rather than automatically upgraded or deleted. Any reset is explicit and affects application-owned relationships and UI metadata, not provider transcripts.
+## Herdr
+
+Inside a Herdr pane, claude-tree reports the displayed tree or terminal's activity and its workspace resume command. Herdr 0.9.2+ can run that command after a server restart, in the pane's original directory. The `claude-tree` command must be on `PATH`. Reporting is optional and failures do not interrupt normal use.
+
+Herdr does not accept resume arguments containing apostrophes or control characters, or commands exceeding its size limits. Such commands are omitted while activity reporting continues. Outside Herdr, the integration does nothing.
 
 ## Development
 

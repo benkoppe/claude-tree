@@ -31,6 +31,23 @@ const provider = {
   capabilities: { historicalBranching: true },
 }
 
+test("duplicate-session dialog defaults to Cancel and requires an explicit Open anyway choice", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 })
+  const warning: ApplicationViewModel = { ...rootsView(), modal: { _tag: "ConfirmOpenSession", sessionId: "root-1", ownerPid: 202 } }
+  const running = await startPresentation(setup.renderer, warning)
+  try {
+    await frame(setup, (value) => value.includes("Session already open"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => !value.includes("Session already open"))
+    expect(running.harness.calls.some((call) => call.startsWith("resume:"))).toBeFalse()
+    await Effect.runPromise(running.harness.update(warning))
+    await frame(setup, (value) => value.includes("Open anyway"))
+    setup.mockInput.pressKey("TAB")
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("resume:root-1:override"))
+  } finally { await running.stop() }
+})
+
 test("renders roots and preserves directional graph navigation intent", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const roots = rootsView()
@@ -1654,8 +1671,8 @@ function makeHarness(
       newSession: Effect.sync(() => calls.push("new")).pipe(
         Effect.andThen(actionOverrides.newSession ?? Effect.succeed(true)),
       ),
-      resumeSession: (sessionId: string) => Effect.sync(() => {
-        calls.push(`resume:${sessionId}`)
+      resumeSession: (sessionId: string, allowDuplicate?: boolean) => Effect.sync(() => {
+        calls.push(`resume:${sessionId}${allowDuplicate ? ":override" : ""}`)
         return true
       }),
       openEndpoint: (sessionId: string) => Effect.gen(function*() {
