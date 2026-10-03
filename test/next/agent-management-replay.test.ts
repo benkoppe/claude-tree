@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { Deferred, Effect, Fiber, PubSub } from "effect"
@@ -18,7 +19,7 @@ import { makeTerminalSupervisor, type TerminalActivityEvent } from "../../src/se
 import { stopTestServer } from "./helpers/stop-test-server"
 
 test("agent management replay: hidden completion, stale evidence, and verified durable owner release", async () => {
-  const directory = await mkdtemp("/tmp/opencode/agent-replay-")
+  const directory = await mkdtemp(join(tmpdir(), "agent-replay-"))
   try {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const pty = new ReplayPty()
