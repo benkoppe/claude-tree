@@ -63,6 +63,7 @@ const SPINNER_INTERVAL_MS = 80
 const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
 const HISTORY_LOADING_MESSAGE = "This tree is still loading. You can open it when loading finishes."
 const TERMINAL_RETURN_CONTROL = { key: "Ctrl+Space", description: "back" }
+const TERMINAL_RETURN_PREFIX = " c/t · "
 
 export interface OpenTuiProviderIdentity {
   readonly id: string
@@ -427,20 +428,9 @@ class OpenTuiPresentationController {
       selectable: false,
       wrapMode: "none",
       content: styledText([
-        chunk(" ", theme.textMuted),
+        chunk(TERMINAL_RETURN_PREFIX, theme.textMuted),
         ...renderControls([TERMINAL_RETURN_CONTROL]).chunks,
       ]),
-    }))
-    this.terminalReturnBar.add(new TextRenderable(renderer, {
-      id: "terminal-session-label",
-      width: 4,
-      flexShrink: 0,
-      height: TERMINAL_RETURN_BAR_HEIGHT,
-      fg: theme.textMuted,
-      bg: theme.background,
-      selectable: false,
-      wrapMode: "none",
-      content: "c/t ",
     }))
     renderer.root.add(this.terminalReturnBar)
 
@@ -1769,9 +1759,9 @@ class OpenTuiPresentationController {
   }
 
   private isTerminalReturnHit(event: MouseEvent): boolean {
-    const x = event.x - this.terminalReturnBar.screenX
+    const x = event.x - this.terminalReturnBar.screenX - displayWidth(TERMINAL_RETURN_PREFIX)
     return event.y === this.terminalReturnBar.screenY && x >= 0 &&
-      x < displayWidth(` ${TERMINAL_RETURN_CONTROL.key} ${TERMINAL_RETURN_CONTROL.description}`)
+      x < displayWidth(`${TERMINAL_RETURN_CONTROL.key} ${TERMINAL_RETURN_CONTROL.description}`)
   }
 
   private readonly onFooterMouseUp = (event: MouseEvent) => {

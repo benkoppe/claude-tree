@@ -242,7 +242,7 @@ The application has two modes: navigator and embedded terminal. In terminal mode
 
 Avoid intercepting ordinary agent keys. Host shortcuts should be mode-specific, visible to the user, and configurable when practical.
 
-Terminal mode keeps a persistent, clickable `Ctrl+Space back` bar on the bottom row, using the navigator footer's text styling and full-width background. Reserve that row in the emulator and PTY dimensions, including for hidden terminals and on resize, so the control never covers provider output.
+Terminal mode keeps a persistent bottom bar with left-aligned `c/t · Ctrl+Space back`, using the navigator footer's text styling and full-width background. The keybinding is clickable. Reserve that row in the emulator and PTY dimensions, including for hidden terminals and on resize, so the control never covers provider output.
 
 ## Shared Working Tree Is Deliberate
 
