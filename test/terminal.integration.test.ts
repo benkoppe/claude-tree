@@ -8,6 +8,32 @@ import { BunPtyProcessFactory, type TerminalProcess, type TerminalSurface } from
 import { NullTerminalObserver } from "../src/domain/model"
 import { cleanupProcessGroup } from "../src/infrastructure/process-group"
 
+test("terminal reserves the return bar row on creation and resize", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 10 })
+  const renderer = new OpenTuiTerminalRenderer(setup.renderer)
+  const sizes: number[][] = []
+  try {
+    const surface = renderer.createSurface("sizing", {
+      onData() {}, onScreenChange() {},
+      onResize(columns, rows) { sizes.push([columns, rows]) },
+    })
+    surface.setActive(true)
+    surface.write(new TextEncoder().encode("\u001b[999;1Hlast row"))
+    await setup.renderOnce()
+    expect(renderer.rows).toBe(9)
+    expect(surface.screen().lines).toHaveLength(9)
+    setup.resize(40, 8)
+    await setup.renderOnce()
+    surface.write(new TextEncoder().encode("\u001b[2J\u001b[999;1Hresized last row"))
+    expect(renderer.columns).toBe(40)
+    expect(renderer.rows).toBe(7)
+    expect(surface.screen().lines).toHaveLength(7)
+    expect(sizes).toContainEqual([40, 7])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("production snapshots compose fresh text and cursor without publishing screen callbacks", async () => {
   const setup = await createTestRenderer({ width: 60, height: 10 })
   const renderer = new OpenTuiTerminalRenderer(setup.renderer)

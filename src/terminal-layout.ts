@@ -1,0 +1,1 @@
+export const TERMINAL_RETURN_BAR_HEIGHT = 1
