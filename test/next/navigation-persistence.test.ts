@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { EventEmitter } from "node:events"
 import type { Worker } from "node:worker_threads"
 
-import { Deferred, Effect, Exit, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import { makeNavigationPersistenceWorker, NAVIGATION_WORKER_CLOSE_TIMEOUT_MS } from "../../src/infrastructure/metadata/navigation-persistence"
@@ -92,6 +92,8 @@ class ControlledWorker extends EventEmitter {
   readonly requests: NavigationWorkerRequest[] = []
   readonly savePosted = Deferred.makeUnsafe<void>()
   readonly closePosted = Deferred.makeUnsafe<void>()
+  readonly created = Deferred.makeUnsafe<void>()
+  autoReady = true
   terminated = 0
   unreferenced = 0
   postMessage(message: NavigationWorkerRequest) {
@@ -101,10 +103,48 @@ class ControlledWorker extends EventEmitter {
   unref() { this.unreferenced++ }
   terminate() { this.terminated++; this.emit("exit", 1); return Promise.resolve(1) }
   create = (): Worker => {
-    queueMicrotask(() => this.emit("message", { _tag: "Ready" }))
+    Deferred.doneUnsafe(this.created, Effect.void)
+    if (this.autoReady) queueMicrotask(() => this.emit("message", { _tag: "Ready" }))
     return this as unknown as Worker
   }
 }
+
+test("worker readiness can take longer than five seconds", async () => {
+  const worker = new ControlledWorker()
+  worker.autoReady = false
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const startup = yield* Effect.forkChild(makeNavigationPersistenceWorker({ projectDirectory: "/project", providerId: "claude", instanceId: "instance" }, worker.create))
+    yield* Deferred.await(worker.created)
+    yield* TestClock.adjust(6_000)
+    expect(worker.requests).toEqual([])
+    expect(worker.terminated).toBe(0)
+    worker.emit("message", { _tag: "Ready" })
+    const persistence = yield* Fiber.join(startup)
+    const closing = yield* Effect.forkChild(persistence.close)
+    yield* Deferred.await(worker.closePosted)
+    worker.emit("message", { _tag: "Closed" })
+    yield* Fiber.join(closing)
+  })).pipe(Effect.provide(TestClock.layer())))
+})
+
+test("interrupting startup closes with a finite wait without killing a possible lock holder", async () => {
+  const worker = new ControlledWorker()
+  worker.autoReady = false
+  await Effect.runPromise(Effect.gen(function*() {
+    const startup = yield* Effect.forkChild(Effect.scoped(makeNavigationPersistenceWorker({ projectDirectory: "/project", providerId: "claude", instanceId: "instance" }, worker.create)))
+    yield* Deferred.await(worker.created)
+    const interruption = yield* Effect.forkChild(Fiber.interrupt(startup))
+    yield* Deferred.await(worker.closePosted)
+    yield* TestClock.adjust(NAVIGATION_WORKER_CLOSE_TIMEOUT_MS)
+    yield* Fiber.join(interruption)
+    const exit = yield* Fiber.await(startup)
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+    expect(worker.terminated).toBe(0)
+    expect(worker.unreferenced).toBe(1)
+    worker.emit("message", { _tag: "Closed" })
+    expect(worker.terminated).toBe(1)
+  }).pipe(Effect.provide(TestClock.layer())))
+})
 
 test("worker exit settles in-flight requests and rejects further saves", async () => {
   const worker = new ControlledWorker()

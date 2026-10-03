@@ -1,5 +1,10 @@
 # Agent management adversarial review loop
 
+This ledger records the initial orchestration revamp. Subsequent removal of
+default productive-work deadlines and its separate review are documented in
+[`timeout-policy.md`](timeout-policy.md); earlier acquisition deadline references
+below describe that initial milestone, not the current default waiting policy.
+
 ## Constraints and acceptance
 
 Preserve stock Claude Code/Codex TUIs, provider transcript truth, strict fork

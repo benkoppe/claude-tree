@@ -13,6 +13,7 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk"
 import { Clock, Effect, Layer } from "effect"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 
 import { ProviderError, ProviderProtocolError } from "../../../domain/errors"
 import type {
@@ -89,8 +90,6 @@ const defaultSdk: ClaudeSdk = {
 }
 
 const DEFAULT_FORK_VALIDATION_RETRY_DELAYS_MS = [25, 50, 100, 200]
-const DEFAULT_FORK_VALIDATION_TIMEOUT_MS = 5_000
-const DEFAULT_SDK_OPERATION_TIMEOUT_MS = 10_000
 const TRANSCRIPT_READ_CONCURRENCY = 8
 
 
@@ -119,12 +118,12 @@ interface SourcePrefix {
 
 interface OperationDeadline {
   readonly operation: string
-  readonly expiresAt: number
-  readonly timeoutMs: number
+  readonly expiresAt: number | undefined
+  readonly timeoutMs: number | undefined
 }
 
 interface TimeoutBudget {
-  readonly durationMs: number
+  readonly durationMs: number | undefined
   readonly error: ProviderError
 }
 
@@ -179,13 +178,13 @@ export class ClaudeProvider implements AgentProviderApi {
   private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
   private sessionTitles: ReadonlyMap<string, string> = new Map()
   private readonly retryDelays: readonly number[]
-  private readonly operationTimeoutMs: number
-  private readonly executableLookupTimeoutMs: number
-  private readonly forkSessionTimeoutMs: number
-  private readonly forkValidationTimeoutMs: number
-  private readonly listSessionsTimeoutMs: number
-  private readonly transcriptReadTimeoutMs: number
-  private readonly provenanceImportTimeoutMs: number
+  private readonly operationTimeoutMs: number | undefined
+  private readonly executableLookupTimeoutMs: number | undefined
+  private readonly forkSessionTimeoutMs: number | undefined
+  private readonly forkValidationTimeoutMs: number | undefined
+  private readonly listSessionsTimeoutMs: number | undefined
+  private readonly transcriptReadTimeoutMs: number | undefined
+  private readonly provenanceImportTimeoutMs: number | undefined
   private readonly timeoutErrors = new WeakSet<object>()
 
   constructor(
@@ -200,18 +199,13 @@ export class ClaudeProvider implements AgentProviderApi {
     this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
     this.retryDelays =
       options.forkValidationRetryDelaysMs ?? DEFAULT_FORK_VALIDATION_RETRY_DELAYS_MS
-    this.operationTimeoutMs = options.operationTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.executableLookupTimeoutMs =
-      options.executableLookupTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.forkSessionTimeoutMs = options.forkSessionTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.forkValidationTimeoutMs =
-      options.forkValidationTimeoutMs ?? DEFAULT_FORK_VALIDATION_TIMEOUT_MS
-    this.listSessionsTimeoutMs =
-      options.listSessionsTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.transcriptReadTimeoutMs =
-      options.transcriptReadTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.provenanceImportTimeoutMs =
-      options.provenanceImportTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
+    this.operationTimeoutMs = optionalOperationTimeout(options.operationTimeoutMs)
+    this.executableLookupTimeoutMs = optionalOperationTimeout(options.executableLookupTimeoutMs)
+    this.forkSessionTimeoutMs = optionalOperationTimeout(options.forkSessionTimeoutMs)
+    this.forkValidationTimeoutMs = optionalOperationTimeout(options.forkValidationTimeoutMs)
+    this.listSessionsTimeoutMs = optionalOperationTimeout(options.listSessionsTimeoutMs)
+    this.transcriptReadTimeoutMs = optionalOperationTimeout(options.transcriptReadTimeoutMs)
+    this.provenanceImportTimeoutMs = optionalOperationTimeout(options.provenanceImportTimeoutMs)
 
     this.loadSessionSnapshot = this.loadSessionSnapshotProgressively(() => Effect.void)
 
@@ -340,7 +334,7 @@ export class ClaudeProvider implements AgentProviderApi {
     const operation = Effect.gen({ self: this }, function*() {
       const deadline = yield* this.makeDeadline(
         "branchFrom",
-        Math.min(this.operationTimeoutMs, this.forkValidationTimeoutMs),
+        this.operationTimeoutMs,
       )
       const sourceEntries = yield* this.readSessionEntries(target.sessionId, "branchFrom", deadline)
       const activeContext = yield* this.requireActiveContext(
@@ -518,15 +512,12 @@ export class ClaudeProvider implements AgentProviderApi {
           },
         }),
       )
-      const result = yield* request.pipe(
-        Effect.timeoutOrElse({
-          duration: budget.durationMs,
-          orElse: () => Effect.succeed(this.ambiguousBranchMutation(
+      const result = yield* withOperationTimeout(request, budget.durationMs,
+          () => Effect.succeed(this.ambiguousBranchMutation(
             parentSessionId,
             sourceMessageId,
             `${budget.error.message}; Claude may have created a child session`,
           )),
-        }),
       )
       return result
     })
@@ -585,11 +576,15 @@ export class ClaudeProvider implements AgentProviderApi {
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       yield* this.validateLaunchInput(session.id, replayText)
+      const validationDeadline = yield* this.makeDeadline("validateFork", this.forkValidationTimeoutMs)
+      const effectiveDeadline = validationDeadline.expiresAt !== undefined &&
+        (deadline.expiresAt === undefined || validationDeadline.expiresAt < deadline.expiresAt)
+        ? validationDeadline : deadline
       const validation = yield* this.readAndValidateCreatedFork(
         session.id,
         parentSessionId,
         sourcePrefix,
-        deadline,
+        effectiveDeadline,
       )
       const acquireLaunch = this.acquireLaunch("resume", session.id, replayText)
       if (validation._tag === "Invalid") {
@@ -1044,20 +1039,19 @@ export class ClaudeProvider implements AgentProviderApi {
   ): Effect.Effect<TerminalLaunch, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       yield* this.validateLaunchInput(sessionId, draft)
-      const executable = yield* Effect.tryPromise({
+      const executable = yield* withOperationTimeout(Effect.tryPromise({
         try: () => handledPromise(this.resolveExecutable),
         catch: (cause) => this.providerError(
           "acquireLaunch",
           "Could not locate the Claude Code executable",
           cause,
         ),
-      }).pipe(Effect.timeoutOrElse({
-        duration: this.executableLookupTimeoutMs,
-        orElse: () => Effect.fail(this.timeoutError(
+      }), this.executableLookupTimeoutMs,
+        () => Effect.fail(this.timeoutError(
           "acquireLaunch",
-          this.executableLookupTimeoutMs,
+          this.executableLookupTimeoutMs!,
         )),
-      }))
+      )
       if (typeof executable !== "string" || executable.length === 0 || executable.includes("\0")) {
         return yield* Effect.fail(this.providerError(
           "acquireLaunch",
@@ -1116,51 +1110,51 @@ export class ClaudeProvider implements AgentProviderApi {
   private callSdk<A>(
     operation: string,
     call: () => PromiseLike<A>,
-    timeoutMs: number,
+    timeoutMs: number | undefined,
     deadline: OperationDeadline,
   ): Effect.Effect<A, ProviderError> {
     return Effect.gen({ self: this }, function*() {
       const budget = yield* this.timeoutBudget(operation, timeoutMs, deadline)
-      return yield* Effect.tryPromise({
+      return yield* withOperationTimeout(Effect.tryPromise({
         try: () => handledPromise(call),
         catch: (cause) => this.providerError(
           operation,
           `Claude ${operation} failed: ${errorMessage(cause)}`,
           cause,
         ),
-      }).pipe(Effect.timeoutOrElse({
-        duration: budget.durationMs,
-        orElse: () => Effect.fail(budget.error),
-      }))
+      }), budget.durationMs, () => Effect.fail(budget.error))
     })
   }
 
   private makeDeadline(
     operation: string,
-    timeoutMs: number,
+    timeoutMs: number | undefined,
   ): Effect.Effect<OperationDeadline> {
     return Clock.currentTimeMillis.pipe(Effect.map((now) => ({
       operation,
       timeoutMs,
-      expiresAt: now + timeoutMs,
+      expiresAt: timeoutMs === undefined ? undefined : now + timeoutMs,
     })))
   }
 
   private remainingMillis(deadline: OperationDeadline): Effect.Effect<number> {
     return Clock.currentTimeMillis.pipe(
-      Effect.map((now) => Math.max(0, deadline.expiresAt - now)),
+      Effect.map((now) => deadline.expiresAt === undefined ? Infinity : Math.max(0, deadline.expiresAt - now)),
     )
   }
 
   private timeoutBudget(
     operation: string,
-    timeoutMs: number,
+    timeoutMs: number | undefined,
     deadline: OperationDeadline,
   ): Effect.Effect<TimeoutBudget, ProviderError> {
     return Effect.gen({ self: this }, function*() {
       const remaining = yield* this.remainingMillis(deadline)
       if (remaining <= 0) return yield* Effect.fail(this.deadlineError(deadline))
-      return timeoutMs <= remaining
+      if (timeoutMs === undefined && deadline.expiresAt === undefined) {
+        return { durationMs: undefined, error: this.providerError(operation, "Operation has no deadline") }
+      }
+      return timeoutMs !== undefined && timeoutMs <= remaining
         ? { durationMs: timeoutMs, error: this.timeoutError(operation, timeoutMs) }
         : { durationMs: remaining, error: this.deadlineError(deadline) }
     })
@@ -1176,7 +1170,7 @@ export class ClaudeProvider implements AgentProviderApi {
   }
 
   private deadlineError(deadline: OperationDeadline): ProviderError {
-    return this.timeoutError(deadline.operation, deadline.timeoutMs)
+    return this.timeoutError(deadline.operation, deadline.timeoutMs!)
   }
 
   private failureCode(cause: unknown, sessionId?: string): HistoryFailure {

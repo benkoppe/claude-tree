@@ -8,11 +8,11 @@ import { Cause, Data, Effect, Exit, FiberSet, Option, Scope } from "effect"
 import { TerminalLaunchDirectory } from "../../../services/provider"
 import type { TerminalLaunchResources } from "../../../domain/persistence"
 import { PROVIDER_RESOURCE_STAGE_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 
 import { cleanupProcessGroup, type ProcessGroupHandle } from "../../process-group"
 
 const DEFAULT_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
-const DEFAULT_ACQUISITION_TIMEOUT_MS = 5_000
 const STDERR_LIMIT_BYTES = 8_192
 
 export class CodexSidecarError extends Data.TaggedError("CodexSidecarError")<{
@@ -72,10 +72,6 @@ export function makeCodexSidecar(
   dependencies: CodexSidecarDependencies = {},
   options: CodexSidecarLaunchOptions = {},
 ): Effect.Effect<CodexSidecar, CodexSidecarError, Scope.Scope> {
-  const acquisitionTimeoutMs = positiveDuration(
-    options.acquisitionTimeoutMs,
-    DEFAULT_ACQUISITION_TIMEOUT_MS,
-  )
   const cleanupTimeoutMs = positiveDuration(options.cleanupTimeoutMs, DEFAULT_CLEANUP_TIMEOUT_MS)
   const removeDirectory = dependencies.removeDirectory ??
     ((path: string) => rm(path, { recursive: true, force: true }))
@@ -84,6 +80,10 @@ export function makeCodexSidecar(
     durablySyncToken(path, parent, syncSignal, dependencies.openFile))
 
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+    const acquisitionTimeoutMs = yield* Effect.try({
+      try: () => optionalOperationTimeout(options.acquisitionTimeoutMs),
+      catch: (cause) => sidecarError("acquire", "Acquisition timeout must be a finite positive duration", cause),
+    })
     const ownerDirectory = yield* Effect.serviceOption(TerminalLaunchDirectory)
     const runPromise = yield* FiberSet.makeRuntimePromise<never>()
     let directoryRemoved = false
@@ -551,17 +551,14 @@ function removeTokenDirectory(
 
 function boundedAcquisitionPhase<A>(
   effect: Effect.Effect<A, CodexSidecarError>,
-  timeoutMs: number,
+  timeoutMs: number | undefined,
   operation: string,
   description: string,
 ): Effect.Effect<A, CodexSidecarError> {
-  return effect.pipe(Effect.timeoutOrElse({
-    duration: timeoutMs,
-    orElse: () => Effect.fail(sidecarError(
+  return withOperationTimeout(effect, timeoutMs, () => Effect.fail(sidecarError(
       operation,
       `Timed out attempting to ${description} after ${timeoutMs}ms`,
-    )),
-  }))
+    )))
 }
 
 function sidecarError(operation: string, message: string, cause?: unknown): CodexSidecarError {

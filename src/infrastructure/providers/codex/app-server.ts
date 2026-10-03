@@ -1,4 +1,5 @@
 import { Cause, Data, Deferred, Effect, Exit, FiberSet, Schema, Scope, Sink, Stdio, Stream } from "effect"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 
 import { makeCodexAppServerPatchedProtocol, type CodexAppServerPatchedProtocol } from "../../../vendor/t3/codex/protocol"
 import { CodexAppServerTransportError, type CodexAppServerError as UpstreamError } from "../../../vendor/t3/codex/errors"
@@ -9,8 +10,6 @@ import {
   type ProcessGroupHandle,
 } from "../../process-group"
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
-const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000
 const DEFAULT_JSONL_RECORD_LIMIT_BYTES = 1_024 * 1_024
 const STDERR_LIMIT_BYTES = 8_192
@@ -107,6 +106,7 @@ export class CodexProcessError extends Data.TaggedError("CodexProcessError")<{
 }> {}
 
 export class CodexConnectionError extends Data.TaggedError("CodexConnectionError")<{
+  readonly retryable?: boolean
   readonly url: string
   readonly message: string
   readonly cause?: unknown
@@ -264,7 +264,7 @@ class ClientImpl implements CodexAppServerClient {
   constructor(
     private readonly transport: CodexTransport,
     private readonly runPromise: ScopedRunPromise,
-    private readonly requestTimeoutMs: number,
+    private readonly requestTimeoutMs: number | undefined,
     private readonly shutdownTimeoutMs: number,
     private readonly maxJsonlRecordBytes: number,
     private readonly maxPendingRequests: number,
@@ -427,14 +427,12 @@ class ClientImpl implements CodexAppServerClient {
           Deferred.await(deferred),
         )
       })
-      return yield* execute.pipe(
-        Effect.timeoutOrElse({
-          duration: self.requestTimeoutMs,
-          orElse: () => Effect.fail(self.requestFailure(pending, new CodexRequestTimeout({
+      return yield* withOperationTimeout(execute, self.requestTimeoutMs,
+          () => Effect.fail(self.requestFailure(pending, new CodexRequestTimeout({
             method,
-            timeoutMs: self.requestTimeoutMs,
+            timeoutMs: self.requestTimeoutMs!,
           }))),
-        }),
+      ).pipe(
         Effect.mapError((error) => self.requestFailure(pending, error)),
         Effect.onInterrupt(() => {
           const failure = pending.mutation && pending.sent
@@ -463,13 +461,12 @@ class ClientImpl implements CodexAppServerClient {
   }
 
   private notify(method: string): Effect.Effect<void, CodexAppServerError> {
-    return this.protocol!.notify(method).pipe(Effect.mapError((error) => this.mapUpstreamError(error)), Effect.timeoutOrElse({
-      duration: this.requestTimeoutMs,
-      orElse: () => Effect.fail(new CodexRequestTimeout({
+    return withOperationTimeout(this.protocol!.notify(method).pipe(Effect.mapError((error) => this.mapUpstreamError(error))), this.requestTimeoutMs,
+      () => Effect.fail(new CodexRequestTimeout({
         method,
-        timeoutMs: this.requestTimeoutMs,
+        timeoutMs: this.requestTimeoutMs!,
       })),
-    }))
+    )
   }
 
   private write(message: unknown, requestId?: number): Effect.Effect<void, CodexAppServerError> {
@@ -961,7 +958,7 @@ export function connectCodexAppServerSidecar(
     try: (signal) => connectWebSocketTransport(
       url,
       options.bearerToken,
-      positiveDuration(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS),
+      optionalOperationTimeout(options.connectTimeoutMs),
       signal,
     ),
     catch: (cause) => cause instanceof CodexConnectionError || cause instanceof CodexProtocolError
@@ -976,6 +973,7 @@ function acquireClient(
   acquireTransport: Effect.Effect<CodexTransport, CodexAppServerError>,
   options: CodexAppServerOptions | CodexSidecarOptions,
 ): Effect.Effect<CodexAppServerClient, CodexAppServerError, Scope.Scope> {
+  const requestTimeoutMs = optionalOperationTimeout(options.requestTimeoutMs)
   return Effect.gen(function*() {
     const runPromise = yield* FiberSet.makeRuntimePromise<never>()
     return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
@@ -983,7 +981,7 @@ function acquireClient(
       const client = new ClientImpl(
         transport,
         runPromise,
-        positiveDuration(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+        requestTimeoutMs,
         positiveDuration(options.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS),
         positiveInteger(options.maxJsonlRecordBytes, DEFAULT_JSONL_RECORD_LIMIT_BYTES),
         positiveInteger(options.maxPendingRequests, DEFAULT_PENDING_REQUEST_LIMIT),
@@ -1042,7 +1040,7 @@ function spawnCodex(command: readonly string[]): CodexAppServerProcess {
 async function connectWebSocketTransport(
   url: string,
   bearerToken: string,
-  connectTimeoutMs: number,
+  connectTimeoutMs: number | undefined,
   signal: AbortSignal,
 ): Promise<CodexTransport> {
   assertLoopbackWebSocketUrl(url)
@@ -1100,23 +1098,31 @@ async function connectWebSocketTransport(
       signal.removeEventListener("abort", onAbort)
       socket.removeEventListener("open", onOpen)
       socket.removeEventListener("error", onError)
+      socket.removeEventListener("close", onClose)
       effect()
     }
-    const timer = setTimeout(() => {
+    const timer = connectTimeoutMs === undefined ? undefined : setTimeout(() => {
       socket.terminate()
       settleExit(1)
       finish(() => reject(new CodexConnectionError({
         url,
         message: `Timed out connecting to Codex sidecar after ${connectTimeoutMs}ms`,
+        retryable: true,
       })))
     }, connectTimeoutMs)
     const onOpen = () => finish(resolve)
+    const onClose = () => finish(() => reject(new CodexConnectionError({
+      url,
+      message: "Codex sidecar closed before the connection was established",
+    })))
     const onError = (event: Event) => {
       socket.terminate()
       settleExit(1)
       finish(() => reject(new CodexConnectionError({
         url,
         message: "Unable to connect to Codex sidecar",
+        retryable: "message" in event && typeof event.message === "string" &&
+          /ECONNREFUSED|Failed to connect|Connection refused/i.test(event.message),
         cause: event,
       })))
     }
@@ -1136,6 +1142,7 @@ async function connectWebSocketTransport(
     signal.addEventListener("abort", onAbort, { once: true })
     socket.addEventListener("open", onOpen, { once: true })
     socket.addEventListener("error", onError, { once: true })
+    socket.addEventListener("close", onClose, { once: true })
   })
 
   return {
