@@ -1,5 +1,5 @@
 // Adapted from T3 Code's orchestration-v2/KeyedSerialExecutor.ts.
-// Copyright (c) 2026 T3 Tools Inc. MIT; see src/vendor/t3/LICENSE.
+// Copyright (c) 2026 T3 Tools Inc. MIT; see THIRD_PARTY_LICENSES.
 import { Effect, Ref, Semaphore } from "effect"
 
 interface LockEntry {

@@ -64,15 +64,11 @@ Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (d
 
 ## Development
 
-Agent management reuses the scoped protocol and keyed-execution primitives from
-[T3 Code's orchestrator V2](https://github.com/pingdotgg/t3code/pull/2829), while
-preserving stock agent TUIs. Codex lifecycle events are observed through a
-transparent proxy; Claude uses supported session APIs and conservative terminal
-observation. Ownership and cleanup remain local to this application.
-
-The vendored MIT notice is retained in [`src/vendor/t3/LICENSE`](src/vendor/t3/LICENSE).
-Regenerate the pinned sources with `bun scripts/update-t3-vendor.ts`; verify
-reproducibility with `bun scripts/update-t3-vendor.ts --check`.
+Agent management preserves stock agent TUIs. A local Codex protocol adapter and
+transparent proxy observe lifecycle events; Claude uses supported session APIs
+and conservative terminal observation. Ownership and cleanup remain local to
+this application. The keyed executor is adapted from T3 Code; its MIT notice is
+retained in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
 
 The development shell includes Bun and the validated provider CLIs available for the platform:
 

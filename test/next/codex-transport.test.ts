@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { stopTestServer } from "./helpers/stop-test-server"
-import { Cause, Deferred, Effect, Exit, Fiber, PubSub, Sink, Stdio, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, PubSub } from "effect"
 import { TestClock } from "effect/testing"
 import type { ProviderTerminalEvent } from "../../src/services/provider"
-import { makeCodexAppServerPatchedProtocol } from "../../src/vendor/t3/codex/protocol"
 
 import {
   CodexCleanupError,
@@ -23,31 +22,32 @@ import {
 } from "../../src/infrastructure/providers/codex/tui-proxy"
 
 describe("Effect Codex app-server transport", () => {
-  test("vendor dispatch belongs to each request caller rather than a detached outgoing queue", async () => {
-    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const held = yield* Deferred.make<void>()
-      const sent: string[] = []
-      const cancelled: string[] = []
-      const protocol = yield* makeCodexAppServerPatchedProtocol({
-        stdio: Stdio.make({ args: Effect.succeed([]),
-          stdin: Stream.fromReadableStream({ evaluate: () => new ReadableStream<Uint8Array>(), onError: (cause) => cause }).pipe(Stream.orDie),
-          stdout: () => Sink.drain, stderr: () => Sink.drain,
-        }),
-        sendWire: (encoded) => {
-          const { method } = JSON.parse(encoded) as { method: string }
-          return Effect.sync(() => { sent.push(method) }).pipe(
-            Effect.andThen(Deferred.await(held)),
-            Effect.onInterrupt(() => Effect.sync(() => { cancelled.push(method) })),
-          )
-        },
+  test("a response cannot bypass its caller's outstanding transport write", async () => {
+    const dispatched = Deferred.makeUnsafe<void>()
+    let release!: () => void
+    let completed = false
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+      if (message.method === "thread/read") controls.respond(message.id, { thread: thread("held") })
+    }, { write(data, messages) {
+      if (messages[0]?.method !== "thread/read") return data.length
+      return new Promise<number>((resolve) => {
+        release = () => resolve(data.length)
+        Deferred.doneUnsafe(dispatched, Effect.void)
       })
-      const first = yield* Effect.forkChild(protocol.request("first"))
-      const second = yield* Effect.forkChild(protocol.request("second"))
+    } })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      yield* Effect.addFinalizer(() => Effect.sync(() => release?.()))
+      const read = yield* Effect.forkChild(client.readThread("held").pipe(
+        Effect.tap(() => Effect.sync(() => { completed = true })),
+      ))
+      yield* Deferred.await(dispatched)
       yield* TestClock.adjust(0)
-      expect(sent).toEqual(["first", "second"])
-      yield* Fiber.interrupt(first)
-      yield* Fiber.interrupt(second)
-      expect(cancelled).toEqual(["first", "second"])
+      expect(completed).toBeFalse()
+      release()
+      expect((yield* Fiber.join(read)).id).toBe("held")
+      expect(completed).toBeTrue()
     })).pipe(Effect.provide(TestClock.layer())))
   })
 
@@ -750,26 +750,22 @@ describe("Effect Codex app-server transport", () => {
     })))
   })
 
-  test("answers unsupported server requests without exposing a raw request API", async () => {
-    const rejectionWritten = Deferred.makeUnsafe<void>()
+  test.each(["account/login/start", "item/commandExecution/requestApproval", "item/tool/requestUserInput"])(
+    "fails closed without answering server request %s", async (method) => {
     const transport = fakeProcess((message, controls) => {
-      if (message.id === "server-1" && message.error) Deferred.doneUnsafe(rejectionWritten, Effect.void)
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/loaded/list") {
-        controls.emit(`${JSON.stringify({ id: "server-1", method: "account/login/start", params: {} })}\n`)
-        controls.respond(message.id, { data: ["loaded"] })
+        controls.emit(`${JSON.stringify({ id: "server-1", method, params: {} })}\n`)
       }
     })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
-      expect(yield* client.listLoadedThreadIds()).toEqual(["loaded"])
-      yield* Deferred.await(rejectionWritten)
+      const error = yield* Effect.flip(client.listLoadedThreadIds())
+      expect(error).toBeInstanceOf(CodexProtocolError)
+      expect(error.message).toContain(`Unsupported server request: ${method}`)
     })))
-    expect(transport.messages).toContainEqual({
-      id: "server-1",
-      error: { code: -32601, message: "Unsupported server request: account/login/start" },
-    })
+    expect(transport.messages.some((message) => message.id === "server-1")).toBeFalse()
   })
 
   test("fails pending requests on process exit with bounded stderr diagnostics", async () => {

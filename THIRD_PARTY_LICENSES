@@ -1,3 +1,6 @@
+src/services/keyed-serial-executor.ts is adapted from T3 Code.
+Source: https://github.com/pingdotgg/t3code
+
 MIT License
 
 Copyright (c) 2026 T3 Tools Inc.

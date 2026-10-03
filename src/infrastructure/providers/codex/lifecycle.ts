@@ -2,20 +2,20 @@ import { Schema } from "effect"
 
 import type { ProviderTerminalEvent } from "../../../services/provider"
 import {
-  V2ThreadStatusChangedNotification,
-  V2TurnCompletedNotification__TurnStatus,
-} from "../../../vendor/t3/codex/_generated/schema.gen"
+  CodexThreadStatusNotificationSchema,
+  CodexTurnStatusSchema,
+} from "./protocol-schema"
 
 // Only lifecycle fields are consumed; stock TUI item payloads pass through unchanged.
 const TurnNotification = Schema.Struct({
   threadId: Schema.NonEmptyString,
-  turn: Schema.Struct({ id: Schema.NonEmptyString, status: V2TurnCompletedNotification__TurnStatus }),
+  turn: Schema.Struct({ id: Schema.NonEmptyString, status: CodexTurnStatusSchema }),
 })
 const Envelope = Schema.Struct({ method: Schema.String, params: Schema.Unknown })
 const decodeEnvelope = Schema.decodeUnknownOption(Schema.fromJsonString(Envelope))
 const decodeCorrelation = Schema.decodeUnknownOption(Schema.Struct({ threadId: Schema.NonEmptyString }))
 const decodeTurn = Schema.decodeUnknownOption(TurnNotification)
-const decodeStatus = Schema.decodeUnknownOption(V2ThreadStatusChangedNotification)
+const decodeStatus = Schema.decodeUnknownOption(CodexThreadStatusNotificationSchema)
 
 export class CodexLifecycleObserver {
   private threadId: string | undefined
