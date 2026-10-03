@@ -40,6 +40,7 @@ export interface TerminalProcess {
   readonly ptyDrained: Promise<void>
   readonly exitCode: number | null
   readonly ptyOpen: boolean
+  readonly outputTail?: string
   write(data: Uint8Array): void
   resize(cols: number, rows: number): void
   signalGroup(signal: NodeJS.Signals): void

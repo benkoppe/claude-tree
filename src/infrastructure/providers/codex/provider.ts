@@ -90,6 +90,7 @@ export interface CodexObservedServices {
   readonly bearerToken: string
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
   readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
+  readonly failureDetails?: () => string | undefined
   readonly close: () => Effect.Effect<void, CodexObservedServicesError>
 }
 
@@ -772,6 +773,7 @@ export class CodexProvider implements AgentProviderApi {
         observer: this.observerFactory(),
         transitions,
         ...(observed.providerEvents === undefined ? {} : { providerEvents: observed.providerEvents }),
+        ...(observed.failureDetails === undefined ? {} : { failureDetails: observed.failureDetails }),
       }
       return {
         launch,
@@ -1229,6 +1231,16 @@ export function makeObservedServices(
       bearerToken: sidecar.bearerToken,
       transitions: proxy.transitions,
       providerEvents: proxy.providerEvents,
+      failureDetails: () => {
+        const exitCode = sidecar.process.exitCode
+        let detail = ""
+        try { detail = Effect.runSync(sidecar.stderr) } catch { /* Diagnostics cannot block cleanup. */ }
+        return [
+          exitCode === null ? "Codex app-server exit was not observed before cleanup."
+            : `Codex app-server exited with code ${exitCode} before cleanup.`,
+          detail.trim(),
+        ].filter(Boolean).join("\n")
+      },
       close,
     }
   }))

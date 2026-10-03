@@ -71,6 +71,8 @@ export interface TerminalLaunch {
   /** Best-effort wakeups, never proof that a turn completed. */
   readonly activityHints?: PubSub.PubSub<"reconcile">
   readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
+  /** Synchronous failure snapshot, captured before cleanup changes provider state. */
+  readonly failureDetails?: () => string | undefined
 }
 
 export type ProviderTerminalEvent =

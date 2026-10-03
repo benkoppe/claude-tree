@@ -113,6 +113,7 @@ export interface TerminalExitEvent extends SequencedTerminalEvent {
   readonly exitCode: number
   readonly wasActive: boolean
   readonly draftPreview?: DraftPreview
+  readonly outputTail?: string
   readonly cleanupError?: TerminalCleanupError
   readonly ownershipReleased?: true
 }
@@ -311,6 +312,7 @@ interface TerminalOwner {
   readonly sequence: SequenceAllocator
   cleanupResult: Deferred.Deferred<void, TerminalCleanupError>
   readonly observer: TerminalLaunch["observer"]
+  readonly failureDetails?: TerminalLaunch["failureDetails"]
   readonly process: TerminalProcess
   readonly processGroupId: number
   readonly surface: TerminalSurface
@@ -398,6 +400,7 @@ interface CleanupPlan {
   readonly gracePeriodMs: number
   readonly naturalExit?: { readonly exitCode: number; readonly sequenceId: number; readonly wasActive: boolean }
   readonly forcedExit?: { readonly wasActive: boolean }
+  readonly failureDetails?: string
 }
 
 type CleanupDecision =
@@ -1092,6 +1095,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         sequence,
         cleanupResult: Deferred.makeUnsafe<void, TerminalCleanupError>(),
         observer: launch.observer,
+        ...(launch.failureDetails === undefined ? {} : { failureDetails: launch.failureDetails }),
         process,
         processGroupId: process.processGroupId,
         surface,
@@ -1690,6 +1694,10 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     naturalExit?: CleanupPlan["naturalExit"],
     forcedExit = false,
   ): CleanupPlan {
+    let failureDetails: string | undefined
+    if (naturalExit && naturalExit.exitCode !== 0) {
+      this.ignoreCallback(() => { failureDetails = owner.failureDetails?.()?.slice(-8 * 1_024) })
+    }
     Deferred.doneUnsafe(owner.cleanupRequested, Effect.void)
     owner.cleanupStarted = true
     owner.cleanupInProgress = true
@@ -1700,6 +1708,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       result: owner.cleanupResult,
       operation,
       gracePeriodMs,
+      ...(failureDetails ? { failureDetails } : {}),
       ...(naturalExit === undefined ? {} : { naturalExit }),
       ...(forcedExit
         ? {
@@ -1861,6 +1870,12 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       ? undefined
       : { ...plan.forcedExit, sequenceId: plan.owner.sequence.next++ })
     if (!exitNotification) return
+    let outputTail: string | undefined
+    if (plan.naturalExit && plan.naturalExit.exitCode !== 0) {
+      let terminalOutput: string | undefined
+      this.ignoreCallback(() => { terminalOutput = plan.owner.process.outputTail })
+      outputTail = [terminalOutput, plan.failureDetails].filter(Boolean).join("\n\n")
+    }
     plan.owner.exitNotificationSent = true
     this.ignoreCallback(() => this.events.onProcessExited?.({
       ownerId: plan.owner.ownerId,
@@ -1868,6 +1883,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       sessionId: plan.owner.sessionId,
       exitCode: plan.naturalExit?.exitCode ?? plan.owner.process.exitCode ?? 1,
       wasActive: exitNotification.wasActive,
+      ...(outputTail ? { outputTail } : {}),
       ...(plan.owner.draftPreview === undefined
         ? {}
         : { draftPreview: plan.owner.draftPreview }),

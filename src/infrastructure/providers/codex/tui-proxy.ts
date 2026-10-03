@@ -228,9 +228,16 @@ function createProxyState(
               return
             }
             socket.data.upstream = upstream
+            const forward = (text: string) => {
+              if (socket.data.closed) return
+              for (const observed of lifecycle.observe(text, currentThreadId, socket.data)) {
+                PubSub.publishUnsafe(providerEvents, observed)
+              }
+              socket.send(text)
+            }
             if (connectTimeoutMs !== undefined) socket.data.connectTimer = setTimeout(() => {
-              terminateQuietly(upstream)
               closeQuietly(socket, 1013, "Upstream connect timeout")
+              terminateQuietly(upstream)
             }, connectTimeoutMs)
 
             upstream.addEventListener("open", () => {
@@ -239,15 +246,22 @@ function createProxyState(
                 for (const message of socket.data.queued.splice(0)) upstream.send(message.text)
                 socket.data.queuedBytes = 0
               } catch {
-                terminateQuietly(upstream)
                 closeQuietly(socket, 1011, "Unable to flush upstream messages")
+                terminateQuietly(upstream)
               }
             }, { once: true })
             upstream.addEventListener("message", (event) => {
               try {
                 if (typeof event.data !== "string") {
-                  terminateQuietly(upstream)
                   closeQuietly(socket, 1003, "Upstream messages must be text")
+                  terminateQuietly(upstream)
+                  return
+                }
+                const queuedBehindTransition = socket.data.pendingServerMessages > 0
+                const immediateTransition = queuedBehindTransition
+                  ? undefined : observeServerMessage(socket.data, event.data)
+                if (!queuedBehindTransition && !immediateTransition) {
+                  forward(event.data)
                   return
                 }
                 enqueueServerMessage(
@@ -256,7 +270,8 @@ function createProxyState(
                   maxServerMessages,
                   maxServerMessageBytes,
                   async () => {
-                    const transition = observeServerMessage(socket.data, event.data)
+                    const transition = queuedBehindTransition
+                      ? observeServerMessage(socket.data, event.data) : immediateTransition
                     if (transition) {
                       if (!await publishTransition(
                         state,
@@ -273,27 +288,24 @@ function createProxyState(
                         }
                       }
                     }
-                    if (!socket.data.closed) {
-                      for (const observed of lifecycle.observe(event.data, currentThreadId, socket.data)) {
-                        PubSub.publishUnsafe(providerEvents, observed)
-                      }
-                      socket.send(event.data)
-                    }
+                    forward(event.data)
                   },
                 )
               } catch {
-                terminateQuietly(upstream)
                 closeQuietly(socket, 1011, "Unable to process upstream message")
+                terminateQuietly(upstream)
               }
             })
             upstream.addEventListener("error", () => {
+              if (socket.data.closed) return
               clearConnectTimer(socket.data)
-              socket.close(1011, "Upstream failed")
+              closeQuietly(socket, 1011, "Upstream failed")
             }, { once: true })
             upstream.addEventListener("close", (event) => {
+              if (socket.data.closed) return
               clearConnectTimer(socket.data)
               disconnectLifecycle(socket.data)
-              socket.close(event.code === 1000 ? 1000 : 1011, "Upstream closed")
+              closeQuietly(socket, event.code === 1000 ? 1000 : 1011, upstreamCloseReason(event.code, event.reason))
             }, { once: true })
           },
           message(socket, message) {
@@ -320,8 +332,8 @@ function createProxyState(
               socket.data.queued.push({ text: message, bytes })
               socket.data.queuedBytes += bytes
             } catch {
-              terminateQuietly(socket.data.upstream)
               closeQuietly(socket, 1011, "Unable to process protocol message")
+              terminateQuietly(socket.data.upstream)
             }
           },
           close(socket) {
@@ -563,6 +575,16 @@ function observeServerMessage(
   }
 }
 
+function upstreamCloseReason(code: number, detail: string): string {
+  const message = `Upstream closed (${code})${detail ? `: ${detail}` : ""}`
+  let reason = ""
+  for (const character of message) {
+    if (Buffer.byteLength(reason + character) > 123) break
+    reason += character
+  }
+  return reason
+}
+
 function transitionFailure(request: PendingSwitch, detail: string): CodexThreadTransitionFailed {
   return {
     _tag: "TransitionFailed",
@@ -649,8 +671,8 @@ function enqueueServerMessage(
   const data = socket.data
   const bytes = Buffer.byteLength(text)
   if (data.pendingServerMessages >= messageLimit || data.pendingServerMessageBytes + bytes > byteLimit) {
+    closeQuietly(socket, 1013, "Upstream message queue limit exceeded")
     terminateQuietly(data.upstream)
-    socket.close(1013, "Upstream message queue limit exceeded")
     return
   }
   data.pendingServerMessages += 1
@@ -695,6 +717,8 @@ function closeQuietly(
   code: number,
   reason: string,
 ): void {
+  if (socket.data.closed) return
+  socket.data.closed = true
   try {
     socket.close(code, reason)
   } catch {

@@ -87,8 +87,12 @@ describe("Effect Codex app-server transport", () => {
         // A second connection's contradictory evidence is still forwarded, but is not authoritative.
         yield* send(ancillary, { method: "turn/completed", params: { threadId: "root", turn: { id: "one", status: "completed" } } })
         const ancillaryClosed = socketClosed(ancillary.socket)
-        ancillary.upstream.close(1000)
-        yield* Effect.promise(() => ancillaryClosed)
+        ancillary.upstream.close(1008, "🧪".repeat(30))
+        const ancillaryClose = yield* Effect.promise(() => ancillaryClosed)
+        expect(ancillaryClose.code).toBe(1011)
+        expect(ancillaryClose.reason).toStartWith("Upstream closed (1008): 🧪")
+        expect(Buffer.byteLength(ancillaryClose.reason)).toBeLessThanOrEqual(123)
+        expect(ancillaryClose.reason).not.toContain("�")
         yield* send(primary, { method: "thread/status/changed", params: { threadId: "root", status: { type: "active", activeFlags: ["waitingOnApproval"] } } })
         yield* Effect.promise(() => waitUntil(() => events.length >= 3))
         expect(events.map((event) => event._tag)).toEqual(["Observation", "Activity", "Activity"])
@@ -1165,7 +1169,69 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }
   })
 
-  test("forwards current-sized Codex responses without closing the proxy", async () => {
+  test("ordinary MCP startup bursts bypass the identity barrier queue and preserve order", async () => {
+    const token = "bootstrap-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`, bearerToken: token,
+          initialThreadId: "thread-a", maxServerMessages: 1, maxServerMessageBytes: 128,
+        })
+        const client = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+        yield* Effect.addFinalizer(() => Effect.sync(() => client.terminate()))
+        yield* Effect.promise(() => socketOpened(client))
+        const received: string[] = []
+        const frames = Array.from({ length: 1_024 }, (_, index) => JSON.stringify({
+          method: "mcpServer/startupStatusChanged", params: { name: "codex_apps", index },
+        }))
+        const forwarded = new Promise<void>((resolve, reject) => {
+          client.addEventListener("message", (event) => {
+            received.push(event.data as string)
+            if (received.length === frames.length) resolve()
+          })
+          client.addEventListener("close", () => reject(new Error("Proxy closed during MCP bootstrap")))
+        })
+        client.send(JSON.stringify({ method: "bootstrap" }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        for (const frame of frames) upstream.requests[0]!.socket.send(frame)
+        yield* Effect.promise(() => forwarded).pipe(Effect.timeout(5_000))
+        expect(received).toEqual(frames)
+        expect(client.readyState).toBe(WebSocket.OPEN)
+        yield* proxy.close()
+      })))
+    } finally { await upstream.close() }
+  })
+
+  test("proxy queue overflow preserves its cause when terminating upstream", async () => {
+    const token = "overflow-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`, bearerToken: token,
+          initialThreadId: "thread-a", maxServerMessages: 1,
+        })
+        const subscription = yield* PubSub.subscribe(proxy.transitions)
+        const client = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+        yield* Effect.addFinalizer(() => Effect.sync(() => client.terminate()))
+        yield* Effect.promise(() => socketOpened(client))
+        client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        upstream.respond(1, topLevelThread("thread-b"))
+        const request = yield* PubSub.take(subscription)
+        const closed = socketClosed(client)
+        upstream.requests[0]!.socket.send(JSON.stringify({ method: "progress", params: {} }))
+        const event = yield* Effect.promise(() => closed)
+        expect(event.code).toBe(1013)
+        expect(event.reason).toBe("Upstream message queue limit exceeded")
+        yield* Deferred.succeed(request.acknowledgment, undefined)
+        yield* proxy.close()
+      })))
+    } finally { await upstream.close() }
+  })
+
+  test("forwards large ordinary Codex responses without charging identity queue capacity", async () => {
     const token = "proxy-secret"
     const upstream = controlledProtocolServer(token)
     try {
@@ -1180,7 +1246,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         })
         yield* Effect.promise(() => socketOpened(client))
 
-        const largePayload = "x".repeat(7_500_000)
+        const largePayload = "x".repeat(9_500_000)
         const firstResponse = socketMessage(client, 5_000)
         client.send(JSON.stringify({ id: 1, method: "plugin/list", params: {} }))
         yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))

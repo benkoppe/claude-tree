@@ -1079,6 +1079,41 @@ test("one unbounded semantic queue preserves transition order and sequence IDs u
   }))
 })
 
+test.each([false, true])("failed natural exits retain diagnostics without vetoing cleanup (tail fails: %s)", async (tailFails) => {
+  const fixture = makeFixture()
+  const exits: TerminalExitEvent[] = []
+  fixture.dependencies.events = { onProcessExited: (event) => exits.push(event) }
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const acquired = acquiredLaunch("startup-error", fixture)
+    let capturedBeforeCleanup = false
+    yield* supervisor.show({
+      session: session("startup-error"),
+      acquireLaunch: Effect.succeed({ ...acquired, launch: { ...acquired.launch,
+        failureDetails: () => {
+          capturedBeforeCleanup = !fixture.log.includes("provider-close:startup-error")
+          return "Codex app-server exited with code 137 before cleanup."
+        },
+      } }),
+    })
+    const process = fixture.processes.processes[0]!
+    let readAfterCleanup = false
+    Object.defineProperty(process, "outputTail", { get() {
+      readAfterCleanup = fixture.log.includes("unref:startup-error")
+      if (tailFails) throw new Error("diagnostic accessor failed")
+      return "ERROR: No saved session found."
+    } })
+    process.finish(1)
+    yield* eventually(() => exits.length === 1)
+    expect(exits[0]).toMatchObject({
+      sessionId: "startup-error", exitCode: 1, ownershipReleased: true,
+      outputTail: tailFails ? "Codex app-server exited with code 137 before cleanup."
+        : "ERROR: No saved session found.\n\nCodex app-server exited with code 137 before cleanup.",
+    })
+    expect(readAfterCleanup).toBeTrue()
+    expect(capturedBeforeCleanup).toBeTrue()
+  }))
+})
+
 test("a semantic transition defect fails its acknowledgment before supervised cleanup", async () => {
   const fixture = makeFixture()
   const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
