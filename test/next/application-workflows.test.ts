@@ -284,6 +284,95 @@ describe("application actor", () => {
     expect(fixture.calls.filter((call) => call === `show:${child.session.id}`)).toHaveLength(1)
   })
 
+  test("delayed reactivation completion preserves an adopted owner's identity and return destination", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let shows = 0
+      const terminals: TerminalSupervisorApi = {
+        ...fixture.options.terminals,
+        show: (prepared) => Effect.gen(function*() {
+          const ownerId = yield* fixture.options.terminals.show(prepared)
+          if (++shows === 2) {
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(release)
+          }
+          return ownerId
+        }),
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.returnFromTerminal
+      const opening = yield* Effect.forkChild(runtime.resumeSession(ROOT))
+      yield* Deferred.await(entered)
+      fixture.adoptOwner(ROOT, "adopted")
+      const acknowledgment = yield* Deferred.make<void, unknown>()
+      expect(yield* runtime.handleTerminalSessionChanged({
+        ownerId: "owner-1", sequenceId: 1, previousSessionId: ROOT,
+        session: session("adopted", "Adopted"), kind: "temporary-adoption",
+        adoptionToken: "delayed-show", wasActive: true, acknowledgment,
+      })).toBeTrue()
+      yield* Deferred.await(acknowledgment)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(opening)
+      const state = yield* runtime.getState
+      expect([...state.terminals.keys()]).toEqual(["adopted"])
+      expect(state.terminals.get("adopted")).toMatchObject({ ownerId: "owner-1", phase: "running" })
+      expect(state.surface).toMatchObject({ _tag: "Terminal", sessionId: "adopted",
+        returnTo: { _tag: "Graph", familySessionId: "adopted", target: { kind: "endpoint", sessionId: "adopted" } } })
+      expect(yield* runtime.handleTerminalActivity({
+        ownerId: "owner-1", sequenceId: 2, sessionId: "adopted", activity: "working", wasActive: true,
+      })).toBeTrue()
+      yield* runtime.returnFromTerminal
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Graph", familySessionId: "adopted" })
+      yield* runtime.stopSession("adopted")
+      expect((yield* runtime.getState).terminals.size).toBe(0)
+    })))
+  })
+
+  test("replacement launch settles buffered predecessor events without rejecting its own queued events", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let shows = 0
+      const terminals: TerminalSupervisorApi = {
+        ...fixture.options.terminals,
+        show: (prepared) => Effect.gen(function*() {
+          const ownerId = yield* fixture.options.terminals.show(prepared)
+          if (++shows === 2) {
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(release)
+          }
+          return ownerId
+        }),
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals })
+      yield* runtime.resumeSession(ROOT)
+      expect(yield* fixture.options.terminals.stopSession(ROOT, undefined, "owner-1")).toBeTrue()
+      expect(yield* runtime.handleTerminalExit({ ownerId: "owner-1", sequenceId: 1,
+        sessionId: ROOT, exitCode: 0, wasActive: true, ownershipReleased: true })).toBeTrue()
+      const opening = yield* Effect.forkChild(runtime.resumeSession(ROOT))
+      yield* Deferred.await(entered)
+      const stale = yield* Effect.forkChild(runtime.handleTerminalActivity({
+        ownerId: "owner-1", sequenceId: 2, sessionId: ROOT, activity: "working", wasActive: true,
+      }))
+      const current = yield* Effect.forkChild(runtime.handleTerminalActivity({
+        ownerId: "owner-2", sequenceId: 1, sessionId: ROOT, activity: "working", wasActive: true,
+      }))
+      // A query queued after both requests confirms the actor has buffered them.
+      yield* runtime.getState
+      expect(stale.pollUnsafe()).toBeUndefined()
+      expect(current.pollUnsafe()).toBeUndefined()
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(opening)
+      expect(yield* Fiber.join(stale)).toBeFalse()
+      expect(yield* Fiber.join(current)).toBeTrue()
+      expect((yield* runtime.getState).terminals.get(ROOT)).toMatchObject({ ownerId: "owner-2", activity: "working" })
+    })))
+  })
+
   test("cursor acceptance and terminal display do not wait for navigation persistence", async () => {
     const fixture = makeFixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -654,7 +743,7 @@ describe("application actor", () => {
       })
       const terminals: TerminalSupervisorApi = {
         ...fixture.options.terminals,
-        stopSession: (sessionId) => fixture.options.terminals.stopSession(sessionId).pipe(
+        stopSession: (sessionId, gracePeriodMs, expectedOwnerId) => fixture.options.terminals.stopSession(sessionId, gracePeriodMs, expectedOwnerId).pipe(
           Effect.andThen(Effect.fail(cleanupError)),
         ),
       }
@@ -982,6 +1071,116 @@ describe("application actor", () => {
     expect(state.terminals.has(child)).toBeTrue()
   })
 
+  for (const kind of ["temporary-adoption", "native-fork"] as const) {
+    for (const mode of ["stop", "remove"] as const) {
+      for (const found of [true, false]) {
+        test(`${mode} binds its owner across ${kind} and ${found ? "confirms cleanup" : "rejects an unconfirmed stop"}`, async () => {
+          const fixture = makeFixture()
+          const previousSessionId = kind === "temporary-adoption" ? "temporary" : ROOT
+          const adoptedSessionId = "adopted-stop-owner"
+          const entered = Deferred.makeUnsafe<void>()
+          const release = Deferred.makeUnsafe<void>()
+          const stopCalls: Array<readonly [string, number | undefined, string | undefined]> = []
+          const terminals: TerminalSupervisorApi = {
+            ...fixture.options.terminals,
+            stopSession: (sessionId, gracePeriodMs, expectedOwnerId) => Effect.gen(function*() {
+              stopCalls.push([sessionId, gracePeriodMs, expectedOwnerId])
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(release)
+              return found ? yield* fixture.options.terminals.stopSession(sessionId, gracePeriodMs, expectedOwnerId) : false
+            }),
+          }
+          let commits = 0
+          const metadata: ApplicationMetadataFacet = {
+            ...fixture.options.metadata,
+            commitRemoval: (removal, affected, token) => {
+              commits += 1
+              return fixture.options.metadata.commitRemoval(removal, affected, token)
+            },
+          }
+          await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+            const runtime = yield* makeAppRuntime({ ...fixture.options, terminals, metadata })
+            if (kind === "temporary-adoption") yield* runtime.newSession
+            else yield* runtime.resumeSession(ROOT)
+            const removal = {
+              kind: "subtree" as const,
+              target: { kind: "endpoint" as const, sessionId: previousSessionId, afterMessageId: null },
+              createdAt: "2026-09-03T00:00:00.000Z",
+            }
+            const operation = yield* Effect.forkScoped(Effect.exit(mode === "stop"
+              ? runtime.stopSession(previousSessionId) : runtime.remove(removal, [previousSessionId])))
+            yield* Deferred.await(entered)
+            fixture.adoptOwner(previousSessionId, adoptedSessionId)
+            const acknowledgment = yield* Deferred.make<void, unknown>()
+            expect(yield* runtime.handleTerminalSessionChanged({
+              ownerId: "owner-1", sequenceId: 1, previousSessionId,
+              session: session(adoptedSessionId, "Adopted"), kind,
+              adoptionToken: `stop-${kind}-${mode}-${found}`, wasActive: true, acknowledgment,
+            })).toBeTrue()
+            yield* Deferred.await(acknowledgment)
+            yield* Deferred.succeed(release, undefined)
+            const outcome = yield* Fiber.join(operation)
+            expect(Exit.isSuccess(outcome)).toBe(found)
+            expect(stopCalls).toEqual([[previousSessionId, undefined, "owner-1"]])
+            const state = yield* runtime.getState
+            expect(state.terminals.has(adoptedSessionId)).toBe(!found)
+            expect((yield* fixture.options.terminals.ownedSessionIds).has(adoptedSessionId)).toBe(!found)
+            expect(commits).toBe(mode === "remove" && found ? 1 : 0)
+          })))
+        })
+      }
+    }
+  }
+
+  for (const [mode, confirmed] of [["stop", true], ["stop", false], ["remove", true], ["remove", false]] as const) {
+    test(`${mode} does not stop or clear a replacement owner after its admitted owner exits (confirmed: ${confirmed})`, async () => {
+      const fixture = makeFixture()
+      const entered = Deferred.makeUnsafe<void>()
+      const release = Deferred.makeUnsafe<void>()
+      const terminals: TerminalSupervisorApi = {
+        ...fixture.options.terminals,
+        stopSession: (sessionId, gracePeriodMs, expectedOwnerId) => Effect.gen(function*() {
+          expect(expectedOwnerId).toBe("owner-1")
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+          return confirmed ? true : yield* fixture.options.terminals.stopSession(sessionId, gracePeriodMs, expectedOwnerId)
+        }),
+      }
+      let commits = 0
+      const metadata: ApplicationMetadataFacet = {
+        ...fixture.options.metadata,
+        commitRemoval: (removal) => Effect.sync(() => {
+          commits += 1
+          return removal
+        }),
+      }
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const runtime = yield* makeAppRuntime({ ...fixture.options, terminals, metadata })
+        yield* runtime.resumeSession(ROOT)
+        const removal = {
+          kind: "subtree" as const,
+          target: { kind: "endpoint" as const, sessionId: ROOT, afterMessageId: null },
+          createdAt: "2026-09-03T00:00:00.000Z",
+        }
+        const operation = yield* Effect.forkScoped(Effect.exit(mode === "stop"
+          ? runtime.stopSession(ROOT) : runtime.remove(removal, [ROOT])))
+        yield* Deferred.await(entered)
+        expect(yield* fixture.options.terminals.stopSession(ROOT, undefined, "owner-1")).toBeTrue()
+        expect(yield* runtime.handleTerminalExit({
+          ownerId: "owner-1", sequenceId: 1, sessionId: ROOT,
+          exitCode: 0, wasActive: true, ownershipReleased: true,
+        })).toBeTrue()
+        yield* runtime.resumeSession(ROOT)
+        expect((yield* runtime.getState).terminals.get(ROOT)?.ownerId).toBe("owner-2")
+        yield* Deferred.succeed(release, undefined)
+        expect(Exit.isSuccess(yield* Fiber.join(operation))).toBe(mode === "stop" && confirmed)
+        expect((yield* runtime.getState).terminals.get(ROOT)?.ownerId).toBe("owner-2")
+        expect((yield* fixture.options.terminals.runningSessionIds).has(ROOT)).toBeTrue()
+        expect(commits).toBe(0)
+      })))
+    })
+  }
+
   test("removal admitted before a native fork follows the transitioned owner", async () => {
     const fixture = makeFixture()
     const child = "native-child"
@@ -990,16 +1189,14 @@ describe("application actor", () => {
     let committedRemoval: ProjectState["removals"][number] | undefined
     const terminals: TerminalSupervisorApi = {
       ...fixture.options.terminals,
-      stopSession: (sessionId) => {
-        fixture.calls.push(`stop:${sessionId}`)
-        if (sessionId === ROOT) {
-          return Effect.gen(function*() {
+      stopSession: (sessionId, gracePeriodMs, expectedOwnerId) => {
+        expect(expectedOwnerId).toBe("owner-1")
+        expect(gracePeriodMs).toBeUndefined()
+        return Effect.gen(function*() {
             yield* Deferred.succeed(staleStopStarted, undefined)
             yield* Deferred.await(releaseStaleStop)
-            return false
-          })
-        }
-        return Effect.succeed(sessionId === child)
+            return yield* fixture.options.terminals.stopSession(sessionId, gracePeriodMs, expectedOwnerId)
+        })
       },
     }
     const metadata: ApplicationMetadataFacet = {
@@ -1043,7 +1240,7 @@ describe("application actor", () => {
       return yield* runtime.getState
     })))
 
-    expect(fixture.calls).toEqual(expect.arrayContaining([`stop:${ROOT}`, `stop:${child}`]))
+    expect(fixture.calls.filter((call) => call.startsWith("stop:"))).toEqual([`stop:${ROOT}`])
     expect(committedRemoval).toEqual({
       ...removal,
       target: { ...removal.target, sessionId: child },
@@ -2796,18 +2993,13 @@ describe("application actor", () => {
     let committedRemoval: ProjectState["removals"][number] | undefined
     const terminals: TerminalSupervisorApi = {
       ...fixture.options.terminals,
-      stopSession: (sessionId) => {
-        fixture.calls.push(`stop:${sessionId}`)
-        if (sessionId === "temporary") {
-          return Effect.gen(function*() {
+      stopSession: (sessionId, gracePeriodMs, expectedOwnerId) => {
+        expect(expectedOwnerId).toBe("owner-1")
+        return Effect.gen(function*() {
             yield* Deferred.succeed(staleStopStarted, undefined)
             yield* Deferred.await(releaseStaleStop)
-            return false
-          })
-        }
-        return Effect.sync(() => {
           order.push(`stop:${sessionId}`)
-          return sessionId === persisted
+          return yield* fixture.options.terminals.stopSession(sessionId, gracePeriodMs, expectedOwnerId)
         })
       },
     }
@@ -2837,6 +3029,7 @@ describe("application actor", () => {
       const removing = yield* Effect.forkScoped(runtime.remove(removal, ["temporary"]))
       yield* Deferred.await(staleStopStarted)
 
+      fixture.adoptOwner("temporary", persisted)
       const acknowledgment = yield* Deferred.make<void, unknown>()
       expect(yield* runtime.handleTerminalSessionChanged({
         ownerId: "owner-1",
@@ -2851,7 +3044,7 @@ describe("application actor", () => {
       yield* Deferred.await(acknowledgmentStarted)
       yield* Deferred.succeed(releaseStaleStop, undefined)
       yield* TestClock.adjust(0)
-      expect(order).toEqual([])
+      expect(order).toEqual(["stop:temporary"])
       expect(removing.pollUnsafe()).toBeUndefined()
 
       yield* Deferred.succeed(releaseAcknowledgment, undefined)
@@ -2860,8 +3053,8 @@ describe("application actor", () => {
       return yield* runtime.getState
     }).pipe(Effect.provide(TestClock.layer()))))
 
-    expect(order).toEqual(["acknowledged", `stop:${persisted}`, "committed"])
-    expect(fixture.calls).toEqual(expect.arrayContaining(["stop:temporary", `stop:${persisted}`]))
+    expect(order).toEqual(["stop:temporary", "acknowledged", "committed"])
+    expect(fixture.calls.filter((call) => call.startsWith("stop:"))).toEqual(["stop:temporary"])
     expect(committedRemoval).toEqual({
       ...removal,
       target: { ...removal.target, sessionId: persisted },
@@ -2878,7 +3071,7 @@ describe("application actor", () => {
     const baseStop = fixture.options.terminals.stopSession
     const terminals: TerminalSupervisorApi = {
       ...fixture.options.terminals,
-      stopSession: (sessionId) => sessionId === CHILD
+      stopSession: (sessionId, gracePeriodMs, expectedOwnerId) => sessionId === CHILD
         ? Effect.fail(new TerminalCleanupError({
             operation: "stop",
             issues: [{
@@ -2888,7 +3081,7 @@ describe("application actor", () => {
               message: "cleanup failed",
             }],
           }))
-        : baseStop(sessionId),
+        : baseStop(sessionId, gracePeriodMs, expectedOwnerId),
     }
     const provider: AgentProviderApi = {
       ...fixture.options.provider,
@@ -3499,10 +3692,13 @@ function makeFixture(): Fixture {
       activeSessionId = null
       return hidden
     }),
-    stopSession: (sessionId) => Effect.sync(() => {
+    stopSession: (sessionId, _gracePeriodMs, expectedOwnerId) => Effect.sync(() => {
       calls.push(`stop:${sessionId}`)
-      if (activeSessionId === sessionId) activeSessionId = null
-      return owned.delete(sessionId)
+      const target = expectedOwnerId === undefined ? sessionId
+        : [...owned].find(([, ownerId]) => ownerId === expectedOwnerId)?.[0]
+      if (target === undefined) return false
+      if (activeSessionId === target) activeSessionId = null
+      return owned.delete(target)
     }),
     shutdown: () => Effect.sync(() => {
       fixture.shutdowns += 1

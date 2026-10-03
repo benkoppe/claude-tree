@@ -3,9 +3,12 @@ import { isAbsolute } from "node:path"
 import { Data, Deferred, Effect, FiberSet, PubSub, Scope } from "effect"
 
 import type { IdentityTransitionKind } from "../../../domain/persistence"
+import type { ProviderTerminalEvent } from "../../../services/provider"
+import { CodexLifecycleObserver } from "./lifecycle"
+import { PROVIDER_RESOURCE_STAGE_TIMEOUT_MS } from "../../../services/lifecycle-policy"
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
-const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000
+const DEFAULT_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
 const DEFAULT_PREOPEN_MESSAGES = 64
 const DEFAULT_PREOPEN_BYTES = 256 * 1_024
 const DEFAULT_PENDING_REQUESTS = 256
@@ -74,6 +77,7 @@ export interface CodexTuiProxyOptions {
 export interface CodexTuiProxy {
   readonly remoteUrl: string
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly providerEvents: PubSub.PubSub<ProviderTerminalEvent>
   readonly close: () => Effect.Effect<void, CodexTuiProxyError>
 }
 
@@ -107,6 +111,7 @@ interface ProxyState {
   readonly port: number
   readonly clients: Set<Bun.ServerWebSocket<ProxySocketData>>
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly providerEvents: PubSub.PubSub<ProviderTerminalEvent>
   readonly cleanupTimeoutMs: number
   readonly runPromise: ScopedRunPromise
   closed: boolean
@@ -131,11 +136,13 @@ export function makeCodexTuiProxy(
       PubSub.bounded<CodexTuiProxyTransitionRequest>(transitionCapacity),
       PubSub.shutdown,
     )
-    const state = yield* createProxyState(options, transitions, transitionCapacity, runPromise)
+    const providerEvents = yield* Effect.acquireRelease(PubSub.unbounded<ProviderTerminalEvent>(), PubSub.shutdown)
+    const state = yield* createProxyState(options, transitions, providerEvents, transitionCapacity, runPromise)
     yield* Effect.addFinalizer(() => cleanupProxy(state).pipe(Effect.orDie))
     return {
       remoteUrl: `ws://127.0.0.1:${state.port}`,
       transitions,
+      providerEvents,
       close: () => cleanupProxy(state),
     }
   })
@@ -144,6 +151,7 @@ export function makeCodexTuiProxy(
 function createProxyState(
   options: CodexTuiProxyOptions,
   transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>,
+  providerEvents: PubSub.PubSub<ProviderTerminalEvent>,
   transitionCapacity: number,
   runPromise: ScopedRunPromise,
 ): Effect.Effect<ProxyState, CodexTuiProxyError> {
@@ -152,9 +160,18 @@ function createProxyState(
       assertLoopbackWebSocketUrl(options.upstreamUrl)
       requireIdentifier(options.initialThreadId, "initial thread id")
       const clients = new Set<Bun.ServerWebSocket<ProxySocketData>>()
+      const lifecycle = new CodexLifecycleObserver()
       let clientSlots = 0
       let currentThreadId = options.initialThreadId
       let awaitingTemporaryAdoption = options.initialThreadIsTemporary === true
+      const disconnectLifecycle = (data: ProxySocketData) => {
+        // Release evidence after this generation's queued frames, never before them.
+        data.serverTail = data.serverTail.then(() => {
+          for (const observed of lifecycle.disconnect(data, currentThreadId)) {
+            PubSub.publishUnsafe(providerEvents, observed)
+          }
+        })
+      }
       const state = {} as ProxyState
       const maxPreOpenMessages = positiveInteger(options.maxPreOpenMessages, DEFAULT_PREOPEN_MESSAGES)
       const maxPreOpenBytes = positiveInteger(options.maxPreOpenBytes, DEFAULT_PREOPEN_BYTES)
@@ -260,7 +277,12 @@ function createProxyState(
                         }
                       }
                     }
-                    if (!socket.data.closed) socket.send(event.data)
+                    if (!socket.data.closed) {
+                      for (const observed of lifecycle.observe(event.data, currentThreadId, socket.data)) {
+                        PubSub.publishUnsafe(providerEvents, observed)
+                      }
+                      socket.send(event.data)
+                    }
                   },
                 )
               } catch {
@@ -274,6 +296,7 @@ function createProxyState(
             }, { once: true })
             upstream.addEventListener("close", (event) => {
               clearConnectTimer(socket.data)
+              disconnectLifecycle(socket.data)
               socket.close(event.code === 1000 ? 1000 : 1011, "Upstream closed")
             }, { once: true })
           },
@@ -309,6 +332,7 @@ function createProxyState(
             clients.delete(socket)
             clientSlots -= 1
             clearSocketState(socket.data)
+            disconnectLifecycle(socket.data)
           },
         },
       })
@@ -345,6 +369,7 @@ function createProxyState(
         port,
         clients,
         transitions,
+        providerEvents,
         cleanupTimeoutMs: positiveInteger(options.cleanupTimeoutMs, DEFAULT_CLEANUP_TIMEOUT_MS),
         runPromise,
         closed: false,

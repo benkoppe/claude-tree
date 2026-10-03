@@ -1,4 +1,8 @@
-import { Cause, Data, Deferred, Effect, Exit, FiberSet, Schema, Scope } from "effect"
+import { Cause, Data, Deferred, Effect, Exit, FiberSet, Schema, Scope, Sink, Stdio, Stream } from "effect"
+
+import { makeCodexAppServerPatchedProtocol, type CodexAppServerPatchedProtocol } from "../../../vendor/t3/codex/protocol"
+import { CodexAppServerTransportError, type CodexAppServerError as UpstreamError } from "../../../vendor/t3/codex/errors"
+import { V2TurnCompletedNotification__TurnStatus } from "../../../vendor/t3/codex/_generated/schema.gen"
 
 import {
   cleanupProcessGroup,
@@ -216,12 +220,7 @@ const GitInfoSchema = Schema.Struct({
 const ThreadItemSchema = Schema.Struct({ id: Schema.String, type: Schema.String })
 const TurnSchema = Schema.Struct({
   id: Schema.String,
-  status: Schema.Union([
-    Schema.Literal("completed"),
-    Schema.Literal("interrupted"),
-    Schema.Literal("failed"),
-    Schema.Literal("inProgress"),
-  ]),
+  status: V2TurnCompletedNotification__TurnStatus,
   items: Schema.Array(ThreadItemSchema),
 })
 const ThreadSchema = Schema.Struct({
@@ -240,6 +239,12 @@ const ThreadListSchema = Schema.Struct({
 const LoadedThreadListSchema = Schema.Struct({ data: Schema.Array(Schema.String) })
 
 class ClientImpl implements CodexAppServerClient {
+  private protocol: CodexAppServerPatchedProtocol | undefined
+  private protocolScope: Scope.Closeable | undefined
+  private protocolInputController!: ReadableStreamDefaultController<Uint8Array>
+  private readonly protocolInput = new ReadableStream<Uint8Array>({
+    start: (controller) => { this.protocolInputController = controller },
+  })
   private nextRequestId = 1
   private readonly pending = new Map<number, PendingRequest>()
   private readonly stdoutTask: Promise<void>
@@ -295,6 +300,26 @@ class ClientImpl implements CodexAppServerClient {
   initialize(): Effect.Effect<void, CodexAppServerError> {
     const self = this
     return Effect.gen(function*() {
+      self.protocolScope = yield* Scope.make("parallel")
+      self.protocol = yield* Scope.provide(makeCodexAppServerPatchedProtocol({
+        stdio: Stdio.make({
+          args: Effect.succeed([]),
+          stdin: Stream.fromReadableStream({ evaluate: () => self.protocolInput, onError: (cause) => cause }).pipe(Stream.orDie),
+          stdout: () => Sink.drain,
+          stderr: () => Sink.drain,
+        }),
+        sendWire: (encoded) => Effect.suspend(() => {
+          const message = JSON.parse(encoded) as { id?: number; method?: string }
+          const id = message.method !== undefined && message.id !== undefined ? message.id : undefined
+          if (id !== undefined && !self.pending.has(id)) return Effect.void
+          return self.write(message, id).pipe(Effect.mapError((cause) =>
+            new CodexAppServerTransportError({ operation: "read-input-stream", cause })))
+        }),
+        onRequest: (request) => Effect.fail(new CodexAppServerTransportError({
+          operation: "read-input-stream", cause: new Error(`Unsupported server request: ${request.method}`),
+        })),
+        onTermination: (error) => Effect.sync(() => self.failAll(self.mapUpstreamError(error))),
+      }), self.protocolScope)
       const result = yield* self.request("initialize", {
         clientInfo: { name: "claude_tree", title: "claude-tree", version: "0.1.0" },
         capabilities: null,
@@ -397,10 +422,10 @@ class ClientImpl implements CodexAppServerClient {
       const pending: PendingRequest = { method, deferred, mutation, assigned: false, sent: false }
       const execute = Effect.gen(function*() {
         self.pending.set(id, pending)
-        yield* self.write({ id, method, params }, id).pipe(
-          Effect.catch((error) => Effect.sync(() => self.failAll(error))),
+        return yield* Effect.raceFirst(
+          self.protocol!.request(method, params, id).pipe(Effect.mapError((error) => self.mapUpstreamError(error))),
+          Deferred.await(deferred),
         )
-        return yield* Deferred.await(deferred)
       })
       return yield* execute.pipe(
         Effect.timeoutOrElse({
@@ -438,7 +463,7 @@ class ClientImpl implements CodexAppServerClient {
   }
 
   private notify(method: string): Effect.Effect<void, CodexAppServerError> {
-    return this.write({ method }).pipe(Effect.timeoutOrElse({
+    return this.protocol!.notify(method).pipe(Effect.mapError((error) => this.mapUpstreamError(error)), Effect.timeoutOrElse({
       duration: this.requestTimeoutMs,
       orElse: () => Effect.fail(new CodexRequestTimeout({
         method,
@@ -569,6 +594,8 @@ class ClientImpl implements CodexAppServerClient {
     }
     queued.cancelled = true
     queued.phase = "completed"
+    const index = this.writeQueue.indexOf(queued)
+    if (index >= 0) this.writeQueue.splice(index, 1)
     const error = this.failure ?? new CodexProcessError({
       operation: "write",
       message: "Codex app-server write was cancelled before dispatch",
@@ -681,7 +708,10 @@ class ClientImpl implements CodexAppServerClient {
         this.failProtocol("read", "Codex app-server emitted a non-string method")
         return
       }
-      if (!hasId) return
+      if (!hasId) {
+        this.protocolInputController.enqueue(new TextEncoder().encode(`${line}\n`))
+        return
+      }
       if (typeof message.id !== "number" && typeof message.id !== "string") {
         this.failProtocol("read", "Codex app-server emitted a server request with an invalid id")
         return
@@ -721,18 +751,20 @@ class ClientImpl implements CodexAppServerClient {
         this.failProtocol("read", `Codex app-server returned a malformed error for ${pending.method}`)
         return
       }
-      this.pending.delete(message.id)
-      Deferred.doneUnsafe(pending.deferred, Effect.fail(new CodexRpcError({
-        method: pending.method,
-        code: message.error.code,
-        message: message.error.message,
-        ...(Object.hasOwn(message.error, "data") ? { data: message.error.data } : {}),
-      })))
+      this.protocolInputController.enqueue(new TextEncoder().encode(`${line}\n`))
       return
     }
 
-    this.pending.delete(message.id)
-    Deferred.doneUnsafe(pending.deferred, Effect.succeed(message.result))
+    this.protocolInputController.enqueue(new TextEncoder().encode(`${line}\n`))
+  }
+
+  private mapUpstreamError(error: UpstreamError): CodexAppServerError {
+    if (error._tag === "CodexAppServerRequestError") return new CodexRpcError({
+      method: error.method ?? "request", code: error.code, message: error.message,
+      ...(error.data === undefined ? {} : { data: error.data }),
+    })
+    if (error._tag === "CodexAppServerTransportError" && isCodexAppServerError(error.cause)) return error.cause
+    return new CodexProtocolError({ operation: "protocol", message: error.message, cause: error })
   }
 
   private async readStderr(): Promise<void> {
@@ -777,6 +809,7 @@ class ClientImpl implements CodexAppServerClient {
   private failAll(error: CodexAppServerError): void {
     if (this.failure) return
     this.failure = error
+    try { this.protocolInputController.error(error) } catch { /* Already closed. */ }
     for (const pending of this.pending.values()) {
       Deferred.doneUnsafe(pending.deferred, Effect.fail(this.requestFailure(pending, error)))
     }
@@ -793,6 +826,11 @@ class ClientImpl implements CodexAppServerClient {
     })
     this.failAll(closingError)
     const failures: unknown[] = []
+    if (this.protocolScope) {
+      const scope = await settlementWithin(this.runPromise(Scope.close(this.protocolScope, Exit.void)), this.shutdownTimeoutMs)
+      if (scope._tag === "Rejected") failures.push(scope.cause)
+      else if (scope._tag === "TimedOut") failures.push(new Error("Codex protocol scope cleanup timed out"))
+    }
     this.cancelQueuedWrites(closingError)
     if (!this.stdinEnded) {
       try {
