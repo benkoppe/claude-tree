@@ -56,31 +56,9 @@ describe("Effect Codex app-server transport", () => {
     const upstream = controlledProtocolServer(token)
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-        const proxy = yield* makeCodexTuiProxy({
-          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
-          bearerToken: token, initialThreadId: "root",
-        })
-        const subscription = yield* PubSub.subscribe(proxy.providerEvents)
-        const events: ProviderTerminalEvent[] = []
-        yield* Effect.forkScoped(Effect.forever(PubSub.take(subscription).pipe(
-          Effect.tap((event) => Effect.sync(() => { events.push(event) })),
-        )))
-        const connect = (marker: string) => Effect.gen(function*() {
-          const socket = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
-          yield* Effect.addFinalizer(() => Effect.sync(() => socket.terminate()))
-          yield* Effect.promise(() => socketOpened(socket))
-          socket.send(JSON.stringify({ method: marker }))
-          yield* Effect.promise(() => waitUntil(() => upstream.requests.some((request) => request.message.method === marker)))
-          return { socket, upstream: upstream.requests.find((request) => request.message.method === marker)!.socket }
-        })
+        const { proxy, events, connect, forward: send } = yield* lifecycleReplayFixture(upstream, token)
         const primary = yield* connect("primary")
         const ancillary = yield* connect("ancillary")
-        const send = (client: typeof primary, frame: unknown) => Effect.promise(async () => {
-          const raw = JSON.stringify(frame)
-          const forwarded = socketMessage(client.socket)
-          client.upstream.send(raw)
-          expect(await forwarded).toBe(raw)
-        })
         const started = { method: "turn/started", params: { threadId: "root", turn: { id: "one", status: "inProgress" } } }
         yield* send(primary, started)
         yield* Effect.promise(() => waitUntil(() => events.length === 2))
@@ -122,30 +100,9 @@ describe("Effect Codex app-server transport", () => {
     const upstream = controlledProtocolServer(token)
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-        const proxy = yield* makeCodexTuiProxy({
-          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
-          bearerToken: token, initialThreadId: "root",
-        })
-        const subscription = yield* PubSub.subscribe(proxy.providerEvents)
-        const events: ProviderTerminalEvent[] = []
-        yield* Effect.forkScoped(Effect.forever(PubSub.take(subscription).pipe(
-          Effect.tap((event) => Effect.sync(() => { events.push(event) })),
-        )))
-        const connect = (marker: string) => Effect.gen(function*() {
-          const socket = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
-          yield* Effect.addFinalizer(() => Effect.sync(() => socket.terminate()))
-          yield* Effect.promise(() => socketOpened(socket))
-          socket.send(JSON.stringify({ method: marker }))
-          yield* Effect.promise(() => waitUntil(() => upstream.requests.some((request) => request.message.method === marker)))
-          return { socket, upstream: upstream.requests.find((request) => request.message.method === marker)!.socket }
-        })
+        const { proxy, events, connect, forward } = yield* lifecycleReplayFixture(upstream, token)
         const send = (client: { socket: WebSocket; upstream: Bun.ServerWebSocket<unknown> }, method: string, params: unknown) =>
-          Effect.promise(async () => {
-            const raw = JSON.stringify({ method, params })
-            const forwarded = socketMessage(client.socket)
-            client.upstream.send(raw)
-            expect(await forwarded).toBe(raw)
-          })
+          forward(client, { method, params })
         const turn = (id: string, status: string) => ({ threadId: "root", turn: { id, status } })
         const primary = yield* connect("primary")
         yield* send(primary, "turn/started", turn("one", "inProgress"))
@@ -1530,6 +1487,36 @@ function thread(id: string): {
     turns: [],
     futureField: "accepted",
   }
+}
+
+function lifecycleReplayFixture(upstream: ReturnType<typeof controlledProtocolServer>, token: string) {
+  return Effect.gen(function*() {
+    const proxy = yield* makeCodexTuiProxy({
+      upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
+      bearerToken: token, initialThreadId: "root",
+    })
+    const subscription = yield* PubSub.subscribe(proxy.providerEvents)
+    const events: ProviderTerminalEvent[] = []
+    yield* Effect.forkScoped(Effect.forever(PubSub.take(subscription).pipe(
+      Effect.tap((event) => Effect.sync(() => { events.push(event) })),
+    )))
+    const connect = (marker: string) => Effect.gen(function*() {
+      const socket = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+      yield* Effect.addFinalizer(() => Effect.sync(() => socket.terminate()))
+      yield* Effect.promise(() => socketOpened(socket))
+      socket.send(JSON.stringify({ method: marker }))
+      yield* Effect.promise(() => waitUntil(() => upstream.requests.some((request) => request.message.method === marker)))
+      return { socket, upstream: upstream.requests.find((request) => request.message.method === marker)!.socket }
+    })
+    const forward = (client: { socket: WebSocket; upstream: Bun.ServerWebSocket<unknown> }, frame: unknown) =>
+      Effect.promise(async () => {
+        const raw = JSON.stringify(frame)
+        const forwarded = socketMessage(client.socket)
+        client.upstream.send(raw)
+        expect(await forwarded).toBe(raw)
+      })
+    return { proxy, events, connect, forward }
+  })
 }
 
 function controlledProtocolServer(token: string, openDelayMs = 0): {

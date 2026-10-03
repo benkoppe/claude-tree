@@ -64,10 +64,7 @@ Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (d
 
 ## Development
 
-Agent management preserves stock agent TUIs. A local Codex protocol adapter and
-transparent proxy observe lifecycle events; Claude uses supported session APIs
-and conservative terminal observation. Ownership and cleanup remain local to
-this application. The keyed executor is adapted from T3 Code; its MIT notice is
+The keyed executor is adapted from T3 Code; its MIT notice is
 retained in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
 
 The development shell includes Bun and the validated provider CLIs available for the platform:
