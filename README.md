@@ -62,6 +62,17 @@ Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (d
 
 ## Development
 
+Agent management reuses the scoped protocol and keyed-execution primitives from
+[T3 Code's orchestrator V2](https://github.com/pingdotgg/t3code/pull/2829), while
+preserving stock agent TUIs. Codex lifecycle events are observed through a
+transparent proxy; Claude uses supported session APIs and conservative terminal
+observation. Ownership and cleanup remain local to this application.
+
+The pinned upstream source, MIT notice, update instructions, and local adaptations
+are documented in [`src/vendor/t3/README.md`](src/vendor/t3/README.md).
+The adversarial review findings, regression coverage, and remaining live-provider
+validation limits are recorded in [`docs/agent-management-review-plan.md`](docs/agent-management-review-plan.md).
+
 The development shell includes Bun and the validated provider CLIs available for the platform:
 
 ```sh

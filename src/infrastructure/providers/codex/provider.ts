@@ -27,7 +27,9 @@ import {
   type TerminalTransitionAcknowledgmentError,
   type TerminalTransitionEvent,
   type TerminalTransitionRequest,
+  type ProviderTerminalEvent,
 } from "../../../services/provider"
+import { PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS } from "../../../services/lifecycle-policy"
 import {
   CodexMutationAmbiguousError,
   CodexProtocolError,
@@ -60,7 +62,7 @@ import {
 const TRANSCRIPT_READ_CONCURRENCY = 16
 const OVERLOAD_RETRY_DELAYS_MS = [25, 50, 100, 200]
 const SIDECAR_START_TIMEOUT_MS = 5_000
-const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = 1_000
+const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS
 const SIDECAR_RETRY_DELAY_MS = 10
 const TOKEN_ENVIRONMENT_VARIABLE = "CLAUDE_TREE_CODEX_TOKEN"
 const METADATA_DEADLINE_MS = 30_000
@@ -86,6 +88,7 @@ export interface CodexObservedServices {
   readonly remoteUrl: string
   readonly bearerToken: string
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
   readonly close: () => Effect.Effect<void, CodexObservedServicesError>
 }
 
@@ -767,6 +770,7 @@ export class CodexProvider implements AgentProviderApi {
         env: { [TOKEN_ENVIRONMENT_VARIABLE]: observed.bearerToken },
         observer: this.observerFactory(),
         transitions,
+        ...(observed.providerEvents === undefined ? {} : { providerEvents: observed.providerEvents }),
       }
       return {
         launch,
@@ -1220,6 +1224,7 @@ export function makeObservedServices(
       ...(sidecar.resources === undefined ? {} : { resources: sidecar.resources }),
       bearerToken: sidecar.bearerToken,
       transitions: proxy.transitions,
+      providerEvents: proxy.providerEvents,
       close,
     }
   }))

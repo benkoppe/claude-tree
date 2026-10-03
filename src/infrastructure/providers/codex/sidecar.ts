@@ -7,10 +7,11 @@ import { dirname, join } from "node:path"
 import { Cause, Data, Effect, Exit, FiberSet, Option, Scope } from "effect"
 import { TerminalLaunchDirectory } from "../../../services/provider"
 import type { TerminalLaunchResources } from "../../../domain/persistence"
+import { PROVIDER_RESOURCE_STAGE_TIMEOUT_MS } from "../../../services/lifecycle-policy"
 
 import { cleanupProcessGroup, type ProcessGroupHandle } from "../../process-group"
 
-const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000
+const DEFAULT_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
 const DEFAULT_ACQUISITION_TIMEOUT_MS = 5_000
 const STDERR_LIMIT_BYTES = 8_192
 
