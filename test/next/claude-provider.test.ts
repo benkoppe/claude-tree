@@ -896,6 +896,30 @@ describe("Effect Claude provider", () => {
     }
   })
 
+  test("default discovery waits beyond former deadlines and remains cancellable", async () => {
+    let resolveList!: (sessions: readonly SDKSessionInfo[]) => void
+    const started = Deferred.makeUnsafe<void>()
+    const provider = providerWith({ listSessions: () => new Promise((resolve) => {
+      resolveList = resolve
+      Deferred.doneUnsafe(started, Effect.void)
+    }) })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const task = yield* Effect.forkChild(provider.loadSessionSnapshot)
+      yield* Deferred.await(started)
+      yield* TestClock.adjust(60_000)
+      resolveList([])
+      expect((yield* Fiber.join(task)).sessions).toEqual([])
+      const cancelled = yield* Effect.forkChild(provider.loadSessionSnapshot)
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(cancelled)
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test.each([0, -1, Infinity, NaN])("rejects invalid productive limits (%s)", (value) => {
+    expect(() => new ClaudeProvider("/project", {}, { operationTimeoutMs: value })).toThrow(RangeError)
+    expect(() => new ClaudeProvider("/project", {}, { forkValidationTimeoutMs: value })).toThrow(RangeError)
+  })
+
   test("times out a hung session list through the typed provider error channel", async () => {
     const provider = providerWith({
       listSessions: () => new Promise<readonly SDKSessionInfo[]>(() => undefined),
@@ -1109,6 +1133,37 @@ describe("Effect Claude provider", () => {
     await Promise.resolve()
   })
 
+  test.each([undefined, 10])("slow source reads and mutation do not consume child-validation patience (%s)", async (validationTimeout) => {
+    const parent = [message(ROOT, "parent-1", "assistant", "answer")]
+    const copied = [copyMessage(parent[0]!, CHILD, "child-1")]
+    const sourceStarted = Deferred.makeUnsafe<void>()
+    const forkStarted = Deferred.makeUnsafe<void>()
+    let resolveSource!: (messages: readonly SessionMessage[]) => void
+    let resolveFork!: (result: { sessionId: string }) => void
+    const provider = providerWith({
+      messages: { [ROOT]: () => new Promise((resolve) => {
+        resolveSource = resolve
+        Deferred.doneUnsafe(sourceStarted, Effect.void)
+      }), [CHILD]: copied },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copied[0]!, ROOT, parent[0]!.uuid)] },
+      forkSession: () => new Promise((resolve) => {
+        resolveFork = resolve
+        Deferred.doneUnsafe(forkStarted, Effect.void)
+      }),
+      ...(validationTimeout === undefined ? {} : { forkValidationTimeoutMs: validationTimeout }),
+    })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const task = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "parent-1" }))
+      yield* Deferred.await(sourceStarted)
+      yield* TestClock.adjust(60_000)
+      resolveSource(parent)
+      yield* Deferred.await(forkStarted)
+      yield* TestClock.adjust(60_000)
+      resolveFork({ sessionId: CHILD })
+      expect((yield* Fiber.join(task))._tag).toBe("ValidatedBranch")
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
   test("recovers a fork-validation timeout as an independent child without retrying creation", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     let forkCalls = 0
@@ -1142,7 +1197,7 @@ describe("Effect Claude provider", () => {
     expect(outcome._tag).toBe("CreatedIndependentSession")
     if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected independent")
     expect(outcome.session.id).toBe(CHILD)
-    expect(outcome.reason).toContain("Claude branchFrom timed out after 10ms")
+    expect(outcome.reason).toContain("Claude validateFork timed out after 10ms")
   })
 
   test("retains validated ancestry when bounded executable lookup later times out", async () => {

@@ -13,10 +13,10 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk"
 import { Clock, Effect, Layer } from "effect"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 
 import { ProviderError, ProviderProtocolError } from "../../../domain/errors"
 import type {
-  AgentMessage,
   AgentSession,
   AgentSessionSnapshot,
   MessageRef,
@@ -37,6 +37,8 @@ import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
 import { NavigationHistoryError, projectNavigationHistory } from "./navigation-history"
 import { RecordEvidence } from "./record-evidence"
+import { markCompactionSummaries, normalizeTranscript, normalizePreview, sourceRole, type ClaudeMessage } from "./transcript"
+export { formatMessage, extractUserPromptText } from "./transcript"
 import { safeHistoryFailure, type HistoryTrace, type HistoryStage, type HistoryFailure } from "../../../diagnostics/history-trace"
 
 export interface ClaudeSdk {
@@ -87,21 +89,9 @@ const defaultSdk: ClaudeSdk = {
   importSessionToStore,
 }
 
-const LOCAL_COMMAND_INVOCATION_PATTERN =
-  /^<command-name>.*?<\/command-name>(?:\s*<command-message>.*?<\/command-message>)?(?:\s*<command-args>.*?<\/command-args>)?$/s
-const LOCAL_COMMAND_OUTPUT_PATTERN =
-  /^<local-command-(stdout|stderr|caveat)>.*<\/local-command-\1>$/s
-const NO_RESPONSE_REQUESTED = "No response requested."
 const DEFAULT_FORK_VALIDATION_RETRY_DELAYS_MS = [25, 50, 100, 200]
-const DEFAULT_FORK_VALIDATION_TIMEOUT_MS = 5_000
-const DEFAULT_SDK_OPERATION_TIMEOUT_MS = 10_000
 const TRANSCRIPT_READ_CONCURRENCY = 8
 
-interface ClaudeMessage extends AgentMessage {
-  readonly sourceType: "user" | "assistant" | "system"
-  readonly rawMessage: unknown
-  readonly replayText?: string
-}
 
 interface ClaudeActiveContext {
   readonly messages: readonly ClaudeMessage[]
@@ -128,13 +118,13 @@ interface SourcePrefix {
 
 interface OperationDeadline {
   readonly operation: string
-  readonly expiresAt: number
-  readonly timeoutMs: number
+  readonly expiresAt: number | undefined
+  readonly timeoutMs: number | undefined
 }
 
 interface TimeoutBudget {
-  readonly durationMs: number
-  readonly error: ProviderError
+  readonly durationMs: number | undefined
+  readonly error: () => ProviderError
 }
 
 type ForkValidation =
@@ -188,13 +178,13 @@ export class ClaudeProvider implements AgentProviderApi {
   private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
   private sessionTitles: ReadonlyMap<string, string> = new Map()
   private readonly retryDelays: readonly number[]
-  private readonly operationTimeoutMs: number
-  private readonly executableLookupTimeoutMs: number
-  private readonly forkSessionTimeoutMs: number
-  private readonly forkValidationTimeoutMs: number
-  private readonly listSessionsTimeoutMs: number
-  private readonly transcriptReadTimeoutMs: number
-  private readonly provenanceImportTimeoutMs: number
+  private readonly operationTimeoutMs: number | undefined
+  private readonly executableLookupTimeoutMs: number | undefined
+  private readonly forkSessionTimeoutMs: number | undefined
+  private readonly forkValidationTimeoutMs: number | undefined
+  private readonly listSessionsTimeoutMs: number | undefined
+  private readonly transcriptReadTimeoutMs: number | undefined
+  private readonly provenanceImportTimeoutMs: number | undefined
   private readonly timeoutErrors = new WeakSet<object>()
 
   constructor(
@@ -209,18 +199,13 @@ export class ClaudeProvider implements AgentProviderApi {
     this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
     this.retryDelays =
       options.forkValidationRetryDelaysMs ?? DEFAULT_FORK_VALIDATION_RETRY_DELAYS_MS
-    this.operationTimeoutMs = options.operationTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.executableLookupTimeoutMs =
-      options.executableLookupTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.forkSessionTimeoutMs = options.forkSessionTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.forkValidationTimeoutMs =
-      options.forkValidationTimeoutMs ?? DEFAULT_FORK_VALIDATION_TIMEOUT_MS
-    this.listSessionsTimeoutMs =
-      options.listSessionsTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.transcriptReadTimeoutMs =
-      options.transcriptReadTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
-    this.provenanceImportTimeoutMs =
-      options.provenanceImportTimeoutMs ?? DEFAULT_SDK_OPERATION_TIMEOUT_MS
+    this.operationTimeoutMs = optionalOperationTimeout(options.operationTimeoutMs)
+    this.executableLookupTimeoutMs = optionalOperationTimeout(options.executableLookupTimeoutMs)
+    this.forkSessionTimeoutMs = optionalOperationTimeout(options.forkSessionTimeoutMs)
+    this.forkValidationTimeoutMs = optionalOperationTimeout(options.forkValidationTimeoutMs)
+    this.listSessionsTimeoutMs = optionalOperationTimeout(options.listSessionsTimeoutMs)
+    this.transcriptReadTimeoutMs = optionalOperationTimeout(options.transcriptReadTimeoutMs)
+    this.provenanceImportTimeoutMs = optionalOperationTimeout(options.provenanceImportTimeoutMs)
 
     this.loadSessionSnapshot = this.loadSessionSnapshotProgressively(() => Effect.void)
 
@@ -349,7 +334,7 @@ export class ClaudeProvider implements AgentProviderApi {
     const operation = Effect.gen({ self: this }, function*() {
       const deadline = yield* this.makeDeadline(
         "branchFrom",
-        Math.min(this.operationTimeoutMs, this.forkValidationTimeoutMs),
+        this.operationTimeoutMs,
       )
       const sourceEntries = yield* this.readSessionEntries(target.sessionId, "branchFrom", deadline)
       const activeContext = yield* this.requireActiveContext(
@@ -527,15 +512,12 @@ export class ClaudeProvider implements AgentProviderApi {
           },
         }),
       )
-      const result = yield* request.pipe(
-        Effect.timeoutOrElse({
-          duration: budget.durationMs,
-          orElse: () => Effect.succeed(this.ambiguousBranchMutation(
+      const result = yield* withOperationTimeout(request, budget.durationMs,
+          () => Effect.succeed(this.ambiguousBranchMutation(
             parentSessionId,
             sourceMessageId,
-            `${budget.error.message}; Claude may have created a child session`,
+            `${budget.error().message}; Claude may have created a child session`,
           )),
-        }),
       )
       return result
     })
@@ -594,11 +576,15 @@ export class ClaudeProvider implements AgentProviderApi {
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       yield* this.validateLaunchInput(session.id, replayText)
+      const validationDeadline = yield* this.makeDeadline("validateFork", this.forkValidationTimeoutMs)
+      const effectiveDeadline = validationDeadline.expiresAt !== undefined &&
+        (deadline.expiresAt === undefined || validationDeadline.expiresAt < deadline.expiresAt)
+        ? validationDeadline : deadline
       const validation = yield* this.readAndValidateCreatedFork(
         session.id,
         parentSessionId,
         sourcePrefix,
-        deadline,
+        effectiveDeadline,
       )
       const acquireLaunch = this.acquireLaunch("resume", session.id, replayText)
       if (validation._tag === "Invalid") {
@@ -1053,20 +1039,19 @@ export class ClaudeProvider implements AgentProviderApi {
   ): Effect.Effect<TerminalLaunch, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       yield* this.validateLaunchInput(sessionId, draft)
-      const executable = yield* Effect.tryPromise({
+      const executable = yield* withOperationTimeout(Effect.tryPromise({
         try: () => handledPromise(this.resolveExecutable),
         catch: (cause) => this.providerError(
           "acquireLaunch",
           "Could not locate the Claude Code executable",
           cause,
         ),
-      }).pipe(Effect.timeoutOrElse({
-        duration: this.executableLookupTimeoutMs,
-        orElse: () => Effect.fail(this.timeoutError(
+      }), this.executableLookupTimeoutMs,
+        () => Effect.fail(this.timeoutError(
           "acquireLaunch",
-          this.executableLookupTimeoutMs,
+          this.executableLookupTimeoutMs!,
         )),
-      }))
+      )
       if (typeof executable !== "string" || executable.length === 0 || executable.includes("\0")) {
         return yield* Effect.fail(this.providerError(
           "acquireLaunch",
@@ -1125,53 +1110,53 @@ export class ClaudeProvider implements AgentProviderApi {
   private callSdk<A>(
     operation: string,
     call: () => PromiseLike<A>,
-    timeoutMs: number,
+    timeoutMs: number | undefined,
     deadline: OperationDeadline,
   ): Effect.Effect<A, ProviderError> {
     return Effect.gen({ self: this }, function*() {
       const budget = yield* this.timeoutBudget(operation, timeoutMs, deadline)
-      return yield* Effect.tryPromise({
+      return yield* withOperationTimeout(Effect.tryPromise({
         try: () => handledPromise(call),
         catch: (cause) => this.providerError(
           operation,
           `Claude ${operation} failed: ${errorMessage(cause)}`,
           cause,
         ),
-      }).pipe(Effect.timeoutOrElse({
-        duration: budget.durationMs,
-        orElse: () => Effect.fail(budget.error),
-      }))
+      }), budget.durationMs, () => Effect.fail(budget.error()))
     })
   }
 
   private makeDeadline(
     operation: string,
-    timeoutMs: number,
+    timeoutMs: number | undefined,
   ): Effect.Effect<OperationDeadline> {
     return Clock.currentTimeMillis.pipe(Effect.map((now) => ({
       operation,
       timeoutMs,
-      expiresAt: now + timeoutMs,
+      expiresAt: timeoutMs === undefined ? undefined : now + timeoutMs,
     })))
   }
 
   private remainingMillis(deadline: OperationDeadline): Effect.Effect<number> {
     return Clock.currentTimeMillis.pipe(
-      Effect.map((now) => Math.max(0, deadline.expiresAt - now)),
+      Effect.map((now) => deadline.expiresAt === undefined ? Infinity : Math.max(0, deadline.expiresAt - now)),
     )
   }
 
   private timeoutBudget(
     operation: string,
-    timeoutMs: number,
+    timeoutMs: number | undefined,
     deadline: OperationDeadline,
   ): Effect.Effect<TimeoutBudget, ProviderError> {
     return Effect.gen({ self: this }, function*() {
       const remaining = yield* this.remainingMillis(deadline)
       if (remaining <= 0) return yield* Effect.fail(this.deadlineError(deadline))
-      return timeoutMs <= remaining
-        ? { durationMs: timeoutMs, error: this.timeoutError(operation, timeoutMs) }
-        : { durationMs: remaining, error: this.deadlineError(deadline) }
+      return timeoutMs !== undefined && timeoutMs <= remaining
+        ? { durationMs: timeoutMs, error: () => this.timeoutError(operation, timeoutMs) }
+        : {
+            durationMs: deadline.expiresAt === undefined ? undefined : remaining,
+            error: () => this.deadlineError(deadline),
+          }
     })
   }
 
@@ -1185,7 +1170,7 @@ export class ClaudeProvider implements AgentProviderApi {
   }
 
   private deadlineError(deadline: OperationDeadline): ProviderError {
-    return this.timeoutError(deadline.operation, deadline.timeoutMs)
+    return this.timeoutError(deadline.operation, deadline.timeoutMs!)
   }
 
   private failureCode(cause: unknown, sessionId?: string): HistoryFailure {
@@ -1259,82 +1244,6 @@ export function claudeProviderLayer(
 
 export const layer = claudeProviderLayer
 export const makeClaudeProviderLayer = claudeProviderLayer
-
-function normalizeTranscript(
-  sessionId: string,
-  messages: readonly SessionMessage[],
-): readonly ClaudeMessage[] {
-  if (!Array.isArray(messages)) throw new Error("Transcript is not an array")
-  let assistantDisplayGroupId: string | undefined
-  const seenIds = new Set<string>()
-  return messages.map((message, ordinal) => {
-    const candidate: unknown = message
-    if (!isRecord(candidate)) throw new Error(`Message ${ordinal} is not an object`)
-    const sourceType = candidate.type
-    if (sourceType !== "user" && sourceType !== "assistant" && sourceType !== "system") {
-      throw new Error(`Message ${ordinal} has an unsupported role`)
-    }
-    if (
-      typeof candidate.uuid !== "string" ||
-      candidate.uuid.length === 0 ||
-      seenIds.has(candidate.uuid)
-    ) {
-      throw new Error(`Message ${ordinal} has no unique ID`)
-    }
-    if (candidate.session_id !== sessionId) {
-      throw new Error(`Message ${candidate.uuid} belongs to another session`)
-    }
-    seenIds.add(candidate.uuid)
-
-    const normalizedSource: Pick<SessionMessage, "type" | "message"> = {
-      type: sourceType,
-      message: candidate.message,
-    }
-
-    const localCommandArtifact = isLocalCommandArtifact(normalizedSource)
-    const taskNotification = sourceType === "user" &&
-      /^\s*<task-notification>\s*<task-id>[^<]+<\/task-id>[\s\S]*?<\/task-notification>/.test(
-        extractUserPromptText(candidate.message) ?? "",
-      )
-    const visible = !localCommandArtifact && !taskNotification && isVisibleMessage(normalizedSource)
-    // Notifications start a new response without representing a human submission.
-    if (sourceType === "user" && (visible || taskNotification)) assistantDisplayGroupId = candidate.uuid
-    const replayText = sourceType === "user" && !localCommandArtifact && !taskNotification
-      ? extractUserPromptText(candidate.message)
-      : undefined
-    const turnComplete = assistantTurnComplete(normalizedSource)
-    const copyIdentity = JSON.stringify(candidate.message) ?? "undefined"
-    return {
-      id: candidate.uuid,
-      role: sourceRole(sourceType),
-      preview: formatMessage(candidate.message),
-      text: extractMessageText(candidate.message),
-      ordinal,
-      visible,
-      sourceType,
-      rawMessage: candidate.message,
-      copyIdentity,
-      ...(sourceType === "assistant" && assistantDisplayGroupId !== undefined
-        ? { displayGroupId: assistantDisplayGroupId }
-        : {}),
-      ...(turnComplete === undefined ? {} : { turnComplete }),
-      ...(replayText === undefined ? {} : { replayText }),
-    }
-  })
-}
-
-function markCompactionSummaries(
-  messages: readonly ClaudeMessage[],
-  entries: readonly SessionStoreEntry[],
-): readonly ClaudeMessage[] {
-  const boundaries = new Set(entries.filter((entry) => entry.type === "system" && entry.subtype === "compact_boundary").map((entry) => entry.uuid))
-  const summaryIds = new Set(entries.filter((entry) => entry.type === "user" &&
-    (entry.isCompactSummary === true || (typeof entry.parentUuid === "string" && boundaries.has(entry.parentUuid))))
-    .map((entry) => entry.uuid))
-  return messages.map((message) => summaryIds.has(message.id)
-    ? { ...message, visible: false, historyBoundary: "compaction" as const }
-    : message)
-}
 
 function normalizeConversationRecords(entries: readonly SessionStoreEntry[]): readonly ConversationRecord[] {
   const records: ConversationRecord[] = []
@@ -1462,90 +1371,6 @@ function validateFork(
   })) }
 }
 
-export function formatMessage(message: unknown): string {
-  if (typeof message === "string") return normalizePreview(message)
-  if (!isRecord(message)) return "[unavailable message]"
-  const content = message.content
-  if (typeof content === "string") return normalizePreview(content)
-  if (!Array.isArray(content)) return "[unavailable message]"
-
-  const parts: string[] = []
-  for (const block of content) {
-    if (!isRecord(block)) continue
-    if (block.type === "text" && typeof block.text === "string") parts.push(block.text)
-    else if (block.type === "tool_use" && typeof block.name === "string") {
-      parts.push(`[tool: ${block.name}]`)
-    } else if (block.type === "tool_result") parts.push("[tool result]")
-    else if (block.type === "thinking") parts.push("[thinking]")
-  }
-  return normalizePreview(parts.join(" ") || "[non-text message]")
-}
-
-function extractMessageText(message: unknown): string {
-  if (typeof message === "string") return message
-  if (!isRecord(message)) return ""
-  if (typeof message.content === "string") return message.content
-  if (!Array.isArray(message.content)) return ""
-  return message.content.flatMap((block) =>
-    isRecord(block) && block.type === "text" && typeof block.text === "string" ? [block.text] : [],
-  ).join("\n")
-}
-
-export function extractUserPromptText(message: unknown): string | undefined {
-  if (typeof message === "string") return message.trim().length > 0 ? message : undefined
-  if (!isRecord(message)) return undefined
-  const content = message.content
-  if (typeof content === "string") return content.trim().length > 0 ? content : undefined
-  if (!Array.isArray(content) || content.length === 0) return undefined
-
-  const parts: string[] = []
-  for (const block of content) {
-    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") {
-      return undefined
-    }
-    parts.push(block.text)
-  }
-  const text = parts.join("\n")
-  return text.trim().length > 0 ? text : undefined
-}
-
-function isVisibleMessage(message: Pick<SessionMessage, "type" | "message">): boolean {
-  if (message.type !== "user" && message.type !== "assistant") return false
-  if (typeof message.message === "string") return message.message.trim().length > 0
-  if (!isRecord(message.message)) return false
-  const content = message.message.content
-  if (typeof content === "string") return content.trim().length > 0
-  if (!Array.isArray(content)) return false
-  return content.some(
-    (block) => isRecord(block) &&
-      block.type === "text" &&
-      typeof block.text === "string" &&
-      block.text.trim().length > 0,
-  )
-}
-
-function isLocalCommandArtifact(message: Pick<SessionMessage, "type" | "message">): boolean {
-  const text = extractUserPromptText(message.message)?.trim()
-  if (!text) return false
-  if (message.type === "assistant") {
-    return isRecord(message.message) &&
-      message.message.model === "<synthetic>" &&
-      text === NO_RESPONSE_REQUESTED
-  }
-  return message.type === "user" &&
-    (LOCAL_COMMAND_INVOCATION_PATTERN.test(text) || LOCAL_COMMAND_OUTPUT_PATTERN.test(text))
-}
-
-function assistantTurnComplete(
-  message: Pick<SessionMessage, "type" | "message">,
-): boolean | undefined {
-  if (message.type !== "assistant" || !isRecord(message.message)) return undefined
-  const stopReason = message.message.stop_reason
-  if (stopReason === null) return false
-  if (typeof stopReason !== "string") return undefined
-  return stopReason !== "tool_use" && stopReason !== "pause_turn"
-}
-
 function toSessionSummary(session: SDKSessionInfo): AgentSession {
   if (
     !isRecord(session) ||
@@ -1571,14 +1396,6 @@ function toSessionSummary(session: SDKSessionInfo): AgentSession {
       ? { gitBranch: session.gitBranch }
       : {}),
   }
-}
-
-function sourceRole(type: "user" | "assistant" | "system"): AgentMessage["role"] {
-  return type === "assistant" ? "agent" : type
-}
-
-function normalizePreview(value: string): string {
-  return value.replace(/\s+/g, " ").trim() || "[empty message]"
 }
 
 function isValidSessionId(value: string): boolean {

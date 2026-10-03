@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import { createConnection, type Socket } from "node:net"
+import { stopTestServer } from "./helpers/stop-test-server"
 import { Cause, Deferred, Effect, Exit, Fiber, PubSub } from "effect"
 import { TestClock } from "effect/testing"
+import type { ProviderTerminalEvent } from "../../src/services/provider"
 
 import {
   CodexCleanupError,
@@ -21,6 +22,208 @@ import {
 } from "../../src/infrastructure/providers/codex/tui-proxy"
 
 describe("Effect Codex app-server transport", () => {
+  test("a response cannot bypass its caller's outstanding transport write", async () => {
+    const dispatched = Deferred.makeUnsafe<void>()
+    let release!: () => void
+    let completed = false
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+      if (message.method === "thread/read") controls.respond(message.id, { thread: thread("held") })
+    }, { write(data, messages) {
+      if (messages[0]?.method !== "thread/read") return data.length
+      return new Promise<number>((resolve) => {
+        release = () => resolve(data.length)
+        Deferred.doneUnsafe(dispatched, Effect.void)
+      })
+    } })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      yield* Effect.addFinalizer(() => Effect.sync(() => release?.()))
+      const read = yield* Effect.forkChild(client.readThread("held").pipe(
+        Effect.tap(() => Effect.sync(() => { completed = true })),
+      ))
+      yield* Deferred.await(dispatched)
+      yield* TestClock.adjust(0)
+      expect(completed).toBeFalse()
+      release()
+      expect((yield* Fiber.join(read)).id).toBe("held")
+      expect(completed).toBeTrue()
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("real proxy keeps lifecycle authority across ancillary close and reconnects without resubmission", async () => {
+    const token = "reconnect-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const { proxy, events, connect, forward: send } = yield* lifecycleReplayFixture(upstream, token)
+        const primary = yield* connect("primary")
+        const ancillary = yield* connect("ancillary")
+        const started = { method: "turn/started", params: { threadId: "root", turn: { id: "one", status: "inProgress" } } }
+        yield* send(primary, started)
+        yield* Effect.promise(() => waitUntil(() => events.length === 2))
+        // A second connection's contradictory evidence is still forwarded, but is not authoritative.
+        yield* send(ancillary, { method: "turn/completed", params: { threadId: "root", turn: { id: "one", status: "completed" } } })
+        const ancillaryClosed = socketClosed(ancillary.socket)
+        ancillary.upstream.close(1008, "🧪".repeat(30))
+        const ancillaryClose = yield* Effect.promise(() => ancillaryClosed)
+        expect(ancillaryClose.code).toBe(1011)
+        expect(ancillaryClose.reason).toStartWith("Upstream closed (1008): 🧪")
+        expect(Buffer.byteLength(ancillaryClose.reason)).toBeLessThanOrEqual(123)
+        expect(ancillaryClose.reason).not.toContain("�")
+        yield* send(primary, { method: "thread/status/changed", params: { threadId: "root", status: { type: "active", activeFlags: ["waitingOnApproval"] } } })
+        yield* Effect.promise(() => waitUntil(() => events.length >= 3))
+        expect(events.map((event) => event._tag)).toEqual(["Observation", "Activity", "Activity"])
+        const primaryClosed = socketClosed(primary.socket)
+        primary.upstream.close(1000)
+        yield* Effect.promise(() => primaryClosed)
+        yield* Effect.promise(() => waitUntil(() => events.length === 4))
+        expect(events[3]).toEqual({ _tag: "Unavailable", sessionId: "root" })
+        const reconnect = yield* connect("reconnect")
+        yield* send(reconnect, started)
+        yield* send(reconnect, { method: "turn/completed", params: { threadId: "root", turn: { id: "one", status: "completed" } } })
+        yield* Effect.promise(() => waitUntil(() => events.length === 6))
+        expect(events.slice(4)).toEqual([
+          { _tag: "Activity", sessionId: "root", activity: "working" },
+          { _tag: "Activity", sessionId: "root", activity: "idle" },
+        ])
+        expect(events.filter((event) => event._tag === "Observation")).toHaveLength(1)
+        yield* proxy.close()
+      })))
+    } finally {
+      await upstream.close()
+    }
+  })
+
+  test("real proxy recovers a missed reconnect start and releases only unsupported authoritative root evidence", async () => {
+    const token = "correlation-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const { proxy, events, connect, forward } = yield* lifecycleReplayFixture(upstream, token)
+        const send = (client: { socket: WebSocket; upstream: Bun.ServerWebSocket<unknown> }, method: string, params: unknown) =>
+          forward(client, { method, params })
+        const turn = (id: string, status: string) => ({ threadId: "root", turn: { id, status } })
+        const primary = yield* connect("primary")
+        yield* send(primary, "turn/started", turn("one", "inProgress"))
+        yield* Effect.promise(() => waitUntil(() => events.length === 2))
+        const closed = socketClosed(primary.socket)
+        primary.upstream.close(1000)
+        yield* Effect.promise(() => closed)
+        yield* Effect.promise(() => waitUntil(() => events.length === 3))
+        const reconnect = yield* connect("reconnect")
+        yield* send(reconnect, "thread/status/changed", { threadId: "root", status: { type: "active", activeFlags: [] } })
+        yield* send(reconnect, "turn/completed", turn("two", "completed"))
+        yield* Effect.promise(() => waitUntil(() => events.length === 5))
+        expect(events.slice(2)).toEqual([
+          { _tag: "Unavailable", sessionId: "root" },
+          { _tag: "Activity", sessionId: "root", activity: "working" },
+          { _tag: "Activity", sessionId: "root", activity: "idle" },
+        ])
+        yield* send(reconnect, "turn/started", turn("three", "inProgress"))
+        const ancillary = yield* connect("ancillary")
+        yield* send(ancillary, "turn/completed", { threadId: "root", turn: null })
+        yield* send(reconnect, "turn/completed", { threadId: "child", turn: null })
+        yield* send(reconnect, "thread/status/changed", {
+          threadId: "root", status: { type: "active", activeFlags: ["waitingOnApproval"] },
+        })
+        yield* Effect.promise(() => waitUntil(() => events.length === 8))
+        expect(events.filter((event) => event._tag === "Unavailable")).toHaveLength(1)
+        for (const unsupported of [
+          { method: "thread/status/changed", params: { threadId: "root", status: { type: "active", activeFlags: ["futureFlag"] } } },
+          { method: "turn/completed", params: turn("three", "future") },
+        ]) {
+          const before = events.length
+          yield* send(reconnect, unsupported.method, unsupported.params)
+          yield* send(reconnect, "turn/started", turn("three", "inProgress"))
+          yield* Effect.promise(() => waitUntil(() => events.length === before + 2))
+          expect(events.slice(before)).toEqual([
+            { _tag: "Unavailable", sessionId: "root" },
+            { _tag: "Activity", sessionId: "root", activity: "working" },
+          ])
+        }
+        yield* send(reconnect, "turn/completed", turn("three", "completed"))
+        yield* Effect.promise(() => waitUntil(() => {
+          const last = events.at(-1)
+          return last?._tag === "Activity" && last.activity === "idle"
+        }))
+        expect(events.filter((event) => event._tag === "Observation")).toHaveLength(2)
+        yield* proxy.close()
+      })))
+    } finally {
+      await upstream.close()
+    }
+  })
+
+  test("initialization waits for the initialized notification's actual dispatch", async () => {
+    const dispatched = Deferred.makeUnsafe<void>()
+    let release!: () => void
+    let acquired = false
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+    }, { write(data, messages) {
+      if (messages[0]?.method !== "initialized") return data.length
+      return new Promise<number>((resolve) => {
+        release = () => resolve(data.length)
+        Deferred.doneUnsafe(dispatched, Effect.void)
+      })
+    } })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      yield* Effect.addFinalizer(() => Effect.sync(() => release?.()))
+      const acquisition = yield* Effect.forkChild(makeCodexAppServerClient("codex", {
+        spawn: () => transport.process,
+      }).pipe(Effect.tap(() => Effect.sync(() => { acquired = true }))))
+      yield* Deferred.await(dispatched)
+      yield* TestClock.adjust(0)
+      expect(acquired).toBeFalse()
+      release()
+      yield* Fiber.join(acquisition)
+      expect(acquired).toBeTrue()
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("replays native lifecycle through the real proxy without changing stock TUI frames", async () => {
+    const token = "replay-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
+          bearerToken: token, initialThreadId: "root",
+        })
+        const subscription = yield* PubSub.subscribe(proxy.providerEvents)
+        const socket = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+        yield* Effect.addFinalizer(() => Effect.sync(() => socket.terminate()))
+        yield* Effect.promise(() => socketOpened(socket))
+        socket.send(JSON.stringify({ method: "replay/ready" }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        const frames = [
+          { method: "turn/started", params: { threadId: "root", turn: { id: "one", status: "inProgress", items: [] } } },
+          { method: "thread/status/changed", params: { threadId: "root", status: { type: "active", activeFlags: ["waitingOnApproval"] } } },
+          { method: "turn/completed", params: { threadId: "child", turn: { id: "child", status: "completed" } } },
+          { method: "thread/status/changed", params: { threadId: "root", status: { type: "idle" } } },
+          { method: "turn/completed", params: { threadId: "root", turn: { id: "one", status: "completed", items: [] } } },
+        ]
+        for (const frame of frames) {
+          const raw = JSON.stringify(frame)
+          const forwarded = socketMessage(socket)
+          upstream.requests[0]!.socket.send(raw)
+          expect(yield* Effect.promise(() => forwarded)).toBe(raw)
+        }
+        const events = yield* Effect.forEach([0, 1, 2, 3], () => PubSub.take(subscription))
+        expect(events).toEqual([
+          { _tag: "Observation", sessionId: "root", observation: { _tag: "Submission" } },
+          { _tag: "Activity", sessionId: "root", activity: "working" },
+          { _tag: "Activity", sessionId: "root", activity: "blocked" },
+          { _tag: "Activity", sessionId: "root", activity: "idle" },
+        ])
+        yield* proxy.close()
+      })))
+    } finally {
+      await upstream.close()
+    }
+  })
+
   test("aggregates initialization failure with incomplete app-server rollback", async () => {
     const transport = fakeProcess(() => {}, { ignoreEnd: true })
 
@@ -108,6 +311,44 @@ describe("Effect Codex app-server transport", () => {
 
       transport.respond(expiredId, { thread: thread("expired") })
       expect((yield* client.readThread("live")).id).toBe("live")
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test.each([0, -1, Infinity, NaN])("rejects invalid request patience before spawning (%s)", (value) => {
+    let spawned = false
+    expect(() => makeCodexAppServerClient("codex", {
+      requestTimeoutMs: value,
+      spawn: () => { spawned = true; throw new Error("must not spawn") },
+    })).toThrow(RangeError)
+    expect(spawned).toBeFalse()
+  })
+
+  test("default initialization and requests wait beyond former deadlines", async () => {
+    const initialized = Deferred.makeUnsafe<void>()
+    const dispatched = Deferred.makeUnsafe<void>()
+    let initializeId: number | undefined
+    let readId: number | undefined
+    const transport = fakeProcess((message) => {
+      if (message.method === "initialize") {
+        initializeId = typeof message.id === "number" ? message.id : undefined
+        Deferred.doneUnsafe(initialized, Effect.void)
+      }
+      if (message.method === "thread/read") {
+        readId = typeof message.id === "number" ? message.id : undefined
+        Deferred.doneUnsafe(dispatched, Effect.void)
+      }
+    })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquisition = yield* Effect.forkChild(makeCodexAppServerClient("codex", { spawn: () => transport.process }))
+      yield* Deferred.await(initialized)
+      yield* TestClock.adjust(60_000)
+      transport.respond(initializeId, {})
+      const client = yield* Fiber.join(acquisition)
+      const read = yield* Effect.forkChild(client.readThread("slow"))
+      yield* Deferred.await(dispatched)
+      yield* TestClock.adjust(60_000)
+      transport.respond(readId, { thread: thread("slow") })
+      expect((yield* Fiber.join(read)).id).toBe("slow")
     })).pipe(Effect.provide(TestClock.layer())))
   })
 
@@ -217,6 +458,48 @@ describe("Effect Codex app-server transport", () => {
         message.method === "thread/read" &&
         (message.params as { threadId?: string }).threadId === "cancelled"
       )).toBeFalse()
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("reclaims cancelled queued writes while a transport write is blocked", async () => {
+    const dispatched = Deferred.makeUnsafe<void>()
+    let release!: () => void
+    let blockerId: number | string | undefined
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+      if (message.method === "thread/read") {
+        const { threadId } = message.params as { threadId: string }
+        if (threadId === "blocker") blockerId = message.id
+        else controls.respond(message.id, { thread: thread(threadId) })
+      }
+    }, { write(data, messages) {
+      if ((messages[0]?.params as { threadId?: string } | undefined)?.threadId !== "blocker") return data.length
+      return new Promise<number>((resolve) => {
+        release = () => { resolve(data.length); transport.respond(blockerId, { thread: thread("blocker") }) }
+        Deferred.doneUnsafe(dispatched, Effect.void)
+      })
+    } })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process, maxPendingRequests: 2 })
+      yield* Effect.addFinalizer(() => Effect.sync(() => release?.()))
+      const blocker = yield* Effect.forkChild(client.readThread("blocker"))
+      yield* Deferred.await(dispatched)
+      for (let index = 0; index < 16; index += 1) {
+        const cancelled = yield* Effect.forkChild(index % 2 === 0
+          ? client.readThread(`cancelled-${index}`)
+          : client.forkThread("source", "turn", "/project"))
+        yield* TestClock.adjust(0)
+        yield* Fiber.interrupt(cancelled)
+        const exit = yield* Fiber.await(cancelled)
+        expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+      }
+      const live = yield* Effect.forkChild(client.readThread("live"))
+      yield* TestClock.adjust(0)
+      release()
+      expect((yield* Fiber.join(blocker)).id).toBe("blocker")
+      expect((yield* Fiber.join(live)).id).toBe("live")
+      expect(transport.messages.filter((message) => message.method === "thread/read")).toHaveLength(2)
+      expect(transport.messages.some((message) => message.method === "thread/fork")).toBeFalse()
     })).pipe(Effect.provide(TestClock.layer())))
   })
 
@@ -428,26 +711,22 @@ describe("Effect Codex app-server transport", () => {
     })))
   })
 
-  test("answers unsupported server requests without exposing a raw request API", async () => {
-    const rejectionWritten = Deferred.makeUnsafe<void>()
+  test.each(["account/login/start", "item/commandExecution/requestApproval", "item/tool/requestUserInput"])(
+    "fails closed without answering server request %s", async (method) => {
     const transport = fakeProcess((message, controls) => {
-      if (message.id === "server-1" && message.error) Deferred.doneUnsafe(rejectionWritten, Effect.void)
       if (message.method === "initialize") controls.respond(message.id, {})
       if (message.method === "thread/loaded/list") {
-        controls.emit(`${JSON.stringify({ id: "server-1", method: "account/login/start", params: {} })}\n`)
-        controls.respond(message.id, { data: ["loaded"] })
+        controls.emit(`${JSON.stringify({ id: "server-1", method, params: {} })}\n`)
       }
     })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
-      expect(yield* client.listLoadedThreadIds()).toEqual(["loaded"])
-      yield* Deferred.await(rejectionWritten)
+      const error = yield* Effect.flip(client.listLoadedThreadIds())
+      expect(error).toBeInstanceOf(CodexProtocolError)
+      expect(error.message).toContain(`Unsupported server request: ${method}`)
     })))
-    expect(transport.messages).toContainEqual({
-      id: "server-1",
-      error: { code: -32601, message: "Unsupported server request: account/login/start" },
-    })
+    expect(transport.messages.some((message) => message.id === "server-1")).toBeFalse()
   })
 
   test("fails pending requests on process exit with bounded stderr diagnostics", async () => {
@@ -847,7 +1126,69 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }
   })
 
-  test("forwards current-sized Codex responses without closing the proxy", async () => {
+  test("ordinary MCP startup bursts bypass the identity barrier queue and preserve order", async () => {
+    const token = "bootstrap-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`, bearerToken: token,
+          initialThreadId: "thread-a", maxServerMessages: 1, maxServerMessageBytes: 128,
+        })
+        const client = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+        yield* Effect.addFinalizer(() => Effect.sync(() => client.terminate()))
+        yield* Effect.promise(() => socketOpened(client))
+        const received: string[] = []
+        const frames = Array.from({ length: 1_024 }, (_, index) => JSON.stringify({
+          method: "mcpServer/startupStatusChanged", params: { name: "codex_apps", index },
+        }))
+        const forwarded = new Promise<void>((resolve, reject) => {
+          client.addEventListener("message", (event) => {
+            received.push(event.data as string)
+            if (received.length === frames.length) resolve()
+          })
+          client.addEventListener("close", () => reject(new Error("Proxy closed during MCP bootstrap")))
+        })
+        client.send(JSON.stringify({ method: "bootstrap" }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        for (const frame of frames) upstream.requests[0]!.socket.send(frame)
+        yield* Effect.promise(() => forwarded).pipe(Effect.timeout(5_000))
+        expect(received).toEqual(frames)
+        expect(client.readyState).toBe(WebSocket.OPEN)
+        yield* proxy.close()
+      })))
+    } finally { await upstream.close() }
+  })
+
+  test("proxy queue overflow preserves its cause when terminating upstream", async () => {
+    const token = "overflow-token"
+    const upstream = controlledProtocolServer(token)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeCodexTuiProxy({
+          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`, bearerToken: token,
+          initialThreadId: "thread-a", maxServerMessages: 1,
+        })
+        const subscription = yield* PubSub.subscribe(proxy.transitions)
+        const client = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+        yield* Effect.addFinalizer(() => Effect.sync(() => client.terminate()))
+        yield* Effect.promise(() => socketOpened(client))
+        client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
+        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
+        upstream.respond(1, topLevelThread("thread-b"))
+        const request = yield* PubSub.take(subscription)
+        const closed = socketClosed(client)
+        upstream.requests[0]!.socket.send(JSON.stringify({ method: "progress", params: {} }))
+        const event = yield* Effect.promise(() => closed)
+        expect(event.code).toBe(1013)
+        expect(event.reason).toBe("Upstream message queue limit exceeded")
+        yield* Deferred.succeed(request.acknowledgment, undefined)
+        yield* proxy.close()
+      })))
+    } finally { await upstream.close() }
+  })
+
+  test("forwards large ordinary Codex responses without charging identity queue capacity", async () => {
     const token = "proxy-secret"
     const upstream = controlledProtocolServer(token)
     try {
@@ -862,7 +1203,7 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         })
         yield* Effect.promise(() => socketOpened(client))
 
-        const largePayload = "x".repeat(7_500_000)
+        const largePayload = "x".repeat(9_500_000)
         const firstResponse = socketMessage(client, 5_000)
         client.send(JSON.stringify({ id: 1, method: "plugin/list", params: {} }))
         yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
@@ -915,45 +1256,6 @@ describe("Effect Codex sidecar and TUI proxy", () => {
           expect(transition.error).toBeInstanceOf(CodexTuiProxyError)
           expect(transition).toMatchObject({ operation: "start", previousThreadId: "thread-a" })
         }
-        client.close()
-      })))
-    } finally {
-      await upstream.close()
-    }
-  })
-
-  test("does not forward a switch response until its transition is acknowledged", async () => {
-    const token = "proxy-secret"
-    const upstream = controlledProtocolServer(token)
-    try {
-      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-        const proxy = yield* makeCodexTuiProxy({
-          upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
-          bearerToken: token,
-          initialThreadId: "thread-a",
-        })
-        const subscription = yield* PubSub.subscribe(proxy.transitions)
-        const client = new WebSocket(proxy.remoteUrl, {
-          headers: { Authorization: `Bearer ${token}` },
-        })
-        yield* Effect.promise(() => socketOpened(client))
-        let forwarded = false
-        const response = socketMessage(client).then((message) => {
-          forwarded = true
-          return message
-        })
-        client.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }))
-        yield* Effect.promise(() => waitUntil(() => upstream.requests.length === 1))
-        upstream.respond(1, topLevelThread("thread-b"))
-
-        const request = yield* PubSub.take(subscription).pipe(Effect.timeout(1_000))
-        yield* Effect.sleep(20)
-        expect(forwarded).toBeFalse()
-        yield* Deferred.succeed(request.acknowledgment, undefined)
-        expect(JSON.parse(yield* Effect.promise(() => response))).toMatchObject({
-          id: 1,
-          result: { thread: { id: "thread-b" } },
-        })
         client.close()
       })))
     } finally {
@@ -1187,6 +1489,36 @@ function thread(id: string): {
   }
 }
 
+function lifecycleReplayFixture(upstream: ReturnType<typeof controlledProtocolServer>, token: string) {
+  return Effect.gen(function*() {
+    const proxy = yield* makeCodexTuiProxy({
+      upstreamUrl: `ws://127.0.0.1:${upstream.server.port}`,
+      bearerToken: token, initialThreadId: "root",
+    })
+    const subscription = yield* PubSub.subscribe(proxy.providerEvents)
+    const events: ProviderTerminalEvent[] = []
+    yield* Effect.forkScoped(Effect.forever(PubSub.take(subscription).pipe(
+      Effect.tap((event) => Effect.sync(() => { events.push(event) })),
+    )))
+    const connect = (marker: string) => Effect.gen(function*() {
+      const socket = new WebSocket(proxy.remoteUrl, { headers: { Authorization: `Bearer ${token}` } })
+      yield* Effect.addFinalizer(() => Effect.sync(() => socket.terminate()))
+      yield* Effect.promise(() => socketOpened(socket))
+      socket.send(JSON.stringify({ method: marker }))
+      yield* Effect.promise(() => waitUntil(() => upstream.requests.some((request) => request.message.method === marker)))
+      return { socket, upstream: upstream.requests.find((request) => request.message.method === marker)!.socket }
+    })
+    const forward = (client: { socket: WebSocket; upstream: Bun.ServerWebSocket<unknown> }, frame: unknown) =>
+      Effect.promise(async () => {
+        const raw = JSON.stringify(frame)
+        const forwarded = socketMessage(client.socket)
+        client.upstream.send(raw)
+        expect(await forwarded).toBe(raw)
+      })
+    return { proxy, events, connect, forward }
+  })
+}
+
 function controlledProtocolServer(token: string, openDelayMs = 0): {
   readonly server: ReturnType<typeof Bun.serve>
   readonly requests: Array<{ socket: Bun.ServerWebSocket<unknown>; message: WireMessage }>
@@ -1244,29 +1576,6 @@ function topLevelThread(id: string): Record<string, unknown> {
     ephemeral: false,
     parentThreadId: null,
     futureField: true,
-  }
-}
-
-async function stopTestServer(server: ReturnType<typeof Bun.serve>): Promise<void> {
-  const port = server.port!
-  let probe: Socket | undefined
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    const stopped = server.stop(true)
-    // Bun can close the listener without settling stop() after WebSocket use.
-    await Promise.race([stopped, new Promise<void>((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error("Test server cleanup timed out")), 1_000)
-      probe = createConnection({ host: "127.0.0.1", port })
-      probe.once("connect", () => reject(new Error("Test server listener remained open")))
-      probe.once("error", (error: NodeJS.ErrnoException) => {
-        if (error.code === "ECONNREFUSED") resolve()
-        else reject(error)
-      })
-    })])
-  } finally {
-    clearTimeout(timer)
-    probe?.destroy()
-    server.unref()
   }
 }
 

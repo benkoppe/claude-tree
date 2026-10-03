@@ -6,7 +6,6 @@ import type { NavigationMetadataFacet } from "../../application/navigation-write
 import { PersistenceError } from "../../domain/errors"
 import type { NavigationWorkerOptions, NavigationWorkerRequest, NavigationWorkerResponse } from "./navigation-protocol"
 
-export const NAVIGATION_WORKER_STARTUP_TIMEOUT_MS = 5_000
 export const NAVIGATION_WORKER_CLOSE_TIMEOUT_MS = 1_000
 
 export interface NavigationPersistence extends NavigationMetadataFacet {
@@ -18,7 +17,7 @@ export function makeNavigationPersistenceWorker(
   options: NavigationWorkerOptions,
   createWorker: () => Worker = () => new Worker(new URL("./navigation-worker.ts", import.meta.url), { workerData: options }),
 ): Effect.Effect<NavigationPersistence, PersistenceError, Scope.Scope> {
-  return Effect.gen(function*() {
+  return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const error = (message: string) => new PersistenceError({ operation: "navigation worker", path: options.projectDirectory, message })
     const ready = Deferred.makeUnsafe<void, PersistenceError>()
     const exited = Deferred.makeUnsafe<void, PersistenceError>()
@@ -71,9 +70,7 @@ export function makeNavigationPersistenceWorker(
     }).pipe(Effect.timeoutOrElse({ duration: NAVIGATION_WORKER_CLOSE_TIMEOUT_MS, orElse: () => Effect.fail(error("Navigation worker did not finish closing")) }),
       Effect.onError(() => Effect.sync(() => worker.unref())))
     yield* Effect.addFinalizer(() => close.pipe(Effect.catch((failure) => Effect.logError(failure))))
-    yield* Deferred.await(ready).pipe(Effect.timeoutOrElse({
-      duration: NAVIGATION_WORKER_STARTUP_TIMEOUT_MS, orElse: () => Effect.fail(error("Navigation worker did not become ready")),
-    }))
+    yield* restore(Deferred.await(ready))
     return {
       saveNavigation: (navigation) => Effect.gen(function*() {
         if (failed || closing) return yield* Effect.fail(failed ?? error("Navigation worker is closing"))
@@ -86,5 +83,5 @@ export function makeNavigationPersistenceWorker(
       }),
       close,
     }
-  })
+  }))
 }

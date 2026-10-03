@@ -19,6 +19,7 @@ import {
   makeProviderStateRepository,
   type ProviderStateRepositoryApi,
 } from "../../src/services/provider-state-repository"
+import { withTransactionLock } from "../../src/infrastructure/metadata/storage"
 
 const temporaryDirectories: string[] = []
 
@@ -161,6 +162,113 @@ describe("ProviderStateRepository schema v3", () => {
       )))
 
     expect((await run(first.loadMetadata)).relations).toHaveLength(16)
+  })
+
+  test("each execution of a reusable transaction Effect has a distinct lock token", async () => {
+    const { project, state } = await fixture()
+    const repository = await openRepository(project, state)
+    const lockPath = join(dirname(repository.statePath), "state.lock")
+    const platform = testPlatform({ pid: 9002 })
+    const owners: { ownerToken: string; ownerPid: number }[] = []
+    const transaction = withTransactionLock(platform, lockPath, Effect.promise(async () => {
+      owners.push(JSON.parse(await readFile(lockPath, "utf8")))
+    }))
+
+    await run(transaction)
+    await run(transaction)
+
+    expect(owners).toHaveLength(2)
+    expect(owners[0]!.ownerToken).not.toBe(owners[1]!.ownerToken)
+    expect(owners.map((owner) => owner.ownerPid)).toEqual([platform.pid, platform.pid])
+    expect(await exists(lockPath)).toBeFalse()
+  })
+
+  test("a delayed local recovery cannot unlink a replacement acquired by re-executing the original Effect", async () => {
+    const { project, state } = await fixture()
+    const repository = await openRepository(project, state)
+    const lockPath = join(dirname(repository.statePath), "state.lock")
+    const delayedRecovery = deferred()
+    const resumeRecovery = deferred()
+    const winnerEntered = deferred()
+    const delayedObservedWinner = deferred()
+    const finishWinner = deferred()
+    let failedRelease = false
+    const failedPlatform = testPlatform({
+      remove: async (path, options) => {
+        if (path === lockPath && !failedRelease) {
+          failedRelease = true
+          throw new Error("injected lock release failure")
+        }
+        await nativePersistencePlatform.remove(path, options)
+      },
+    })
+
+    let delayed = false
+    const delayRecovery = async () => {
+      if (delayed) return
+      delayed = true
+      delayedRecovery.resolve()
+      await resumeRecovery.promise
+    }
+    const delayedPlatform = testPlatform({
+      link: async (from, to) => {
+        if (to.includes(".reclaim-")) await delayRecovery()
+        await nativePersistencePlatform.link(from, to)
+      },
+      remove: async (path, options) => {
+        // Also intercept the former unguarded unlink, so this regression fails on it.
+        if (path === lockPath) await delayRecovery()
+        await nativePersistencePlatform.remove(path, options)
+      },
+      processLiveness: async () => {
+        delayedObservedWinner.resolve()
+        return "alive"
+      },
+    })
+    let activeTransactions = 0
+    let overlappingTransactions = false
+    const use = (entered: () => void, wait: Promise<void>) => Effect.promise(async () => {
+      activeTransactions++
+      overlappingTransactions ||= activeTransactions > 1
+      try {
+        entered()
+        await wait
+      } finally {
+        activeTransactions--
+      }
+    })
+    let holdWinner = false
+    const originalEffect = withTransactionLock(failedPlatform, lockPath, Effect.suspend(() =>
+      holdWinner ? use(winnerEntered.resolve, finishWinner.promise) : Effect.void))
+    await expect(run(originalEffect)).rejects.toThrow("injected lock release failure")
+    const failedOwner = JSON.parse(await readFile(lockPath, "utf8"))
+
+    const delayedWrite = run(withTransactionLock(delayedPlatform, lockPath,
+      use(delayedObservedWinner.resolve, Promise.resolve())))
+    void delayedWrite.catch(() => undefined)
+    let winningWrite: Promise<void> | undefined
+    try {
+      await boundedBarrier(delayedRecovery.promise, "delayed local recovery")
+      holdWinner = true
+      winningWrite = run(originalEffect)
+      void winningWrite.catch(() => undefined)
+      await boundedBarrier(winnerEntered.promise, "winning replacement transaction")
+      const winningLock = await readFile(lockPath, "utf8")
+      expect(JSON.parse(winningLock).ownerToken).not.toBe(failedOwner.ownerToken)
+      resumeRecovery.resolve()
+      await boundedBarrier(delayedObservedWinner.promise, "delayed contender observing replacement")
+      expect(overlappingTransactions).toBeFalse()
+      expect(await readFile(lockPath, "utf8")).toBe(winningLock)
+      finishWinner.resolve()
+      await Promise.all([winningWrite, delayedWrite])
+      expect(overlappingTransactions).toBeFalse()
+      expect(activeTransactions).toBe(0)
+      expect(await exists(lockPath)).toBeFalse()
+    } finally {
+      resumeRecovery.resolve()
+      finishWinner.resolve()
+      await Promise.allSettled([delayedWrite, ...(winningWrite ? [winningWrite] : [])])
+    }
   })
 
   test("only the winning stale-lock reclaimer unlinks before a replacement lock", async () => {
@@ -311,6 +419,92 @@ describe("ProviderStateRepository schema v3", () => {
     expect(error).toBeInstanceOf(PersistenceError)
     expect((error as PersistenceError).message).toContain("injected reclaimer cleanup failure")
     expect((await run(repository.loadMetadata)).relations).toEqual([])
+  })
+
+  test.each(["alive", "unknown"] as const)("waits beyond two seconds for a %s lock, then completes after release", async (liveness) => {
+    const { project, state } = await fixture()
+    const checkingLiveness = Deferred.makeUnsafe<void>()
+    const platform = testPlatform({
+      processLiveness: async () => {
+        Deferred.doneUnsafe(checkingLiveness, Effect.void)
+        return liveness
+      },
+    })
+    const repository = await openRepository(project, state, platform)
+    const lockPath = join(dirname(repository.statePath), "state.lock")
+    const lock = JSON.stringify({ schemaVersion: 3, ownerToken: "held-owner", ownerPid: 9001, createdAt: timestamp(0) })
+    await writeFile(lockPath, lock)
+    await run(Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(saveRelationEffect(repository, relation("child", "root")))
+      yield* Deferred.await(checkingLiveness)
+      yield* TestClock.adjust(3_000)
+      expect(yield* Effect.promise(() => readFile(lockPath, "utf8"))).toBe(lock)
+      yield* Effect.promise(() => rm(lockPath))
+      yield* TestClock.adjust(10)
+      yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestClock.layer())))
+    expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
+  })
+
+  test.each([false, true])("slow contention reads remain interruptible without a 250ms cutoff (interrupt=%s)", async (interrupt) => {
+    const { project, state } = await fixture()
+    const readingLock = Deferred.makeUnsafe<void>()
+    const releaseRead = deferred()
+    let blockRead = false
+    const platform = testPlatform({
+      processLiveness: async () => "alive",
+      readFile: async (path) => {
+        if (blockRead && path.endsWith("state.lock")) {
+          blockRead = false
+          Deferred.doneUnsafe(readingLock, Effect.void)
+          await releaseRead.promise
+        }
+        return nativePersistencePlatform.readFile(path)
+      },
+    })
+    const repository = await openRepository(project, state, platform)
+    const lockPath = join(dirname(repository.statePath), "state.lock")
+    const lock = JSON.stringify({ schemaVersion: 3, ownerToken: "slow-read-owner", ownerPid: 9001, createdAt: timestamp(0) })
+    await writeFile(lockPath, lock)
+    blockRead = true
+    try {
+      await run(Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(repository.loadMetadata)
+        yield* Deferred.await(readingLock)
+        yield* TestClock.adjust(1_000)
+        if (interrupt) {
+          yield* Fiber.interrupt(fiber)
+          const exit = yield* Fiber.await(fiber)
+          expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+          expect(yield* Effect.promise(() => readFile(lockPath, "utf8"))).toBe(lock)
+        } else {
+          yield* Effect.promise(() => rm(lockPath))
+          releaseRead.resolve()
+          expect((yield* Fiber.join(fiber)).relations).toEqual([])
+        }
+      }).pipe(Effect.provide(TestClock.layer())))
+    } finally {
+      releaseRead.resolve()
+    }
+  })
+
+  test("reconciles exact lock ownership after a lost exclusive-link acknowledgment", async () => {
+    const { project, state } = await fixture()
+    let loseAcknowledgment = false
+    const platform = testPlatform({
+      link: async (from, to) => {
+        await nativePersistencePlatform.link(from, to)
+        if (loseAcknowledgment && to.endsWith("state.lock")) {
+          loseAcknowledgment = false
+          throw Object.assign(new Error("lost exclusive-link acknowledgment"), { code: "EIO" })
+        }
+      },
+    })
+    const repository = await openRepository(project, state, platform)
+    loseAcknowledgment = true
+    await run(saveRelationEffect(repository, relation("child", "root")))
+    expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
+    expect(await exists(join(dirname(repository.statePath), "state.lock"))).toBeFalse()
   })
 
   test("waiting for a live lock is interruptible", async () => {
@@ -481,7 +675,7 @@ describe("ProviderStateRepository schema v3", () => {
     expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
   })
 
-  for (const corruption of ["extra field", "cycle", "source mismatch", "noncanonical", "v1", "v2", "unknown version"] as const) {
+  for (const corruption of ["extra field", "cycle", "source mismatch", "noncanonical", "v2", "unknown version"] as const) {
     test(`rejects ${corruption} in place before another write`, async () => {
       const { project, state } = await fixture()
       const repository = await openRepository(project, state)
@@ -491,7 +685,6 @@ describe("ProviderStateRepository schema v3", () => {
         cycle: { relations: [relation("one", "two"), relation("two", "one")] },
         "source mismatch": { relations: [{ ...relation("child", "root"), sourceMessageId: "later-source" }] },
         noncanonical: { relations: [relation("z", "root"), relation("a", "root")] },
-        v1: { schemaVersion: 1 },
         v2: { schemaVersion: 2 },
         "unknown version": { schemaVersion: 99 },
       }

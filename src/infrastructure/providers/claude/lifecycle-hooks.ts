@@ -8,7 +8,7 @@ const TOKEN_ENV = "CLAUDE_TREE_HOOK_TOKEN"
 const HOOK_PATH = "/lifecycle"
 const MAX_BODY_BYTES = 64 * 1024
 const REQUEST_TIMEOUT_MS = 750
-// Leave margin inside the supervisor's 500ms explicit-close and scope deadlines.
+// Leave margin inside the supervisor's explicit-close and scope deadlines.
 const CLEANUP_TIMEOUT_MS = 200
 const MAX_REQUESTS = 4
 

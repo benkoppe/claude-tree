@@ -9,6 +9,7 @@ import { createTestRenderer } from "@opentui/core/testing"
 import { OpenTuiTerminalRenderer } from "../../src/infrastructure/terminal/opentui-terminal-renderer"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 import { CodexTerminalObserver } from "../../src/infrastructure/providers/codex/terminal-observer"
+import { CodexLifecycleObserver } from "../../src/infrastructure/providers/codex/lifecycle"
 import { makeAppRuntime, type AppRuntime } from "../../src/application/runtime"
 import type { ApplicationMetadataFacet } from "../../src/application/operations"
 import type { ApplicationState } from "../../src/application/state"
@@ -60,6 +61,7 @@ import {
 } from "../../src/infrastructure/providers/codex/tui-proxy"
 import type {
   AgentProviderApi,
+  ProviderTerminalEvent,
   PreparedTerminal,
   TerminalLaunch,
   TerminalTransitionAcknowledgmentError,
@@ -81,6 +83,350 @@ import {
 
 const temporaryDirectories: string[] = []
 
+for (const late of [false, true]) {
+  test(`commit-then-fail reservation is retained until exact-token compensation (late: ${late})`, async () => {
+    const fixture = makeFixture()
+    const enter = Deferred.makeUnsafe<void>()
+    const commit = Deferred.makeUnsafe<void>()
+    let inspectionFails = true
+    let allocations = 0
+    const ownership = new Proxy(fixture.leases, {
+      get(target, key) {
+        if (key === "load") return inspectionFails ? Effect.fail(new PersistenceError({
+          operation: "load", path: "reservation", message: "inspection unavailable",
+        })) : fixture.leases.load
+        if (key === "reserve") return (id: string, options: Parameters<typeof fixture.leases.reserve>[1]) => Effect.gen(function*() {
+          allocations += 1
+          yield* Deferred.succeed(enter, undefined)
+          if (late) yield* Deferred.await(commit)
+          yield* fixture.leases.reserve(id, options)
+          return yield* Effect.fail(new PersistenceError({
+            operation: "reserve", path: id, message: "directory sync failed after commit",
+          }))
+        })
+        return Reflect.get(target, key)
+      },
+    })
+    await withClockSupervisor({ ...fixture.dependencies, ownership, launchPersistenceTimeoutMs: 20 },
+      (supervisor) => Effect.scoped(Effect.gen(function*() {
+        const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show(prepared("uncertain-reserve", fixture))))
+        yield* Deferred.await(enter)
+        if (late) yield* TestClock.adjust(20)
+        expect(Exit.isFailure(yield* Fiber.join(opening))).toBeTrue()
+        yield* Deferred.succeed(commit, undefined)
+        yield* eventually(() => fixture.leases.current("uncertain-reserve") !== undefined)
+        expect([...yield* supervisor.ownedSessionIds]).toEqual(["uncertain-reserve"])
+        expect(Exit.isFailure(yield* Effect.exit(supervisor.stopSession("uncertain-reserve")))).toBeTrue()
+        expect(Exit.isFailure(yield* Effect.exit(supervisor.shutdown()))).toBeTrue()
+        expect(fixture.leases.current("uncertain-reserve")).toBeDefined()
+        inspectionFails = false
+        expect(yield* supervisor.stopSession("uncertain-reserve")).toBeTrue()
+        expect([...yield* supervisor.ownedSessionIds]).toEqual([])
+        expect(fixture.leases.current("uncertain-reserve")).toBeUndefined()
+        expect(allocations).toBe(1)
+        expect(fixture.processes.processes).toHaveLength(0)
+        yield* supervisor.shutdown()
+      })))
+  })
+}
+
+test.each(["activation", "registration", "diagnostics-throw", "cleanup-failure"] as const)("an early child exit is safely reported (%s)", async (mode) => {
+  const fixture = makeFixture()
+  const diagnosticsThrow = mode === "diagnostics-throw"
+  if (mode === "cleanup-failure") fixture.providerCloseFailures = 99
+  const entered = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  const attach = fixture.leases.attach
+  const ownership = new Proxy(fixture.leases, {
+    get(target, key) {
+      if (key === "attach") return (...args: Parameters<typeof attach>) =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(
+          mode === "registration" ? Effect.fail(new PersistenceError({
+            operation: "attach", path: "/state", message: "Registration failed",
+          })) : attach(...args)))
+      return Reflect.get(target, key)
+    },
+  })
+  const exits: TerminalExitEvent[] = []
+  fixture.dependencies.events = { onProcessExited: (event) => exits.push(event) }
+  await withSupervisor({ ...fixture.dependencies, ownership }, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const acquired = acquiredLaunch("already-exited", fixture)
+    let capturedBeforeCleanup = false
+    let readAfterCleanup = false
+    const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+      session: session("already-exited"),
+      acquireLaunch: Effect.succeed({ ...acquired, launch: { ...acquired.launch,
+        failureDetails: () => {
+          capturedBeforeCleanup = !fixture.log.includes("provider-close:already-exited")
+          if (diagnosticsThrow) throw new Error("provider diagnostics unavailable")
+          return "Provider failed before cleanup."
+        },
+      } }),
+    })))
+    yield* Deferred.await(entered)
+    const process = fixture.processes.processes[0]!
+    Object.defineProperty(process, "outputTail", { get() {
+      readAfterCleanup = fixture.log.includes("unref:already-exited")
+      if (diagnosticsThrow) throw new Error("terminal diagnostics unavailable")
+      return "ERROR: startup failed."
+    } })
+    process.finish(1)
+    yield* Deferred.succeed(release, undefined)
+    const result = yield* Fiber.join(opening)
+    expect(Exit.isFailure(result)).toBeTrue()
+    expect(capturedBeforeCleanup).toBeTrue()
+    expect(exits).toHaveLength(0)
+    expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+    if (mode === "cleanup-failure") {
+      if (Exit.isFailure(result)) expect(Cause.squash(result.cause)).toBeInstanceOf(TerminalCleanupError)
+      expect(fixture.leases.current("already-exited")).toBeDefined()
+      expect([...yield* supervisor.ownedSessionIds]).toEqual(["already-exited"])
+      const reopening = yield* Effect.exit(supervisor.show(prepared("already-exited", fixture)))
+      expect(Exit.isFailure(reopening)).toBeTrue()
+      expect(fixture.processes.processes).toHaveLength(1)
+      fixture.providerCloseFailures = 0
+      expect(yield* supervisor.stopSession("already-exited")).toBeTrue()
+      expect(fixture.leases.current("already-exited")).toBeUndefined()
+      return
+    }
+    if (Exit.isFailure(result)) {
+      const error = Cause.squash(result.cause) as TerminalError
+      expect(error._tag).toBe("TerminalError")
+      expect(error.message).toContain("Agent session exited with code 1")
+      if (!diagnosticsThrow) {
+        expect(error.message).toContain("ERROR: startup failed.")
+        expect(error.message).toContain("Provider failed before cleanup.")
+      }
+      expect(error.cause).toBeDefined()
+      if (mode === "registration") expect(error.cause).toBeInstanceOf(PersistenceError)
+    }
+    expect(readAfterCleanup).toBeTrue()
+    expect(fixture.leases.current("already-exited")).toBeUndefined()
+    expect([...yield* supervisor.ownedSessionIds]).toEqual([])
+    expect(fixture.renderer.surfaces[0]!.released).toBeTrue()
+  })))
+})
+
+test("stop cannot report absence while a late reservation is unresolved", async () => {
+  const fixture = makeFixture()
+  const reserve = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  fixture.leases.reserveBarriers.push(reserve)
+  fixture.leases.releaseBarriers.push(release)
+  await withClockSupervisor({ ...fixture.dependencies, launchPersistenceTimeoutMs: 20, persistenceTimeoutMs: 10 },
+    (supervisor) => Effect.scoped(Effect.gen(function*() {
+      const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show(prepared("late-reserve", fixture))))
+      yield* eventually(() => fixture.log.includes("lease-acquire:late-reserve"))
+      yield* TestClock.adjust(20)
+      expect(Exit.isFailure(yield* Fiber.join(opening))).toBeTrue()
+      const unresolvedStop = yield* Effect.forkScoped(Effect.exit(supervisor.stopSession("late-reserve")))
+      yield* TestClock.adjust(10)
+      expect(Exit.isFailure(yield* Fiber.join(unresolvedStop))).toBeTrue()
+      expect([...yield* supervisor.ownedSessionIds]).toEqual(["late-reserve"])
+      yield* Deferred.succeed(reserve, undefined)
+      yield* eventually(() => fixture.log.includes("lease-release:late-reserve"))
+      const compensatedStop = yield* Effect.forkScoped(supervisor.stopSession("late-reserve"))
+      for (let index = 0; index < 20; index += 1) yield* Effect.yieldNow
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Fiber.join(compensatedStop)).toBeTrue()
+      expect([...yield* supervisor.ownedSessionIds]).toEqual([])
+      expect(fixture.leases.current("late-reserve")).toBeUndefined()
+    })))
+})
+
+test("adoption cannot let an old-identity open activate the adopted terminal", async () => {
+  const fixture = makeFixture()
+  const entered = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  const commit = fixture.leases.commitIdentity
+  const ownership = new Proxy(fixture.leases, {
+    get(target, key) {
+      if (key === "commitIdentity") return (options: Parameters<typeof commit>[0]) =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(commit(options)))
+      return Reflect.get(target, key)
+    },
+  })
+  fixture.dependencies.events = { onSessionChanged: acknowledge }
+  await withSupervisor({ ...fixture.dependencies, ownership }, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const transitions = yield* PubSub.unbounded<TerminalTransitionRequest>()
+    const ownerId = yield* supervisor.show(prepared("temporary", fixture, { transitions, transient: true }))
+    const acknowledgment = yield* publishTransition(transitions, {
+      _tag: "SessionChanged", kind: "temporary-adoption", session: session("real"),
+    })
+    yield* Deferred.await(entered)
+    const reopened = yield* Effect.exit(supervisor.show(prepared("temporary", fixture)))
+    expect(Exit.isFailure(reopened)).toBeTrue()
+    const claimedDestination = yield* Effect.exit(supervisor.show(prepared("real", fixture)))
+    expect(Exit.isFailure(claimedDestination)).toBeTrue()
+    yield* supervisor.show(prepared("independent", fixture))
+    expect(yield* supervisor.hideActive).toBe("independent")
+    expect(yield* supervisor.stopSession("independent")).toBeTrue()
+    const stopping = yield* Effect.forkScoped(supervisor.stopSession("temporary", undefined, ownerId))
+    yield* Deferred.succeed(release, undefined)
+    yield* Deferred.await(acknowledgment)
+    expect(yield* Fiber.join(stopping)).toBeTrue()
+    expect([...yield* supervisor.ownedSessionIds]).toEqual([])
+  })))
+})
+
+test("shutdown releases and stops unrelated live terminals before launch rollback finishes", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    yield* supervisor.show(prepared("live", fixture))
+    const entered = yield* Deferred.make<void>()
+    const rollbackEntered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const launching = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+      session: session("slow"), acquireLaunch: Effect.gen(function*() {
+        yield* Effect.addFinalizer(() => Deferred.succeed(rollbackEntered, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        yield* Deferred.succeed(entered, undefined)
+        return yield* Effect.never
+      }),
+    })))
+    yield* Deferred.await(entered)
+    const shutdown = yield* Effect.forkScoped(supervisor.shutdown())
+    yield* Deferred.await(rollbackEntered)
+    yield* eventually(() => fixture.processes.processes[0]!.signals.length > 0)
+    const releasedBeforeRollback = fixture.renderer.surfaces[0]!.released
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(launching)
+    yield* Fiber.join(shutdown)
+    expect(releasedBeforeRollback).toBeTrue()
+  })))
+})
+
+test("pre-owner cleanup failures remain owned and are included in shutdown", async () => {
+  const fixture = makeFixture()
+  fixture.processes.spawnFailures = 1
+  fixture.providerCloseFailures = 99
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const opening = yield* Effect.exit(supervisor.show(prepared("rollback", fixture)))
+    expect(Exit.isFailure(opening)).toBeTrue()
+    expect([...yield* supervisor.ownedSessionIds]).toEqual(["rollback"])
+    const shutdown = yield* Effect.flip(supervisor.shutdown())
+    expect(shutdown.issues.some((issue) => issue.sessionId === "rollback" && issue.stage === "provider")).toBeTrue()
+    expect(fixture.leases.current("rollback")?.status).toBe("cleanup-incomplete")
+  }))
+})
+
+test("native unavailability recovers hidden terminal evidence without another redraw", async () => {
+  const fixture = makeFixture()
+  const activities: string[] = []
+  fixture.dependencies.events = { onActivityChanged: (event) => activities.push(event.activity) }
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const providerEvents = yield* PubSub.unbounded<ProviderTerminalEvent>()
+    let screenActivity: AgentActivity | undefined
+    const observer: TerminalObserver = {
+      observeInput() {}, observeOutput: () => [], observeDraft: () => undefined,
+      observeScreen: () => screenActivity, reconcileScreen: () => screenActivity,
+    }
+    yield* supervisor.show(prepared("native", fixture, { observer, providerEvents }))
+    yield* supervisor.hideActive
+    yield* PubSub.publish(providerEvents, { _tag: "Activity", sessionId: "native", activity: "idle" })
+    for (let index = 0; index < 20; index += 1) yield* Effect.yieldNow
+    screenActivity = "blocked"
+    fixture.processes.processes[0]!.output(bytes("blocking screen"))
+    for (let index = 0; index < 20; index += 1) yield* Effect.yieldNow
+    expect(activities).toEqual([])
+    yield* PubSub.publish(providerEvents, { _tag: "Unavailable", sessionId: "native" })
+    yield* eventually(() => activities.includes("blocked"))
+    expect((yield* supervisor.ownershipSnapshot)[0]!.activity).toBe("blocked")
+  }))
+})
+
+test("a stalled launch does not block focus, stop, or another session's launch", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    yield* supervisor.show(prepared("live", fixture))
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const slow = yield* Effect.forkScoped(supervisor.show({
+      session: session("slow"),
+      acquireLaunch: Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.as(acquiredLaunch("slow", fixture)),
+      ),
+    }))
+    yield* Deferred.await(entered)
+    expect(yield* supervisor.hideActive).toBe("live")
+    yield* supervisor.show(prepared("live", fixture))
+    expect(yield* supervisor.stopSession("live")).toBeTrue()
+    yield* supervisor.show(prepared("other", fixture))
+    expect(yield* supervisor.activeSessionId).toBe("other")
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(slow)
+  })))
+})
+
+test("concurrent opens of one session acquire exactly one launch", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let acquisitions = 0
+    const launch: PreparedTerminal = {
+      session: session("same"),
+      acquireLaunch: Effect.sync(() => { acquisitions += 1 }).pipe(
+        Effect.andThen(Deferred.succeed(entered, undefined)),
+        Effect.andThen(Deferred.await(release)),
+        Effect.as(acquiredLaunch("same", fixture)),
+      ),
+    }
+    const first = yield* Effect.forkScoped(supervisor.show(launch))
+    yield* Deferred.await(entered)
+    const second = yield* Effect.forkScoped(supervisor.show(launch))
+    yield* Deferred.succeed(release, undefined)
+    expect(yield* Fiber.join(first)).toBe(yield* Fiber.join(second))
+    expect(acquisitions).toBe(1)
+  })))
+})
+
+test("shutdown interrupts provider acquisition and waits for its rollback", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const finalized = yield* Deferred.make<void>()
+    const launch = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+      session: session("acquiring"),
+      acquireLaunch: Effect.gen(function*() {
+        yield* Effect.addFinalizer(() => Deferred.succeed(finalized, undefined))
+        yield* Deferred.succeed(entered, undefined)
+        return yield* Effect.never
+      }),
+    })))
+    yield* Deferred.await(entered)
+    yield* supervisor.shutdown()
+    expect(Exit.isFailure(yield* Fiber.join(launch))).toBeTrue()
+    expect(yield* Deferred.isDone(finalized)).toBeTrue()
+    expect([...yield* supervisor.ownedSessionIds]).toEqual([])
+    expect(fixture.log.some((entry) => entry.startsWith("spawn:"))).toBeFalse()
+  })))
+})
+
+test("provider acquisition has a bounded deadline and cannot spawn after rollback", async () => {
+  const fixture = makeFixture()
+  await withClockSupervisor({ ...fixture.dependencies, acquisitionTimeoutMs: 100 }, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const finalized = yield* Deferred.make<void>()
+    const launch = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+      session: session("deadline"),
+      acquireLaunch: Effect.gen(function*() {
+        yield* Effect.addFinalizer(() => Deferred.succeed(finalized, undefined))
+        yield* Deferred.succeed(entered, undefined)
+        return yield* Effect.never
+      }),
+    })))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(100)
+    const outcome = yield* Fiber.join(launch)
+    expect(Exit.isFailure(outcome)).toBeTrue()
+    if (Exit.isFailure(outcome)) expect(String(Cause.squash(outcome.cause))).toContain("Provider acquisition exceeded 100ms")
+    expect(yield* Deferred.isDone(finalized)).toBeTrue()
+    expect([...yield* supervisor.ownedSessionIds]).toEqual([])
+    expect(fixture.processes.processes).toHaveLength(0)
+  })))
+})
+
 for (const provider of [
   { name: "Claude", create: () => new ClaudeTerminalObserver(), title: "⠋ Claude Code",
     lines: ["────────────────", "❯ ", "────────────────"], row: 1,
@@ -89,7 +435,8 @@ for (const provider of [
     lines: ["› ", "", "? for shortcuts"], row: 0,
     working: "• Working (12s • esc to interrupt)", blocker: "press enter to confirm or esc to cancel" },
 ]) {
-  for (const trigger of ["manual", "automatic", "hint"] as const) {
+  for (const trigger of ["manual", "automatic", "hint", "native"] as const) {
+    if (trigger === "native" && provider.name !== "Codex") continue
     test(`${provider.name} ${trigger} recovery drives the real actor from hidden Working to accepted answer and unread updates`, async () => {
       const fixture = makeFixture()
       let runtime: AppRuntime | undefined
@@ -101,6 +448,12 @@ for (const provider of [
       await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
         const sessionId = "recovery"
         const activityHints = yield* PubSub.unbounded<"reconcile">()
+        const providerEvents = yield* PubSub.unbounded<ProviderTerminalEvent>()
+        const lifecycle = new CodexLifecycleObserver()
+        const replay = (method: string, params: unknown) => Effect.forEach(
+          lifecycle.observe(JSON.stringify({ method, params }), sessionId),
+          (event) => PubSub.publish(providerEvents, event), { discard: true },
+        )
         const observer = provider.create()
         const idleScreen = { lines: provider.lines, cursor: { x: 2, y: provider.row, visible: true } }
         let probes = 0
@@ -132,7 +485,7 @@ for (const provider of [
           loadSessionSnapshot: loadSnapshot,
           loadSessionSnapshotFor: () => loadSnapshot,
           readTranscripts: () => loadSnapshot.pipe(Effect.map((snapshot) => snapshot.transcripts)),
-          prepareResume: () => Effect.succeed(prepared(sessionId, fixture, { observer, activityHints })),
+          prepareResume: () => Effect.succeed(prepared(sessionId, fixture, { observer, activityHints, providerEvents })),
           prepareNewSession: Effect.die("Unexpected new session"),
           branchFrom: () => Effect.die("Unexpected branch"),
         }
@@ -153,7 +506,8 @@ for (const provider of [
         // Establish the pre-generation screen through the real snapshot boundary.
         yield* app.returnFromTerminal
         yield* waitForRuntimeState(app, (state) => state.refresh.active.size === 0)
-        fixture.processes.processes[0]!.output(bytes(`\u001b]0;${provider.title}\u0007`))
+        if (trigger === "native") yield* replay("turn/started", { threadId: sessionId, turn: { id: "turn", status: "inProgress" } })
+        else fixture.processes.processes[0]!.output(bytes(`\u001b]0;${provider.title}\u0007`))
         yield* waitForRuntimeState(app, (state) => state.terminals.get(sessionId)?.activity === "working")
         messages = [question, answer]
         // A terminal-return read must withhold even a provider-completed assistant tail while Working.
@@ -176,14 +530,22 @@ for (const provider of [
         const refresh = trigger === "manual" ? yield* Effect.forkChild(app.refresh()) : undefined
         if (trigger === "automatic") yield* TestClock.adjust(2_000)
         if (trigger === "hint") yield* PubSub.publish(activityHints, "reconcile")
-        yield* eventually(() => probes === 1)
-        yield* TestClock.adjust(99)
-        expect(probes).toBe(1)
-        expect((yield* app.getState).terminals.get(sessionId)?.activity).toBe("working")
-        yield* TestClock.adjust(1)
+        if (trigger === "native") {
+          yield* replay("thread/status/changed", { threadId: sessionId, status: { type: "idle" } })
+          yield* replay("turn/completed", { threadId: "child", turn: { id: "child-turn", status: "completed" } })
+          expect((yield* app.getState).terminals.get(sessionId)?.activity).toBe("working")
+          yield* replay("turn/completed", { threadId: sessionId, turn: { id: "turn", status: "completed" } })
+        } else {
+          yield* eventually(() => probes === 1)
+          yield* TestClock.adjust(99)
+          expect(probes).toBe(1)
+          expect((yield* app.getState).terminals.get(sessionId)?.activity).toBe("working")
+          yield* TestClock.adjust(1)
+        }
         const pending = yield* waitForRuntimeState(app, (state) =>
           state.terminals.get(sessionId)?.activity === "idle" && state.pendingCompletions.has(sessionId))
-        expect(probes).toBe(2)
+        expect(probes).toBe(trigger === "native" ? 0 : 2)
+        if (trigger === "native") fixture.processes.processes[0]!.output(bytes(`\u001b]0;${provider.title}\u0007`))
         expect(pending.provider.transcripts.get(sessionId)).toEqual({ _tag: "Available", messages: [question] })
         expect(pending.unviewedSessionIds.has(sessionId)).toBeFalse()
         yield* Deferred.succeed(releaseCompletion, undefined)
@@ -767,6 +1129,41 @@ test("one unbounded semantic queue preserves transition order and sequence IDs u
       "session:real", "activity:working", "activity:idle", "exit:real",
     ])
     expect(observed.slice(-3).every((event) => "sessionId" in event && event.sessionId === "real")).toBeTrue()
+  }))
+})
+
+test.each([false, true])("failed natural exits retain diagnostics without vetoing cleanup (tail fails: %s)", async (tailFails) => {
+  const fixture = makeFixture()
+  const exits: TerminalExitEvent[] = []
+  fixture.dependencies.events = { onProcessExited: (event) => exits.push(event) }
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.gen(function*() {
+    const acquired = acquiredLaunch("startup-error", fixture)
+    let capturedBeforeCleanup = false
+    yield* supervisor.show({
+      session: session("startup-error"),
+      acquireLaunch: Effect.succeed({ ...acquired, launch: { ...acquired.launch,
+        failureDetails: () => {
+          capturedBeforeCleanup = !fixture.log.includes("provider-close:startup-error")
+          return "Codex app-server exited with code 137 before cleanup."
+        },
+      } }),
+    })
+    const process = fixture.processes.processes[0]!
+    let readAfterCleanup = false
+    Object.defineProperty(process, "outputTail", { get() {
+      readAfterCleanup = fixture.log.includes("unref:startup-error")
+      if (tailFails) throw new Error("diagnostic accessor failed")
+      return "ERROR: No saved session found."
+    } })
+    process.finish(1)
+    yield* eventually(() => exits.length === 1)
+    expect(exits[0]).toMatchObject({
+      sessionId: "startup-error", exitCode: 1, ownershipReleased: true,
+      outputTail: tailFails ? "Codex app-server exited with code 137 before cleanup."
+        : "ERROR: No saved session found.\n\nCodex app-server exited with code 137 before cleanup.",
+    })
+    expect(readAfterCleanup).toBeTrue()
+    expect(capturedBeforeCleanup).toBeTrue()
   }))
 })
 
@@ -1622,7 +2019,7 @@ test("a transition fails with a typed stale-owner error without waiting for clea
       Deferred.await(acknowledgment).pipe(Effect.timeout(1_000)),
     )
     expect(acknowledgmentError).toBeInstanceOf(TerminalError)
-    expect(acknowledgmentError.message).toContain("stopped while deriving")
+    expect(acknowledgmentError.message).toMatch(/stopped while deriving|cancelled by cleanup/)
 
     fixture.processOptions.unknownLiveness = false
     fixture.processes.processes[0]!.finish(0)
@@ -1730,7 +2127,6 @@ test("a late reserve is compensated before retry and can never recreate released
 
 for (const [operation, phase] of [
   ["reserve", "waiting-for-lock"],
-  ["reserve", "cleaning-orphan-artifacts"],
   ["attach", "committing-state"],
 ] as const) {
   test(`healthy launch ${operation} survives a slow ${phase} phase`, async () => {
@@ -1742,6 +2138,7 @@ for (const [operation, phase] of [
       yield* Deferred.await(release)
     })
     const ownership: TerminalOwnershipRepository = {
+      load: fixture.leases.load,
       reserve: (id, options) => operation === "reserve"
         ? Effect.sync(() => options?.onPhase?.(phase)).pipe(
             Effect.andThen(wait), Effect.andThen(fixture.leases.reserve(id, options)),
@@ -1762,7 +2159,7 @@ for (const [operation, phase] of [
       const supervisor = yield* makeTerminalSupervisor({ ...fixture.dependencies, ownership })
       const opening = yield* Effect.forkScoped(supervisor.show(prepared("slow-launch", fixture)))
       yield* Deferred.await(entered)
-      yield* TestClock.adjust(750)
+      yield* TestClock.adjust(60_000)
       expect(opening.pollUnsafe()).toBeUndefined()
       expect(yield* supervisor.activeSessionId).toBeNull()
       expect(fixture.renderer.surfaces.some((surface) => surface.active)).toBeFalse()
@@ -1773,6 +2170,343 @@ for (const [operation, phase] of [
       expect(fixture.log).not.toContain("lease-release:slow-launch")
       yield* supervisor.stopSession("slow-launch")
     }).pipe(Effect.provide(TestClock.layer()))))
+  })
+}
+
+test("productive acquisition skips omitted deadline timers", async () => {
+  const fixture = makeFixture()
+  const entered = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const opening = yield* Effect.forkScoped(supervisor.show({
+      session: session("patient-acquisition"),
+      acquireLaunch: Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)), Effect.as(acquiredLaunch("patient-acquisition", fixture)),
+      ),
+    }))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(60_000)
+    expect(opening.pollUnsafe()).toBeUndefined()
+    expect(fixture.processes.processes).toHaveLength(0)
+    yield* supervisor.show(prepared("unrelated", fixture))
+    yield* supervisor.stopSession("unrelated")
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(opening)
+    expect(yield* supervisor.activeSessionId).toBe("patient-acquisition")
+  })))
+})
+
+for (const option of ["acquisitionTimeoutMs", "launchPersistenceTimeoutMs", "transitionDerivationTimeoutMs",
+  "applicationAcknowledgmentTimeoutMs"] as const) {
+  for (const value of [NaN, Infinity, 0, -1]) {
+    test(`${option} rejects invalid productive budget ${value}`, async () => {
+      const fixture = makeFixture()
+      await expect(Effect.runPromise(Effect.scoped(makeTerminalSupervisor({
+        ...fixture.dependencies, [option]: value,
+      })))).rejects.toThrow("Operation timeout must be a finite positive number")
+    })
+  }
+}
+
+for (const phase of ["reserve", "acquisition", "attach"] as const) {
+  test(`same-session stop cancels pending ${phase} without focusing late work`, async () => {
+    const fixture = makeFixture()
+    const entered = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    let interrupted = false
+    const wait = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)),
+      Effect.onInterrupt(() => Effect.sync(() => { interrupted = true })))
+    const ownership = new Proxy(fixture.leases, {
+      get(target, key) {
+        if (phase === "reserve" && key === "reserve") return (...args: Parameters<TerminalOwnershipRepository["reserve"]>) =>
+          wait.pipe(Effect.andThen(fixture.leases.reserve(...args)))
+        if (phase === "attach" && key === "attach") return (...args: Parameters<TerminalOwnershipRepository["attach"]>) =>
+          wait.pipe(Effect.andThen(fixture.leases.attach(...args)))
+        return Reflect.get(target, key)
+      },
+    })
+    await withClockSupervisor({ ...fixture.dependencies, ownership, persistenceTimeoutMs: 10 },
+      (supervisor) => Effect.scoped(Effect.gen(function*() {
+        const terminal = prepared("cancel-launch", fixture)
+        const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show(phase === "acquisition"
+          ? { ...terminal, acquireLaunch: wait.pipe(Effect.as(acquiredLaunch("cancel-launch", fixture))) }
+          : terminal)))
+        yield* Deferred.await(entered)
+        const expectedOwnerId = phase === "attach" ? (yield* supervisor.ownershipSnapshot)[0]!.ownerId : undefined
+        const stop = yield* Effect.forkScoped(Effect.exit(supervisor.stopSession("cancel-launch", undefined, expectedOwnerId)))
+        for (let attempt = 0; attempt < 20 && stop.pollUnsafe() === undefined; attempt++) yield* TestClock.adjust(100)
+        expect(stop.pollUnsafe()).toBeDefined()
+        const stopped = yield* Fiber.join(stop)
+        expect(Exit.isFailure(yield* Fiber.join(opening))).toBeTrue()
+        if (phase === "acquisition") {
+          expect(stopped).toEqual(Exit.succeed(true))
+          expect(interrupted).toBeTrue()
+          expect(fixture.leases.current("cancel-launch")).toBeUndefined()
+        } else {
+          expect(Exit.isFailure(stopped)).toBeTrue()
+          if (Exit.isFailure(stopped)) expect(Cause.squash(stopped.cause)).toBeInstanceOf(TerminalCleanupError)
+          expect(interrupted).toBeFalse()
+          expect(yield* supervisor.ownedSessionIds).toContain("cancel-launch")
+        }
+        expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+        if (phase === "attach") expect(fixture.processes.processes[0]?.ptyOpen).toBeFalse()
+        yield* Deferred.succeed(release, undefined)
+        if (phase === "reserve") yield* eventually(() => fixture.log.includes("lease-release:cancel-launch"))
+        if (phase === "attach") yield* eventually(() => fixture.log.some((entry) => entry.startsWith("lease-update:cancel-launch:")))
+        yield* supervisor.shutdown()
+        expect(fixture.leases.current("cancel-launch")).toBeUndefined()
+        expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+      })))
+  })
+}
+
+test("stop follows captured launch rollback without waiting behind a queued replacement", async () => {
+  const fixture = makeFixture()
+  const firstEntered = Deferred.makeUnsafe<void>()
+  const rollbackEntered = Deferred.makeUnsafe<void>()
+  const releaseRollback = Deferred.makeUnsafe<void>()
+  const firstRelease = Deferred.makeUnsafe<void>()
+  const secondEntered = Deferred.makeUnsafe<void>()
+  const secondRelease = Deferred.makeUnsafe<void>()
+  let secondInterrupted = false
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const first = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+      session: session("queued-replacement"),
+      acquireLaunch: Effect.gen(function*() {
+        yield* Effect.addFinalizer(() => Deferred.succeed(rollbackEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRollback)),
+        ))
+        yield* Deferred.succeed(firstEntered, undefined)
+        yield* Deferred.await(firstRelease)
+        return acquiredLaunch("queued-replacement", fixture)
+      }),
+    })))
+    yield* Deferred.await(firstEntered)
+    const firstToken = fixture.leases.current("queued-replacement")!.ownerToken
+    const second = yield* Effect.forkScoped(supervisor.show({
+      session: session("queued-replacement"),
+      acquireLaunch: Deferred.succeed(secondEntered, undefined).pipe(
+        Effect.andThen(Deferred.await(secondRelease)),
+        Effect.as(acquiredLaunch("queued-replacement", fixture)),
+        Effect.onInterrupt(() => Effect.sync(() => { secondInterrupted = true })),
+      ),
+    }))
+    for (let attempt = 0; attempt < 20; attempt++) yield* Effect.yieldNow
+    const stop = yield* Effect.forkScoped(supervisor.stopSession("queued-replacement"))
+    yield* Deferred.await(rollbackEntered)
+    for (let attempt = 0; attempt < 20; attempt++) yield* Effect.yieldNow
+    yield* Deferred.succeed(releaseRollback, undefined)
+    yield* Deferred.await(secondEntered)
+    yield* TestClock.adjust(60_000)
+    expect(stop.pollUnsafe()).toBeDefined()
+    expect(yield* Fiber.join(stop)).toBeTrue()
+    expect(Exit.isFailure(yield* Fiber.join(first))).toBeTrue()
+    expect(second.pollUnsafe()).toBeUndefined()
+    expect(secondInterrupted).toBeFalse()
+    expect(fixture.leases.current("queued-replacement")!.ownerToken).not.toBe(firstToken)
+    expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+    yield* Deferred.succeed(firstRelease, undefined)
+    yield* Deferred.succeed(secondRelease, undefined)
+    const secondOwner = yield* Fiber.join(second)
+    expect((yield* supervisor.ownershipSnapshot)[0]?.ownerId).toBe(secondOwner)
+    expect(yield* supervisor.activeSessionId).toBe("queued-replacement")
+    expect(secondInterrupted).toBeFalse()
+    expect(yield* supervisor.stopSession("queued-replacement", undefined, secondOwner)).toBeTrue()
+    expect(fixture.leases.current("queued-replacement")).toBeUndefined()
+  })))
+})
+
+test("stop reports incomplete captured launch rollback within its cleanup budget", async () => {
+  const fixture = makeFixture()
+  const entered = Deferred.makeUnsafe<void>()
+  const rollbackEntered = Deferred.makeUnsafe<void>()
+  const releaseRollback = Deferred.makeUnsafe<void>()
+  const never = Deferred.makeUnsafe<void>()
+  await withClockSupervisor({ ...fixture.dependencies, persistenceTimeoutMs: 10 },
+    (supervisor) => Effect.scoped(Effect.gen(function*() {
+      const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show({
+        session: session("unresolved-rollback"),
+        acquireLaunch: Effect.gen(function*() {
+          yield* Effect.addFinalizer(() => Deferred.succeed(rollbackEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseRollback)),
+          ))
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(never)
+          return acquiredLaunch("unresolved-rollback", fixture)
+        }),
+      })))
+      yield* Deferred.await(entered)
+      const stop = yield* Effect.forkScoped(Effect.exit(supervisor.stopSession("unresolved-rollback")))
+      yield* Deferred.await(rollbackEntered)
+      yield* TestClock.adjust(280)
+      const outcome = yield* Fiber.join(stop)
+      expect(Exit.isFailure(outcome)).toBeTrue()
+      if (Exit.isFailure(outcome)) expect(Cause.squash(outcome.cause)).toBeInstanceOf(TerminalCleanupError)
+      expect(Exit.isFailure(yield* Fiber.join(opening))).toBeTrue()
+      expect(yield* supervisor.ownedSessionIds).toContain("unresolved-rollback")
+      expect(fixture.leases.current("unresolved-rollback")).toBeDefined()
+      yield* Deferred.succeed(releaseRollback, undefined)
+      expect(fixture.leases.current("unresolved-rollback")).toBeDefined()
+      expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+    })))
+})
+
+test("expected-owner stop does not cancel a replacement's admitted launch", async () => {
+  const fixture = makeFixture()
+  const entered = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  await withClockSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const oldOwner = yield* supervisor.show(prepared("replacement", fixture))
+    yield* supervisor.stopSession("replacement", undefined, oldOwner)
+    const opening = yield* Effect.forkScoped(supervisor.show({
+      session: session("replacement"),
+      acquireLaunch: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)),
+        Effect.as(acquiredLaunch("replacement", fixture))),
+    }))
+    yield* Deferred.await(entered)
+    const staleStop = yield* Effect.forkScoped(supervisor.stopSession("replacement", undefined, oldOwner))
+    yield* TestClock.adjust(60_000)
+    expect(opening.pollUnsafe()).toBeUndefined()
+    expect(staleStop.pollUnsafe()).toBeDefined()
+    yield* Deferred.succeed(release, undefined)
+    const newOwner = yield* Fiber.join(opening)
+    expect(yield* Fiber.join(staleStop)).toBeFalse()
+    expect(newOwner).not.toBe(oldOwner)
+    expect(yield* supervisor.activeSessionId).toBe("replacement")
+    expect((yield* supervisor.ownershipSnapshot)[0]?.ownerId).toBe(newOwner)
+  })))
+})
+
+for (const phase of ["derivation", "identity", "application", "journal"] as const) {
+  test(`productive ${phase} waits beyond former deadlines without stopping its owner`, async () => {
+    const fixture = makeFixture()
+    const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
+    const entered = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    const wait = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+    let applicationEvent: TerminalSessionChangedEvent | undefined
+    const ownership = new Proxy(fixture.leases, {
+      get(target, key) {
+        if (phase === "identity" && key === "commitIdentity") return (options: Parameters<TerminalOwnershipRepository["commitIdentity"]>[0]) =>
+          wait.pipe(Effect.andThen(fixture.leases.commitIdentity(options)))
+        if (phase === "journal" && key === "ack") return (token: string) =>
+          wait.pipe(Effect.andThen(fixture.leases.ack(token)))
+        return Reflect.get(target, key)
+      },
+    })
+    const events = { onSessionChanged: (event: TerminalSessionChangedEvent) => {
+      applicationEvent = event
+      if (phase === "application") Deferred.doneUnsafe(entered, Effect.void)
+      else Deferred.doneUnsafe(event.acknowledgment!, Effect.void)
+    } }
+    await withClockSupervisor({ ...fixture.dependencies, ownership, events }, (supervisor) => Effect.gen(function*() {
+      const ownerId = yield* supervisor.show(prepared("patient-source", fixture, { transitions }))
+      const acknowledgment = yield* publishTransition(transitions, {
+        _tag: "SessionChanged", kind: "native-fork", session: session("patient-child"),
+        ...(phase === "derivation" ? { derivation: wait.pipe(Effect.as(undefined)) } : {}),
+      })
+      yield* Deferred.await(entered)
+      yield* TestClock.adjust(60_000)
+      expect(yield* Deferred.isDone(acknowledgment)).toBeFalse()
+      expect((yield* supervisor.ownershipSnapshot)[0]?.state).toBe("running")
+      yield* supervisor.show(prepared("unrelated", fixture))
+      yield* supervisor.stopSession("unrelated")
+      yield* Deferred.succeed(release, undefined)
+      if (phase === "application") yield* Deferred.succeed(applicationEvent!.acknowledgment!, undefined)
+      yield* Deferred.await(acknowledgment)
+      expect((yield* supervisor.ownershipSnapshot)[0]?.ownerId).toBe(ownerId)
+      expect(yield* supervisor.runningSessionIds).toEqual(new Set(["patient-child"]))
+      expect((yield* fixture.leases.load).pendingIdentityAdoptions).toHaveLength(0)
+    }))
+  })
+
+  for (const trigger of ["stop", "shutdown", "exit"] as const) {
+    test(`${trigger} cancels productive ${phase} observation without interrupting admitted writes`, async () => {
+      const fixture = makeFixture()
+      const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
+      const entered = Deferred.makeUnsafe<void>()
+      const release = Deferred.makeUnsafe<void>()
+      const wait = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+      let interrupted = false
+      const transactionWait = wait.pipe(Effect.onInterrupt(() => Effect.sync(() => { interrupted = true })))
+      const ownership = new Proxy(fixture.leases, {
+        get(target, key) {
+          if (phase === "identity" && key === "commitIdentity") return (options: Parameters<TerminalOwnershipRepository["commitIdentity"]>[0]) =>
+            transactionWait.pipe(Effect.andThen(fixture.leases.commitIdentity(options)))
+          if (phase === "journal" && key === "ack") return (token: string) =>
+            transactionWait.pipe(Effect.andThen(fixture.leases.ack(token)))
+          return Reflect.get(target, key)
+        },
+      })
+      const events = { onSessionChanged: (event: TerminalSessionChangedEvent) => {
+        if (phase === "application") Deferred.doneUnsafe(entered, Effect.void)
+        else Deferred.doneUnsafe(event.acknowledgment!, Effect.void)
+      } }
+      await withClockSupervisor({ ...fixture.dependencies, ownership, events,
+        persistenceTimeoutMs: 10, applicationAcknowledgmentTimeoutMs: 20,
+      }, (supervisor) => Effect.scoped(Effect.gen(function*() {
+        yield* supervisor.show(prepared("cancel-source", fixture, { transitions }))
+        const acknowledgment = yield* publishTransition(transitions, {
+          _tag: "SessionChanged", kind: "native-fork", session: session("cancel-child"),
+          ...(phase === "derivation" ? { derivation: wait.pipe(Effect.as(undefined)) } : {}),
+        })
+        yield* Deferred.await(entered)
+        const cleanup = yield* Effect.forkScoped(Effect.exit(trigger === "shutdown" ? supervisor.shutdown()
+          : trigger === "exit" ? Effect.sync(() => fixture.processes.processes[0]!.finish(0)).pipe(
+              Effect.andThen(eventually(() => fixture.processes.processes[0]?.ptyOpen === false)))
+          : supervisor.stopSession(phase === "application" || phase === "journal" ? "cancel-child" : "cancel-source")))
+        for (let attempt = 0; attempt < 20 && cleanup.pollUnsafe() === undefined; attempt++) {
+          yield* TestClock.adjust(100)
+        }
+        expect(cleanup.pollUnsafe()).toBeDefined()
+        yield* Fiber.join(cleanup)
+        expect(yield* Deferred.isDone(acknowledgment)).toBeTrue()
+        expect(fixture.processes.processes[0]?.ptyOpen).toBeFalse()
+        expect(interrupted).toBeFalse()
+        if (phase === "identity") {
+          expect(yield* supervisor.ownedSessionIds).toEqual(new Set(["cancel-source", "cancel-child"]))
+          expect(fixture.leases.current("cancel-source")).toBeDefined()
+        }
+        yield* Deferred.succeed(release, undefined)
+        if (phase === "identity") yield* eventually(() => fixture.leases.current("cancel-child") !== undefined)
+        if (phase === "journal") {
+          yield* eventually(() => fixture.log.some((entry) => entry.startsWith("lease-ack:")))
+          expect((yield* fixture.leases.load).pendingIdentityAdoptions).toHaveLength(0)
+        }
+        // Reconciliation is forward-only and does not focus the late result.
+        const retry = yield* Effect.forkScoped(Effect.exit(supervisor.shutdown()))
+        for (let attempt = 0; attempt < 20 && retry.pollUnsafe() === undefined; attempt++) yield* TestClock.adjust(100)
+        expect(retry.pollUnsafe()).toBeDefined()
+        yield* Fiber.join(retry)
+        expect(fixture.leases.replaceCalls).not.toContain("cancel-child:cancel-source")
+        expect(yield* supervisor.activeSessionId).toBeNull()
+      })))
+    })
+  }
+}
+
+for (const phase of ["derivation", "application"] as const) {
+  test(`explicit finite ${phase} budget still times out`, async () => {
+    const fixture = makeFixture()
+    const transitions = await Effect.runPromise(PubSub.unbounded<TerminalTransitionRequest>())
+    const entered = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    const events = { onSessionChanged: () => Deferred.doneUnsafe(entered, Effect.void) }
+    await withClockSupervisor({ ...fixture.dependencies, events,
+      transitionDerivationTimeoutMs: 10, applicationAcknowledgmentTimeoutMs: 10,
+    }, (supervisor) => Effect.gen(function*() {
+      yield* supervisor.show(prepared("finite-source", fixture, { transitions }))
+      const acknowledgment = yield* publishTransition(transitions, {
+        _tag: "SessionChanged", kind: "native-fork", session: session("finite-child"),
+        ...(phase === "derivation" ? { derivation: Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)), Effect.as(undefined),
+        ) } : {}),
+      })
+      yield* Deferred.await(entered)
+      yield* TestClock.adjust(10)
+      expect(Exit.isFailure(yield* Effect.exit(Deferred.await(acknowledgment)))).toBeTrue()
+      yield* Deferred.succeed(release, undefined)
+    }))
   })
 }
 
@@ -1830,6 +2564,45 @@ test("shutdown cancels the long launch wait and compensates a later reservation 
     expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
     expect(fixture.processes.processes).toHaveLength(0)
   }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("shutdown cancels initial registration observation and retains its exact late attach", async () => {
+  const fixture = makeFixture()
+  const entered = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  let interrupted = false
+  let attaches = 0
+  const ownership = new Proxy(fixture.leases, {
+    get(target, key) {
+      if (key === "attach") return (...args: Parameters<TerminalOwnershipRepository["attach"]>) => Effect.gen(function*() {
+        attaches++
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+        return yield* fixture.leases.attach(...args)
+      }).pipe(Effect.onInterrupt(() => Effect.sync(() => { interrupted = true })))
+      return Reflect.get(target, key)
+    },
+  })
+  await withClockSupervisor({ ...fixture.dependencies, ownership, persistenceTimeoutMs: 10 },
+    (supervisor) => Effect.scoped(Effect.gen(function*() {
+      const opening = yield* Effect.forkScoped(Effect.exit(supervisor.show(prepared("late-attach", fixture))))
+      yield* Deferred.await(entered)
+      const shutdown = yield* Effect.forkScoped(Effect.exit(supervisor.shutdown()))
+      for (let attempt = 0; attempt < 20 && shutdown.pollUnsafe() === undefined; attempt++) yield* TestClock.adjust(100)
+      expect(shutdown.pollUnsafe()).toBeDefined()
+      expect(Exit.isFailure(yield* Fiber.join(shutdown))).toBeTrue()
+      expect(Exit.isFailure(yield* Fiber.join(opening))).toBeTrue()
+      expect(attaches).toBe(1)
+      expect(interrupted).toBeFalse()
+      expect(fixture.leases.current("late-attach")).toBeDefined()
+      expect(fixture.renderer.surfaces[0]?.released).toBeTrue()
+      expect(fixture.log.some((entry) => entry.startsWith("focus:"))).toBeFalse()
+      yield* Deferred.succeed(release, undefined)
+      yield* eventually(() => fixture.log.some((entry) => entry.startsWith("lease-update:late-attach:")))
+      yield* supervisor.shutdown()
+      expect(attaches).toBe(1)
+      expect(fixture.leases.current("late-attach")).toBeUndefined()
+    })))
 })
 
 test("a timed-out provider scope close remains uncertain and never releases its lease", async () => {
@@ -2164,6 +2937,7 @@ function prepared(
   options: {
     readonly transitions?: PubSub.PubSub<TerminalTransitionRequest>
     readonly activityHints?: PubSub.PubSub<"reconcile">
+    readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
     readonly observer?: TerminalObserver
     readonly transient?: boolean
     readonly command?: TerminalLaunch["command"]
@@ -2184,6 +2958,7 @@ function acquiredLaunch(
   options: {
     readonly transitions?: PubSub.PubSub<TerminalTransitionRequest>
     readonly activityHints?: PubSub.PubSub<"reconcile">
+    readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
     readonly observer?: TerminalObserver
     readonly command?: TerminalLaunch["command"]
   } = {},
@@ -2195,6 +2970,7 @@ function acquiredLaunch(
     observer: options.observer ?? new NullTerminalObserver(),
     ...(options.transitions === undefined ? {} : { transitions: options.transitions }),
     ...(options.activityHints === undefined ? {} : { activityHints: options.activityHints }),
+    ...(options.providerEvents === undefined ? {} : { providerEvents: options.providerEvents }),
   }
   return {
     launch,
@@ -2247,6 +3023,9 @@ function eventName(event: TerminalActivityEvent | TerminalSessionChangedEvent | 
 }
 
 class FakeOwnershipRepository implements TerminalOwnershipRepository {
+  readonly load: TerminalOwnershipRepository["load"] = Effect.sync(() => ({
+    relations: [], removals: [], navigations: [], terminalOwners: [...this.leases.values()], pendingIdentityAdoptions: [],
+  }))
   readonly launchDirectory = (owner: PersistedTerminalOwner) => `/unused-launches/${owner.ownerToken}`
   reserveFailures = 0
   attachFailures = 0

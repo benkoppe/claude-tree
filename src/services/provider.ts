@@ -2,11 +2,13 @@ import { Context, Deferred, Effect, PubSub, Scope } from "effect"
 
 import type {
   AgentSession,
+  AgentActivity,
   AgentSessionSnapshot,
   BranchDerivation,
   DraftPreview,
   MessageRef,
   TerminalObserver,
+  TerminalObservation,
   TranscriptRead,
 } from "../domain/model"
 import type {
@@ -68,7 +70,15 @@ export interface TerminalLaunch {
   readonly transitions?: PubSub.PubSub<TerminalTransitionRequest>
   /** Best-effort wakeups, never proof that a turn completed. */
   readonly activityHints?: PubSub.PubSub<"reconcile">
+  readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
+  /** Synchronous failure snapshot, captured before cleanup changes provider state. */
+  readonly failureDetails?: () => string | undefined
 }
+
+export type ProviderTerminalEvent =
+  | { readonly _tag: "Activity"; readonly sessionId: string; readonly activity: AgentActivity }
+  | { readonly _tag: "Observation"; readonly sessionId: string; readonly observation: TerminalObservation }
+  | { readonly _tag: "Unavailable"; readonly sessionId: string }
 
 export interface AcquiredTerminalLaunch {
   readonly launch: TerminalLaunch

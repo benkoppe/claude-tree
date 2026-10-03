@@ -36,6 +36,8 @@
           fileset = lib.fileset.unions [
             ../bun.lock
             ../package.json
+            ../LICENSE
+            ../THIRD_PARTY_LICENSES
             ../src
           ];
         };
@@ -58,7 +60,7 @@
           runHook preInstall
 
           mkdir -p "$out/lib/claude-tree" "$out/bin"
-          cp -R src package.json node_modules "$out/lib/claude-tree"
+          cp -R src package.json LICENSE THIRD_PARTY_LICENSES node_modules "$out/lib/claude-tree"
           chmod u+w "$out/lib/claude-tree/src/build-metadata.json"
           cp ${pkgs.writeText "claude-tree-build-metadata.json" buildMetadata} "$out/lib/claude-tree/src/build-metadata.json"
           makeWrapper ${lib.getExe pkgs.bun} "$out/bin/claude-tree" \

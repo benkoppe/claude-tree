@@ -5,10 +5,10 @@ import { Deferred, Effect } from "effect"
 
 import { readBuildInfo, type BuildInfo } from "../build-info"
 import { resolveProjectDirectory, type CliOptions } from "../cli-options"
+import { optionalOperationTimeout, withOperationTimeout } from "../services/operation-deadline"
 import { HistoryDiagnosticReportSchema, HistoryTrace, type HistoryDiagnosticReport, type HistoryFailure } from "./history-trace"
 import type { HistoryDiagnosticJob } from "./history-process"
 
-export const HISTORY_DIAGNOSTIC_TIMEOUT_MS = 30_000
 const WORKER_CLOSE_TIMEOUT_MS = 1_000
 
 export function diagnosticFailure(build: BuildInfo, code: HistoryFailure): HistoryDiagnosticReport {
@@ -23,8 +23,10 @@ export function runHistoryWorker(
     execPath: process.execPath, stdio: ["ignore", "ignore", "ignore", "ipc"],
     env: { ...process.env, DEBUG: "", DEBUG_CLAUDE_AGENT_SDK: "" },
   }),
+  executionTimeoutMs?: number,
 ): Effect.Effect<HistoryDiagnosticReport> {
   return Effect.scoped(Effect.gen(function*() {
+    yield* Effect.sync(() => optionalOperationTimeout(executionTimeoutMs))
     const reply = yield* Deferred.make<HistoryDiagnosticReport, HistoryFailure>()
     let closing: Promise<void> | undefined
     const close = (worker: ChildProcess) => Effect.suspend(() => Effect.tryPromise({
@@ -57,9 +59,10 @@ export function runHistoryWorker(
       try { worker.send(job, (error) => { if (error) Deferred.doneUnsafe(reply, Effect.fail("worker-failed")) }) }
       catch { Deferred.doneUnsafe(reply, Effect.fail("worker-failed")) }
     })
-    const result = yield* Deferred.await(reply).pipe(Effect.timeoutOrElse({
-      duration: HISTORY_DIAGNOSTIC_TIMEOUT_MS, orElse: () => Effect.fail("diagnostic-timeout" as const),
-    }), Effect.catch((code) => Effect.succeed(diagnosticFailure(job.build, code))))
+    const result = yield* withOperationTimeout(Deferred.await(reply), executionTimeoutMs,
+      () => Effect.fail("diagnostic-timeout" as const)).pipe(
+      Effect.catch((code) => Effect.succeed(diagnosticFailure(job.build, code))),
+    )
     const closed = yield* close(worker).pipe(Effect.result)
     return closed._tag === "Failure" ? diagnosticFailure(job.build, closed.failure) : result
   })).pipe(Effect.catch(() => Effect.succeed(diagnosticFailure(job.build, "worker-failed"))))
