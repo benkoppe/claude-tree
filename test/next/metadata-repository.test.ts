@@ -45,8 +45,6 @@ describe("ProviderStateRepository schema v3", () => {
       relations: [],
       removals: [],
       navigations: [],
-      terminalOwners: [],
-      pendingIdentityAdoptions: [],
     })
     expect((await stat(repository.statePath)).mode & 0o777).toBe(0o600)
     expect((await stat(manifestPath)).mode & 0o777).toBe(0o600)

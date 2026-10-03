@@ -6,8 +6,8 @@ import {
   makeHerdrReporter,
   type HerdrCommandExecutor,
   type HerdrReporterApi,
+  type HerdrResume,
 } from "../../services/herdr"
-import type { TerminalHerdrReporter } from "../../services/terminal-supervisor"
 
 export const HERDR_PROCESS_CLEANUP_PERIOD_MS = 100
 
@@ -40,22 +40,18 @@ export function HerdrReporterLive(options: HerdrLiveOptions = {}): Layer.Layer<H
   return Layer.effect(HerdrReporter, makeLiveHerdrReporter(options))
 }
 
-export function makeTerminalHerdrReporter(
-  reporter: HerdrReporterApi,
-): TerminalHerdrReporter {
-  return {
-    report: reporter.report,
-    shutdown: reporter.shutdown,
-  }
-}
-
 export function reportApplicationToHerdr(
   reporter: HerdrReporterApi,
   viewModels: Stream.Stream<ApplicationViewModel>,
+  workspace?: Omit<HerdrResume, "destination">,
 ): Effect.Effect<void, never, Scope.Scope> {
   return Effect.forkScoped(Stream.runForEach(viewModels, (viewModel) => Effect.sync(() => {
     const surface = viewModel.surface
-    reporter.report(viewModel.shuttingDown || surface._tag === "Roots" ? "idle" : surface.status)
+    if (viewModel.shuttingDown) return
+    reporter.report(surface._tag === "Roots" ? "idle" : surface.status, workspace ? {
+      ...workspace, destination: surface._tag === "Roots" ? `roots:${surface.selectedSessionId ?? ""}`
+        : surface._tag === "Graph" ? `graph:${surface.familySessionId}` : `terminal:${surface.sessionId}`,
+    } : undefined)
   }))).pipe(Effect.asVoid)
 }
 

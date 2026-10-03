@@ -25,8 +25,6 @@ import type {
   BranchRelation,
   ConversationRemoval,
   IdentityTransitionKind,
-  PendingIdentityAdoption,
-  ProjectState,
 } from "../domain/persistence"
 import type {
   AgentProviderApi,
@@ -44,6 +42,7 @@ import type {
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
 import { TerminalCleanupError } from "../services/terminal-supervisor"
+import { SessionOwnedError } from "../domain/errors"
 import { replaceSessionIdInProjectState } from "../services/provider-state-repository"
 import { HISTORY_RETRY_DELAYS_MS, HISTORY_CONFIRMATION_DELAY_MS } from "../services/lifecycle-policy"
 import { causeFailures, errorDetails, errorSummary as errorMessage } from "../error-format"
@@ -118,7 +117,7 @@ export interface AppRuntime {
   readonly enterRoot: (sessionId: string) => ApplicationIntentEffect
   readonly selectGraph: (familySessionId: string, target: NavigationTarget, selectionId?: string) => ApplicationIntentEffect
   readonly newSession: ApplicationIntentEffect
-  readonly resumeSession: (sessionId: string) => ApplicationIntentEffect
+  readonly resumeSession: (sessionId: string, allowDuplicate?: boolean) => ApplicationIntentEffect
   readonly openEndpoint: (sessionId: string) => ApplicationIntentEffect
   readonly branchFrom: (target: MessageRef) => ApplicationIntentEffect
   readonly returnFromTerminal: ApplicationIntentEffect
@@ -169,7 +168,7 @@ type ActorControlMessage = LifecycleControlMessage | CommandCompletedMessage
 type ActorCommand =
   | { readonly _tag: "Refresh"; readonly refresh: ActiveRefresh; readonly reply?: IntentEnvelope["reply"]; readonly enterRoot?: { readonly sessionId: string; readonly requestGeneration: number } }
   | { readonly _tag: "PrepareNew"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly allowDuplicate?: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Branch"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Show"; readonly prepared: PreparedTerminal; readonly identityGeneration: number; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Hide"; readonly reply: IntentEnvelope["reply"] }
@@ -187,7 +186,6 @@ type ActorCommand =
       readonly reply: IntentEnvelope["reply"]
     }
   | { readonly _tag: "AcknowledgeTransition"; readonly event: TerminalSessionChangedEvent }
-  | { readonly _tag: "AcknowledgeStartupAdoptions"; readonly adoptions: readonly PendingIdentityAdoption[] }
   | { readonly _tag: "Navigation"; readonly navigation: NavigationState; readonly reply?: IntentEnvelope["reply"] }
   | { readonly _tag: "CompletionTimer"; readonly sessionId: string; readonly ownerId: string; readonly version: number }
   | { readonly _tag: "SubmissionTimer"; readonly sessionId: string; readonly ownerId: string; readonly revision: number }
@@ -214,15 +212,7 @@ export function makeAppRuntime(
   options: AppRuntimeOptions,
 ): Effect.Effect<AppRuntime, unknown, Scope.Scope> {
   return Effect.gen(function*() {
-    const orphanedAdoptions = [...yield* options.metadata.orphanedAdoptions].sort((left, right) =>
-      left.adoptionToken.localeCompare(right.adoptionToken))
-    for (const adoption of orphanedAdoptions) {
-      yield* options.metadata.reconcileOrphanedAdoption(adoption.adoptionToken)
-    }
-
     const projectState = yield* options.metadata.loadMetadata
-    const pendingAdoptions = [...yield* options.metadata.pendingAdoptions].sort((left, right) =>
-      left.adoptionToken.localeCompare(right.adoptionToken))
     let state: ApplicationState = makeInitialApplicationState({
       relations: projectState.relations,
       removals: projectState.removals,
@@ -262,7 +252,7 @@ export function makeAppRuntime(
     let nextRemovalRequestId = 1
     let accepting = true
     let startupNavigationEligible = true
-    let startupRecoveryPending = true
+    let startupNavigationPending = true
     let navigationGeneration = 0
     let navigatorRequestGeneration = 0
     let shutdownResult: DeferredType.Deferred<void, ApplicationShutdownError> | undefined
@@ -866,7 +856,7 @@ export function makeAppRuntime(
         yield* launch(
           `transition:${ownerId}`,
           { _tag: "AcknowledgeTransition", event },
-          Effect.suspend(() => options.metadata.ack(event.adoptionToken)),
+          Effect.void,
           false,
         )
       } else {
@@ -937,45 +927,18 @@ export function makeAppRuntime(
             message: errorMessage(cause),
           })
         }
-        if (startupRecoveryPending && command.refresh.mode === "full" && Exit.isSuccess(exit)) {
-          startupRecoveryPending = false
+        if (startupNavigationPending && command.refresh.mode === "full" && Exit.isSuccess(exit)) {
+          startupNavigationPending = false
           if (command.reply) yield* Deferred.succeed(command.reply, undefined)
           if (startupNavigationEligible) {
             const restored = restoreNavigatorSurface(state, projectState.navigation)
             yield* publish({ _tag: "Navigated", surface: restored })
-          }
-          let validationError: unknown
-          try {
-            for (const adoption of pendingAdoptions) {
-              validateStartupAdoption(state, projectState, adoption)
+            if (projectState.navigation?.view === "graph" && restored._tag === "Roots") {
+              yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: "Saved workspace destination is unavailable. Returned to conversation roots." } })
+              yield* startNavigation(restored)
             }
-          } catch (cause) {
-            validationError = cause
           }
-          if (validationError !== undefined) {
-            startupRecoveryPending = true
-            yield* publish({
-              _tag: "ModalOpened",
-              modal: {
-                _tag: "Error",
-                message: `Restore session identity: ${errorMessage(validationError)}`,
-              },
-            })
-            yield* startNavigation(state.surface)
-            return
-          }
-          if (pendingAdoptions.length === 0) {
-            yield* finishStartup()
-          } else {
-            yield* launch("startup:adoptions", {
-              _tag: "AcknowledgeStartupAdoptions",
-              adoptions: pendingAdoptions,
-            }, Effect.forEach(
-              pendingAdoptions,
-              (adoption) => Effect.suspend(() => options.metadata.ack(adoption.adoptionToken)),
-              { discard: true },
-            ), false)
-          }
+          yield* finishStartup()
           return
         }
         const reconciliationSessionIds = new Set([
@@ -1088,7 +1051,7 @@ export function makeAppRuntime(
           return
         }
         yield* startShow(
-          exit.value as PreparedTerminal,
+          { ...(exit.value as PreparedTerminal), ...(command.allowDuplicate ? { allowDuplicate: true } : {}) },
           command.restoreTo,
           command.reply,
           command.reportFailure,
@@ -1155,13 +1118,14 @@ export function makeAppRuntime(
 
       if (command._tag === "Show") {
         if (Exit.isFailure(exit)) {
+          const failure = Cause.squash(exit.cause)
           preparedTerminals.delete(command.prepared.session.id)
           yield* rejectUnclaimedSessionEvents(command.prepared.session.id)
           yield* publish({
             _tag: "TerminalShowFailed",
             sessionId: command.prepared.session.id,
             restoreTo: command.restoreTo,
-            ...(command.reportFailure ? { message: errorMessage(Cause.squash(exit.cause)) } : {}),
+            ...(command.reportFailure && !(failure instanceof SessionOwnedError) ? { message: errorMessage(failure) } : {}),
           })
           if (command.prepared.session.transient) {
             yield* publish({
@@ -1171,6 +1135,9 @@ export function makeAppRuntime(
             })
           }
           if (command.persistFailureFallback) yield* startNavigation(state.surface)
+          if (failure instanceof SessionOwnedError) yield* publish({ _tag: "ModalOpened", modal: {
+            _tag: "ConfirmOpenSession", sessionId: command.prepared.session.id, ownerPid: failure.ownerPid,
+          } })
           yield* failReply(command.reply, "OpenEndpoint", "Open session", Cause.squash(exit.cause), false)
           return
         }
@@ -1377,22 +1344,6 @@ export function makeAppRuntime(
         return
       }
 
-      if (command._tag === "AcknowledgeStartupAdoptions") {
-        if (Exit.isFailure(exit)) {
-          startupRecoveryPending = true
-          yield* publish({
-            _tag: "ModalOpened",
-            modal: {
-              _tag: "Error",
-              message: `Restore session identity: ${errorMessage(Cause.squash(exit.cause))}`,
-            },
-          })
-          yield* startNavigation(state.surface)
-          return
-        }
-        yield* finishStartup()
-        return
-      }
     })
 
     const applyQueuedTransitionCompletions: Effect.Effect<void, never, Scope.Scope> =
@@ -1515,6 +1466,7 @@ export function makeAppRuntime(
               _tag: "PrepareResume",
               session,
               reportFailure: intent.reportFailure,
+              ...(intent.allowDuplicate ? { allowDuplicate: true } : {}),
               restoreTo: navigatorSurface(session.id),
               reply: envelope.reply,
             }, operations.prepareResume(session), false)
@@ -2236,7 +2188,7 @@ export function makeAppRuntime(
       enterRoot: (sessionId) => request({ _tag: "EnterRoot", sessionId }),
       selectGraph: (familySessionId, target, selectionId) => request({ _tag: "SelectGraph", familySessionId, target, ...(selectionId === undefined ? {} : { selectionId }) }),
       newSession: request({ _tag: "NewSession" }),
-      resumeSession: (sessionId) => request({ _tag: "ResumeSession", sessionId, reportFailure: true }),
+      resumeSession: (sessionId, allowDuplicate) => request({ _tag: "ResumeSession", sessionId, reportFailure: true, ...(allowDuplicate ? { allowDuplicate: true } : {}) }),
       openEndpoint: (sessionId) => request({ _tag: "OpenEndpoint", sessionId }),
       branchFrom: (target) => request({ _tag: "BranchFrom", target }),
       returnFromTerminal: request({ _tag: "ReturnFromTerminal" }),
@@ -2279,7 +2231,6 @@ function commandIntent(command: ActorCommand): ApplicationIntent["_tag"] {
     case "CompletionTimer": return "Refresh"
     case "SubmissionTimer": return "Refresh"
     case "AcknowledgeTransition": return "OpenEndpoint"
-    case "AcknowledgeStartupAdoptions": return "Refresh"
   }
 }
 
@@ -2328,7 +2279,6 @@ function commandOperation(command: ActorCommand): string {
     case "Stop": return "Stop session"
     case "Remove": return "Remove conversation"
     case "AcknowledgeTransition": return "Acknowledge session identity"
-    case "AcknowledgeStartupAdoptions": return "Restore session identity"
     case "Navigation": return "Save navigation"
     case "CompletionTimer": return "Schedule completion refresh"
     case "SubmissionTimer": return "Discover submitted user prefix"
@@ -2496,41 +2446,6 @@ function replaceSessionIdInInFlightRemoval(
     aliases.set(`${replaced.sessionId}\0${replaced.messageId}`, replaced)
   }
   return { ...removal, target: { ...removal.target, aliases: [...aliases.values()] } }
-}
-
-function validateStartupAdoption(
-  state: ApplicationState,
-  projectState: ProjectState,
-  adoption: PendingIdentityAdoption,
-): void {
-  if (!state.provider.sessions.has(adoption.sessionId)) {
-    throw new Error(
-      `Pending identity adoption ${adoption.adoptionToken} is absent from the provider snapshot`,
-    )
-  }
-  if (adoption.relation !== undefined && !state.relations.some((relation) =>
-    isDeepStrictEqual(relation, adoption.relation))) {
-    throw new Error(
-      `Pending identity adoption ${adoption.adoptionToken} is absent from projected branch metadata`,
-    )
-  }
-  if (projectState.navigation && navigationContainsSession(
-    projectState.navigation,
-    adoption.previousSessionId,
-  )) {
-    throw new Error(
-      `Pending identity adoption ${adoption.adoptionToken} has stale navigation identity`,
-    )
-  }
-}
-
-function navigationContainsSession(navigation: NavigationState, sessionId: string): boolean {
-  if (navigation.view === "roots") return navigation.selectedSessionId === sessionId
-  if (navigation.view === "terminal") return navigation.sessionId === sessionId
-  if (navigation.familySessionId === sessionId) return true
-  if (navigation.target.kind === "endpoint") return navigation.target.sessionId === sessionId
-  return navigation.target.preferred.sessionId === sessionId ||
-    navigation.target.aliases.some((alias) => alias.sessionId === sessionId)
 }
 
 function restoreNavigatorSurface(

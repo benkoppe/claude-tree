@@ -5,7 +5,7 @@ export type CliOptions =
   | { command: "help" }
   | { command: "version" }
   | { command: "diagnose-history"; provider: "claude"; sessionId: string; project: string }
-  | { command: "run"; provider: "claude" | "codex"; project: string }
+  | { command: "run"; provider: "claude" | "codex"; project: string; resumeWorkspaceId?: string }
 
 export function parseCliArguments(args: readonly string[]): CliOptions {
   if (args.includes("--help") || args.includes("-h")) return { command: "help" }
@@ -15,11 +15,17 @@ export function parseCliArguments(args: readonly string[]): CliOptions {
   let project = "."
   let projectSet = false
   let diagnosticSession: string | undefined
+  let resumeWorkspaceId: string | undefined
 
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!
     if (argument === "--codex") {
       provider = "codex"
+    } else if (argument === "--resume") {
+      if (resumeWorkspaceId !== undefined) throw new Error("Specify --resume only once")
+      const id = args[++index]
+      if (!id || id.startsWith("-")) throw new Error("--resume requires a workspace ID")
+      resumeWorkspaceId = id
     } else if (argument === "--diagnose-history") {
       if (diagnosticSession !== undefined) throw new Error("Specify --diagnose-history only once")
       const sessionId = args[++index]
@@ -36,10 +42,11 @@ export function parseCliArguments(args: readonly string[]): CliOptions {
   }
 
   if (diagnosticSession !== undefined) {
+    if (resumeWorkspaceId !== undefined) throw new Error("--resume cannot be combined with --diagnose-history")
     if (provider !== "claude") throw new Error("History diagnostics currently support Claude Code only")
     return { command: "diagnose-history", provider, sessionId: diagnosticSession, project }
   }
-  return { command: "run", provider, project }
+  return { command: "run", provider, project, ...(resumeWorkspaceId === undefined ? {} : { resumeWorkspaceId }) }
 }
 
 export async function resolveProjectDirectory(project: string, cwd = process.cwd()): Promise<string> {

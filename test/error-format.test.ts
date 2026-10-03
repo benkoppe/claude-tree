@@ -63,12 +63,12 @@ test("excessive nesting and aggregate width have explicit omission markers", () 
 test("terminal cleanup messages include all issue contexts and underlying failures", () => {
   const cause = new Error("state lock timed out")
   const issues = [
-    { ownerId: "owner-1", sessionId: "session-1", stage: "lease" as const, message: "Unable to release ownership", cause },
+    { ownerId: "owner-1", sessionId: "session-1", stage: "guard" as const, message: "Unable to release ownership", cause },
     { ownerId: "terminal-supervisor", sessionId: "", stage: "runtime" as const, message: "Runtime scope did not close" },
   ]
   const error = new TerminalCleanupError({ operation: "shutdown", issues, ownershipReleased: true })
   expect(error.message).toBe(
-    "Terminal shutdown cleanup failed:\nsession session-1 [lease]: Unable to release ownership\n  Caused by: state lock timed out\nterminal-supervisor [runtime]: Runtime scope did not close",
+    "Terminal shutdown cleanup failed:\nsession session-1 [guard]: Unable to release ownership\n  Caused by: state lock timed out\nterminal-supervisor [runtime]: Runtime scope did not close",
   )
   expect(errorSummary(error)).toBe(error.message)
   expect(errorDetails(error)).toBe(error.message)

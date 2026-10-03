@@ -1,9 +1,13 @@
 import { PROGRAM_NAME } from "./program"
 
-export const CLI_HELP = `${PROGRAM_NAME} [--codex] [PROJECT]
+export const CLI_HELP = `${PROGRAM_NAME} [--codex] [--resume WORKSPACE_ID] [PROJECT]
 
 Explore and run coding-agent conversations for PROJECT (default: current directory).
 Claude Code is used by default; pass --codex to use Codex.
+
+  --resume WORKSPACE_ID
+    Restore saved navigation and reopen the visible provider session, if any.
+    Hidden agents are not restarted. Find the current resume command in About.
 
 History diagnostics (Claude Code):
   --diagnose-history SESSION_ID [PROJECT]

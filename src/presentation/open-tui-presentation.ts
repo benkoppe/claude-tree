@@ -74,6 +74,7 @@ export interface OpenTuiProviderIdentity {
 }
 
 export interface OpenTuiPresentationOptions {
+  readonly resumeCommand?: string
   readonly setProcessTitle?: (title: string) => void
   readonly setTerminalTitle?: (title: string) => void
 }
@@ -1107,7 +1108,7 @@ class OpenTuiPresentationController {
 
   private completeConfirmation(choice: "confirm" | "cancel"): void {
     const modal = this.viewModel?.modal
-    if (!modal || (modal._tag !== "ConfirmRemoval" && modal._tag !== "ConfirmStop" && modal._tag !== "ConfirmStopTree")) return
+    if (!modal || (modal._tag !== "ConfirmRemoval" && modal._tag !== "ConfirmStop" && modal._tag !== "ConfirmStopTree" && modal._tag !== "ConfirmOpenSession")) return
     if (choice === "cancel") {
       this.enqueue(this.appRuntime.closeModal)
       return
@@ -1121,7 +1122,9 @@ class OpenTuiPresentationController {
     const self = this
     this.runAction(Effect.gen(function*() {
       yield* self.appRuntime.closeModal
-      if (modal._tag === "ConfirmStopTree") {
+      if (modal._tag === "ConfirmOpenSession") {
+        yield* self.appRuntime.resumeSession(modal.sessionId, true)
+      } else if (modal._tag === "ConfirmStopTree") {
         if (!self.isStopTreeTargetActionable(modal)) return
         const sessionIds = modal.sessionIds.filter((id) => self.viewModel?.liveSessionIds.has(id))
         const results = yield* Effect.forEach(sessionIds, (id) => self.appRuntime.stopSession(id).pipe(Effect.result), {
@@ -1233,6 +1236,7 @@ class OpenTuiPresentationController {
     this.pendingMouseAction = null
     if (modal?._tag === "ConfirmStop" || modal?._tag === "ConfirmStopTree") this.modalChoice = "confirm"
     if (modal?._tag === "ConfirmRemoval") this.modalChoice = "cancel"
+    if (modal?._tag === "ConfirmOpenSession") this.modalChoice = "cancel"
   }
 
   private issueDetails(): readonly string[] {
@@ -1435,7 +1439,7 @@ class OpenTuiPresentationController {
       this.dialogBody.content = this.pickerContent(picker, rows)
       this.dialogActions.visible = false
     } else if (modal) {
-      const content = modalContent(modal)
+      const content = modalContent(modal, this.options.resumeCommand)
       const about = modal._tag === "About"
       const error = modal._tag === "Error"
       if (error && modal.message !== this.errorMessage) {
@@ -1507,7 +1511,7 @@ class OpenTuiPresentationController {
       ]),
       chunk(this.errorCopyLabel(), theme.textMuted, TextAttributes.NONE, theme.element),
     ])
-    const label = modal._tag === "ConfirmStopTree" ? "Kill" : modal._tag === "ConfirmStop" ? "Stop" : "Delete"
+    const label = modal._tag === "ConfirmOpenSession" ? "Open anyway" : modal._tag === "ConfirmStopTree" ? "Kill" : modal._tag === "ConfirmStop" ? "Stop" : "Delete"
     return styledText([
       chunk(
         "Cancel",
@@ -1773,7 +1777,7 @@ class OpenTuiPresentationController {
     if (this.leafPicker) {
       this.leafPicker = null
       this.render()
-    } else if (this.viewModel?.modal?._tag === "ConfirmRemoval" || this.viewModel?.modal?._tag === "ConfirmStop" || this.viewModel?.modal?._tag === "ConfirmStopTree") {
+    } else if (this.viewModel?.modal?._tag === "ConfirmRemoval" || this.viewModel?.modal?._tag === "ConfirmStop" || this.viewModel?.modal?._tag === "ConfirmStopTree" || this.viewModel?.modal?._tag === "ConfirmOpenSession") {
       this.completeConfirmation("cancel")
     } else if (this.viewModel?.modal) {
       this.enqueue(this.appRuntime.closeModal)
@@ -2033,7 +2037,7 @@ class OpenTuiPresentationController {
   }
 }
 
-function modalContent(modal: ApplicationModal): {
+function modalContent(modal: ApplicationModal, resumeCommand?: string): {
   readonly title: string
   readonly body: string | ReturnType<typeof styledText>
 } {
@@ -2043,6 +2047,7 @@ function modalContent(modal: ApplicationModal): {
       body: styledText([
         chunk(PROGRAM_NAME, theme.text, TextAttributes.BOLD, theme.element),
         chunk(`\nVersion ${PROGRAM_VERSION}`, theme.textMuted, TextAttributes.NONE, theme.element),
+        ...(resumeCommand ? [chunk(`\n\nResume this workspace:\n${resumeCommand}`, theme.text, TextAttributes.NONE, theme.element)] : []),
         chunk(
           "\n\nNote: Branches are not isolated. All conversations share this working directory and can modify the same files.",
           theme.warning,
@@ -2053,6 +2058,10 @@ function modalContent(modal: ApplicationModal): {
     }
   }
   if (modal._tag === "Error") return { title: "Error", body: modal.message }
+  if (modal._tag === "ConfirmOpenSession") return {
+    title: "Session already open",
+    body: `Another claude-tree instance (PID ${modal.ownerPid}) has this session open.\n\nOpening it again may cause conflicting writes to the conversation. Open anyway does not stop the other instance.`,
+  }
   if (modal._tag === "ConfirmStopTree") {
     return {
       title: "Kill tree terminals",
