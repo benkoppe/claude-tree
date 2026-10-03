@@ -13,7 +13,9 @@ import {
 } from "../../src/domain/errors"
 import {
   CodexCleanupError,
+  CodexConnectionError,
   CodexProcessError,
+  CodexProtocolError,
   CodexMutationAmbiguousError,
   CodexRequestTimeout,
   CodexRpcError,
@@ -48,6 +50,7 @@ import {
   type CodexTuiProxyTransitionRequest,
 } from "../../src/infrastructure/providers/codex/tui-proxy"
 import type {
+  ProviderTerminalEvent,
   TerminalTransitionAcknowledgmentError,
   TerminalTransitionRequest,
 } from "../../src/services/provider"
@@ -161,19 +164,47 @@ describe("Effect Codex provider", () => {
     })
     const deadlineError = await Effect.runPromise(Effect.flip(deadline.loadSessionSnapshot))
     expect(deadlineError.message).toContain("overall deadline")
+  })
 
-    const branchDeadline = providerWith(fakeClient({
-      readThread: () => Effect.succeed(thread(ROOT, [turn("parent-turn", "completed", [
-        { id: "parent-agent", type: "agentMessage", text: "Answer" },
-      ])])),
-      forkThread: () => Effect.never,
-    }), { metadataDeadlineMs: 10 })
-    const branchOutcome = await Effect.runPromise(
-      branchDeadline.branchFrom({ sessionId: ROOT, messageId: "parent-agent" }),
-    )
-    expect(branchOutcome._tag).toBe("AmbiguousBranchMutation")
-    if (branchOutcome._tag !== "AmbiguousBranchMutation") throw new Error("expected ambiguity")
-    expect(branchOutcome.reason).toContain("overall deadline after thread/fork dispatch")
+  test("default metadata waits beyond former deadlines and cancellation closes its server", async () => {
+    const ready = Deferred.makeUnsafe<void>()
+    const reply = Deferred.makeUnsafe<{ data: CodexThread[]; nextCursor: null }>()
+    let closed = 0
+    const provider = providerWith(fakeClient({
+      listThreads: () => Effect.sync(() => Deferred.doneUnsafe(ready, Effect.void)).pipe(Effect.andThen(Deferred.await(reply))),
+      close: () => Effect.sync(() => { closed++ }),
+    }))
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const task = yield* Effect.forkChild(provider.loadSessionSnapshot)
+      yield* Deferred.await(ready)
+      yield* TestClock.adjust(60_000)
+      yield* Deferred.succeed(reply, { data: [], nextCursor: null })
+      expect((yield* Fiber.join(task)).sessions).toEqual([])
+      const stalled = providerWith(fakeClient({ listThreads: () => Effect.never, close: () => Effect.sync(() => { closed++ }) }))
+      const cancelled = yield* Effect.forkChild(stalled.loadSessionSnapshot)
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(cancelled)
+      expect(closed).toBeGreaterThanOrEqual(2)
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("unlimited metadata retains an independent finite cleanup observation", async () => {
+    const closing = Deferred.makeUnsafe<void>()
+    const provider = providerWith(fakeClient({
+      listThreads: () => Effect.succeed({ data: [], nextCursor: null }),
+      close: () => Effect.sync(() => Deferred.doneUnsafe(closing, Effect.void)).pipe(Effect.andThen(Effect.never)),
+    }), { metadataCleanupTimeoutMs: 10 })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const task = yield* Effect.forkChild(provider.loadSessionSnapshot.pipe(Effect.flip))
+      yield* Deferred.await(closing)
+      yield* TestClock.adjust(10)
+      expect((yield* Fiber.join(task)).message).toContain("cleanup exceeded 10ms")
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test.each([0, -1, Infinity, NaN])("rejects invalid metadata patience (%s)", (value) => {
+    expect(() => providerWith(fakeClient(), { metadataDeadlineMs: value })).toThrow(RangeError)
+    expect(() => providerWith(fakeClient(), { metadataCleanupTimeoutMs: value })).toThrow(RangeError)
   })
 
   test("uses one scoped app-server for list and all snapshot reads", async () => {
@@ -1076,6 +1107,32 @@ describe("Effect Codex provider", () => {
     expect(proxyRollback.cause).toBeInstanceOf(AggregateError)
   })
 
+  test("readiness and proxy acquisition have no default productive deadline", async () => {
+    const readinessStarted = Deferred.makeUnsafe<void>()
+    const ready = Deferred.makeUnsafe<void>()
+    const proxyStarted = Deferred.makeUnsafe<void>()
+    const proxyDone = Deferred.makeUnsafe<void>()
+    let closes = 0
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const task = yield* Effect.forkChild(Effect.scoped(makeObservedServices("codex", ROOT, {
+        sidecarFactory: () => Effect.succeed(fakeSidecar(() => Effect.sync(() => { closes++ }))),
+        waitUntilReady: () => Effect.sync(() => Deferred.doneUnsafe(readinessStarted, Effect.void)).pipe(Effect.andThen(Deferred.await(ready))),
+        proxyFactory: () => Effect.sync(() => Deferred.doneUnsafe(proxyStarted, Effect.void)).pipe(
+          Effect.andThen(Deferred.await(proxyDone)),
+          Effect.andThen(Effect.fail(new CodexTuiProxyError({ operation: "listen", message: "explicit proxy failure" }))),
+        ),
+      })).pipe(Effect.flip))
+      yield* Deferred.await(readinessStarted)
+      yield* TestClock.adjust(60_000)
+      yield* Deferred.succeed(ready, undefined)
+      yield* Deferred.await(proxyStarted)
+      yield* TestClock.adjust(60_000)
+      yield* Deferred.succeed(proxyDone, undefined)
+      expect((yield* Fiber.join(task)).message).toBe("explicit proxy failure")
+      expect(closes).toBe(1)
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
   test("interrupts readiness and settles sidecar rollback before acquisition exits", async () => {
     let closes = 0
     const exit = await Effect.runPromise(Effect.gen(function*() {
@@ -1100,6 +1157,149 @@ describe("Effect Codex provider", () => {
 
     expect(exit._tag).toBe("Failure")
     expect(closes).toBe(1)
+  })
+
+  test("sidecar process exit ends connected initialization even while its connection remains open", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const connected = yield* Deferred.make<void>()
+      let resolveExit!: (code: number) => void
+      let closes = 0
+      let connectionOpen = false
+      let connectionClosed = false
+      const sidecar = fakeSidecar(() => Effect.sync(() => { closes++ }))
+      Object.assign(sidecar.process, { exited: new Promise<number>((resolve) => { resolveExit = resolve }) })
+      Object.assign(sidecar, { stderr: Effect.succeed("startup failed") })
+      const task = yield* Effect.forkChild(Effect.scoped(makeObservedServices("codex", ROOT, {
+        sidecarFactory: () => Effect.succeed(sidecar),
+        connectSidecar: () => Effect.gen(function*() {
+          yield* Effect.acquireRelease(
+            Effect.sync(() => { connectionOpen = true }),
+            () => Effect.sync(() => { connectionClosed = true }),
+          )
+          yield* Deferred.succeed(connected, undefined)
+          return yield* Effect.never
+        }),
+        proxyFactory: () => Effect.die("must not acquire proxy after process exit"),
+      })).pipe(Effect.flip))
+      yield* Deferred.await(connected)
+      yield* TestClock.adjust(120_000)
+      expect(task.pollUnsafe()).toBeUndefined()
+      expect(connectionOpen).toBeTrue()
+      expect(connectionClosed).toBeFalse()
+      Object.assign(sidecar.process, { exitCode: 7 })
+      resolveExit(7)
+      const error = yield* Fiber.join(task)
+      expect(error).toBeInstanceOf(CodexSidecarError)
+      expect(error.message).toBe("Codex app-server exited during startup with code 7: startup failed")
+      expect(connectionClosed).toBeTrue()
+      expect(closes).toBe(1)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("healthy connection and initialization wait beyond former budgets without restarting", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const connecting = yield* Deferred.make<void>()
+      const connected = yield* Deferred.make<void>()
+      const openConnection = yield* Deferred.make<void>()
+      const initialized = yield* Deferred.make<void>()
+      let attempts = 0
+      let closes = 0
+      const task = yield* Effect.forkChild(makeObservedServices("codex", ROOT, {
+        sidecarFactory: () => Effect.succeed(fakeSidecar(() => Effect.sync(() => { closes++ }))),
+        connectSidecar: (_url, options) => Effect.gen(function*() {
+          attempts++
+          expect(options.connectTimeoutMs).toBeUndefined()
+          expect(options.requestTimeoutMs).toBeUndefined()
+          yield* Deferred.succeed(connecting, undefined)
+          yield* Deferred.await(openConnection)
+          yield* Deferred.succeed(connected, undefined)
+          yield* Deferred.await(initialized)
+          return fakeClient()
+        }),
+        proxyFactory: () => Effect.gen(function*() {
+          return {
+            remoteUrl: "ws://127.0.0.1:12346",
+            transitions: yield* PubSub.unbounded<CodexTuiProxyTransitionRequest>(),
+            providerEvents: yield* PubSub.unbounded<ProviderTerminalEvent>(),
+            close: () => Effect.void,
+          }
+        }),
+      }))
+      yield* Deferred.await(connecting)
+      yield* TestClock.adjust(120_000)
+      expect(task.pollUnsafe()).toBeUndefined()
+      expect(attempts).toBe(1)
+      yield* Deferred.succeed(openConnection, undefined)
+      yield* Deferred.await(connected)
+      yield* TestClock.adjust(120_000)
+      expect(task.pollUnsafe()).toBeUndefined()
+      expect(attempts).toBe(1)
+      yield* Deferred.succeed(initialized, undefined)
+      const services = yield* Fiber.join(task)
+      expect(services.remoteUrl).toBe("ws://127.0.0.1:12346")
+      yield* services.close()
+      expect(closes).toBe(1)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("cancellation interrupts an indefinitely pending connection and rolls back", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const connecting = yield* Deferred.make<void>()
+      let interrupted = false
+      let closes = 0
+      const task = yield* Effect.forkChild(makeObservedServices("codex", ROOT, {
+        sidecarFactory: () => Effect.succeed(fakeSidecar(() => Effect.sync(() => { closes++ }))),
+        connectSidecar: () => Deferred.succeed(connecting, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.onInterrupt(() => Effect.sync(() => { interrupted = true })),
+        ),
+      }))
+      yield* Deferred.await(connecting)
+      yield* TestClock.adjust(120_000)
+      yield* Fiber.interrupt(task)
+      expect(interrupted).toBeTrue()
+      expect(closes).toBe(1)
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  for (const error of [
+    new CodexConnectionError({ url: "ws://127.0.0.1:12345", message: "Unauthorized" }),
+    new CodexProtocolError({ operation: "initialize", message: "Invalid initialization response" }),
+  ]) {
+    test(`startup does not retry ${error._tag} auth/protocol failure`, async () => {
+      let attempts = 0
+      let closes = 0
+      const failure = await Effect.runPromise(Effect.flip(Effect.scoped(makeObservedServices("codex", ROOT, {
+        sidecarFactory: () => Effect.succeed(fakeSidecar(() => Effect.sync(() => { closes++ }))),
+        connectSidecar: () => Effect.suspend(() => { attempts++; return Effect.fail(error) }),
+      }))))
+      expect(failure).toBe(error)
+      expect(attempts).toBe(1)
+      expect(closes).toBe(1)
+    })
+  }
+
+  test("startup retries affirmative connection refusal without a total deadline", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const refused = yield* Deferred.make<void>()
+      let attempts = 0
+      const terminalFailure = new CodexProtocolError({ operation: "initialize", message: "Invalid response" })
+      const task = yield* Effect.forkChild(makeObservedServices("codex", ROOT, {
+        sidecarFactory: () => Effect.succeed(fakeSidecar(() => Effect.void)),
+        connectSidecar: () => Effect.suspend((): Effect.Effect<never, CodexAppServerError> => {
+          attempts++
+          return attempts === 1
+            ? Deferred.succeed(refused, undefined).pipe(Effect.andThen(Effect.fail(new CodexConnectionError({
+                url: "ws://127.0.0.1:12345", message: "ECONNREFUSED", retryable: true,
+              }))))
+            : Effect.fail(terminalFailure)
+        }),
+      }).pipe(Effect.flip))
+      yield* Deferred.await(refused)
+      yield* TestClock.adjust(120_000)
+      expect(yield* Fiber.join(task)).toBe(terminalFailure)
+      expect(attempts).toBe(2)
+    }).pipe(Effect.provide(TestClock.layer()))))
   })
 })
 

@@ -17,7 +17,7 @@ import type {
   PreparedTerminal,
   ValidatedBranch,
 } from "../services/provider"
-import type { TerminalSupervisorApi } from "../services/terminal-supervisor"
+import type { TerminalCleanupError, TerminalSupervisorApi } from "../services/terminal-supervisor"
 export type ApplicationMetadataFacet = Pick<
   ProviderStateRepositoryApi,
   | "instanceId"
@@ -58,7 +58,7 @@ export interface ApplicationOperations {
     readonly sessionId: string | null
     readonly drafts: ReadonlyMap<string, import("../domain/model").DraftPreview>
   }>
-  readonly stop: TerminalSupervisorApi["stopSession"]
+  readonly stop: (sessionId: string, expectedOwnerId: string) => Effect.Effect<boolean, TerminalCleanupError>
   readonly commitRemoval: (
     removal: ConversationRemoval,
     affectedSessionIds: readonly string[],
@@ -131,7 +131,7 @@ export function makeApplicationOperations(options: {
       sessionId: options.terminals.hideActive,
       drafts: options.terminals.draftPreviews,
     })),
-    stop: (sessionId) => Effect.suspend(() => options.terminals.stopSession(sessionId)),
+    stop: (sessionId, expectedOwnerId) => Effect.suspend(() => options.terminals.stopSession(sessionId, undefined, expectedOwnerId)),
     commitRemoval: (removal, affectedSessionIds, mutationToken) => Effect.suspend(() =>
       options.metadata.commitRemoval(removal, affectedSessionIds, mutationToken)),
   }

@@ -5,7 +5,6 @@ import {
   Deferred,
   Effect,
   Exit,
-  Fiber,
   Option,
   Queue,
   Scope,
@@ -45,8 +44,11 @@ import type {
   TerminalSupervisorEvents,
 } from "../services/terminal-supervisor"
 import { TerminalCleanupError } from "../services/terminal-supervisor"
+import { replaceSessionIdInProjectState } from "../services/provider-state-repository"
+import { HISTORY_RETRY_DELAYS_MS, HISTORY_CONFIRMATION_DELAY_MS } from "../services/lifecycle-policy"
 import { causeFailures, errorDetails, errorSummary as errorMessage } from "../error-format"
 import { makeNavigationWriter } from "./navigation-writer"
+import { makeCommandExecutor, type CommandCompleted } from "./command-executor"
 import { describeSession, selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
   makeApplicationOperations,
@@ -88,12 +90,12 @@ import {
   type ApplicationViewModel,
 } from "./view-model"
 
-const DEFAULT_COMPLETION_DELAYS_MS = [100, 250, 500, 1_000] as const
+const DEFAULT_COMPLETION_DELAYS_MS = HISTORY_RETRY_DELAYS_MS
 const DEFAULT_SHUTDOWN_NAVIGATION_TIMEOUT_MS = 500
 const DEFAULT_SHUTDOWN_TRANSITION_TIMEOUT_MS = 500
 const COMMAND_SCOPE_CLOSE_TIMEOUT_MS = 100
 const RECONCILIATION_FAILURE_BACKOFF_MS = 100
-const TRANSCRIPT_CONFIRMATION_DELAY_MS = 100
+const TRANSCRIPT_CONFIRMATION_DELAY_MS = HISTORY_CONFIRMATION_DELAY_MS
 
 export interface AppRuntimeOptions {
   readonly provider: AgentProviderApi
@@ -138,13 +140,7 @@ export interface AppRuntime {
   readonly shutdown: Effect.Effect<void, ApplicationShutdownError>
 }
 
-type CommandCompletedMessage = {
-  readonly _tag: "CommandCompleted"
-  readonly key: string
-  readonly token: number
-  readonly command: ActorCommand
-  readonly exit: Exit.Exit<unknown, unknown>
-}
+type CommandCompletedMessage = CommandCompleted<ActorCommand>
 
 interface RefreshResult {
   readonly snapshot: AgentSessionSnapshot
@@ -175,14 +171,14 @@ type ActorCommand =
   | { readonly _tag: "PrepareNew"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Branch"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Show"; readonly prepared: PreparedTerminal; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "Show"; readonly prepared: PreparedTerminal; readonly identityGeneration: number; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Hide"; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Stop"; readonly sessionId: string; readonly identityGeneration: number; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "Stop"; readonly sessionId: string; readonly ownerId: string; readonly identityGeneration: number; readonly reply: IntentEnvelope["reply"] }
   | {
       readonly _tag: "Remove"
       readonly workflowKey: string
       readonly step:
-        | { readonly _tag: "Stop"; readonly sessionId: string }
+        | { readonly _tag: "Stop"; readonly sessionId: string; readonly ownerId: string }
         | {
             readonly _tag: "Commit"
             readonly removal: ConversationRemoval
@@ -195,12 +191,6 @@ type ActorCommand =
   | { readonly _tag: "Navigation"; readonly navigation: NavigationState; readonly reply?: IntentEnvelope["reply"] }
   | { readonly _tag: "CompletionTimer"; readonly sessionId: string; readonly ownerId: string; readonly version: number }
   | { readonly _tag: "SubmissionTimer"; readonly sessionId: string; readonly ownerId: string; readonly revision: number }
-
-interface ActiveCommand {
-  readonly token: number
-  readonly command: ActorCommand
-  fiber?: Fiber.Fiber<void, never>
-}
 
 interface OwnerCursor {
   sessionId: string
@@ -256,7 +246,10 @@ export function makeAppRuntime(
     const preparedTerminals = new Map<string, PreparedTerminal>()
     const owners = new Map<string, OwnerCursor>()
     const unclaimedOwnerEvents = new Map<string, OwnerCursor["buffered"]>()
-    const activeCommands = new Map<string, ActiveCommand>()
+    const commandExecutor = makeCommandExecutor<ActorCommand>(commandScope, (completion) => Queue.offer(
+      completion.command._tag === "AcknowledgeTransition" ? controlInbox : inbox, completion,
+    ))
+    const activeCommands = commandExecutor.active
     const pendingRemovals = new Map<string, PendingRemoval>()
     const pendingTransitionAcknowledgments = new Map<string, DeferredType.Deferred<void, unknown>>()
     const completionDelays = options.completionDelaysMs ?? DEFAULT_COMPLETION_DELAYS_MS
@@ -397,28 +390,7 @@ export function makeAppRuntime(
         return
       }
       const token = nextCommandToken++
-      activeCommands.set(key, { token, command })
-      const run = effect.pipe(
-        Effect.onExit((exit) => {
-          const completion: CommandCompletedMessage = {
-            _tag: "CommandCompleted",
-            key,
-            token,
-            command,
-            exit,
-          }
-          return Queue.offer(
-            command._tag === "AcknowledgeTransition" ? controlInbox : inbox,
-            completion,
-          )
-        }),
-        Effect.exit,
-        Effect.asVoid,
-      )
-      const fiber = yield* Effect.forkIn(run, commandScope)
-      const active = activeCommands.get(key)
-      if (active?.token === token) active.fiber = fiber
-      else fiber.interruptUnsafe()
+      yield* commandExecutor.start(key, token, command, effect)
     })
 
     const navigatorSurface = (sessionId?: string): NavigatorSurface => {
@@ -569,7 +541,8 @@ export function makeAppRuntime(
           }))
           return
         }
-        if ([...owners.values()].some((cursor) => cursor.transitioning && affected.has(cursor.sessionId))) {
+        if ([...owners.values()].some((cursor) => cursor.transitioning && affected.has(cursor.sessionId)) ||
+          [...activeCommands.values()].some(({ command }) => command._tag === "AcknowledgeTransition" && affected.has(command.event.session.id))) {
           return
         }
 
@@ -578,14 +551,20 @@ export function makeAppRuntime(
           !workflow.attemptedSessionIds.has(candidate) &&
           !workflow.stoppedSessionIds.has(candidate))
         if (sessionId !== undefined) {
+          const ownerId = state.terminals.get(sessionId)?.ownerId
+          if (!ownerId) {
+            pendingRemovals.delete(key)
+            yield* failReply(workflow.reply, "Remove", "Stop session", new Error(`Session ${sessionId} has no registered terminal owner`))
+            return
+          }
           workflow.attemptedSessionIds.add(sessionId)
           yield* publish({ _tag: "TerminalStopping", sessionId })
           yield* launch(key, {
             _tag: "Remove",
             workflowKey: key,
-            step: { _tag: "Stop", sessionId },
+            step: { _tag: "Stop", sessionId, ownerId },
             reply: workflow.reply,
-          }, operations.stop(sessionId), false)
+          }, operations.stop(sessionId, ownerId), false)
           return
         }
 
@@ -682,6 +661,7 @@ export function makeAppRuntime(
           )
       yield* launch("terminal:show", {
         _tag: "Show",
+        identityGeneration,
         prepared,
         restoreTo,
         reportFailure,
@@ -739,7 +719,7 @@ export function makeAppRuntime(
             if (eventSessionId === sessionId) {
               yield* failTerminalBarrier(
                 message,
-                transitionRejected(`terminal opening failed for ${sessionId}`),
+                transitionRejected(`terminal owner was not claimed for ${sessionId}`),
               )
             } else retained.push(message)
           }
@@ -837,8 +817,9 @@ export function makeAppRuntime(
         if (event.exitCode !== 0 || event.cleanupError) {
           const details = [
             event.exitCode === 0 ? undefined : `Agent session exited with code ${event.exitCode}`,
+            event.exitCode !== 0 && event.outputTail ? `Terminal output:\n${event.outputTail}` : undefined,
             event.cleanupError ? errorMessage(event.cleanupError) : undefined,
-          ].filter((value): value is string => value !== undefined).join("; ")
+          ].filter((value): value is string => value !== undefined).join("\n\n")
           yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: details } })
         }
         if (focusExitedSession) yield* startNavigation(state.surface)
@@ -1194,8 +1175,19 @@ export function makeAppRuntime(
           return
         }
         const ownerId = exit.value as string
-        const sessionId = command.prepared.session.id
-        yield* publish({ _tag: "TerminalShown", sessionId, ownerId, returnTo: command.restoreTo })
+        const sessionId = owners.get(ownerId)?.sessionId ?? command.prepared.session.id
+        let returnNavigation = navigationForSurface(command.restoreTo)
+        for (const transition of identityTransitions) {
+          if (transition.generation <= command.identityGeneration) continue
+          returnNavigation = replaceSessionIdInProjectState({ relations: [], removals: [], navigation: returnNavigation },
+            transition.previousSessionId, transition.sessionId, transition).navigation!
+        }
+        const returnTo: NavigatorSurface = returnNavigation.view === "graph"
+          ? { _tag: "Graph", familySessionId: returnNavigation.familySessionId, target: returnNavigation.target }
+          : command.restoreTo._tag === "Roots" && returnNavigation.view === "roots"
+            ? { _tag: "Roots", selectedSessionId: returnNavigation.selectedSessionId }
+            : command.restoreTo
+        yield* publish({ _tag: "TerminalShown", sessionId, ownerId, returnTo })
         const cursor = owners.get(ownerId) ?? {
           sessionId,
           lastSequenceId: 0,
@@ -1207,6 +1199,7 @@ export function makeAppRuntime(
         cursor.navigationGeneration = navigationGeneration
         owners.set(ownerId, cursor)
         yield* claimBufferedOwnerEvents(ownerId)
+        yield* rejectUnclaimedSessionEvents(command.prepared.session.id)
         yield* startNavigation(state.surface, command.reply)
         return
       }
@@ -1235,17 +1228,26 @@ export function makeAppRuntime(
 
       if (command._tag === "Stop") {
         const sessionId = currentSessionId(command.sessionId, command.identityGeneration)
+        const matchesOwner = state.terminals.get(sessionId)?.ownerId === command.ownerId
+        if (Exit.isSuccess(exit) && exit.value !== true) {
+          yield* failReply(command.reply, "StopSession", "Stop session", new Error(`Terminal owner ${command.ownerId} was not found; stop was not confirmed`))
+          return
+        }
         if (Exit.isFailure(exit)) {
           const cause = Cause.squash(exit.cause)
           const cleanupIncomplete = !(cause instanceof TerminalCleanupError && cause.ownershipReleased)
           const ownerId = state.terminals.get(sessionId)?.ownerId
-          yield* publish({ _tag: "TerminalStopped", sessionId, cleanupIncomplete })
-          if (!cleanupIncomplete) {
+          if (matchesOwner) yield* publish({ _tag: "TerminalStopped", sessionId, cleanupIncomplete })
+          if (matchesOwner && !cleanupIncomplete) {
             preparedTerminals.delete(sessionId)
             if (ownerId) owners.delete(ownerId)
             yield* startRefresh("stop", new Set([sessionId]), ownerId)
           }
           yield* failReply(command.reply, "StopSession", "Stop session", cause)
+          return
+        }
+        if (!matchesOwner) {
+          yield* Deferred.succeed(command.reply, undefined)
           return
         }
         const terminal = state.terminals.get(sessionId)
@@ -1269,7 +1271,7 @@ export function makeAppRuntime(
           const failedSessionId = command.step._tag === "Stop"
             ? currentSessionId(command.step.sessionId, workflow.identityGeneration)
             : undefined
-          if (failedSessionId !== undefined) {
+          if (failedSessionId !== undefined && command.step._tag === "Stop" && state.terminals.get(failedSessionId)?.ownerId === command.step.ownerId) {
             const cleanupIncomplete = !(cause instanceof TerminalCleanupError && cause.ownershipReleased)
             const ownerId = state.terminals.get(failedSessionId)?.ownerId
             yield* publish({
@@ -1303,11 +1305,21 @@ export function makeAppRuntime(
         }
 
         if (command.step._tag === "Stop") {
-          if (exit.value as boolean) {
-            const sessionId = currentSessionId(command.step.sessionId, workflow.identityGeneration)
-            workflow.stoppedSessionIds.add(sessionId)
-            const ownerId = state.terminals.get(sessionId)?.ownerId
-            if (ownerId) owners.delete(ownerId)
+          if (exit.value !== true) {
+            pendingRemovals.delete(command.workflowKey)
+            yield* failReply(command.reply, "Remove", "Stop session", new Error(`Terminal owner ${command.step.ownerId} was not found; removal cannot proceed`))
+            return
+          }
+          const sessionId = currentSessionId(command.step.sessionId, workflow.identityGeneration)
+          const ownerId = state.terminals.get(sessionId)?.ownerId
+          if (ownerId !== undefined && ownerId !== command.step.ownerId) {
+            pendingRemovals.delete(command.workflowKey)
+            yield* failReply(command.reply, "Remove", "Stop session", new Error(`Session ${sessionId} has a replacement terminal owner; removal cannot proceed`))
+            return
+          }
+          workflow.stoppedSessionIds.add(sessionId)
+          if (ownerId === command.step.ownerId) {
+            owners.delete(ownerId)
             preparedTerminals.delete(sessionId)
             yield* publish({ _tag: "TerminalStopped", sessionId })
           }
@@ -1562,6 +1574,10 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not running`)
               return
             }
+            if (!terminal.ownerId) {
+              yield* reject(envelope.reply, intent._tag, "busy", `Session ${sessionId} has no registered terminal owner`)
+              return
+            }
             if (activeCommands.has(`stop:${sessionId}`)) {
               yield* reject(envelope.reply, intent._tag, "busy", `Session ${sessionId} is already stopping`)
               return
@@ -1570,9 +1586,10 @@ export function makeAppRuntime(
             yield* launch(`stop:${sessionId}`, {
               _tag: "Stop",
               sessionId,
+              ownerId: terminal.ownerId,
               identityGeneration,
               reply: envelope.reply,
-            }, operations.stop(sessionId), false)
+            }, operations.stop(sessionId, terminal.ownerId), false)
             return
           }
           case "Remove": {

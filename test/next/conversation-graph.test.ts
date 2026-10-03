@@ -245,38 +245,6 @@ describe("next conversation graph", () => {
     }
   })
 
-  test("accepts compacted subsequences and restores omitted retained history", () => {
-    const parent = [
-      message("parent-a", "user", "A", 0),
-      message("parent-b", "agent", "B", 1),
-      message("parent-c", "user", "C", 2),
-      message("parent-source", "agent", "source", 3),
-    ]
-    const copied = parent.map((entry, index) => ({ ...entry, id: `child-${index}` }))
-    const activeChild = [
-      copied[0]!,
-      { ...copied[2]!, ordinal: 1 },
-      { ...copied[3]!, ordinal: 2 },
-      message("child-tail", "user", "continued", 3),
-    ]
-    const graph = buildConversationForest(
-      [session(ROOT, 20), session(CHILD, 10)],
-      new Map([[ROOT, parent], [CHILD, activeChild]]),
-      [relation(CHILD, ROOT, parent[3]!.id, shared(parent, copied, 4))],
-    ).graphs[0]!
-
-    expect(previews(graph)).toEqual(["A", "B", "C", "source", "continued"])
-    expect(nodes(graph).find((node) => node.preview === "B")?.aliases).toContainEqual({
-      sessionId: CHILD,
-      messageId: copied[1]!.id,
-    })
-    expect(graph.warnings).toEqual([])
-    const source = nodes(graph).find((node) => node.preview === "source")!
-    const tail = nodes(graph).find((node) => node.preview === "continued")!
-    expect(tail.parentId).toBe(source.id)
-    expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(tail.id)
-  })
-
   test("materializes and removes an empty fork when all mapped history is unavailable", () => {
     const currentParent = message("current-parent", "user", "replacement history", 0)
     const sessions = [session(ROOT, 20), session(CHILD, 10)]

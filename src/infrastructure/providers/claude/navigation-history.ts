@@ -237,13 +237,16 @@ function preservationRepairs(
       }
       for (const [id, contextParent] of retained.contextParents) {
         const record = source.get(id)!
-        if (parentOf(record) !== contextParent || !ancestors.has(id)) continue
+        const reanchored = parentOf(record) === retained.anchor
+        if ((parentOf(record) !== contextParent && !reanchored) || !ancestors.has(id)) continue
+        const needsHistoricalParent = id === retained.members[0] || reanchored
         let candidates: ReadonlySet<string | null>
         try {
-          const excluded = new Set([contextParent, ...(headAnchors.get(id) ?? [])])
-          // A head parented to its own summary needs historical evidence. An
-          // internal predecessor may already be an unchanged historical edge.
-          candidates = id === retained.members[0] ? evidence.historicalParents(record, excluded)
+          const excluded = new Set([reanchored ? retained.anchor : contextParent, ...(headAnchors.get(id) ?? [])])
+          // Any member parented directly to its summary needs historical evidence,
+          // including retained attachments. An internal predecessor may already
+          // be an unchanged historical edge.
+          candidates = needsHistoricalParent ? evidence.historicalParents(record, excluded)
             : new Set([...evidence.availableParents(record)].filter((parent) => parent === null || !excluded.has(parent)))
         } catch (error) {
           if (!(error instanceof NavigationHistoryError)) throw error
@@ -257,7 +260,7 @@ function preservationRepairs(
             trace?.decision(retained.boundary.uuid, id, "restore-parent", candidates.size, parent)
             changed = true
           }
-        } else if (candidates.size > 1 || id === retained.members[0]) {
+        } else if (candidates.size > 1 || needsHistoricalParent) {
           trace?.decision(retained.boundary.uuid, id, candidates.size === 0 ? "no-parent" : "conflicting-parents", candidates.size)
           historicalProblems.set(JSON.stringify([retained.boundary.uuid, id]), {
             boundaryId: retained.boundary.uuid, recordId: id,

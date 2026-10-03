@@ -27,9 +27,13 @@ import {
   type TerminalTransitionAcknowledgmentError,
   type TerminalTransitionEvent,
   type TerminalTransitionRequest,
+  type ProviderTerminalEvent,
 } from "../../../services/provider"
+import { PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 import {
   CodexMutationAmbiguousError,
+  CodexConnectionError,
   CodexProtocolError,
   CodexRpcError,
   connectCodexAppServerSidecar,
@@ -59,11 +63,10 @@ import {
 
 const TRANSCRIPT_READ_CONCURRENCY = 16
 const OVERLOAD_RETRY_DELAYS_MS = [25, 50, 100, 200]
-const SIDECAR_START_TIMEOUT_MS = 5_000
-const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = 1_000
+const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS
 const SIDECAR_RETRY_DELAY_MS = 10
 const TOKEN_ENVIRONMENT_VARIABLE = "CLAUDE_TREE_CODEX_TOKEN"
-const METADATA_DEADLINE_MS = 30_000
+const METADATA_CLEANUP_TIMEOUT_MS = 10_000
 const THREAD_LIST_PAGE_LIMIT = 100
 const SNAPSHOT_SESSION_LIMIT = 10_000
 
@@ -86,6 +89,8 @@ export interface CodexObservedServices {
   readonly remoteUrl: string
   readonly bearerToken: string
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly providerEvents?: PubSub.PubSub<ProviderTerminalEvent>
+  readonly failureDetails?: () => string | undefined
   readonly close: () => Effect.Effect<void, CodexObservedServicesError>
 }
 
@@ -108,6 +113,7 @@ export interface CodexObservedServicesDependencies {
     sidecar: CodexSidecar,
   ) => Effect.Effect<void, CodexAppServerError | CodexSidecarError>
   readonly proxyFactory?: typeof makeCodexTuiProxy
+  readonly connectSidecar?: typeof connectCodexAppServerSidecar
 }
 
 export interface CodexProviderRuntimeDependencies {
@@ -126,6 +132,7 @@ export interface CodexProviderOptions {
   readonly transcriptReadConcurrency?: number
   readonly overloadRetryDelaysMs?: readonly number[]
   readonly metadataDeadlineMs?: number
+  readonly metadataCleanupTimeoutMs?: number
   readonly maxThreadListPages?: number
   readonly maxSnapshotSessions?: number
 }
@@ -159,7 +166,8 @@ export class CodexProvider implements AgentProviderApi {
   private readonly canonicalizePath: (path: string) => string | PromiseLike<string>
   private readonly readConcurrency: number
   private readonly overloadRetryDelays: readonly number[]
-  private readonly metadataDeadlineMs: number
+  private readonly metadataDeadlineMs: number | undefined
+  private readonly metadataCleanupTimeoutMs: number
   private readonly maxThreadListPages: number
   private readonly maxSnapshotSessions: number
   private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
@@ -187,7 +195,8 @@ export class CodexProvider implements AgentProviderApi {
       TRANSCRIPT_READ_CONCURRENCY,
     )
     this.overloadRetryDelays = options.overloadRetryDelaysMs ?? OVERLOAD_RETRY_DELAYS_MS
-    this.metadataDeadlineMs = positiveDuration(options.metadataDeadlineMs, METADATA_DEADLINE_MS)
+    this.metadataDeadlineMs = optionalOperationTimeout(options.metadataDeadlineMs)
+    this.metadataCleanupTimeoutMs = optionalOperationTimeout(options.metadataCleanupTimeoutMs) ?? METADATA_CLEANUP_TIMEOUT_MS
     this.maxThreadListPages = positiveInteger(options.maxThreadListPages, THREAD_LIST_PAGE_LIMIT)
     this.maxSnapshotSessions = positiveInteger(options.maxSnapshotSessions, SNAPSHOT_SESSION_LIMIT)
     this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
@@ -380,7 +389,7 @@ export class CodexProvider implements AgentProviderApi {
       reason,
       reconciliation: "full-snapshot",
     })
-    const deadline = Effect.sleep(this.metadataDeadlineMs).pipe(
+    const deadline = Effect.sleep(this.metadataDeadlineMs ?? 0).pipe(
       Effect.tap(() => Effect.sync(() => {
         deadlineExpired = true
       })),
@@ -393,14 +402,12 @@ export class CodexProvider implements AgentProviderApi {
             `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline`,
           ))),
     )
-    return Effect.raceFirst(
-      operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !deadlineExpired
+    const interruptibleOperation = operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !deadlineExpired
         ? Effect.sync(() => this.branchMutationReconciliations.offer(ambiguity(
             "Codex thread/fork was interrupted after dispatch and may have created a child thread",
           )))
-        : Effect.void)),
-      deadline,
-    )
+        : Effect.void))
+    return this.metadataDeadlineMs === undefined ? interruptibleOperation : Effect.raceFirst(interruptibleOperation, deadline)
   }
 
   private withServer<A>(
@@ -468,13 +475,11 @@ export class CodexProvider implements AgentProviderApi {
       return outcome.value
     }))
     if (!bounded) return operationEffect
-    return operationEffect.pipe(Effect.timeoutOrElse({
-      duration: this.metadataDeadlineMs,
-      orElse: () => Effect.fail(this.providerError(
+    return withOperationTimeout(operationEffect, this.metadataDeadlineMs,
+      () => Effect.fail(this.providerError(
         operation,
         `Codex ${operation} exceeded the ${this.metadataDeadlineMs}ms overall deadline`,
-      )),
-    }))
+      )))
   }
 
   private boundedServerCleanup<A, E, R>(
@@ -482,10 +487,10 @@ export class CodexProvider implements AgentProviderApi {
     operation: string,
   ): Effect.Effect<A, E | ProviderError, R> {
     return effect.pipe(Effect.timeoutOrElse({
-      duration: this.metadataDeadlineMs,
+      duration: this.metadataCleanupTimeoutMs,
       orElse: () => Effect.fail(this.providerError(
         operation,
-        `Codex ${operation} app-server cleanup exceeded ${this.metadataDeadlineMs}ms`,
+        `Codex ${operation} app-server cleanup exceeded ${this.metadataCleanupTimeoutMs}ms`,
       )),
     }))
   }
@@ -767,6 +772,8 @@ export class CodexProvider implements AgentProviderApi {
         env: { [TOKEN_ENVIRONMENT_VARIABLE]: observed.bearerToken },
         observer: this.observerFactory(),
         transitions,
+        ...(observed.providerEvents === undefined ? {} : { providerEvents: observed.providerEvents }),
+        ...(observed.failureDetails === undefined ? {} : { failureDetails: observed.failureDetails }),
       }
       return {
         launch,
@@ -1147,14 +1154,23 @@ export function makeObservedServices(
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const sidecar = yield* restore((dependencies.sidecarFactory ?? makeCodexSidecar)(executable))
     const readiness = yield* Effect.exit(
-      restore((dependencies.waitUntilReady ?? waitForSidecar)(sidecar).pipe(
-        Effect.timeoutOrElse({
-          duration: SIDECAR_START_TIMEOUT_MS,
-          orElse: () => Effect.fail(new CodexSidecarError({
+      restore(Effect.raceFirst(
+        dependencies.waitUntilReady
+          ? dependencies.waitUntilReady(sidecar)
+          : waitForSidecar(sidecar, dependencies.connectSidecar),
+        Effect.tryPromise({
+          try: () => sidecar.process.exited,
+          catch: (cause) => new CodexSidecarError({
             operation: "connect",
-            message: `Codex app-server did not become ready within ${SIDECAR_START_TIMEOUT_MS}ms`,
+            message: "Unable to observe Codex app-server exit during startup",
+            cause,
+          }),
+        }).pipe(Effect.flatMap((exitCode) => sidecar.stderr.pipe(
+          Effect.flatMap((detail) => Effect.fail(new CodexSidecarError({
+            operation: "connect",
+            message: `Codex app-server exited during startup with code ${exitCode}${detail ? `: ${detail}` : ""}`,
           })),
-        }),
+        )))),
       )),
     )
     if (Exit.isFailure(readiness)) {
@@ -1177,13 +1193,7 @@ export function makeObservedServices(
       bearerToken: sidecar.bearerToken,
       initialThreadId,
       initialThreadIsTemporary,
-    }).pipe(Effect.timeoutOrElse({
-      duration: SIDECAR_START_TIMEOUT_MS,
-      orElse: () => Effect.fail(new CodexTuiProxyError({
-        operation: "listen",
-        message: `Codex TUI proxy did not start within ${SIDECAR_START_TIMEOUT_MS}ms`,
-      })),
-    }))))
+    })))
     if (Exit.isFailure(proxyAcquisition)) {
       const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
       if (Exit.isFailure(rollback)) {
@@ -1220,6 +1230,17 @@ export function makeObservedServices(
       ...(sidecar.resources === undefined ? {} : { resources: sidecar.resources }),
       bearerToken: sidecar.bearerToken,
       transitions: proxy.transitions,
+      providerEvents: proxy.providerEvents,
+      failureDetails: () => {
+        const exitCode = sidecar.process.exitCode
+        let detail = ""
+        try { detail = Effect.runSync(sidecar.stderr) } catch { /* Diagnostics cannot block cleanup. */ }
+        return [
+          exitCode === null ? "Codex app-server exit was not observed before cleanup."
+            : `Codex app-server exited with code ${exitCode} before cleanup.`,
+          detail.trim(),
+        ].filter(Boolean).join("\n")
+      },
       close,
     }
   }))
@@ -1237,14 +1258,10 @@ function boundedObservedCleanup<A, E>(effect: Effect.Effect<A, E>): Effect.Effec
 
 function waitForSidecar(
   sidecar: CodexSidecar,
+  connectSidecar: typeof connectCodexAppServerSidecar = connectCodexAppServerSidecar,
 ): Effect.Effect<void, CodexAppServerError | CodexSidecarError> {
   return Effect.gen(function*() {
-    const startedAt = yield* Clock.currentTimeMillis
-    const deadline = startedAt + SIDECAR_START_TIMEOUT_MS
-    let lastError: CodexAppServerError | undefined
     while (true) {
-      const now = yield* Clock.currentTimeMillis
-      if (now >= deadline) break
       if (sidecar.process.exitCode !== null) {
         const detail = yield* sidecar.stderr
         return yield* Effect.fail(new CodexSidecarError({
@@ -1253,10 +1270,8 @@ function waitForSidecar(
         }))
       }
       const result = yield* Effect.matchEffect(
-        Effect.scoped(connectCodexAppServerSidecar(sidecar.remoteUrl, {
+        Effect.scoped(connectSidecar(sidecar.remoteUrl, {
           bearerToken: sidecar.bearerToken,
-          connectTimeoutMs: Math.min(250, Math.max(1, deadline - now)),
-          requestTimeoutMs: Math.min(250, Math.max(1, deadline - now)),
           shutdownTimeoutMs: 100,
         })),
         {
@@ -1265,13 +1280,11 @@ function waitForSidecar(
         },
       )
       if (result._tag === "Success") return
-      lastError = result.error
+      if (!(result.error instanceof CodexConnectionError) || !result.error.retryable) {
+        return yield* Effect.fail(result.error)
+      }
       yield* Effect.sleep(SIDECAR_RETRY_DELAY_MS)
     }
-    return yield* Effect.fail(lastError ?? new CodexSidecarError({
-      operation: "connect",
-      message: `Codex app-server did not accept connections within ${SIDECAR_START_TIMEOUT_MS}ms`,
-    }))
   })
 }
 
@@ -1367,10 +1380,6 @@ function isTurnStatus(value: unknown): value is CodexTurnStatus {
 
 function positiveInteger(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback
-}
-
-function positiveDuration(value: number | undefined, fallback: number): number {
-  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback
 }
 
 function errorMessage(error: unknown): string {

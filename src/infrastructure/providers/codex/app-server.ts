@@ -1,12 +1,16 @@
 import { Cause, Data, Deferred, Effect, Exit, FiberSet, Schema, Scope } from "effect"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
+
+import { CodexProtocolError, CodexRpcError, decodeCodexMessage } from "./protocol"
+import { CodexTurnStatusSchema } from "./protocol-schema"
+
+export { CodexProtocolError, CodexRpcError } from "./protocol"
 
 import {
   cleanupProcessGroup,
   type ProcessGroupHandle,
 } from "../../process-group"
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
-const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000
 const DEFAULT_JSONL_RECORD_LIMIT_BYTES = 1_024 * 1_024
 const STDERR_LIMIT_BYTES = 8_192
@@ -76,19 +80,6 @@ export interface CodexThreadListParams {
   readonly sortKey: "updated_at"
 }
 
-export class CodexProtocolError extends Data.TaggedError("CodexProtocolError")<{
-  readonly operation: string
-  readonly message: string
-  readonly cause?: unknown
-}> {}
-
-export class CodexRpcError extends Data.TaggedError("CodexRpcError")<{
-  readonly method: string
-  readonly code: number
-  readonly message: string
-  readonly data?: unknown
-}> {}
-
 export class CodexRequestTimeout extends Data.TaggedError("CodexRequestTimeout")<{
   readonly method: string
   readonly timeoutMs: number
@@ -103,6 +94,7 @@ export class CodexProcessError extends Data.TaggedError("CodexProcessError")<{
 }> {}
 
 export class CodexConnectionError extends Data.TaggedError("CodexConnectionError")<{
+  readonly retryable?: boolean
   readonly url: string
   readonly message: string
   readonly cause?: unknown
@@ -216,12 +208,7 @@ const GitInfoSchema = Schema.Struct({
 const ThreadItemSchema = Schema.Struct({ id: Schema.String, type: Schema.String })
 const TurnSchema = Schema.Struct({
   id: Schema.String,
-  status: Schema.Union([
-    Schema.Literal("completed"),
-    Schema.Literal("interrupted"),
-    Schema.Literal("failed"),
-    Schema.Literal("inProgress"),
-  ]),
+  status: CodexTurnStatusSchema,
   items: Schema.Array(ThreadItemSchema),
 })
 const ThreadSchema = Schema.Struct({
@@ -259,7 +246,7 @@ class ClientImpl implements CodexAppServerClient {
   constructor(
     private readonly transport: CodexTransport,
     private readonly runPromise: ScopedRunPromise,
-    private readonly requestTimeoutMs: number,
+    private readonly requestTimeoutMs: number | undefined,
     private readonly shutdownTimeoutMs: number,
     private readonly maxJsonlRecordBytes: number,
     private readonly maxPendingRequests: number,
@@ -397,19 +384,18 @@ class ClientImpl implements CodexAppServerClient {
       const pending: PendingRequest = { method, deferred, mutation, assigned: false, sent: false }
       const execute = Effect.gen(function*() {
         self.pending.set(id, pending)
-        yield* self.write({ id, method, params }, id).pipe(
-          Effect.catch((error) => Effect.sync(() => self.failAll(error))),
+        return yield* Effect.raceFirst(
+          self.write({ id, method, params }, id).pipe(Effect.andThen(Deferred.await(deferred))),
+          // Termination must settle even a hung write; success still waits for dispatch completion.
+          Deferred.await(deferred).pipe(Effect.flatMap(() => Effect.never)),
         )
-        return yield* Deferred.await(deferred)
       })
-      return yield* execute.pipe(
-        Effect.timeoutOrElse({
-          duration: self.requestTimeoutMs,
-          orElse: () => Effect.fail(self.requestFailure(pending, new CodexRequestTimeout({
+      return yield* withOperationTimeout(execute, self.requestTimeoutMs,
+          () => Effect.fail(self.requestFailure(pending, new CodexRequestTimeout({
             method,
-            timeoutMs: self.requestTimeoutMs,
+            timeoutMs: self.requestTimeoutMs!,
           }))),
-        }),
+      ).pipe(
         Effect.mapError((error) => self.requestFailure(pending, error)),
         Effect.onInterrupt(() => {
           const failure = pending.mutation && pending.sent
@@ -438,13 +424,12 @@ class ClientImpl implements CodexAppServerClient {
   }
 
   private notify(method: string): Effect.Effect<void, CodexAppServerError> {
-    return this.write({ method }).pipe(Effect.timeoutOrElse({
-      duration: this.requestTimeoutMs,
-      orElse: () => Effect.fail(new CodexRequestTimeout({
+    return withOperationTimeout(Effect.suspend(() => this.write({ method })), this.requestTimeoutMs,
+      () => Effect.fail(new CodexRequestTimeout({
         method,
-        timeoutMs: this.requestTimeoutMs,
+        timeoutMs: this.requestTimeoutMs!,
       })),
-    }))
+    )
   }
 
   private write(message: unknown, requestId?: number): Effect.Effect<void, CodexAppServerError> {
@@ -569,6 +554,8 @@ class ClientImpl implements CodexAppServerClient {
     }
     queued.cancelled = true
     queued.phase = "completed"
+    const index = this.writeQueue.indexOf(queued)
+    if (index >= 0) this.writeQueue.splice(index, 1)
     const error = this.failure ?? new CodexProcessError({
       operation: "write",
       message: "Codex app-server write was cancelled before dispatch",
@@ -662,44 +649,19 @@ class ClientImpl implements CodexAppServerClient {
   }
 
   private handleLine(line: string): void {
-    let message: unknown
+    let message: ReturnType<typeof decodeCodexMessage>
     try {
-      message = JSON.parse(line)
+      message = decodeCodexMessage(line)
     } catch (cause) {
-      this.failProtocol("read", "Codex app-server emitted invalid JSONL", cause)
+      this.failAll(cause instanceof CodexProtocolError
+        ? cause
+        : new CodexProtocolError({ operation: "read", message: "Unable to decode Codex app-server message", cause }))
       return
     }
-    if (!isRecord(message)) {
-      this.failProtocol("read", "Codex app-server emitted a non-object message")
-      return
-    }
-
-    const hasId = Object.hasOwn(message, "id")
-    const hasMethod = Object.hasOwn(message, "method")
-    if (hasMethod) {
-      if (typeof message.method !== "string") {
-        this.failProtocol("read", "Codex app-server emitted a non-string method")
-        return
-      }
-      if (!hasId) return
-      if (typeof message.id !== "number" && typeof message.id !== "string") {
-        this.failProtocol("read", "Codex app-server emitted a server request with an invalid id")
-        return
-      }
-      const response = this.runPromise(this.write({
-        id: message.id,
-        error: { code: -32601, message: `Unsupported server request: ${message.method}` },
-      }).pipe(Effect.catch((error) => Effect.sync(() => this.failAll(error)))))
-      void response.catch((cause) => this.failAll(new CodexProcessError({
-        operation: "write",
-        message: "Unable to send unsupported-request response to Codex app-server",
-        cause,
-      })))
-      return
-    }
-
-    if (!hasId || typeof message.id !== "number" || !Number.isSafeInteger(message.id)) {
-      this.failProtocol("read", "Codex app-server emitted a response with an invalid id")
+    if (message.kind === "notification") return
+    if (message.kind === "request") {
+      // Metadata reads never act as a permission/input client. The stock TUI owns those decisions.
+      this.failProtocol("read", `Unsupported server request: ${message.method}`)
       return
     }
     const pending = this.pending.get(message.id)
@@ -709,30 +671,9 @@ class ClientImpl implements CodexAppServerClient {
       return
     }
 
-    const hasResult = Object.hasOwn(message, "result")
-    const hasError = Object.hasOwn(message, "error")
-    if (hasResult === hasError) {
-      this.failProtocol("read", `Codex app-server returned a malformed response for ${pending.method}`)
-      return
-    }
-    if (hasError) {
-      if (!isRecord(message.error) || typeof message.error.code !== "number" ||
-        typeof message.error.message !== "string") {
-        this.failProtocol("read", `Codex app-server returned a malformed error for ${pending.method}`)
-        return
-      }
-      this.pending.delete(message.id)
-      Deferred.doneUnsafe(pending.deferred, Effect.fail(new CodexRpcError({
-        method: pending.method,
-        code: message.error.code,
-        message: message.error.message,
-        ...(Object.hasOwn(message.error, "data") ? { data: message.error.data } : {}),
-      })))
-      return
-    }
-
-    this.pending.delete(message.id)
-    Deferred.doneUnsafe(pending.deferred, Effect.succeed(message.result))
+    Deferred.doneUnsafe(pending.deferred, message.kind === "error"
+      ? Effect.fail(new CodexRpcError({ method: pending.method, ...message.error }))
+      : Effect.succeed(message.result))
   }
 
   private async readStderr(): Promise<void> {
@@ -923,7 +864,7 @@ export function connectCodexAppServerSidecar(
     try: (signal) => connectWebSocketTransport(
       url,
       options.bearerToken,
-      positiveDuration(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS),
+      optionalOperationTimeout(options.connectTimeoutMs),
       signal,
     ),
     catch: (cause) => cause instanceof CodexConnectionError || cause instanceof CodexProtocolError
@@ -938,6 +879,7 @@ function acquireClient(
   acquireTransport: Effect.Effect<CodexTransport, CodexAppServerError>,
   options: CodexAppServerOptions | CodexSidecarOptions,
 ): Effect.Effect<CodexAppServerClient, CodexAppServerError, Scope.Scope> {
+  const requestTimeoutMs = optionalOperationTimeout(options.requestTimeoutMs)
   return Effect.gen(function*() {
     const runPromise = yield* FiberSet.makeRuntimePromise<never>()
     return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
@@ -945,7 +887,7 @@ function acquireClient(
       const client = new ClientImpl(
         transport,
         runPromise,
-        positiveDuration(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+        requestTimeoutMs,
         positiveDuration(options.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS),
         positiveInteger(options.maxJsonlRecordBytes, DEFAULT_JSONL_RECORD_LIMIT_BYTES),
         positiveInteger(options.maxPendingRequests, DEFAULT_PENDING_REQUEST_LIMIT),
@@ -1004,7 +946,7 @@ function spawnCodex(command: readonly string[]): CodexAppServerProcess {
 async function connectWebSocketTransport(
   url: string,
   bearerToken: string,
-  connectTimeoutMs: number,
+  connectTimeoutMs: number | undefined,
   signal: AbortSignal,
 ): Promise<CodexTransport> {
   assertLoopbackWebSocketUrl(url)
@@ -1062,23 +1004,31 @@ async function connectWebSocketTransport(
       signal.removeEventListener("abort", onAbort)
       socket.removeEventListener("open", onOpen)
       socket.removeEventListener("error", onError)
+      socket.removeEventListener("close", onClose)
       effect()
     }
-    const timer = setTimeout(() => {
+    const timer = connectTimeoutMs === undefined ? undefined : setTimeout(() => {
       socket.terminate()
       settleExit(1)
       finish(() => reject(new CodexConnectionError({
         url,
         message: `Timed out connecting to Codex sidecar after ${connectTimeoutMs}ms`,
+        retryable: true,
       })))
     }, connectTimeoutMs)
     const onOpen = () => finish(resolve)
+    const onClose = () => finish(() => reject(new CodexConnectionError({
+      url,
+      message: "Codex sidecar closed before the connection was established",
+    })))
     const onError = (event: Event) => {
       socket.terminate()
       settleExit(1)
       finish(() => reject(new CodexConnectionError({
         url,
         message: "Unable to connect to Codex sidecar",
+        retryable: "message" in event && typeof event.message === "string" &&
+          /ECONNREFUSED|Failed to connect|Connection refused/i.test(event.message),
         cause: event,
       })))
     }
@@ -1098,6 +1048,7 @@ async function connectWebSocketTransport(
     signal.addEventListener("abort", onAbort, { once: true })
     socket.addEventListener("open", onOpen, { once: true })
     socket.addEventListener("error", onError, { once: true })
+    socket.addEventListener("close", onClose, { once: true })
   })
 
   return {

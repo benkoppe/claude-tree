@@ -1,3 +1,5 @@
+import { stripVTControlCharacters } from "node:util"
+
 import { Effect } from "effect"
 
 import type { TerminalLaunch } from "../../services/provider"
@@ -17,6 +19,8 @@ const NESTED_HERDR_ENVIRONMENT_KEYS = [
   "HERDR_WORKSPACE_ID",
 ] as const
 
+const OUTPUT_TAIL_BYTES = 8 * 1_024
+
 export class BunPtyProcessFactory implements TerminalProcessFactory {
   spawn(
     launch: TerminalLaunch,
@@ -24,6 +28,7 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
     callbacks: TerminalProcessCallbacks,
   ): TerminalProcess {
     let pty: Bun.Terminal | undefined
+    let outputTail = Buffer.alloc(0)
     let resolvePtyDrained!: () => void
     const ptyDrained = new Promise<void>((resolve) => {
       resolvePtyDrained = resolve
@@ -45,6 +50,10 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
         rows: dimensions.rows,
         data(childPty, data) {
           pty = childPty
+          const combined = Buffer.concat([outputTail, data.subarray(-OUTPUT_TAIL_BYTES)])
+          let start = Math.max(0, combined.length - OUTPUT_TAIL_BYTES)
+          while (start < combined.length && (combined[start]! & 0xC0) === 0x80) start += 1
+          outputTail = Buffer.from(combined.subarray(start))
           callbacks.onOutput(data)
         },
         exit() {
@@ -73,7 +82,8 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
       throw new Error("Bun did not create a pseudo-terminal for the agent")
     }
 
-    return new BunPtyProcess(subprocess, pty, ptyDrained)
+    return new BunPtyProcess(subprocess, pty, ptyDrained, () => stripVTControlCharacters(outputTail.toString("utf8"))
+      .replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim())
   }
 }
 
@@ -99,7 +109,12 @@ class BunPtyProcess implements TerminalProcess {
     private readonly subprocess: Bun.Subprocess,
     private readonly pty: Bun.Terminal,
     readonly ptyDrained: Promise<void>,
+    private readonly readOutputTail: () => string,
   ) {}
+
+  get outputTail(): string {
+    return this.readOutputTail()
+  }
 
   get pid(): number {
     return this.subprocess.pid

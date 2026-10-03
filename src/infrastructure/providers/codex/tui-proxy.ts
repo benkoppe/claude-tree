@@ -3,9 +3,12 @@ import { isAbsolute } from "node:path"
 import { Data, Deferred, Effect, FiberSet, PubSub, Scope } from "effect"
 
 import type { IdentityTransitionKind } from "../../../domain/persistence"
+import type { ProviderTerminalEvent } from "../../../services/provider"
+import { CodexLifecycleObserver } from "./lifecycle"
+import { PROVIDER_RESOURCE_STAGE_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 
-const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
-const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000
+const DEFAULT_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
 const DEFAULT_PREOPEN_MESSAGES = 64
 const DEFAULT_PREOPEN_BYTES = 256 * 1_024
 const DEFAULT_PENDING_REQUESTS = 256
@@ -13,7 +16,6 @@ const DEFAULT_TRANSITION_CAPACITY = 64
 const DEFAULT_CLIENTS = 8
 const DEFAULT_SERVER_MESSAGES = 256
 const DEFAULT_SERVER_MESSAGE_BYTES = 8 * 1_024 * 1_024
-const DEFAULT_TRANSITION_ACKNOWLEDGMENT_TIMEOUT_MS = 15_000
 
 export type CodexThreadOperation = "start" | "resume" | "fork"
 
@@ -74,6 +76,7 @@ export interface CodexTuiProxyOptions {
 export interface CodexTuiProxy {
   readonly remoteUrl: string
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly providerEvents: PubSub.PubSub<ProviderTerminalEvent>
   readonly close: () => Effect.Effect<void, CodexTuiProxyError>
 }
 
@@ -107,6 +110,7 @@ interface ProxyState {
   readonly port: number
   readonly clients: Set<Bun.ServerWebSocket<ProxySocketData>>
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
+  readonly providerEvents: PubSub.PubSub<ProviderTerminalEvent>
   readonly cleanupTimeoutMs: number
   readonly runPromise: ScopedRunPromise
   closed: boolean
@@ -131,11 +135,13 @@ export function makeCodexTuiProxy(
       PubSub.bounded<CodexTuiProxyTransitionRequest>(transitionCapacity),
       PubSub.shutdown,
     )
-    const state = yield* createProxyState(options, transitions, transitionCapacity, runPromise)
+    const providerEvents = yield* Effect.acquireRelease(PubSub.unbounded<ProviderTerminalEvent>(), PubSub.shutdown)
+    const state = yield* createProxyState(options, transitions, providerEvents, transitionCapacity, runPromise)
     yield* Effect.addFinalizer(() => cleanupProxy(state).pipe(Effect.orDie))
     return {
       remoteUrl: `ws://127.0.0.1:${state.port}`,
       transitions,
+      providerEvents,
       close: () => cleanupProxy(state),
     }
   })
@@ -144,6 +150,7 @@ export function makeCodexTuiProxy(
 function createProxyState(
   options: CodexTuiProxyOptions,
   transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>,
+  providerEvents: PubSub.PubSub<ProviderTerminalEvent>,
   transitionCapacity: number,
   runPromise: ScopedRunPromise,
 ): Effect.Effect<ProxyState, CodexTuiProxyError> {
@@ -152,24 +159,30 @@ function createProxyState(
       assertLoopbackWebSocketUrl(options.upstreamUrl)
       requireIdentifier(options.initialThreadId, "initial thread id")
       const clients = new Set<Bun.ServerWebSocket<ProxySocketData>>()
+      const lifecycle = new CodexLifecycleObserver()
       let clientSlots = 0
       let currentThreadId = options.initialThreadId
       let awaitingTemporaryAdoption = options.initialThreadIsTemporary === true
+      const disconnectLifecycle = (data: ProxySocketData) => {
+        // Release evidence after this generation's queued frames, never before them.
+        data.serverTail = data.serverTail.then(() => {
+          for (const observed of lifecycle.disconnect(data, currentThreadId)) {
+            PubSub.publishUnsafe(providerEvents, observed)
+          }
+        })
+      }
       const state = {} as ProxyState
       const maxPreOpenMessages = positiveInteger(options.maxPreOpenMessages, DEFAULT_PREOPEN_MESSAGES)
       const maxPreOpenBytes = positiveInteger(options.maxPreOpenBytes, DEFAULT_PREOPEN_BYTES)
       const maxPendingRequests = positiveInteger(options.maxPendingRequests, DEFAULT_PENDING_REQUESTS)
-      const connectTimeoutMs = positiveInteger(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS)
+      const connectTimeoutMs = optionalOperationTimeout(options.connectTimeoutMs)
       const maxClients = positiveInteger(options.maxClients, DEFAULT_CLIENTS)
       const maxServerMessages = positiveInteger(options.maxServerMessages, DEFAULT_SERVER_MESSAGES)
       const maxServerMessageBytes = positiveInteger(
         options.maxServerMessageBytes,
         DEFAULT_SERVER_MESSAGE_BYTES,
       )
-      const transitionAcknowledgmentTimeoutMs = positiveInteger(
-        options.transitionAcknowledgmentTimeoutMs,
-        DEFAULT_TRANSITION_ACKNOWLEDGMENT_TIMEOUT_MS,
-      )
+      const transitionAcknowledgmentTimeoutMs = optionalOperationTimeout(options.transitionAcknowledgmentTimeoutMs)
 
       const server = Bun.serve<ProxySocketData>({
         hostname: "127.0.0.1",
@@ -215,9 +228,16 @@ function createProxyState(
               return
             }
             socket.data.upstream = upstream
-            socket.data.connectTimer = setTimeout(() => {
-              terminateQuietly(upstream)
+            const forward = (text: string) => {
+              if (socket.data.closed) return
+              for (const observed of lifecycle.observe(text, currentThreadId, socket.data)) {
+                PubSub.publishUnsafe(providerEvents, observed)
+              }
+              socket.send(text)
+            }
+            if (connectTimeoutMs !== undefined) socket.data.connectTimer = setTimeout(() => {
               closeQuietly(socket, 1013, "Upstream connect timeout")
+              terminateQuietly(upstream)
             }, connectTimeoutMs)
 
             upstream.addEventListener("open", () => {
@@ -226,15 +246,22 @@ function createProxyState(
                 for (const message of socket.data.queued.splice(0)) upstream.send(message.text)
                 socket.data.queuedBytes = 0
               } catch {
-                terminateQuietly(upstream)
                 closeQuietly(socket, 1011, "Unable to flush upstream messages")
+                terminateQuietly(upstream)
               }
             }, { once: true })
             upstream.addEventListener("message", (event) => {
               try {
                 if (typeof event.data !== "string") {
-                  terminateQuietly(upstream)
                   closeQuietly(socket, 1003, "Upstream messages must be text")
+                  terminateQuietly(upstream)
+                  return
+                }
+                const queuedBehindTransition = socket.data.pendingServerMessages > 0
+                const immediateTransition = queuedBehindTransition
+                  ? undefined : observeServerMessage(socket.data, event.data)
+                if (!queuedBehindTransition && !immediateTransition) {
+                  forward(event.data)
                   return
                 }
                 enqueueServerMessage(
@@ -243,7 +270,8 @@ function createProxyState(
                   maxServerMessages,
                   maxServerMessageBytes,
                   async () => {
-                    const transition = observeServerMessage(socket.data, event.data)
+                    const transition = queuedBehindTransition
+                      ? observeServerMessage(socket.data, event.data) : immediateTransition
                     if (transition) {
                       if (!await publishTransition(
                         state,
@@ -260,21 +288,24 @@ function createProxyState(
                         }
                       }
                     }
-                    if (!socket.data.closed) socket.send(event.data)
+                    forward(event.data)
                   },
                 )
               } catch {
-                terminateQuietly(upstream)
                 closeQuietly(socket, 1011, "Unable to process upstream message")
+                terminateQuietly(upstream)
               }
             })
             upstream.addEventListener("error", () => {
+              if (socket.data.closed) return
               clearConnectTimer(socket.data)
-              socket.close(1011, "Upstream failed")
+              closeQuietly(socket, 1011, "Upstream failed")
             }, { once: true })
             upstream.addEventListener("close", (event) => {
+              if (socket.data.closed) return
               clearConnectTimer(socket.data)
-              socket.close(event.code === 1000 ? 1000 : 1011, "Upstream closed")
+              disconnectLifecycle(socket.data)
+              closeQuietly(socket, event.code === 1000 ? 1000 : 1011, upstreamCloseReason(event.code, event.reason))
             }, { once: true })
           },
           message(socket, message) {
@@ -301,14 +332,15 @@ function createProxyState(
               socket.data.queued.push({ text: message, bytes })
               socket.data.queuedBytes += bytes
             } catch {
-              terminateQuietly(socket.data.upstream)
               closeQuietly(socket, 1011, "Unable to process protocol message")
+              terminateQuietly(socket.data.upstream)
             }
           },
           close(socket) {
             clients.delete(socket)
             clientSlots -= 1
             clearSocketState(socket.data)
+            disconnectLifecycle(socket.data)
           },
         },
       })
@@ -345,6 +377,7 @@ function createProxyState(
         port,
         clients,
         transitions,
+        providerEvents,
         cleanupTimeoutMs: positiveInteger(options.cleanupTimeoutMs, DEFAULT_CLEANUP_TIMEOUT_MS),
         runPromise,
         closed: false,
@@ -542,6 +575,16 @@ function observeServerMessage(
   }
 }
 
+function upstreamCloseReason(code: number, detail: string): string {
+  const message = `Upstream closed (${code})${detail ? `: ${detail}` : ""}`
+  let reason = ""
+  for (const character of message) {
+    if (Buffer.byteLength(reason + character) > 123) break
+    reason += character
+  }
+  return reason
+}
+
 function transitionFailure(request: PendingSwitch, detail: string): CodexThreadTransitionFailed {
   return {
     _tag: "TransitionFailed",
@@ -558,7 +601,7 @@ async function publishTransition(
   state: ProxyState,
   transition: ObservedCodexTuiProxyTransition,
   capacity: number,
-  acknowledgmentTimeoutMs: number,
+  acknowledgmentTimeoutMs: number | undefined,
   socket: Bun.ServerWebSocket<ProxySocketData>,
 ): Promise<boolean> {
   if (state.pendingPublications >= capacity) {
@@ -588,13 +631,11 @@ async function publishTransition(
       })
     }
     if (published) {
-      await state.runPromise(Deferred.await(acknowledgment).pipe(Effect.timeoutOrElse({
-        duration: acknowledgmentTimeoutMs,
-        orElse: () => Effect.fail(new CodexTuiProxyError({
+      await state.runPromise(withOperationTimeout(Deferred.await(acknowledgment), acknowledgmentTimeoutMs,
+        () => Effect.fail(new CodexTuiProxyError({
           operation: "publish-transition",
           message: `Codex TUI transition was not acknowledged within ${acknowledgmentTimeoutMs}ms`,
-        })),
-      })))
+        }))))
       if (publishedTransition._tag === "CodexThreadTransition") {
         state.awaitingTemporaryAdoption = false
       }
@@ -630,8 +671,8 @@ function enqueueServerMessage(
   const data = socket.data
   const bytes = Buffer.byteLength(text)
   if (data.pendingServerMessages >= messageLimit || data.pendingServerMessageBytes + bytes > byteLimit) {
+    closeQuietly(socket, 1013, "Upstream message queue limit exceeded")
     terminateQuietly(data.upstream)
-    socket.close(1013, "Upstream message queue limit exceeded")
     return
   }
   data.pendingServerMessages += 1
@@ -676,6 +717,8 @@ function closeQuietly(
   code: number,
   reason: string,
 ): void {
+  if (socket.data.closed) return
+  socket.data.closed = true
   try {
     socket.close(code, reason)
   } catch {

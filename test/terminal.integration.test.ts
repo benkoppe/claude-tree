@@ -120,6 +120,26 @@ test("hidden emulators keep processing output from independent Bun PTYs", async 
   }
 })
 
+test("failed Bun PTYs retain a bounded plain-text error after exit and output drain", async () => {
+  const child = new BunPtyProcessFactory().spawn({
+    sessionId: "failed-startup",
+    command: [process.execPath, "-e", `process.stdout.write("🧪".repeat(4096));
+      process.stderr.write("\\x1b[31mERROR: saved session unavailable — détails\\x1b[0m\\n", () => process.exit(1))`],
+    cwd: process.cwd(),
+    observer: new NullTerminalObserver(),
+  }, { columns: 80, rows: 24 }, { onOutput() {}, onPtyClosed() {} })
+  try {
+    await within(Promise.all([child.exited, child.ptyDrained]), "failed PTY exit and drain")
+    expect(child.exitCode).toBe(1)
+    expect(child.outputTail).toEndWith("ERROR: saved session unavailable — détails")
+    expect(Buffer.byteLength(child.outputTail!)).toBeLessThanOrEqual(8 * 1_024)
+    expect(child.outputTail).not.toContain("\u001b")
+    expect(child.outputTail).not.toContain("�")
+  } finally {
+    try { child.closePty() } finally { child.unref() }
+  }
+})
+
 function spawnOutput(
   terminal: TerminalSurface,
   name: string,
