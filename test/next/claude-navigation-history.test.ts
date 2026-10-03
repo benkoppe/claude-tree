@@ -263,6 +263,38 @@ test.each(["messages", "segment"])("re-emitted preserved %s restore history and 
   expect(JSON.stringify(entries)).toBe(before)
 })
 
+test.each(["missing", "retained", "conflicting"] as const)("a preserved attachment reanchored directly to the summary uses historical evidence (%s)", async (evidence) => {
+  const f = fixture()
+  const tailId = f.ids[6]!
+  const tail: SessionStoreEntry = { type: "attachment", uuid: tailId, parentUuid: f.ids[1], attachment: { type: "fixture" } }
+  const compact = { ...f.compact, logicalParentUuid: tailId, compactMetadata: {
+    preservedMessages: { uuids: [f.ids[0], f.ids[1], tailId], anchorUuid: f.ids[3] },
+    preservedSegment: { headUuid: f.ids[0], tailUuid: tailId, anchorUuid: f.ids[3] },
+  } }
+  const bridgeId = f.ids[7]!
+  const entries = [f.question, f.answer, ...(evidence !== "missing" ? [tail] : []),
+    ...(evidence === "conflicting" ? [{ ...tail, parentUuid: f.ids[0] }] : []), compact,
+    { type: "attachment", uuid: bridgeId, parentUuid: f.ids[2], attachment: { type: "fixture" } },
+    { ...f.summary, parentUuid: bridgeId }, { ...tail, parentUuid: f.ids[3] },
+    { ...f.current, parentUuid: tailId }, f.response]
+  const before = JSON.stringify(entries)
+  const { provider, forks } = await providerFor(f.sessionId, entries)
+  const read = (await Effect.runPromise(provider.readTranscripts([f.sessionId]))).get(f.sessionId)
+  if (evidence === "conflicting") {
+    expect(read).toMatchObject({ _tag: "Unavailable", reason: expect.stringContaining("multiple conflicting historical parents") })
+    await Effect.runPromise(Effect.flip(provider.branchFrom({ sessionId: f.sessionId, messageId: f.ids[5]! })))
+    expect(forks()).toBe(0)
+    expect(JSON.stringify(entries)).toBe(before)
+    return
+  }
+  if (read?._tag !== "Available") throw new Error(JSON.stringify(read))
+  expect(read.coverage?._tag).toBe(evidence === "retained" ? undefined : "Limited")
+  expect(read.messages.map((message) => message.id)).toEqual(evidence === "retained"
+    ? [f.ids[0]!, f.ids[1]!, f.ids[3]!, f.ids[4]!, f.ids[5]!]
+    : [f.ids[3]!, f.ids[0]!, f.ids[1]!, f.ids[4]!, f.ids[5]!])
+  expect(JSON.stringify(entries)).toBe(before)
+})
+
 test("missing or contradictory original preserved ancestry fails with an evidence error", () => {
   for (const original of [[], [record("answer", "one"), record("answer", "two")]]) {
     const compact = { ...boundary("compact", "answer"), compactMetadata: {
