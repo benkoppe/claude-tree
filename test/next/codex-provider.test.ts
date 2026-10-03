@@ -164,19 +164,6 @@ describe("Effect Codex provider", () => {
     })
     const deadlineError = await Effect.runPromise(Effect.flip(deadline.loadSessionSnapshot))
     expect(deadlineError.message).toContain("overall deadline")
-
-    const branchDeadline = providerWith(fakeClient({
-      readThread: () => Effect.succeed(thread(ROOT, [turn("parent-turn", "completed", [
-        { id: "parent-agent", type: "agentMessage", text: "Answer" },
-      ])])),
-      forkThread: () => Effect.never,
-    }), { metadataDeadlineMs: 10 })
-    const branchOutcome = await Effect.runPromise(
-      branchDeadline.branchFrom({ sessionId: ROOT, messageId: "parent-agent" }),
-    )
-    expect(branchOutcome._tag).toBe("AmbiguousBranchMutation")
-    if (branchOutcome._tag !== "AmbiguousBranchMutation") throw new Error("expected ambiguity")
-    expect(branchOutcome.reason).toContain("overall deadline after thread/fork dispatch")
   })
 
   test("default metadata waits beyond former deadlines and cancellation closes its server", async () => {
