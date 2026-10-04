@@ -2,18 +2,7 @@
 
 Application metadata is stored in `$XDG_STATE_HOME/claude-tree/state.sqlite` (default `~/.local/state/claude-tree/state.sqlite`). Keep this on a local filesystem, not a network share or an actively synchronized directory. Provider transcripts remain in provider storage.
 
-## Existing JSON installations
-
-Close **all old claude-tree invocations** before cutover. Old releases use a different session-guard namespace and continue writing their JSON files. Import each project/provider explicitly:
-
-```sh
-claude-tree state import-json /path/to/project
-claude-tree state import-json --codex /path/to/project
-```
-
-Only strict, canonical schema v3 documents without obsolete lease/ownership layouts are imported. The operation preserves relationships, correspondence order, removals, timestamps, and workspace IDs. Original files are never deleted or rewritten. Reimporting identical source data is harmless; changed source data is not merged into an imported scope.
-
-Fresh invocations still start from roots. `--resume WORKSPACE_ID PROJECT` copies saved navigation into a new workspace; it does not recover hidden agents or terminal state.
+For pre-SQLite installations, see the [legacy JSON import guide](legacy/json-state.md).
 
 ## Maintenance
 
