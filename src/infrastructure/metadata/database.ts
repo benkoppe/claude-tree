@@ -3,8 +3,8 @@ import { chmod, open, stat } from "node:fs/promises"
 import { dirname, isAbsolute, join } from "node:path"
 import { Database } from "bun:sqlite"
 import type { Statement } from "bun:sqlite"
+import type { FileHandle } from "node:fs/promises"
 import { drizzle } from "drizzle-orm/bun-sqlite"
-import { migrate } from "drizzle-orm/bun-sqlite/migrator"
 import { readMigrationFiles } from "drizzle-orm/migrator"
 import { Effect } from "effect"
 
@@ -54,11 +54,33 @@ function connection(path: string) {
     return statement
   }
   db.query = query as Database["query"]
+  let closed = false
   return { db, close: () => {
-    for (const statement of statements.values()) statement.finalize()
-    statements.clear()
-    db.close(true)
+    if (closed) return
+    const errors: unknown[] = []
+    for (const [sql, statement] of statements) {
+      try { statement.finalize(); statements.delete(sql) } catch (error) { errors.push(error) }
+    }
+    try { db.close(true); closed = true; statements.clear() } catch (error) { errors.push(error) }
+    if (errors.length) throw new AggregateError(errors, "Unable to close state database")
   } }
+}
+
+export interface StateDatabasePlatform {
+  readonly openLock: (path: string) => Promise<Pick<FileHandle, "fd" | "close">>
+  readonly connect: (path: string) => { readonly db: Database; readonly close: () => void }
+  readonly fileLocker: typeof fileLocker
+}
+
+export const nativeStateDatabasePlatform: StateDatabasePlatform = {
+  openLock: (path) => open(path, "a", 0o600), connect: connection, fileLocker,
+}
+
+async function closeWithBackstop(close: () => Promise<void>): Promise<void> {
+  try { await close() } catch (error) {
+    try { await close() } catch (retryError) { throw new AggregateError([error, retryError], "State cleanup failed") }
+    throw error
+  }
 }
 
 export interface StateDatabase {
@@ -72,80 +94,100 @@ export function databasePath(stateHome: string): string {
   return join(stateHome, "claude-tree", "state.sqlite")
 }
 
-export function openStateDatabase(stateHome: string, requireExisting = false, policy: DatabaseSchemaPolicy = schemaPolicy): Effect.Effect<StateDatabase, unknown> {
+export function openStateDatabase(stateHome: string, requireExisting = false, policy: DatabaseSchemaPolicy = schemaPolicy, platform: StateDatabasePlatform = nativeStateDatabasePlatform): Effect.Effect<StateDatabase, unknown> {
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const path = databasePath(stateHome)
-    const lock = fileLocker()
+    const lock = platform.fileLocker()
     yield* createDirectoryDurably(nativePersistencePlatform, dirname(path))
-    const startup = yield* Effect.tryPromise({ try: () => open(`${path}.startup.lock`, "a", 0o600), catch: (e) => e })
-    const gateResult = yield* Effect.exit(Effect.tryPromise({ try: () => open(`${path}.schema.lock`, "a", 0o600), catch: (e) => e }))
-    if (gateResult._tag === "Failure") { yield* Effect.promise(() => startup.close()); return yield* Effect.failCause(gateResult.cause) }
-    const gate = gateResult.value
     let db: Database | undefined
-    let opened: ReturnType<typeof connection> | undefined
-    let closed = false
-    const close = async () => { if (closed) return; opened?.close(); closed = true; await gate.close() }
-    const acquire = Effect.gen(function*() {
-      while (!lock(startup.fd, 2 | 4)) yield* Effect.sleep(10)
-      while (!lock(gate.fd, 1 | 4)) yield* Effect.sleep(10)
-    }).pipe(Effect.timeoutOrElse({ duration: 2_000, orElse: () => Effect.fail(new Error("State schema is being upgraded; retry after other invocations exit")) }))
-    const result = yield* Effect.exit(restore(acquire).pipe(Effect.andThen(Effect.tryPromise({ try: async () => {
-      let exists = true
-      try { await stat(path) } catch (error) { if (isErrorCode(error, "ENOENT")) exists = false; else throw error }
-      if (!exists && requireExisting) throw new Error("Provider state is missing")
-      if (!exists) {
-        try { const file = await open(path, "wx", 0o600); await file.close() }
-        catch (e) { if (!isErrorCode(e, "EEXIST")) throw e }
-      }
-      opened = connection(path)
-      db = opened.db
-      const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
-      const application = db.query<{ application_id: number }, []>("PRAGMA application_id").get()!.application_id
-      const tables = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()
-      const pristine = version === 0 && application === 0 && tables.length === 0
-      if (!pristine && application !== DATABASE_APPLICATION_ID) throw new Error("Not a claude-tree state database; existing file was left untouched")
-      if (version > policy.version || (!pristine && version < 1)) throw new Error(`Unsupported state database schema ${version}`)
-      if (!pristine) validateMigrationHistory(db, policy, version)
-      db.run("PRAGMA foreign_keys = ON")
-      db.run("PRAGMA busy_timeout = 0")
-      if (version < policy.version) {
-        lock(gate.fd, 8)
-        if (!lock(gate.fd, 2 | 4)) throw new Error("Exit other claude-tree invocations before upgrading the state schema")
-        // Reopen after acquiring exclusivity: another startup may have initialized it.
-        opened.close()
-        opened = connection(path)
-        db = opened.db
-        db.run("PRAGMA foreign_keys = ON")
-        const current = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
-        const currentApplication = db.query<{ application_id: number }, []>("PRAGMA application_id").get()!.application_id
-        if (current > 0 && currentApplication !== DATABASE_APPLICATION_ID) throw new Error("Not a claude-tree state database")
-        if (current > policy.version) throw new Error(`Unsupported state database schema ${current}`)
-        if (current > 0) validateMigrationHistory(db, policy, current)
-        if (current < policy.version) {
-          const migrations = readMigrationFiles({ migrationsFolder: policy.folder })
-          if (migrations.length !== policy.migrations.length || migrations.some((entry, index) => entry.hash !== policy.migrations[index]?.hash || entry.folderMillis !== policy.migrations[index]?.when)) throw new Error("Packaged migrations do not match this application")
-          if (current > 0) {
-            const backup = `${path}.before-v${policy.version}-${Date.now()}.sqlite`
-            await backupDatabase(db, backup)
+    let opened: ReturnType<StateDatabasePlatform["connect"]> | undefined
+    let gate: Awaited<ReturnType<StateDatabasePlatform["openLock"]>> | undefined
+    let closing: Promise<void> | undefined
+    const release = async () => {
+      if (opened) { opened.close(); opened = undefined }
+      if (gate) { await gate.close(); gate = undefined }
+    }
+    const close = () => closing ??= release().finally(() => { closing = undefined })
+    return yield* Effect.acquireUseRelease(
+      Effect.tryPromise({ try: () => platform.openLock(`${path}.startup.lock`), catch: (e) => e }),
+      (startup) => Effect.gen(function*() {
+        const schemaGate = yield* Effect.tryPromise({ try: () => platform.openLock(`${path}.schema.lock`), catch: (e) => e })
+        gate = schemaGate
+        const acquire = Effect.gen(function*() {
+          while (!lock(startup.fd, 2 | 4)) yield* Effect.sleep(10)
+          while (!lock(schemaGate.fd, 1 | 4)) yield* Effect.sleep(10)
+        }).pipe(Effect.timeoutOrElse({ duration: 2_000, orElse: () => Effect.fail(new Error("State schema is being upgraded; retry after other invocations exit")) }))
+        yield* restore(acquire)
+        return yield* Effect.tryPromise({ try: async () => {
+          let exists = true
+          try { await stat(path) } catch (error) { if (isErrorCode(error, "ENOENT")) exists = false; else throw error }
+          if (!exists && requireExisting) throw new Error("Provider state is missing")
+          if (!exists) {
+            try { const file = await open(path, "wx", 0o600); await file.close() }
+            catch (e) { if (!isErrorCode(e, "EEXIST")) throw e }
           }
-          migrate(databaseOrm(db), { migrationsFolder: policy.folder })
-          if (db.query("PRAGMA foreign_key_check").all().length) throw new Error("Migration violated foreign key integrity")
-        }
-        lock(gate.fd, 1)
-      }
-      const migratedVersion = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
-      if (migratedVersion !== policy.version) throw new Error("Migration did not atomically publish its schema version")
-      validateMigrationHistory(db, policy)
-      db.run("PRAGMA journal_mode = WAL")
-      db.run("PRAGMA synchronous = FULL")
-      await chmod(path, 0o600)
-      await syncDirectory(nativePersistencePlatform, dirname(path))
-      return { db, path, close }
-    }, catch: (e) => e }))))
-    yield* Effect.promise(() => startup.close())
-    if (result._tag === "Failure") { yield* Effect.promise(close); return yield* Effect.failCause(result.cause) }
-    return result.value
+          opened = platform.connect(path)
+          db = opened.db
+          const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
+          const application = db.query<{ application_id: number }, []>("PRAGMA application_id").get()!.application_id
+          const tables = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()
+          const pristine = version === 0 && application === 0 && tables.length === 0
+          if (!pristine && application !== DATABASE_APPLICATION_ID) throw new Error("Not a claude-tree state database; existing file was left untouched")
+          if (version > policy.version || (!pristine && version < 1)) throw new Error(`Unsupported state database schema ${version}`)
+          if (!pristine) validateMigrationHistory(db, policy, version)
+          db.run("PRAGMA foreign_keys = ON")
+          db.run("PRAGMA busy_timeout = 0")
+          if (version < policy.version) {
+            lock(schemaGate.fd, 8)
+            if (!lock(schemaGate.fd, 2 | 4)) throw new Error("Exit other claude-tree invocations before upgrading the state schema")
+            opened.close()
+            opened = undefined
+            opened = platform.connect(path)
+            db = opened.db
+            db.run("PRAGMA foreign_keys = ON")
+            db.run("PRAGMA synchronous = FULL")
+            const current = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
+            const currentApplication = db.query<{ application_id: number }, []>("PRAGMA application_id").get()!.application_id
+            if (current > 0 && currentApplication !== DATABASE_APPLICATION_ID) throw new Error("Not a claude-tree state database")
+            if (current > policy.version) throw new Error(`Unsupported state database schema ${current}`)
+            if (current > 0) validateMigrationHistory(db, policy, current)
+            if (current < policy.version) {
+              const migrations = readMigrationFiles({ migrationsFolder: policy.folder })
+              if (migrations.length !== policy.version || migrations.length !== policy.migrations.length || migrations.some((entry, index) => entry.hash !== policy.migrations[index]?.hash || entry.folderMillis !== policy.migrations[index]?.when)) throw new Error("Packaged migrations do not match this application")
+              if (current > 0) await backupDatabase(db, `${path}.before-v${policy.version}-${Date.now()}.sqlite`)
+              applyMigrations(db, migrations, current, policy)
+            }
+            lock(schemaGate.fd, 1)
+          }
+          const migratedVersion = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
+          if (migratedVersion !== policy.version) throw new Error("Migration did not atomically publish its schema version")
+          validateMigrationHistory(db, policy)
+          db.run("PRAGMA journal_mode = WAL")
+          db.run("PRAGMA synchronous = FULL")
+          await chmod(path, 0o600)
+          await syncDirectory(nativePersistencePlatform, dirname(path))
+          return { db, path, close }
+        }, catch: (e) => e })
+      }),
+      (startup) => Effect.tryPromise({ try: () => closeWithBackstop(() => startup.close()), catch: (e) => e }),
+    ).pipe(Effect.onExit((exit) => exit._tag === "Failure"
+      ? Effect.tryPromise({ try: () => closeWithBackstop(close), catch: (e) => e }) : Effect.void))
   }))
+}
+
+function applyMigrations(db: Database, migrations: ReturnType<typeof readMigrationFiles>, current: number, policy: DatabaseSchemaPolicy): void {
+  db.transaction(() => {
+    db.run("CREATE TABLE IF NOT EXISTS __drizzle_migrations (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)")
+    for (let index = current; index < migrations.length; index++) {
+      const migration = migrations[index]!
+      for (const statement of migration.sql) if (statement.trim()) db.query(statement).run()
+      db.query("INSERT INTO __drizzle_migrations (id, hash, created_at) VALUES (?, ?, ?)").run(index + 1, migration.hash, migration.folderMillis)
+    }
+    if (db.query<{ application_id: number }, []>("PRAGMA application_id").get()?.application_id !== DATABASE_APPLICATION_ID) throw new Error("Migration changed the database application identity")
+    if (db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version !== policy.version) throw new Error("Migration did not atomically publish its schema version")
+    if (db.query("PRAGMA foreign_key_check").all().length) throw new Error("Migration violated foreign key integrity")
+    validateMigrationHistory(db, policy)
+  }).immediate()
 }
 
 export function validateMigrationHistory(db: Database, policy: DatabaseSchemaPolicy = schemaPolicy, version = policy.version): void {
