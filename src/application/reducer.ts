@@ -23,6 +23,7 @@ import { reconcileTranscript, isTranscriptPrefix, sameTranscript, stableTranscri
 import {
   selectConversationForest,
   selectFamilyRootSessionId,
+  selectFamilySessionIds,
   selectProjectedTranscript,
   selectTranscriptRead,
   selectVisibleEndpointSessionIds,
@@ -41,6 +42,7 @@ import type {
 export const MAX_COMPLETION_REFRESH_ATTEMPTS = HISTORY_RETRY_DELAYS_MS.length
 
 export type StateEvent =
+  | { readonly _tag: "PreparedRefreshPublished"; readonly base: ApplicationState; readonly candidate: ApplicationState }
   | { readonly _tag: "RefreshProgress"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
   | { readonly _tag: "RefreshStarted"; readonly refresh: ActiveRefresh; readonly replaceAll?: boolean }
   | { readonly _tag: "RefreshSucceeded"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
@@ -48,11 +50,11 @@ export type StateEvent =
   | { readonly _tag: "RefreshSuperseded"; readonly key: string; readonly generation: number }
   | { readonly _tag: "LocalSessionProjected"; readonly session: AgentSession; readonly transcript?: TranscriptRead; readonly temporary?: boolean }
   | { readonly _tag: "PersistedBranchProjected"; readonly session: AgentSession; readonly relation: BranchRelation; readonly transcript?: TranscriptRead }
-  | { readonly _tag: "TransientSessionRolledBack"; readonly sessionId: string; readonly restoreTo: NavigatorSurface }
+  | { readonly _tag: "TransientSessionRolledBack"; readonly sessionId: string; readonly restoreTo: ApplicationState["surface"] }
   | { readonly _tag: "Navigated"; readonly surface: ApplicationSurface; readonly selectionId?: string }
   | { readonly _tag: "TerminalShowStarted"; readonly sessionId: string }
-  | { readonly _tag: "TerminalShown"; readonly sessionId: string; readonly ownerId: string; readonly returnTo: NavigatorSurface }
-  | { readonly _tag: "TerminalShowFailed"; readonly sessionId: string; readonly restoreTo: NavigatorSurface; readonly message?: string }
+  | { readonly _tag: "TerminalShown"; readonly sessionId: string; readonly ownerId: string; readonly returnTo: NavigatorSurface; readonly focus?: boolean }
+  | { readonly _tag: "TerminalShowFailed"; readonly sessionId: string; readonly restoreTo: ApplicationState["surface"]; readonly message?: string }
   | { readonly _tag: "TerminalReturned"; readonly sessionId: string; readonly draft?: DraftPreview }
   | { readonly _tag: "TerminalActivityObserved"; readonly sessionId: string; readonly ownerId: string; readonly activity: "working" | "blocked" | "idle"; readonly wasVisible: boolean }
   | { readonly _tag: "TerminalObservationObserved"; readonly sessionId: string; readonly ownerId: string; readonly observation: TerminalObservation }
@@ -69,11 +71,18 @@ export type StateEvent =
   | { readonly _tag: "ShutdownCompleted" }
   | { readonly _tag: "ShutdownFailed"; readonly message: string }
 
-export function reduceApplicationState(state: ApplicationState, event: StateEvent): ApplicationState {
+export function reduceApplicationState(state: ApplicationState, event: StateEvent, deferRefreshRepair = false): ApplicationState {
   if (state.shutdown === "stopped" || state.shutdown === "cleanup-incomplete") return state
   if (state.shutdown === "shutting-down" && !isShutdownEvent(event)) return state
 
   switch (event._tag) {
+    case "PreparedRefreshPublished": {
+      const next: ApplicationState = { ...event.candidate, surface: state.surface, selectionId: state.selectionId,
+        modal: event.candidate.modal === event.base.modal ? state.modal : event.candidate.modal }
+      const previousGraph = state.surface._tag === "Graph" ? selectConversationForest(state).graphBySessionId.get(state.surface.familySessionId) : undefined
+      const nextGraph = next.surface._tag === "Graph" ? selectConversationForest(next).graphBySessionId.get(next.surface.familySessionId) : undefined
+      return previousGraph && previousGraph === nextGraph ? next : repairNavigatorSurface(next)
+    }
     case "RefreshProgress": {
       const refresh = state.refresh.active.get(event.key)
       if (!refresh || refresh.generation !== event.generation) return state
@@ -92,7 +101,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       const progressive = { ...state, refresh: { ...state.refresh, active: new Map(state.refresh.active).set(event.key, {
         ...refresh, mode: "incremental" as const, sessionIds: new Set(ready.keys()),
       }) } }
-      const next = refreshSucceeded(progressive, event.key, event.generation, { sessions: event.snapshot.sessions, transcripts: ready }, true)
+      const next = refreshSucceeded(progressive, event.key, event.generation, { sessions: event.snapshot.sessions, transcripts: ready }, true, deferRefreshRepair)
       return { ...next, refresh: { ...next.refresh, initialPending: state.refresh.initialPending,
         active: new Map(next.refresh.active).set(event.key, { ...refresh, stagedTranscripts: staged, progressSessionIds: new Set([
           ...(refresh.progressSessionIds ?? []), ...ready.keys(),
@@ -187,7 +196,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       }
     }
     case "RefreshSucceeded":
-      return refreshSucceeded(state, event.key, event.generation, event.snapshot)
+      return refreshSucceeded(state, event.key, event.generation, event.snapshot, false, deferRefreshRepair)
     case "LocalSessionProjected":
       return projectLocalSession(state, event.session, event.transcript, event.temporary)
     case "PersistedBranchProjected": {
@@ -211,7 +220,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
         }),
       }
     case "TerminalShown":
-      return terminalShown(state, event.sessionId, event.ownerId, event.returnTo)
+      return terminalShown(state, event.sessionId, event.ownerId, event.returnTo, event.focus ?? true)
     case "TerminalShowFailed": {
       const terminals = new Map(state.terminals)
       if (terminals.get(event.sessionId)?.phase === "showing") terminals.delete(event.sessionId)
@@ -347,6 +356,7 @@ function refreshSucceeded(
   generation: number,
   snapshot: AgentSessionSnapshot,
   progress = false,
+  deferRepair = false,
 ): ApplicationState {
   const active = state.refresh.active.get(key)
   if (!active || active.generation !== generation) return state
@@ -525,7 +535,10 @@ function refreshSucceeded(
 
   const without = removeRefresh(state, key, generation)
   const conversationActivity = new Map(state.conversationActivity)
-  for (const [id, session] of sessions) {
+  const changedSessionIds = new Set([...incomingSessions.keys(), ...snapshot.transcripts.keys()])
+  for (const id of changedSessionIds) {
+    const session = sessions.get(id)
+    if (!session) continue
     const previousSession = state.local.sessions.get(id) ?? state.provider.sessions.get(id)
     const baseline = conversationActivity.get(id) ?? previousSession?.lastModified ?? session.lastModified
     const previous = selectTranscriptRead(state, id)
@@ -538,11 +551,15 @@ function refreshSucceeded(
   for (const id of conversationActivity.keys()) {
     if (!sessions.has(id) && !localSessions.has(id)) conversationActivity.delete(id)
   }
-  for (const [id, session] of sessions) {
+  for (const id of incomingSessions.keys()) {
+    const session = sessions.get(id)
+    if (!session) continue
     const previous = state.provider.sessions.get(id)
     if (previous && isDeepStrictEqual(previous, session)) sessions.set(id, previous)
   }
-  for (const [id, read] of transcripts) {
+  for (const id of snapshot.transcripts.keys()) {
+    const read = transcripts.get(id)
+    if (!read) continue
     const previous = state.provider.transcripts.get(id)
     if (previous?._tag === "Available" && read._tag === "Available" && sameTranscript(previous.messages, read.messages)) {
       transcripts.set(id, isDeepStrictEqual(previous.coverage, read.coverage) && isDeepStrictEqual(previous.context, read.context)
@@ -554,7 +571,7 @@ function refreshSucceeded(
   const retainedLocalSessions = reuseMap(state.local.sessions, localSessions)
   const retainedLocalTranscripts = reuseMap(state.local.transcripts, localTranscripts)
   const retainedTemporaryIds = reuseSet(state.local.temporarySessionIds, temporarySessionIds)
-  return repairNavigatorSurface({
+  const next: ApplicationState = {
     ...without,
     conversationActivity: reuseMap(state.conversationActivity, conversationActivity),
     historyStatus: reuseMap(state.historyStatus, historyStatus),
@@ -577,7 +594,12 @@ function refreshSucceeded(
       : completionExhausted
       ? { modal: { _tag: "Error", message: "Completed response did not become available" } as const }
       : {}),
-  })
+  }
+  if (active.mode === "incremental" && state.surface._tag === "Graph") {
+    const selectedFamily = selectFamilySessionIds(state, state.surface.familySessionId)
+    if (![...changedSessionIds].some((id) => selectedFamily.has(id))) return next
+  }
+  return deferRepair ? next : repairNavigatorSurface(next)
 }
 
 function reuseMap<K, V>(previous: ReadonlyMap<K, V>, next: ReadonlyMap<K, V>): ReadonlyMap<K, V> {
@@ -622,15 +644,16 @@ function terminalShown(
   sessionId: string,
   ownerId: string,
   returnTo: NavigatorSurface,
+  focus: boolean,
 ): ApplicationState {
   const previous = state.terminals.get(sessionId)
   const pendingCompletions = new Map(state.pendingCompletions)
   const completion = pendingCompletions.get(sessionId)
   if (completion?.ownerId !== ownerId) pendingCompletions.delete(sessionId)
-  else if (completion) pendingCompletions.set(sessionId, { ...completion, markUnviewed: false })
+  else if (completion && focus) pendingCompletions.set(sessionId, { ...completion, markUnviewed: false })
   return {
     ...state,
-    surface: { _tag: "Terminal", sessionId, returnTo },
+    surface: focus ? { _tag: "Terminal", sessionId, returnTo } : state.surface,
     terminals: new Map(state.terminals).set(sessionId, {
       ...(previous?.ownerId === ownerId ? previous : {}),
       ownerId,
@@ -642,7 +665,7 @@ function terminalShown(
       replacementCandidates: withoutMap(state.replacementCandidates, sessionId),
       rewindAnchors: withoutMap(state.rewindAnchors, sessionId),
     } : {}),
-    unviewedSessionIds: without(state.unviewedSessionIds, sessionId),
+    unviewedSessionIds: focus ? without(state.unviewedSessionIds, sessionId) : state.unviewedSessionIds,
   }
 }
 
@@ -838,7 +861,7 @@ function terminalStopped(
 function rollbackTransient(
   state: ApplicationState,
   sessionId: string,
-  restoreTo: NavigatorSurface,
+  restoreTo: ApplicationState["surface"],
 ): ApplicationState {
   if (!state.local.temporarySessionIds.has(sessionId)) return state
   return {

@@ -96,7 +96,7 @@ export interface TerminalActivityCheck {
   readonly activity?: AgentActivity; readonly issue?: "unrecognized-screen" | "observer-failed"
 }
 export interface TerminalSupervisorApi {
-  readonly show: (prepared: PreparedTerminal) => Effect.Effect<string, ProviderError | ProviderProtocolError | PersistenceError | SessionOwnedError | SessionRemovedError | TerminalError | TerminalCleanupError>
+  readonly show: (prepared: PreparedTerminal, shouldActivate?: () => boolean) => Effect.Effect<string, ProviderError | ProviderProtocolError | PersistenceError | SessionOwnedError | SessionRemovedError | TerminalError | TerminalCleanupError>
   readonly hideActive: Effect.Effect<string | null>
   readonly stopSession: (sessionId: string, gracePeriodMs?: number, expectedOwnerId?: string) => Effect.Effect<boolean, TerminalCleanupError>
   readonly shutdown: (gracePeriodMs?: number) => Effect.Effect<void, TerminalCleanupError>
@@ -196,7 +196,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     })
   }
 
-  readonly show: TerminalSupervisorApi["show"] = (prepared) => this.executor.withLock(prepared.session.id,
+  readonly show: TerminalSupervisorApi["show"] = (prepared, shouldActivate = () => true) => this.executor.withLock(prepared.session.id,
     Effect.acquireUseRelease(Effect.sync(() => {
       const launch = { ownerId: `terminal-owner-${this.nextOwner++}`, done: Deferred.makeUnsafe<void>(), cancelled: Deferred.makeUnsafe<void>() }
       this.launches.set(prepared.session.id, launch)
@@ -206,7 +206,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       const existing = this.owners.get(prepared.session.id)
       if (existing) {
         if (existing.state !== "running" || existing.transitioning) return yield* Effect.fail(this.error("show", existing.sessionId, "Session is stopping or switching identity"))
-        yield* this.gate.withPermit(this.activate(existing))
+        yield* this.gate.withPermit(Effect.suspend(() => shouldActivate() ? this.activate(existing) : Effect.void))
         return existing.ownerId
       }
       const claim = yield* restore(this.untilCancelled(this.dependencies.guard.acquire(prepared.session.id, prepared.allowDuplicate), pending.cancelled))
@@ -240,7 +240,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           this.offer(current, { _tag: "Provider", event })
         })))), this.scope))
         yield* this.gate.withPermit(Effect.suspend(() => this.shuttingDown || current.state !== "running" || current.process.exitCode !== null || Deferred.isDoneUnsafe(pending.cancelled)
-          ? Effect.fail(this.error("activate", current.sessionId, "Terminal stopped before activation")) : this.activate(current)))
+          ? Effect.fail(this.error("activate", current.sessionId, "Terminal stopped before activation")) : shouldActivate() ? this.activate(current) : Effect.void))
         Deferred.doneUnsafe(current.ready, Effect.void)
         return current.ownerId
       }))

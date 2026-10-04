@@ -71,6 +71,28 @@ test("opening the same session reuses its terminal and hidden sessions stay runn
     expect(yield* supervisor.runningSessionIds).toEqual(new Set(["one", "two"]))
   }))
 })
+test("a superseded acquisition registers its owner without activating its surface", async () => {
+  const f = fixture()
+  await use(f, (supervisor) => Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let current = true
+    const prepared = f.prepare("slow")
+    const slow = yield* Effect.forkChild(supervisor.show({ ...prepared,
+      acquireLaunch: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(prepared.acquireLaunch)),
+    }, () => current))
+    yield* Deferred.await(entered)
+    current = false
+    yield* supervisor.show(f.prepare("other"))
+    yield* Deferred.succeed(release, undefined)
+    const owner = yield* Fiber.join(slow)
+    expect(yield* supervisor.activeSessionId).toBe("other")
+    expect(yield* supervisor.runningSessionIds).toEqual(new Set(["slow", "other"]))
+    expect(f.log).not.toContain(`focus:${owner}`)
+    yield* supervisor.show(f.prepare("slow"))
+    expect(yield* supervisor.activeSessionId).toBe("slow")
+  }))
+})
 test("stopping one endpoint does not stop its sibling and stale stop IDs cannot stop replacements", async () => {
   const f = fixture()
   await use(f, (supervisor) => Effect.gen(function*() {

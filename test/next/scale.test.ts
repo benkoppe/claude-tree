@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 
 import { makeInitialApplicationState, available, type ApplicationState } from "../../src/application/state"
 import { selectConversationForest } from "../../src/application/selectors"
+import { reduceApplicationState } from "../../src/application/reducer"
 import { indexRootViews, projectApplicationViewModel, projectGraphViewModel, type GraphNodeViewModel, type RootViewModel } from "../../src/application/view-model"
 import type { AgentMessage } from "../../src/domain/model"
 import { renderGraph, renderRoots } from "../../src/presentation/render"
@@ -123,4 +124,39 @@ test("root rows reuse formatted content during movement and invalidate it on res
   expect(titleReads).toBe(24)
   renderRoots(roots, "root-0", 24, 80)
   expect(titleReads).toBe(48)
+})
+
+test("a session-local refresh never compares unrelated transcript content", () => {
+  const initial = fixture()
+  let guarded = false
+  const unrelated = new Proxy(history(100, 10), {
+    get(target, key, receiver) {
+      if (guarded && (key === Symbol.iterator || key === "filter" || key === "every" ||
+        (typeof key === "string" && /^(0|[1-9]\d*)$/.test(key)))) throw new Error("Scanned unrelated history")
+      return Reflect.get(target, key, receiver)
+    },
+  })
+  let state: ApplicationState = { ...initial, provider: { ...initial.provider, transcripts: new Map(initial.provider.transcripts).set("unrelated", available(unrelated)) } }
+  selectConversationForest(state)
+  guarded = true
+  state = reduceApplicationState(state, { _tag: "RefreshStarted", refresh: {
+    key: "targeted", generation: 1, reason: "terminal-return", mode: "incremental", sessionIds: new Set(["root"]),
+  } })
+  expect(() => reduceApplicationState(state, { _tag: "RefreshSucceeded", key: "targeted", generation: 1,
+    snapshot: { sessions: [], transcripts: new Map([["root", available(history(151, 50))]]) },
+  })).not.toThrow()
+})
+
+test("unrelated hydration retains root rows and the selected graph's node views", () => {
+  const state = fixture()
+  const first = projectApplicationViewModel(state)
+  if (first.surface._tag !== "Roots") throw new Error("Expected roots")
+  const root = first.surface.roots.find((row) => row.sessionId === "root")
+  const graph = projectGraphViewModel(state, "root")
+  const changed = { ...state, historyStatus: new Map(state.historyStatus).set("unrelated", { _tag: "Ready" as const }),
+    provider: { ...state.provider, transcripts: new Map(state.provider.transcripts).set("unrelated", available(history(5, 1))) } }
+  const updated = projectApplicationViewModel(changed)
+  if (updated.surface._tag !== "Roots") throw new Error("Expected roots")
+  expect(updated.surface.roots.find((row) => row.sessionId === "root")).toBe(root)
+  expect(projectGraphViewModel(changed, "root").unselectedNodes).toBe(graph.unselectedNodes)
 })

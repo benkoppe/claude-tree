@@ -114,11 +114,7 @@ export function selectConversationForest(state: ApplicationState): ConversationF
   const forest = projectForest(
     data.sessions,
     data.transcripts,
-    state.relations.filter((relation) => {
-      const parent = selectTranscriptRead(state, relation.parentSessionId)
-      const child = selectTranscriptRead(state, relation.childSessionId)
-      return !(parent?._tag === "Available" && parent.coverage) && !(child?._tag === "Available" && child.coverage)
-    }),
+    selectProjectedRelations(state),
     state.removals,
   )
   // Reducer collections are immutable. Navigation, modal, and refresh bookkeeping
@@ -128,6 +124,14 @@ export function selectConversationForest(state: ApplicationState): ConversationF
     relations: state.relations, removals: state.removals, historyStatus: state.historyStatus, forest,
   })
   return forest
+}
+
+export function selectProjectedRelations(state: ApplicationState) {
+  return state.relations.filter((relation) => {
+    const parent = selectTranscriptRead(state, relation.parentSessionId)
+    const child = selectTranscriptRead(state, relation.childSessionId)
+    return !(parent?._tag === "Available" && parent.coverage) && !(child?._tag === "Available" && child.coverage)
+  })
 }
 
 export function selectVisibleConversationForest(state: ApplicationState): ConversationForest {

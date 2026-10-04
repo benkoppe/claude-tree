@@ -154,6 +154,8 @@ export interface AgentProviderApi {
   readonly id: string
   readonly displayName: string
   readonly capabilities: ProviderCapabilities
+  /** Keep provider-local launch hints current when discovery executes in isolation. */
+  readonly observeSessionSummaries?: (sessions: readonly AgentSession[]) => void
   readonly takeBranchMutationReconciliation?: Effect.Effect<AmbiguousBranchMutation>
   readonly loadSessionSnapshot: Effect.Effect<
     AgentSessionSnapshot,

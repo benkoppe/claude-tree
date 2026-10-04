@@ -158,12 +158,12 @@ export function stableTranscriptWhileNonIdle(previous: readonly AgentMessage[], 
 }
 
 export function isTranscriptPrefix(prefix: readonly AgentMessage[], transcript: readonly AgentMessage[]): boolean {
-  return prefix.length <= transcript.length && prefix.every((message, index) => sameLogicalMessage(message, transcript[index]))
+  return prefix === transcript || (prefix.length <= transcript.length && prefix.every((message, index) => sameLogicalMessage(message, transcript[index])))
 }
 
 export function sameTranscript(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
-  return left.length === right.length && left.every((message, index) =>
-    sameLogicalMessage(message, right[index]) && message.historical === right[index]?.historical && message.turnComplete === right[index]?.turnComplete)
+  return left === right || (left.length === right.length && left.every((message, index) =>
+    sameLogicalMessage(message, right[index]) && message.historical === right[index]?.historical && message.turnComplete === right[index]?.turnComplete))
 }
 
 function sameLogicalMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {
