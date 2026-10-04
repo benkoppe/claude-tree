@@ -63,11 +63,3 @@ bun run start
 Without Nix, install Bun and at least one supported provider CLI before running the last three commands.
 
 After changing `bun.lock`, regenerate the Nix dependency set with `nix develop -c bun2nix -o bun.nix`.
-
-### Responsiveness benchmark
-
-Run `bun run benchmark:responsiveness` to measure startup and refresh using real SDK fixture reads, keyboard input, and OpenTUI rendering. It uses disposable data and does not launch agent terminals or modify real transcripts.
-
-For a larger workload, use `BENCHMARK_SESSIONS=1000 BENCHMARK_RECORDS=100 bun run benchmark:responsiveness`. Add `--inline` to compare without read/projection workers; this retains the other optimizations, so it is not the original implementation. Run comparisons sequentially on the same machine without other heavy work.
-
-`inputToVisibleSelection` waits for the matching actor acknowledgment, presentation delivery, and highlighted destination. It includes polling and test-renderer overhead. `sampledAcknowledgedFrameIntervals` includes 16 ms input pacing and is not native FPS. The p95 latency goal is 16.7 ms, not an automated pass/fail threshold; timings depend on machine load and Nix builds may reuse cached results. Keep this benchmark separate from flake checks and deterministic regression tests. It measures loading/refresh, not provider mutations or terminal acquisition.

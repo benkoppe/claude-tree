@@ -19,6 +19,14 @@ Follow general code best practices, such as:
 - Keep normal resource cleanup bounded and idempotent. Cleanup state is process-local; do not introduce persisted orphan recovery. OS-held session guards are advisory across invocations, with a user-confirmed override, and release automatically when the application exits.
 - Test timeouts, retries, heartbeats, and escalation with Effect's `TestClock` or controlled deferred values. Do not add real sleeps to deterministic unit tests.
 
+## Responsiveness Benchmark
+
+Run `bun run benchmark:responsiveness` to measure startup and refresh using real SDK fixture reads, keyboard input, and OpenTUI rendering. It uses disposable data and does not launch agent terminals or modify real transcripts.
+
+For a larger workload, use `BENCHMARK_SESSIONS=1000 BENCHMARK_RECORDS=100 bun run benchmark:responsiveness`. Add `--inline` to compare without read/projection workers; this retains the other optimizations, so it is not the original implementation. Run comparisons sequentially on the same machine without other heavy work.
+
+`inputToVisibleSelection` waits for the matching actor acknowledgment, presentation delivery, and highlighted destination. It includes polling and test-renderer overhead. `sampledAcknowledgedFrameIntervals` includes 16 ms input pacing and is not native FPS. The p95 latency goal is 16.7 ms, not an automated pass/fail threshold; timings depend on machine load and Nix builds may reuse cached results. Keep this benchmark separate from flake checks and deterministic regression tests. It measures loading/refresh, not provider mutations or terminal acquisition.
+
 ## Persistence
 
 - Provider state schema v3 is strict and reset-only. Do not add implicit migration, deletion, quarantine, fallback parsing, or automatic recreation for incompatible persisted state.
