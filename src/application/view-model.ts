@@ -6,6 +6,7 @@ import type {
 } from "../domain/conversation-graph"
 import { reachableSessionEndpoints } from "../domain/conversation-graph"
 import {
+  DEFAULT_GRAPH_VIEWPORT_WIDTH,
   initialVisibleGraphNodeId,
   layoutConversationGraph,
   visibleGraphNodeId,
@@ -119,14 +120,16 @@ export interface ApplicationViewModel {
 }
 
 type GraphView = Extract<SurfaceViewModel, { readonly _tag: "Graph" }>
-const layoutCache = new WeakMap<ConversationGraph, {
-  width: number
-  visible: ReadonlySet<string>
-  layout: ReturnType<typeof layoutConversationGraph>
-  aliases: ReadonlyMap<string, ReadonlyMap<string, string>>
-}>()
+interface GraphGeometry {
+  readonly width: number
+  readonly visible: ReadonlySet<string>
+  readonly layout: ReturnType<typeof layoutConversationGraph>
+  readonly aliases: ReadonlyMap<string, ReadonlyMap<string, string>>
+}
+const layoutCache = new WeakMap<ConversationGraph, GraphGeometry>()
 
-export function cacheGraphLayout(graph: ConversationGraph, visible: ReadonlySet<string>, layout: ReturnType<typeof layoutConversationGraph>): void {
+export function cacheGraphLayout(graph: ConversationGraph, visible: ReadonlySet<string>, layout: ReturnType<typeof layoutConversationGraph>,
+  width = DEFAULT_GRAPH_VIEWPORT_WIDTH): GraphGeometry {
   const aliases = new Map<string, Map<string, string>>()
   for (const node of graph.nodes.values()) {
     if (node.kind !== "message") continue
@@ -136,7 +139,9 @@ export function cacheGraphLayout(graph: ConversationGraph, visible: ReadonlySet<
       messages.set(alias.messageId, node.id)
     }
   }
-  layoutCache.set(graph, { width: 80, visible: new Set([...graph.sessionIds].filter((id) => visible.has(id))), layout, aliases })
+  const geometry = { width, visible: new Set([...graph.sessionIds].filter((id) => visible.has(id))), layout, aliases }
+  layoutCache.set(graph, geometry)
+  return geometry
 }
 const graphViewCache = new WeakMap<ConversationGraph, {
   historyStatus: ApplicationState["historyStatus"]
@@ -265,7 +270,7 @@ export function projectGraphViewModel(
   state: ApplicationState,
   familySessionId: string,
   selection?: NavigationTarget,
-  viewportWidth = 80,
+  viewportWidth = DEFAULT_GRAPH_VIEWPORT_WIDTH,
 ): Extract<SurfaceViewModel, { readonly _tag: "Graph" }> {
   const forest = selectConversationForest(state)
   const graph = forest.graphBySessionId.get(familySessionId) ??
@@ -277,18 +282,8 @@ export function projectGraphViewModel(
   let geometry = layoutCache.get(graph)
   if (!geometry || geometry.width !== viewportWidth || geometry.visible.size !== layoutVisibleIds.size ||
     [...layoutVisibleIds].some((id) => !geometry!.visible.has(id))) {
-    const aliases = new Map<string, Map<string, string>>()
-    for (const node of graph.nodes.values()) {
-      if (node.kind !== "message") continue
-      for (const alias of node.aliases) {
-        let messages = aliases.get(alias.sessionId)
-        if (!messages) aliases.set(alias.sessionId, messages = new Map())
-        messages.set(alias.messageId, node.id)
-      }
-    }
-    geometry = { width: viewportWidth, visible: layoutVisibleIds,
-      layout: layoutConversationGraph(graph, viewportWidth, visibleEndpointSessionIds), aliases }
-    layoutCache.set(graph, geometry)
+    geometry = cacheGraphLayout(graph, layoutVisibleIds,
+      layoutConversationGraph(graph, viewportWidth, visibleEndpointSessionIds), viewportWidth)
   }
   const layout = geometry.layout
   const requestedTarget = selection ?? (state.surface._tag === "Graph" ? state.surface.target : undefined)

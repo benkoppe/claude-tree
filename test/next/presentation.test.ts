@@ -982,7 +982,7 @@ test("keeps graph updates visible while an endpoint terminal is opening", async 
     await waitFor(() => running.harness.calls.includes("open:root-1"))
     const updated = linearGraph("root-1", "Opening conversation", "draft created during open")
     await Effect.runPromise(running.harness.update(updated))
-    const opening = await frame(setup, (value) => value.includes("Message tree"))
+    const opening = await frame(setup, (value) => value.includes("draft created during open"))
     expect(opening).toContain("draft created during open")
     await Effect.runPromise(Deferred.succeed(release, undefined))
   } finally {

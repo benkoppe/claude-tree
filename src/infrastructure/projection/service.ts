@@ -18,13 +18,13 @@ export interface ProjectionService {
 export function makeProjectionService(
   createWorker: () => Worker = () => new Worker(new URL("./worker.ts", import.meta.url)),
 ): Effect.Effect<ProjectionService, unknown, Scope.Scope> {
-  return Effect.gen(function*() {
+  return Effect.uninterruptible(Effect.gen(function*() {
     const pending = new Map<number, Deferred.Deferred<Extract<ProjectionResponse, { _tag: "Projected" }>, Error>>()
     let nextId = 1
     let closing: Promise<number> | undefined
     let failure: Error | undefined
     const fail = (cause: unknown) => {
-      failure = cause instanceof Error ? cause : new Error(String(cause))
+      failure ??= cause instanceof Error ? cause : new Error(String(cause))
       for (const reply of pending.values()) Deferred.doneUnsafe(reply, Effect.fail(failure))
       pending.clear()
     }
@@ -68,5 +68,5 @@ export function makeProjectionService(
           }))
       }),
     }
-  })
+  }))
 }

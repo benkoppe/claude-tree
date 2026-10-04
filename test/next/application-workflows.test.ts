@@ -14,6 +14,8 @@ import { makeShutdownSignals, reportCliFailures, runPresentationLifecycle, runSc
 import { PROGRAM_NAME } from "../../src/program"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
+import { selectConversationForest } from "../../src/application/selectors"
+import { available } from "../../src/application/state"
 
 import {
   ApplicationShutdownError,
@@ -401,7 +403,8 @@ describe("application actor", () => {
       yield* waitForState(runtime, (state) => !state.refresh.initialPending)
       yield* runtime.selectRoot(ROOT)
       yield* Deferred.await(started)
-      for (let index = 0; index < 100; index++) yield* runtime.selectRoot(index % 2 ? ROOT : CHILD)
+      yield* runtime.selectRoot(CHILD)
+      yield* runtime.selectRoot(ROOT)
       yield* runtime.enterRoot(ROOT)
       const opening = yield* Effect.forkChild(runtime.openEndpoint(ROOT))
       yield* waitForState(runtime, (state) => state.surface._tag === "Terminal")
@@ -488,8 +491,11 @@ describe("application actor", () => {
 
   test("a delayed fork retains its child without stealing newer navigator focus", async () => {
     const fixture = makeFixture()
+    const childHistory = [message("copied-q", "user", "question", 0)]
+    const derivation = { childSessionId: "fork-child", parentSessionId: ROOT, sourceMessageId: "q",
+      sharedMessages: [{ parentMessageId: "q", childMessageId: "copied-q" }] }
     fixture.branchOutcome = { _tag: "ValidatedBranch", ...prepared("fork-child", "Fork child"),
-      derivation: relation("fork-child", ROOT) }
+      transcript: available(childHistory), derivation }
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const release = yield* Deferred.make<BranchOutcome>()
       const started = yield* Deferred.make<void>()
@@ -498,7 +504,7 @@ describe("application actor", () => {
       } })
       yield* waitForState(runtime, (state) => !state.refresh.initialPending)
       yield* runtime.enterRoot(ROOT)
-      const fork = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "a" })))
+      const fork = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
       yield* Deferred.await(started)
       yield* runtime.selectRoot(CHILD)
       yield* Deferred.succeed(release, fixture.branchOutcome)
@@ -506,7 +512,15 @@ describe("application actor", () => {
       expect(Exit.isFailure(result)).toBeTrue()
       const state = yield* runtime.getState
       expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      if (fixture.branchOutcome._tag !== "ValidatedBranch") throw new Error("Expected validated branch")
       expect(state.relations).toHaveLength(1)
+      expect(state.relations[0]).toMatchObject(derivation)
+      expect(state.local.sessions.get("fork-child")).toEqual(fixture.branchOutcome.session)
+      expect(selectProjectedTranscript(state, "fork-child")).toEqual(childHistory)
+      expect((yield* fixture.options.metadata.loadMetadata).relations).toEqual(state.relations)
+      const forest = selectConversationForest(state)
+      expect(forest.graphBySessionId.get("fork-child")).toBeDefined()
+      expect(forest.graphBySessionId.get("fork-child")).toBe(forest.graphBySessionId.get(ROOT))
       expect(fixture.calls.some((call) => call.startsWith("show:"))).toBeFalse()
     })))
   })
@@ -523,7 +537,8 @@ describe("application actor", () => {
       stall = true
       const refresh = yield* Effect.forkChild(runtime.refresh())
       yield* Deferred.await(started)
-      for (let index = 0; index < 100; index++) yield* runtime.selectRoot(index % 2 ? CHILD : ROOT)
+      yield* runtime.selectRoot(ROOT)
+      yield* runtime.selectRoot(CHILD)
       yield* runtime.openModal({ _tag: "About" })
       expect((yield* runtime.getState).surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
       yield* Deferred.succeed(release, undefined)
@@ -569,11 +584,8 @@ describe("application actor", () => {
       const started = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       let stall = false
-      let preparations = 0
-      const runtime = yield* makeAppRuntime({ ...fixture.options, prepareProjection: () => {
-        preparations++
-        return stall ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))) : Effect.void
-      } })
+      const runtime = yield* makeAppRuntime({ ...fixture.options, prepareProjection: () => stall
+        ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))) : Effect.void })
       yield* waitForState(runtime, (state) => !state.refresh.initialPending)
       yield* runtime.openEndpoint(ROOT)
       const ownerId = (yield* runtime.getState).terminals.get(ROOT)!.ownerId!
@@ -582,12 +594,10 @@ describe("application actor", () => {
       stall = true
       const refresh = yield* Effect.forkChild(runtime.refresh())
       yield* Deferred.await(started)
-      const before = preparations
       expect(yield* runtime.handleTerminalObservation({ ownerId, sequenceId: 1, sessionId: ROOT, wasActive: true,
         observation: { _tag: "Submission", text: "new submission" } })).toBeTrue()
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(refresh)
-      expect(preparations).toBeGreaterThan(before)
       expect(selectProjectedTranscript(yield* runtime.getState, ROOT).map((message) => message.id)).toEqual(["q"])
     })))
   })

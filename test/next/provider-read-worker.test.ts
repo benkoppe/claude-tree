@@ -5,19 +5,27 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Worker } from "node:worker_threads"
 
-import { Deferred, Effect, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 
 import { makeProviderReads } from "../../src/infrastructure/providers/read-service"
 import type { ProviderReadRequest, ProviderReadResponse } from "../../src/infrastructure/providers/read-worker-protocol"
 
 class ControlledReadWorker extends EventEmitter {
   readonly requests: ProviderReadRequest[] = []
-  readonly posted = Deferred.makeUnsafe<void>()
+  private readonly posted = new Map<string, Deferred.Deferred<void>>()
+  autoClose = true
   terminated = 0
+  private signal(request: ProviderReadRequest) {
+    const key = JSON.stringify(request)
+    let signal = this.posted.get(key)
+    if (!signal) { signal = Deferred.makeUnsafe<void>(); this.posted.set(key, signal) }
+    return signal
+  }
+  waitFor(request: ProviderReadRequest) { return Deferred.await(this.signal(request)) }
   postMessage(request: ProviderReadRequest) {
     this.requests.push(request)
-    Deferred.doneUnsafe(this.posted, Effect.void)
-    if (request._tag === "Close") this.emit("message", { _tag: "Closed" })
+    Deferred.doneUnsafe(this.signal(request), Effect.void)
+    if (request._tag === "Close" && this.autoClose) this.emit("message", { _tag: "Closed" })
   }
   terminate() { this.terminated++; this.emit("exit", 1); return Promise.resolve(1) }
   unref() {}
@@ -38,12 +46,12 @@ test("read progress has backpressure and the final result reuses delivered histo
       transcripts: new Map([["session", { _tag: "Available" as const, messages: [] }]]) }
     const read = yield* Effect.forkChild(reads.loadSnapshot(undefined, () =>
       Deferred.succeed(progressStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseProgress)))))
-    yield* Deferred.await(worker.posted)
+    yield* worker.waitFor({ _tag: "Read", id: 1 })
     worker.send({ _tag: "Progress", id: 1, sequence: 1, snapshot })
     yield* Deferred.await(progressStarted)
     expect(worker.requests.some((request) => request._tag === "Acknowledged")).toBeFalse()
     yield* Deferred.succeed(releaseProgress, undefined)
-    yield* Effect.yieldNow
+    yield* worker.waitFor({ _tag: "Acknowledged", id: 1, sequence: 1 })
     expect(worker.requests).toContainEqual({ _tag: "Acknowledged", id: 1, sequence: 1 })
     worker.send({ _tag: "Completed", id: 1 })
     const result = yield* Fiber.join(read)
@@ -54,16 +62,18 @@ test("read progress has backpressure and the final result reuses delivered histo
   })))
 })
 
-test("interrupting a read cancels only that job and does not strand subsequent reads", async () => {
+test("interrupting a read cancels only that job while another read continues", async () => {
   const worker = new ControlledReadWorker()
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
     const read = yield* Effect.forkChild(reads.loadSnapshot(["old"]))
-    yield* Deferred.await(worker.posted)
+    yield* worker.waitFor({ _tag: "Read", id: 1, sessionIds: ["old"] })
+    const next = yield* Effect.forkChild(reads.loadSnapshot(["new"]))
+    yield* worker.waitFor({ _tag: "Read", id: 2, sessionIds: ["new"] })
     yield* Fiber.interrupt(read)
     expect(worker.requests).toContainEqual({ _tag: "Cancel", id: 1 })
-    const next = yield* Effect.forkChild(reads.loadSnapshot(["new"]))
-    yield* Effect.yieldNow
+    expect(worker.requests).not.toContainEqual({ _tag: "Cancel", id: 2 })
+    expect(worker.terminated).toBe(0)
     worker.send({ _tag: "Completed", id: 2 })
     expect((yield* Fiber.join(next)).transcripts.size).toBe(0)
   })))
@@ -74,7 +84,7 @@ test("worker failure settles admitted reads and prevents further admission", asy
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
     const read = yield* Effect.forkChild(Effect.flip(reads.loadSnapshot()))
-    yield* Deferred.await(worker.posted)
+    yield* worker.waitFor({ _tag: "Read", id: 1 })
     worker.emit("error", new Error("worker failed"))
     expect((yield* Fiber.join(read)).message).toContain("worker failed")
     expect((yield* Effect.flip(reads.loadSnapshot())).message).toContain("worker failed")
@@ -89,7 +99,7 @@ test.each(["failure", "close"] as const)("%s settles a read even while its progr
     const started = yield* Deferred.make<void>()
     const read = yield* Effect.forkChild(Effect.flip(reads.loadSnapshot(undefined, () =>
       Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)))))
-    yield* Deferred.await(worker.posted)
+    yield* worker.waitFor({ _tag: "Read", id: 1 })
     worker.send({ _tag: "Progress", id: 1, sequence: 1, snapshot: { sessions: [], transcripts: new Map() } })
     yield* Deferred.await(started)
     if (mode === "failure") worker.emit("error", new Error("worker failed"))
@@ -97,6 +107,25 @@ test.each(["failure", "close"] as const)("%s settles a read even while its progr
     expect((yield* Fiber.join(read)).message).toContain(mode === "failure" ? "worker failed" : "closing")
     yield* Effect.exit(reads.close)
   })))
+})
+
+test("interruption during worker creation installs cleanup and waits for provider drain", async () => {
+  const worker = new ControlledReadWorker()
+  worker.autoClose = false
+  await Effect.runPromise(Effect.gen(function*() {
+    const acquisition = yield* Effect.forkChild(Effect.scoped(Effect.withFiber((fiber) =>
+      makeProviderReads({ providerId: "claude", projectPath: "/project" }, () => {
+        fiber.interruptUnsafe()
+        return worker.create()
+      }))))
+    yield* worker.waitFor({ _tag: "Close" })
+    expect(worker.terminated).toBe(0)
+    expect(acquisition.pollUnsafe()).toBeUndefined()
+    worker.send({ _tag: "Closed" })
+    const exit = yield* Fiber.await(acquisition)
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+    expect(worker.terminated).toBe(1)
+  }))
 })
 
 test("production worker reads real SDK transcripts, flushes a partial batch, and closes", async () => {

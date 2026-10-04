@@ -171,6 +171,8 @@ type RefreshPublicationMessage =
   | (Extract<StateEvent, { readonly _tag: "RefreshProgress" }> & { readonly acknowledgment?: DeferredType.Deferred<void> })
   | (CommandCompletedMessage & { readonly command: Extract<ActorCommand, { readonly _tag: "Refresh" }> })
 
+type PreparedRefreshPublication = Extract<StateEvent, { readonly _tag: "PreparedRefreshPublished" }>
+
 type ActorControlMessage = LifecycleControlMessage | CommandCompletedMessage
 
 type ActorCommand =
@@ -273,13 +275,9 @@ export function makeAppRuntime(
       readonly relation?: BranchRelation
     }> = []
     const transitionAcknowledgmentFailures = new Map<string, unknown>()
-    let preparedRefresh: { readonly event: Extract<StateEvent, { _tag: "RefreshProgress" | "RefreshSucceeded" }>; readonly base: ApplicationState; readonly candidate: ApplicationState } | undefined
 
     const publish = (event: StateEvent): Effect.Effect<void> => Effect.gen(function*() {
-      const prepared = preparedRefresh && (event._tag === "RefreshProgress" || event._tag === "RefreshSucceeded") &&
-        event.key === preparedRefresh.event.key && event.generation === preparedRefresh.event.generation ? preparedRefresh : undefined
-      const next = reduceApplicationState(state, prepared ? { _tag: "PreparedRefreshPublished", base: prepared.base, candidate: prepared.candidate } : event)
-      if (prepared) preparedRefresh = undefined
+      const next = reduceApplicationState(state, event)
       if (next === state) return
       const viewModel = projectApplicationViewModel(next)
       yield* SubscriptionRef.set(publication, viewModel)
@@ -911,6 +909,7 @@ export function makeAppRuntime(
 
     const completeCommand = (
       message: Extract<ActorMessage, { readonly _tag: "CommandCompleted" }>,
+      prepared?: PreparedRefreshPublication,
     ): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
       const active = activeCommands.get(message.key)
       if (!active || active.token !== message.token) return
@@ -923,7 +922,7 @@ export function makeAppRuntime(
         const invalidatedSessionIds = refresh ? invalidatedRefreshSessionIds(state, refresh) : new Set<string>()
         if (Exit.isSuccess(exit)) {
           const previousModal = state.modal
-          yield* publish({
+          yield* publish(prepared ?? {
             _tag: "RefreshSucceeded",
             key: command.refresh.key,
             generation: command.refresh.generation,
@@ -1620,6 +1619,31 @@ export function makeAppRuntime(
         }
       })
 
+    const acceptRefreshPublication = (
+      message: RefreshPublicationMessage,
+      prepared?: PreparedRefreshPublication,
+    ): Effect.Effect<void, never, Scope.Scope> => message._tag === "CommandCompleted"
+      ? completeCommand(message, prepared)
+      : publish(prepared ?? message).pipe(Effect.ensuring(
+          message.acknowledgment ? Deferred.succeed(message.acknowledgment, undefined) : Effect.void,
+        ))
+
+    const prepareRefreshPublication = (message: RefreshPublicationMessage): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
+      const event = refreshPublicationEvent(message)
+      if (!options.prepareProjection || !event) {
+        yield* acceptRefreshPublication(message)
+        return
+      }
+      const base = state
+      const candidate = reduceApplicationState(base, event, true)
+      if (candidate === base) {
+        yield* acceptRefreshPublication(message)
+        return
+      }
+      yield* Effect.forkIn(options.prepareProjection(candidate).pipe(Effect.onExit((exit) =>
+        Queue.offer(inbox, { _tag: "RefreshPrepared", original: message, base, candidate, exit })), Effect.exit, Effect.asVoid), commandScope)
+    })
+
     const processMessage = (message: ActorMessage): Effect.Effect<void, never, Scope.Scope> => {
       if (message._tag === "RefreshPrepared") return Effect.gen(function*() {
         if (state.shutdown !== "running") {
@@ -1627,7 +1651,7 @@ export function makeAppRuntime(
           return
         }
         if (!sameOperationalState(state, message.base)) {
-          yield* processMessageWithBoundary(message.original)
+          yield* prepareRefreshPublication(message.original)
           return
         }
         if (Exit.isFailure(message.exit)) {
@@ -1635,29 +1659,11 @@ export function makeAppRuntime(
           yield* containMessageDefect(message.original, message.exit.cause as Cause.Cause<never>)
           return
         }
-        const event = refreshPublicationEvent(message.original)
-        if (!event) return
-        preparedRefresh = { event, base: message.base, candidate: message.candidate }
-        yield* processMessageWithBoundary(message.original)
-        preparedRefresh = undefined
-      })
-      if (options.prepareProjection && !preparedRefresh && isRefreshPublicationMessage(message)) {
-        const event = refreshPublicationEvent(message)
-        if (event) return Effect.gen(function*() {
-          const base = state
-          const candidate = reduceApplicationState(base, event, true)
-          if (candidate === base) {
-            if (message._tag === "RefreshProgress" && message.acknowledgment) yield* Deferred.succeed(message.acknowledgment, undefined)
-            if (message._tag === "CommandCompleted") yield* completeCommand(message)
-            return
-          }
-          yield* Effect.forkIn(options.prepareProjection!(candidate).pipe(Effect.onExit((exit) =>
-            Queue.offer(inbox, { _tag: "RefreshPrepared", original: message, base, candidate, exit })), Effect.exit, Effect.asVoid), commandScope)
+        yield* acceptRefreshPublication(message.original, {
+          _tag: "PreparedRefreshPublished", base: message.base, candidate: message.candidate,
         })
-      }
-      if (message._tag === "RefreshProgress") return publish(message).pipe(Effect.ensuring(
-        message.acknowledgment ? Deferred.succeed(message.acknowledgment, undefined) : Effect.void,
-      ))
+      })
+      if (isRefreshPublicationMessage(message)) return prepareRefreshPublication(message)
       if (message._tag === "Startup") {
         return Effect.gen(function*() {
           if (accepting && state.shutdown === "running") {
