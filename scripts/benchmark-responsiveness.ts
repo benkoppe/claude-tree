@@ -8,13 +8,11 @@ import { Effect, Fiber, Stream } from "effect"
 
 import { makeAppRuntime, type AppRuntime } from "../src/application/runtime"
 import type { ApplicationViewModel } from "../src/application/view-model"
-import { makeNavigationPersistenceWorker } from "../src/infrastructure/metadata/navigation-persistence"
-import { nativePersistencePlatform, PersistencePlatform } from "../src/infrastructure/metadata/platform"
+import { makeMetadataWorker } from "../src/infrastructure/metadata/worker-service"
 import { makeProviderReads, withProviderReads } from "../src/infrastructure/providers/read-service"
 import { makeProjectionService } from "../src/infrastructure/projection/service"
 import { makeOpenTuiPresentation } from "../src/presentation/open-tui-presentation"
 import { presentationTheme } from "../src/presentation/theme"
-import { makeProviderStateRepository } from "../src/services/provider-state-repository"
 import type { TerminalSupervisorApi } from "../src/services/terminal-supervisor"
 
 const inline = process.argv.includes("--inline")
@@ -141,11 +139,10 @@ try {
     const projection = inline ? undefined : yield* makeProjectionService()
     const provider = reads ? withProviderReads(localProvider, reads) : localProvider
     const repositoryOptions = { providerId: "claude", projectDirectory: projectPath, stateHome: join(directory, "state") }
-    const repository = yield* makeProviderStateRepository(repositoryOptions)
-    const navigation = yield* makeNavigationPersistenceWorker({ ...repositoryOptions, instanceId: repository.instanceId })
+    const repository = yield* makeMetadataWorker(repositoryOptions)
     const setup = yield* Effect.promise(() => createTestRenderer({ width: 100, height: 30 }))
-    const runtime = yield* makeAppRuntime({ provider, terminals, metadata: { ...repository, saveNavigation: navigation.saveNavigation },
-      closeNavigationPersistence: navigation.close, ...(reads ? { closeProviderReads: reads.close } : {}),
+    const runtime = yield* makeAppRuntime({ provider, terminals, metadata: repository,
+      closeNavigationPersistence: repository.close, ...(reads ? { closeProviderReads: reads.close } : {}),
       ...(projection ? { prepareProjection: projection.prepare, closeProjection: projection.close } : {}),
     })
     const monitor: SelectionMonitor = { requestedId: undefined, deliveredView: undefined }
@@ -185,7 +182,7 @@ try {
     yield* Fiber.join(graphRead)
     yield* presentation.stop
     return { mode: inline ? "inline" : "isolated", sessions: count, recordsPerSession: records, startup, manualRefresh, graphRefresh }
-  }).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform))))
+  })))
   console.log(JSON.stringify(result, null, 2))
 } finally {
   await rm(directory, { recursive: true, force: true })

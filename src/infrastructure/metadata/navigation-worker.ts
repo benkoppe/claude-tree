@@ -15,7 +15,7 @@ port.on("message", (message: NavigationWorkerRequest) => Queue.offerUnsafe(inbox
 const run = Effect.gen(function*() {
   const repository = yield* makeProviderStateRepository({ ...options, requireExisting: true })
   send({ _tag: "Ready" })
-  while (true) {
+  yield* Effect.gen(function*() { while (true) {
     const request = yield* Queue.take(inbox)
     if (request._tag === "Close") return
     const exit = yield* Effect.exit(repository.saveNavigation(request.navigation))
@@ -25,7 +25,7 @@ const run = Effect.gen(function*() {
       send({ _tag: "Failed", id: request.id, operation: "save navigation", path: repository.statePath,
         message: error instanceof Error ? error.message : String(error) })
     }
-  }
+  } }).pipe(Effect.ensuring(repository.close.pipe(Effect.orDie)))
 }).pipe(
   Effect.provideService(PersistencePlatform, { ...nativePersistencePlatform, instanceId: options.instanceId }),
   Effect.catchCause((cause) => Effect.sync(() => {

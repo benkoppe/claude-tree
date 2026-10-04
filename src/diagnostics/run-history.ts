@@ -1,5 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
+import { dirname, join } from "node:path"
 
 import { Deferred, Effect } from "effect"
 
@@ -8,6 +9,7 @@ import { resolveProjectDirectory, type CliOptions } from "../cli-options"
 import { optionalOperationTimeout, withOperationTimeout } from "../services/operation-deadline"
 import { HistoryDiagnosticReportSchema, HistoryTrace, type HistoryDiagnosticReport, type HistoryFailure } from "./history-trace"
 import type { HistoryDiagnosticJob } from "./history-process"
+import { isStandaloneExecutable } from "../infrastructure/worker-entry"
 
 const WORKER_CLOSE_TIMEOUT_MS = 1_000
 
@@ -20,7 +22,7 @@ export function diagnosticFailure(build: BuildInfo, code: HistoryFailure): Histo
 export function runHistoryWorker(
   job: HistoryDiagnosticJob,
   createWorker: () => ChildProcess = () => fork(fileURLToPath(new URL("./history-process.ts", import.meta.url)), [], {
-    execPath: process.execPath, stdio: ["ignore", "ignore", "ignore", "ipc"],
+    execPath: isStandaloneExecutable ? join(dirname(process.execPath), "claude-tree-history") : process.execPath, stdio: ["ignore", "ignore", "ignore", "ipc"],
     env: { ...process.env, DEBUG: "", DEBUG_CLAUDE_AGENT_SDK: "" },
   }),
   executionTimeoutMs?: number,

@@ -1,0 +1,56 @@
+name: Release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run build:release
+      - run: bun run test:release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: dist/
+
+  musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    container:
+      image: oven/bun:1.3.13-alpine
+      options: --user root
+    env:
+      OPENTUI_LIBC: musl
+    steps:
+      - run: apk add --no-cache nodejs npm tar git
+      - uses: actions/checkout@v7
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run build:release
+      - run: bun run test:release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-musl-${{ matrix.os }}
+          path: dist/
