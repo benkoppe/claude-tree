@@ -43,7 +43,15 @@
         };
 
         bunDeps = bun2nix.fetchBunDeps {
-          bunNix = ../bun.nix;
+          # esbuild's other-OS optional binaries are not executable on this host.
+          # Do not pass Solaris binaries through Linux auto-patchelf.
+          bunNix = { copyPathToStore, fetchFromGitHub, fetchgit, fetchurl, ... }@args:
+            let
+              os = if pkgs.stdenv.hostPlatform.isDarwin then "darwin" else "linux";
+              arch = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "x64";
+            in lib.filterAttrs
+              (name: _: !(lib.hasPrefix "@esbuild/" name) || lib.hasPrefix "@esbuild/${os}-${arch}@" name)
+              (import ../bun.nix args);
           autoPatchElf = pkgs.stdenv.hostPlatform.isLinux;
           nativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             ignoreUnusedMuslLoaders

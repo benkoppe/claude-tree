@@ -12,6 +12,7 @@ import { fileLocker } from "../session-guard"
 import { isStandaloneExecutable } from "../worker-entry"
 import { isErrorCode, nativePersistencePlatform } from "./platform"
 import { createDirectoryDurably, syncDirectory } from "./storage"
+import { backupDatabase } from "./backup"
 import journal from "./migrations/meta/_journal.json" with { type: "json" }
 import initialSql from "./migrations/0000_initial.sql" with { type: "text" }
 
@@ -125,10 +126,7 @@ export function openStateDatabase(stateHome: string, requireExisting = false, po
           if (migrations.length !== policy.migrations.length || migrations.some((entry, index) => entry.hash !== policy.migrations[index]?.hash || entry.folderMillis !== policy.migrations[index]?.when)) throw new Error("Packaged migrations do not match this application")
           if (current > 0) {
             const backup = `${path}.before-v${policy.version}-${Date.now()}.sqlite`
-            const handle = await open(backup, "wx", 0o600); await handle.close()
-            db.query("VACUUM INTO ?").run(backup)
-            const durable = await open(backup, "r"); try { await durable.sync() } finally { await durable.close() }
-            await syncDirectory(nativePersistencePlatform, dirname(backup))
+            await backupDatabase(db, backup)
           }
           migrate(databaseOrm(db), { migrationsFolder: policy.folder })
           if (db.query("PRAGMA foreign_key_check").all().length) throw new Error("Migration violated foreign key integrity")

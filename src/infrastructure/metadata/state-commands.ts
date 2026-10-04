@@ -1,5 +1,4 @@
-import { chmod, open } from "node:fs/promises"
-import { dirname, resolve } from "node:path"
+import { resolve } from "node:path"
 import { Effect } from "effect"
 
 import type { CliOptions } from "../../cli-options"
@@ -8,7 +7,7 @@ import { canonicalizeAndValidate } from "../../services/legacy-provider-state"
 import { databaseOrm, openStateDatabase } from "./database"
 import { PersistencePlatform, nativePersistencePlatform } from "./platform"
 import * as s from "./schema"
-import { syncDirectory } from "./storage"
+import { backupDatabase } from "./backup"
 
 export function runStateCommand(options: Extract<CliOptions, { command: "state" }>): Effect.Effect<string, unknown> {
   if (options.action === "export" || options.action === "import-json") return Effect.acquireUseRelease(
@@ -38,14 +37,7 @@ export function runStateCommand(options: Extract<CliOptions, { command: "state" 
         return "State database integrity and metadata checks passed."
       }
       const destination = resolve(options.destination!)
-      // VACUUM INTO refuses an existing file. Reserve a private empty destination first.
-      const file = yield* Effect.tryPromise({ try: () => open(destination, "wx", 0o600), catch: (e) => e })
-      yield* Effect.promise(() => file.close())
-      yield* Effect.try({ try: () => db.query("VACUUM INTO ?").run(destination), catch: (e) => e })
-      yield* Effect.tryPromise({ try: () => chmod(destination, 0o600), catch: (e) => e })
-      const backup = yield* Effect.tryPromise({ try: () => open(destination, "r"), catch: (e) => e })
-      yield* Effect.acquireUseRelease(Effect.succeed(backup), (handle) => Effect.tryPromise({ try: () => handle.sync(), catch: (e) => e }), (handle) => Effect.promise(() => handle.close()))
-      yield* Effect.tryPromise({ try: () => syncDirectory(nativePersistencePlatform, dirname(destination)), catch: (e) => e })
+      yield* Effect.tryPromise({ try: () => backupDatabase(db, destination), catch: (e) => e })
       return `State backup written to ${destination}.`
     }), ({ close }) => Effect.promise(close))
 }
