@@ -33,7 +33,7 @@ test("help and version bypass TTY and interactive composition", async () => {
   await run(["--help"])
   await run(["--version"])
 
-  expect(output[0]).toStartWith("claude-tree [--codex] [PROJECT]\n")
+  expect(output[0]).toStartWith("claude-tree [--codex] [--resume WORKSPACE_ID] [PROJECT]\n")
   expect(output[0]).toContain("Message tree:")
   expect(output[1]).toBe(`${PROGRAM_NAME} ${PROGRAM_VERSION}\n`)
   expect(runs).toBe(0)

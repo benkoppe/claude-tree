@@ -1,5 +1,4 @@
 import { Data } from "effect"
-import type { OwnershipBlockReason } from "./persistence"
 
 export class ProviderError extends Data.TaggedError("ProviderError")<{
   readonly providerId: string
@@ -33,21 +32,9 @@ export class SessionOwnedError extends Data.TaggedError("SessionOwnedError")<{
   readonly providerId: string
   readonly sessionId: string
   readonly ownerPid: number
-  readonly reason?: OwnershipBlockReason
 }> {
   override get message(): string {
-    if (this.reason !== undefined && this.reason !== "application-present") {
-      const details: Record<Exclude<OwnershipBlockReason, "application-present">, string> = {
-        "liveness-unknown": "process absence could not be verified",
-        "acquisition-incomplete": "launch acquisition was interrupted before all process identities were recorded; automatic recovery cannot prove that no process survived",
-        "terminal-present": "the previous terminal process group still exists",
-        "sidecar-present": "the previous provider sidecar process group still exists",
-        "artifact-cleanup-failed": "the previous launch artifacts could not be removed",
-        "owner-changed": "ownership changed during recovery",
-      }
-      return `Session ${this.sessionId} remains reserved after previous cleanup (original application PID ${this.ownerPid}): ${details[this.reason]}. Retry after resolving the reported cleanup condition.`
-    }
-    return `Session ${this.sessionId} is already owned by another terminal (PID ${this.ownerPid}). Return to that claude-tree instance or stop its terminal before opening this session here.`
+    return `Session ${this.sessionId} is open in another claude-tree instance (PID ${this.ownerPid}). Opening it again may cause conflicting writes to the provider conversation.`
   }
 }
 
