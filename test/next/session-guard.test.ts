@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect } from "effect"
 import { SessionOwnedError } from "../../src/domain/errors"
@@ -8,7 +9,7 @@ import { makeSessionGuard } from "../../src/infrastructure/session-guard"
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))) })
 async function fixture() {
-  const directory = await mkdtemp("/tmp/opencode/session-guard-test-")
+  const directory = await mkdtemp(join(tmpdir(), "session-guard-test-"))
   directories.push(directory)
   const statePath = join(directory, "state.json")
   return { statePath, guard: makeSessionGuard(statePath, "claude") }
