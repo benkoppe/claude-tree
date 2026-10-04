@@ -31,11 +31,12 @@ Provider-specific session formats, branching rules, launch arguments, and termin
 - The provider's own transcripts remain the source of truth for conversation content.
 - Application-owned data should be limited to relationships and UI state that the provider does not persist.
 - Serialize application-state changes through one actor per invocation, even when provider reads and terminal processes run concurrently.
-- Never allow two live terminal owners for the same provider session. Unknown ownership or cleanup state must fail closed rather than being treated as stale.
-- Acquire and release terminal, provider, and persistence resources transactionally. A partially acquired terminal must not become visible, and an incompletely cleaned owner must remain reserved.
+- Never launch two terminals for the same provider session within one invocation. Across invocations, warn about a live session and allow an explicit user override; duplicate ownership is a user-accepted risk, not a hard persistence constraint.
+- Acquire and release terminal and provider resources explicitly. A partially acquired terminal must not become visible. Keep incomplete cleanup process-local rather than persisting crash reservations.
 - Exiting `claude-tree` may stop active child processes, but their persisted provider sessions must remain resumable later.
 - Concurrent branches are intentionally allowed to operate on the same files. Avoid hiding this fact or implying worktree isolation.
 - Prefer a small, understandable local application over daemon or distributed infrastructure unless a later requirement justifies that complexity.
+- Support explicit workspace resume of semantic navigation and the visible provider session. Do not restore PTYs or automatically restart hidden agents.
 
 ## Non-Goals
 
@@ -44,6 +45,7 @@ Provider-specific session formats, branching rules, launch arguments, and termin
 - Using tmux as the process or presentation layer.
 - Automatically isolating branches into Git worktrees.
 - Reconstructing or editing provider transcript files by hand.
-- Automatically migrating or deleting incompatible application state. While the persistence format is reset-only, recovery requires an explicit user reset.
+- Automatically recovering orphaned processes, reservations, launch artifacts, or identity journals after a crash.
+- Automatically migrating or deleting incompatible application state. The persistence format is reset-only and requires an explicit user reset.
 
 Implementation details may evolve when better tools or APIs become available. Preserve the experience and boundaries above rather than treating an early implementation as permanent.

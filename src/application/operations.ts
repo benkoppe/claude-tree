@@ -25,10 +25,6 @@ export type ApplicationMetadataFacet = Pick<
   | "saveNavigation"
   | "updateMetadata"
   | "commitRemoval"
-  | "pendingAdoptions"
-  | "orphanedAdoptions"
-  | "reconcileOrphanedAdoption"
-  | "ack"
 >
 
 export interface PersistedBranch {

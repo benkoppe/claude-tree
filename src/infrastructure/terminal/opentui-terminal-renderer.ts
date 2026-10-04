@@ -11,6 +11,7 @@ import type {
   TerminalSurface,
   TerminalSurfaceCallbacks,
 } from "./types"
+import { TERMINAL_RETURN_BAR_HEIGHT } from "../../terminal-layout"
 
 const ACTIVE_TERMINAL_Z_INDEX = 10
 const INACTIVE_TERMINAL_Z_INDEX = 0
@@ -25,7 +26,7 @@ export class OpenTuiTerminalRenderer implements TerminalRenderer {
   }
 
   get rows(): number {
-    return Math.max(1, this.renderer.terminalHeight)
+    return Math.max(1, this.renderer.terminalHeight - TERMINAL_RETURN_BAR_HEIGHT)
   }
 
   createSurface(id: string, callbacks: TerminalSurfaceCallbacks): TerminalSurface {
@@ -35,7 +36,9 @@ export class OpenTuiTerminalRenderer implements TerminalRenderer {
       top: 0,
       left: 0,
       width: "100%",
-      height: "100%",
+      bottom: TERMINAL_RETURN_BAR_HEIGHT,
+      height: "auto",
+      minHeight: 1,
       zIndex: INACTIVE_TERMINAL_Z_INDEX,
       visible: true,
       opacity: 0,

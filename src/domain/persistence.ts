@@ -38,40 +38,6 @@ export interface ProjectState {
   readonly navigation?: NavigationState
 }
 
-export type TerminalOwnerStatus =
-  | "reserved"
-  | "running"
-  | "stopping"
-  | "cleanup-incomplete"
-
-/** Complete only after both provider acquisition and PTY registration succeed. */
-export type TerminalLaunchResources =
-  | { readonly kind: "acquiring" }
-  | { readonly kind: "local" }
-  | { readonly kind: "codex"; readonly sidecarProcessGroupId: number }
-
-export type OwnershipBlockReason =
-  | "application-present"
-  | "liveness-unknown"
-  | "acquisition-incomplete"
-  | "terminal-present"
-  | "sidecar-present"
-  | "artifact-cleanup-failed"
-  | "owner-changed"
-
-export interface TerminalOwner {
-  readonly instanceId: string
-  readonly sessionId: string
-  readonly ownerToken: string
-  readonly lastMutationToken?: string
-  readonly ownerPid: number
-  readonly status: TerminalOwnerStatus
-  readonly resources: TerminalLaunchResources
-  readonly processGroupId?: number
-  readonly reservedAt: string
-  readonly updatedAt: string
-}
-
 export type IdentityTransitionKind = "temporary-adoption" | "native-fork"
 
 export interface InstanceNavigation {
@@ -79,25 +45,10 @@ export interface InstanceNavigation {
   readonly navigation: NavigationState
 }
 
-export interface PendingIdentityAdoption {
-  readonly adoptionToken: string
-  readonly kind: IdentityTransitionKind
-  readonly instanceId: string
-  readonly ownerToken: string
-  readonly ownerPid: number
-  readonly processGroupId: number
-  readonly previousSessionId: string
-  readonly sessionId: string
-  readonly createdAt: string
-  readonly relation?: BranchRelation
-}
-
 export interface ProviderState {
   readonly relations: readonly BranchRelation[]
   readonly removals: readonly ConversationRemoval[]
   readonly navigations: readonly InstanceNavigation[]
-  readonly terminalOwners: readonly TerminalOwner[]
-  readonly pendingIdentityAdoptions: readonly PendingIdentityAdoption[]
 }
 
 export const EMPTY_PROJECT_STATE: ProjectState = {

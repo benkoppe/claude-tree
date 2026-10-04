@@ -46,22 +46,6 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
-## Shutdown and recovery
-
-Quitting stops the owned agent processes and restores the host terminal. Provider conversations remain available to resume later.
-
-If shutdown fails, the error lists the affected sessions, cleanup stages, and underlying causes. Simultaneous terminal and navigation-persistence failures are reported together.
-
-After an interrupted shutdown, `claude-tree` checks previous terminal ownership at startup and when opening a session. It releases an orphaned reservation once the old application, its terminal process group, and any recorded Codex sidecar group are definitely gone and its launch artifacts are removed. A saved `stopping` or `cleanup-incomplete` status alone does not block reopening.
-
-If cleanup cannot be verified, the error identifies the remaining condition: a surviving process group, unknown liveness, failed artifact cleanup, or an acquisition interrupted before all process identities were recorded. Resolve that condition and retry. Recovery does not signal unidentified processes or guess that an incompletely recorded launch was harmless.
-
-Normal discovery, history reads, fork operations, terminal acquisition, and persistence wait for completion or cancellation rather than failing after a fixed number of milliseconds. Slow machines and long transcripts may take longer without exhausting a default work deadline. Quit cancels pending work; already admitted durable writes remain tracked and late reservations are compensated without launching a terminal.
-
-Shutdown, resource cleanup, and conservative liveness checks still have finite safety bounds. A cleanup timeout reports unresolved ownership, never proof that a process exited. Waiting longer does not make history reconstruction faster or eliminate genuine SDK, filesystem, or protocol failures.
-
-Application metadata uses a strict, reset-only format under `$XDG_STATE_HOME` (default `~/.local/state`). Older terminal-owner records without a resource inventory are rejected in place, rather than automatically upgraded or deleted. Any reset is explicit and affects application-owned relationships and UI metadata, not provider transcripts.
-
 ## Development
 
 The keyed executor is adapted from T3 Code; its MIT notice is

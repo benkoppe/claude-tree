@@ -31,6 +31,23 @@ const provider = {
   capabilities: { historicalBranching: true },
 }
 
+test("duplicate-session dialog defaults to Cancel and requires an explicit Open anyway choice", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 })
+  const warning: ApplicationViewModel = { ...rootsView(), modal: { _tag: "ConfirmOpenSession", sessionId: "root-1", ownerPid: 202 } }
+  const running = await startPresentation(setup.renderer, warning)
+  try {
+    await frame(setup, (value) => value.includes("Session already open"))
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => !value.includes("Session already open"))
+    expect(running.harness.calls.some((call) => call.startsWith("resume:"))).toBeFalse()
+    await Effect.runPromise(running.harness.update(warning))
+    await frame(setup, (value) => value.includes("Open anyway"))
+    setup.mockInput.pressKey("TAB")
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("resume:root-1:override"))
+  } finally { await running.stop() }
+})
+
 test("renders roots and preserves directional graph navigation intent", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const roots = rootsView()
@@ -338,6 +355,28 @@ test("copies drafts and reports empty nodes and clipboard failures", async () =>
   } finally {
     await running.stop()
   }
+})
+
+test("About copies the exact resume command and handles clipboard failure without closing", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 32 })
+  const resumeCommand = "claude-tree --codex --resume workspace '/project with spaces'"
+  const copied: string[] = []
+  let succeeds = true
+  setup.renderer.copyToClipboardOSC52 = (text) => { copied.push(text); return succeeds }
+  const running = await startPresentation(setup.renderer, { ...rootsView(), modal: { _tag: "About" } },
+    new Map(), undefined, Effect.succeed(true), {}, { resumeCommand })
+  try {
+    await frame(setup, (value) => value.includes(resumeCommand))
+    setup.mockInput.pressKey("c")
+    await frame(setup, (value) => value.includes("Copied"))
+    expect(copied).toEqual([resumeCommand])
+    succeeds = false
+    setup.mockInput.pressKey("c")
+    await frame(setup, (value) => value.includes("Copy failed"))
+    expect((await Effect.runPromise(running.harness.runtime.getViewModel)).modal?._tag).toBe("About")
+    setup.mockInput.pressEnter()
+    await frame(setup, (value) => !value.includes("Resume this workspace"))
+  } finally { await running.stop() }
 })
 
 test.each([60, 120])("short error dialogs fit their content at terminal width %i", async (width) => {
@@ -1006,6 +1045,13 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
   })
 
   try {
+    const terminalFrame = await frame(setup, (value) => value.includes("Ctrl+Space"))
+    expect(terminalFrame).toContain("back")
+    expect(terminalFrame).not.toContain("Message tree")
+    const returnRow = setup.captureSpans().lines[23]!
+    expect(returnRow.spans.every((span) => span.bg.equals(presentationTheme.background))).toBeTrue()
+    expect(returnRow.spans.map((span) => span.text).join("")).toHaveLength(80)
+    expect(returnRow.spans.map((span) => span.text).join("").trim()).toBe("c/t · Ctrl+Space back")
     setup.mockInput.pressKey("q")
     releaseKittyKey(setup, 113)
     setup.mockInput.pressKey("c")
@@ -1018,11 +1064,25 @@ test("terminal mode intercepts only Ctrl+Space and its Kitty release", async () 
     }
 
     setup.mockInput.pressKey(" ", { ctrl: true })
-    await frame(setup, (value) => value.includes("Message tree"))
+    const returnedFrame = await frame(setup, (value) => value.includes("Message tree"))
+    expect(returnedFrame).not.toContain("Ctrl+Space")
     releaseKittyKey(setup, 32, 5)
     expect(running.harness.calls).toContain("return-terminal")
     expect(observed.some((event) => event.name === "space")).toBeFalse()
     expect(observed).toContainEqual({ type: "release", name: "q", stopped: false })
+
+    await Effect.runPromise(running.harness.update(terminal))
+    await frame(setup, (value) => value.includes("Ctrl+Space"))
+    setup.resize(24, 8)
+    await frame(setup, (value) => value.includes("Ctrl+Space back"))
+    const resizedReturnRow = setup.captureSpans().lines[7]!
+    expect(resizedReturnRow.spans.every((span) => span.bg.equals(presentationTheme.background))).toBeTrue()
+    expect(resizedReturnRow.spans.map((span) => span.text).join("")).toHaveLength(24)
+    expect(resizedReturnRow.spans.map((span) => span.text).join("").trim()).toBe("c/t · Ctrl+Space back")
+    await setup.mockMouse.click(2, 7)
+    expect(running.harness.calls.filter((call) => call === "return-terminal")).toHaveLength(1)
+    await setup.mockMouse.click(13, 7)
+    await waitFor(() => running.harness.calls.filter((call) => call === "return-terminal").length === 2)
   } finally {
     await running.stop()
   }
@@ -1675,8 +1735,8 @@ function makeHarness(
       newSession: Effect.sync(() => calls.push("new")).pipe(
         Effect.andThen(actionOverrides.newSession ?? Effect.succeed(true)),
       ),
-      resumeSession: (sessionId: string) => Effect.sync(() => {
-        calls.push(`resume:${sessionId}`)
+      resumeSession: (sessionId: string, allowDuplicate?: boolean) => Effect.sync(() => {
+        calls.push(`resume:${sessionId}${allowDuplicate ? ":override" : ""}`)
         return true
       }),
       openEndpoint: (sessionId: string) => Effect.gen(function*() {

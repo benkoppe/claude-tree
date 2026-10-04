@@ -40,7 +40,6 @@ export interface PersistencePlatformApi {
   readonly rename: (oldPath: string, newPath: string) => Promise<void>
   readonly remove: (path: string, options?: { readonly force?: boolean; readonly recursive?: boolean }) => Promise<void>
   readonly processLiveness: (pid: number) => Promise<ProcessLiveness>
-  readonly processGroupLiveness: (processGroupId: number) => Promise<ProcessLiveness>
 }
 
 const processInstanceId = randomUUID()
@@ -93,7 +92,6 @@ export const nativePersistencePlatform: PersistencePlatformApi = {
     await rm(path, { force: options?.force ?? false, recursive: options?.recursive ?? false })
   },
   processLiveness: async (pid) => livenessFromSignal(pid),
-  processGroupLiveness: async (processGroupId) => livenessFromSignal(-processGroupId),
 }
 
 export const PersistencePlatformLive = Layer.succeed(
