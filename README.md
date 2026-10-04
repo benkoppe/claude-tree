@@ -48,9 +48,6 @@ nix run github:benkoppe/claude-tree#unwrapped
 
 ## Development
 
-The keyed executor is adapted from T3 Code; its MIT notice is
-retained in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
-
 The development shell includes Bun and the validated provider CLIs available for the platform:
 
 ```sh
