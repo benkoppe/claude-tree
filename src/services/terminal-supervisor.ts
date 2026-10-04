@@ -222,6 +222,7 @@ export interface TerminalActivityCheck {
 export interface TerminalSupervisorApi {
   readonly show: (
     prepared: PreparedTerminal,
+    shouldActivate?: () => boolean,
   ) => Effect.Effect<
     string,
     | ProviderError
@@ -473,7 +474,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     this.reportHerdr("idle")
   }
 
-  readonly show: TerminalSupervisorApi["show"] = (prepared) =>
+  readonly show: TerminalSupervisorApi["show"] = (prepared, shouldActivate = () => true) =>
     this.launchExecutor.withLock(prepared.session.id, Effect.acquireUseRelease(
       Effect.sync(() => {
         const launch = {
@@ -522,7 +523,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
                     operation: "activate", sessionId: prepared.session.id,
                     message: "Terminal owner stopped before activation",
                   }))
-                 : this.activate(existing))
+                  : shouldActivate() ? this.activate(existing) : Effect.void)
             }.bind(this)))
             return existing.ownerId
           }
@@ -712,7 +713,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
                   operation: "activate", sessionId: owner.sessionId,
                   message: "Terminal owner stopped before activation",
                 }))
-               : this.activate(owner))
+               : shouldActivate() ? this.activate(owner) : Effect.void)
           }.bind(this))))
           if (Exit.isFailure(activationExit)) {
             const error = Cause.squash(activationExit.cause) as TerminalError

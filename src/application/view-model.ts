@@ -125,6 +125,19 @@ const layoutCache = new WeakMap<ConversationGraph, {
   layout: ReturnType<typeof layoutConversationGraph>
   aliases: ReadonlyMap<string, ReadonlyMap<string, string>>
 }>()
+
+export function cacheGraphLayout(graph: ConversationGraph, visible: ReadonlySet<string>, layout: ReturnType<typeof layoutConversationGraph>): void {
+  const aliases = new Map<string, Map<string, string>>()
+  for (const node of graph.nodes.values()) {
+    if (node.kind !== "message") continue
+    for (const alias of node.aliases) {
+      let messages = aliases.get(alias.sessionId)
+      if (!messages) aliases.set(alias.sessionId, messages = new Map())
+      messages.set(alias.messageId, node.id)
+    }
+  }
+  layoutCache.set(graph, { width: 80, visible: new Set([...graph.sessionIds].filter((id) => visible.has(id))), layout, aliases })
+}
 const graphViewCache = new WeakMap<ConversationGraph, {
   historyStatus: ApplicationState["historyStatus"]
   layout: ReturnType<typeof layoutConversationGraph>
@@ -135,6 +148,7 @@ const graphViewCache = new WeakMap<ConversationGraph, {
   view: GraphView
 }>()
 const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history" | "activation" | "lastModified">>()
+const rootRowCache = new WeakMap<object, RootViewModel>()
 const rootViewCache = new WeakMap<ReturnType<typeof selectVisibleConversationForest>, {
   refresh: ApplicationState["refresh"]["active"]
   provider: ApplicationState["provider"]
@@ -208,7 +222,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       }
       rootSummaryCache.set(graph, summary)
     }
-    return {
+    return retainRootRow(graph, {
       ...summary,
       lastModified: summary.memberSessionIds.reduce((latest, id) => Math.max(latest,
         state.conversationActivity.get(id) ?? data.sessions.get(id)?.lastModified ?? 0), 0),
@@ -216,7 +230,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
       history: selectFamilyHistoryStatus(state, summary.memberSessionIds),
       warnings: [...selectHistoryDetails(state, summary.memberSessionIds), ...graph.warnings],
       status: selectAggregateStatus(state, summary.memberSessionIds),
-    }
+    })
   })
   const pendingIds = new Set<string>()
   const pendingRoots: RootViewModel[] = []
@@ -232,12 +246,12 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
         (state.local.transcripts.get(id) ?? state.provider.transcripts.get(id))?._tag === "Available")
       if (accepted) continue
       for (const id of memberSessionIds) pendingIds.add(id)
-      pendingRoots.push({ sessionId: root.id, title: root.title, activation: selectRootActivation(state, memberSessionIds),
+       pendingRoots.push(retainRootRow(family, { sessionId: root.id, title: root.title, activation: selectRootActivation(state, memberSessionIds),
         lastModified: memberSessionIds.reduce((latest, id) => Math.max(latest,
           state.conversationActivity.get(id) ?? state.provider.sessions.get(id)?.lastModified ?? 0), 0),
         memberSessionIds, messageCount: 0, history, status: selectAggregateStatus(state, memberSessionIds),
         warnings: selectHistoryDetails(state, memberSessionIds),
-      })
+       }))
   }
   const rows = [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
     (left, right) => right.lastModified - left.lastModified || left.sessionId.localeCompare(right.sessionId),
@@ -259,9 +273,10 @@ export function projectGraphViewModel(
   if (!graph) return unavailableGraph(familySessionId)
 
   const visibleEndpointSessionIds = selectVisibleEndpointSessionIds(state)
+  const layoutVisibleIds = new Set([...graph.sessionIds].filter((id) => visibleEndpointSessionIds.has(id)))
   let geometry = layoutCache.get(graph)
-  if (!geometry || geometry.width !== viewportWidth || geometry.visible.size !== visibleEndpointSessionIds.size ||
-    [...visibleEndpointSessionIds].some((id) => !geometry!.visible.has(id))) {
+  if (!geometry || geometry.width !== viewportWidth || geometry.visible.size !== layoutVisibleIds.size ||
+    [...layoutVisibleIds].some((id) => !geometry!.visible.has(id))) {
     const aliases = new Map<string, Map<string, string>>()
     for (const node of graph.nodes.values()) {
       if (node.kind !== "message") continue
@@ -271,7 +286,7 @@ export function projectGraphViewModel(
         messages.set(alias.messageId, node.id)
       }
     }
-    geometry = { width: viewportWidth, visible: visibleEndpointSessionIds,
+    geometry = { width: viewportWidth, visible: layoutVisibleIds,
       layout: layoutConversationGraph(graph, viewportWidth, visibleEndpointSessionIds), aliases }
     layoutCache.set(graph, geometry)
   }
@@ -285,8 +300,10 @@ export function projectGraphViewModel(
     initialVisibleGraphNodeId(graph, visibleEndpointSessionIds) ??
     null
   const cached = graphViewCache.get(graph)
-  if (cached && cached.layout === layout && cached.terminals === state.terminals && cached.drafts === state.drafts &&
-    cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds && cached.historyStatus === state.historyStatus) {
+  if (cached && cached.layout === layout && sameFamilyValues(cached.terminals, state.terminals, graph.sessionIds) && sameFamilyValues(cached.drafts, state.drafts, graph.sessionIds) &&
+    sameFamilyValues(cached.completions, state.pendingCompletions, graph.sessionIds) &&
+    (cached.unviewed === state.unviewedSessionIds || [...graph.sessionIds].every((id) => cached.unviewed.has(id) === state.unviewedSessionIds.has(id))) &&
+    sameFamilyValues(cached.historyStatus, state.historyStatus, graph.sessionIds)) {
     return withGraphSelection(cached.view, selectedNodeId)
   }
   const nodes = [...layout.nodes.values()]
@@ -329,6 +346,30 @@ export function projectGraphViewModel(
   graphViewCache.set(graph, { historyStatus: state.historyStatus, layout, terminals: state.terminals, drafts: state.drafts,
     completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, view })
   return withGraphSelection(view, selectedNodeId)
+}
+
+function sameFamilyValues<A>(previous: ReadonlyMap<string, A>, next: ReadonlyMap<string, A>, sessionIds: ReadonlySet<string>): boolean {
+  return previous === next || [...sessionIds].every((id) => previous.get(id) === next.get(id))
+}
+
+function retainRootRow(key: object, next: RootViewModel): RootViewModel {
+  const previous = rootRowCache.get(key)
+  const history = next.history
+  const oldHistory = previous?.history
+  const sameHistory = history._tag === oldHistory?._tag && (history._tag === "Limited"
+    ? oldHistory._tag === "Limited" && history.contextMessageCount === oldHistory.contextMessageCount
+    : history._tag === "Unavailable" ? oldHistory._tag === "Unavailable" && history.issues.length === oldHistory.issues.length &&
+      history.issues.every((issue, index) => issue.sessionId === oldHistory.issues[index]?.sessionId &&
+        issue.kind === oldHistory.issues[index]?.kind && issue.reason === oldHistory.issues[index]?.reason)
+    : true)
+  if (previous && sameHistory && previous.sessionId === next.sessionId && previous.title === next.title &&
+    previous.lastModified === next.lastModified && previous.activation === next.activation && previous.status === next.status &&
+    previous.messageCount === next.messageCount && previous.memberSessionIds.length === next.memberSessionIds.length &&
+    previous.memberSessionIds.every((id, index) => id === next.memberSessionIds[index]) &&
+    (previous.warnings?.length ?? 0) === (next.warnings?.length ?? 0) &&
+    (previous.warnings ?? []).every((warning, index) => warning === next.warnings?.[index])) return previous
+  rootRowCache.set(key, next)
+  return next
 }
 
 function withGraphSelection(view: GraphView, selectedNodeId: string | null): GraphView {

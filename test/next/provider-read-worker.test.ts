@@ -1,0 +1,140 @@
+import { expect, test } from "bun:test"
+import { EventEmitter } from "node:events"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { Worker } from "node:worker_threads"
+
+import { Deferred, Effect, Fiber } from "effect"
+
+import { makeProviderReads } from "../../src/infrastructure/providers/read-service"
+import type { ProviderReadRequest, ProviderReadResponse } from "../../src/infrastructure/providers/read-worker-protocol"
+
+class ControlledReadWorker extends EventEmitter {
+  readonly requests: ProviderReadRequest[] = []
+  readonly posted = Deferred.makeUnsafe<void>()
+  terminated = 0
+  postMessage(request: ProviderReadRequest) {
+    this.requests.push(request)
+    Deferred.doneUnsafe(this.posted, Effect.void)
+    if (request._tag === "Close") this.emit("message", { _tag: "Closed" })
+  }
+  terminate() { this.terminated++; this.emit("exit", 1); return Promise.resolve(1) }
+  unref() {}
+  send(response: ProviderReadResponse) { this.emit("message", response) }
+  create = (): Worker => {
+    queueMicrotask(() => this.send({ _tag: "Ready" }))
+    return this as unknown as Worker
+  }
+}
+
+test("read progress has backpressure and the final result reuses delivered histories", async () => {
+  const worker = new ControlledReadWorker()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
+    const progressStarted = yield* Deferred.make<void>()
+    const releaseProgress = yield* Deferred.make<void>()
+    const snapshot = { sessions: [{ id: "session", title: "Session", lastModified: 1 }],
+      transcripts: new Map([["session", { _tag: "Available" as const, messages: [] }]]) }
+    const read = yield* Effect.forkChild(reads.loadSnapshot(undefined, () =>
+      Deferred.succeed(progressStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseProgress)))))
+    yield* Deferred.await(worker.posted)
+    worker.send({ _tag: "Progress", id: 1, sequence: 1, snapshot })
+    yield* Deferred.await(progressStarted)
+    expect(worker.requests.some((request) => request._tag === "Acknowledged")).toBeFalse()
+    yield* Deferred.succeed(releaseProgress, undefined)
+    yield* Effect.yieldNow
+    expect(worker.requests).toContainEqual({ _tag: "Acknowledged", id: 1, sequence: 1 })
+    worker.send({ _tag: "Completed", id: 1 })
+    const result = yield* Fiber.join(read)
+    expect(result.transcripts.get("session")).toBe(snapshot.transcripts.get("session"))
+    yield* reads.close
+    yield* reads.close
+    expect(worker.terminated).toBe(1)
+  })))
+})
+
+test("interrupting a read cancels only that job and does not strand subsequent reads", async () => {
+  const worker = new ControlledReadWorker()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
+    const read = yield* Effect.forkChild(reads.loadSnapshot(["old"]))
+    yield* Deferred.await(worker.posted)
+    yield* Fiber.interrupt(read)
+    expect(worker.requests).toContainEqual({ _tag: "Cancel", id: 1 })
+    const next = yield* Effect.forkChild(reads.loadSnapshot(["new"]))
+    yield* Effect.yieldNow
+    worker.send({ _tag: "Completed", id: 2 })
+    expect((yield* Fiber.join(next)).transcripts.size).toBe(0)
+  })))
+})
+
+test("worker failure settles admitted reads and prevents further admission", async () => {
+  const worker = new ControlledReadWorker()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
+    const read = yield* Effect.forkChild(Effect.flip(reads.loadSnapshot()))
+    yield* Deferred.await(worker.posted)
+    worker.emit("error", new Error("worker failed"))
+    expect((yield* Fiber.join(read)).message).toContain("worker failed")
+    expect((yield* Effect.flip(reads.loadSnapshot())).message).toContain("worker failed")
+    yield* Effect.exit(reads.close)
+  })))
+})
+
+test.each(["failure", "close"] as const)("%s settles a read even while its progress consumer is stalled", async (mode) => {
+  const worker = new ControlledReadWorker()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
+    const started = yield* Deferred.make<void>()
+    const read = yield* Effect.forkChild(Effect.flip(reads.loadSnapshot(undefined, () =>
+      Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)))))
+    yield* Deferred.await(worker.posted)
+    worker.send({ _tag: "Progress", id: 1, sequence: 1, snapshot: { sessions: [], transcripts: new Map() } })
+    yield* Deferred.await(started)
+    if (mode === "failure") worker.emit("error", new Error("worker failed"))
+    else yield* reads.close
+    expect((yield* Fiber.join(read)).message).toContain(mode === "failure" ? "worker failed" : "closing")
+    yield* Effect.exit(reads.close)
+  })))
+})
+
+test("production worker reads real SDK transcripts, flushes a partial batch, and closes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "claude-tree-read-worker-"))
+  const projectPath = join(directory, "project")
+  const config = join(directory, "claude")
+  const projectKey = projectPath.replaceAll("/", "-")
+  const sessionId = crypto.randomUUID()
+  const messageId = crypto.randomUUID()
+  await mkdir(projectPath)
+  const transcripts = join(config, "projects", projectKey)
+  await mkdir(transcripts, { recursive: true })
+  await writeFile(join(transcripts, `${sessionId}.jsonl`), JSON.stringify({ type: "user", uuid: messageId, parentUuid: null,
+    sessionId, timestamp: "2026-09-11T00:00:00.000Z", cwd: projectPath, isSidechain: false,
+    message: { role: "user", content: "Worker question" },
+  }) + "\n")
+  const options = { providerId: "claude" as const, projectPath }
+  try {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const reads = yield* makeProviderReads(options, () => new Worker(new URL("../../src/infrastructure/providers/read-worker.ts", import.meta.url), {
+        workerData: options, env: { ...process.env, CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_PROJECT_DIR_NAME: projectKey },
+      }))
+      const progress: number[] = []
+      const snapshot = yield* reads.loadSnapshot(undefined, (snapshot) => Effect.sync(() => progress.push(snapshot.transcripts.size)))
+      expect(progress).toEqual([0, 1])
+      expect(snapshot.sessions.map((session) => session.id)).toEqual([sessionId])
+      const read = snapshot.transcripts.get(sessionId)
+      expect(read?._tag).toBe("Available")
+      if (read?._tag !== "Available") throw new Error("Expected readable SDK transcript")
+      expect(read.messages.map((message) => message.id)).toEqual([messageId])
+      expect(read.messages[0]?.preview).toBe("Worker question")
+      expect(read.messages[0]).not.toHaveProperty("rawMessage")
+      const targeted = yield* reads.loadSnapshot([sessionId])
+      expect(targeted.transcripts.get(sessionId)).toEqual(read)
+      expect((yield* reads.readTranscripts([sessionId])).get(sessionId)).toEqual(read)
+      yield* reads.close
+    })))
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})

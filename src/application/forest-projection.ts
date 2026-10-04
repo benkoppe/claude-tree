@@ -1,3 +1,5 @@
+import { Effect } from "effect"
+
 import { buildConversationForest, type ConversationForest } from "../domain/conversation-graph"
 import type { AgentMessage, AgentSession } from "../domain/model"
 import type { BranchRelation, ConversationRemoval } from "../domain/persistence"
@@ -10,9 +12,44 @@ interface FamilyInputs {
   readonly forest: ConversationForest
 }
 
-const families = new WeakMap<AgentSession, FamilyInputs>()
+const families = new WeakMap<AgentSession, readonly FamilyInputs[]>()
 const sameItems = <A>(left: readonly A[], right: readonly A[]) =>
   left.length === right.length && left.every((item, index) => item === right[index])
+
+function cachedFamily(key: AgentSession, sessions: readonly AgentSession[], histories: FamilyInputs["histories"],
+  relations: readonly BranchRelation[], removals: readonly ConversationRemoval[]): FamilyInputs | undefined {
+  return families.get(key)?.find((previous) => sameItems(previous.sessions, sessions) &&
+    sameItems(previous.histories, histories) && sameItems(previous.relations, relations) && sameItems(previous.removals, removals))
+}
+
+function retainFamily(key: AgentSession, family: FamilyInputs): void {
+  // Keep accepted and prepared versions together while navigation uses the old snapshot.
+  const previous = families.get(key) ?? []
+  families.set(key, [family, ...previous.filter((item) => item !== family)].slice(0, 2))
+}
+
+export interface FamilyProjectionInput {
+  readonly sessions: readonly AgentSession[]
+  readonly transcripts: ReadonlyMap<string, readonly AgentMessage[]>
+  readonly relations: readonly BranchRelation[]
+  readonly removals: readonly ConversationRemoval[]
+}
+
+export function prepareForest(
+  input: FamilyProjectionInput,
+  build: (input: FamilyProjectionInput) => Effect.Effect<ConversationForest, unknown>,
+): Effect.Effect<void, unknown> {
+  return Effect.gen(function*() {
+    for (const group of groupSessionFamilies(new Map(input.sessions.map((session) => [session.id, session])), input.relations).values()) {
+      const histories = group.sessions.map((session) => input.transcripts.get(session.id))
+      const key = group.sessions[0]!
+      if (cachedFamily(key, group.sessions, histories, group.relations, input.removals)) continue
+      const forest = yield* build({ ...group, removals: input.removals, transcripts: new Map(group.sessions.flatMap((session, index) =>
+        histories[index] === undefined ? [] : [[session.id, histories[index]!] as const])) })
+      retainFamily(key, { ...group, histories, removals: input.removals, forest })
+    }
+  })
+}
 
 /** Partition by recorded connectivity, including unavailable parents and invalid attachments.
  * Each component still runs the complete transactional graph validation. */
@@ -30,14 +67,12 @@ export function projectForest(
   for (const group of groups.values()) {
     const histories = group.sessions.map((session) => transcripts.get(session.id))
     const key = group.sessions[0]!
-    const previous = families.get(key)
-    const forest = previous && sameItems(previous.sessions, group.sessions) &&
-      sameItems(previous.histories, histories) && sameItems(previous.relations, group.relations) &&
-      sameItems(previous.removals, removals)
+    const previous = cachedFamily(key, group.sessions, histories, group.relations, removals)
+    const forest = previous
       ? previous.forest
       : buildConversationForest(group.sessions, new Map(group.sessions.flatMap((session, index) =>
         histories[index] === undefined ? [] : [[session.id, histories[index]!] as const])), group.relations, removals)
-    families.set(key, { ...group, histories, removals, forest })
+    retainFamily(key, previous ?? { ...group, histories, removals, forest })
     graphs.push(...forest.graphs)
     for (const [id, graph] of forest.graphBySessionId) graphBySessionId.set(id, graph)
     for (const [id, graph] of forest.graphByRootSessionId) graphByRootSessionId.set(id, graph)
