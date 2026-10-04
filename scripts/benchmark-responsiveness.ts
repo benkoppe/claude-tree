@@ -24,7 +24,7 @@ if (!Number.isSafeInteger(count) || count < 2 || !Number.isSafeInteger(records) 
 const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-responsiveness-")))
 const projectPath = join(directory, "project")
 const config = join(directory, "claude")
-const projectKey = projectPath.replaceAll("/", "-")
+const projectKey = "responsiveness-fixture"
 const transcriptDirectory = join(config, "projects", projectKey)
 await mkdir(projectPath)
 await mkdir(transcriptDirectory, { recursive: true })

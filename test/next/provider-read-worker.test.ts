@@ -130,9 +130,9 @@ test("interruption during worker creation installs cleanup and waits for provide
 
 test("production worker reads real SDK transcripts, flushes a partial batch, and closes", async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-read-worker-")))
-  const projectPath = join(directory, "project")
+  const projectPath = join(directory, "project-with-a-long-path-that-exceeds-the-sdk-project-key-override-limit")
   const config = join(directory, "claude")
-  const projectKey = projectPath.replaceAll("/", "-")
+  const projectKey = "read-worker-fixture"
   const sessionId = crypto.randomUUID()
   const messageId = crypto.randomUUID()
   await mkdir(projectPath)
