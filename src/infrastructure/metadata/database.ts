@@ -18,6 +18,7 @@ import initialSql from "./migrations/0000_initial.sql" with { type: "text" }
 
 export const DATABASE_VERSION = 1
 export const DATABASE_APPLICATION_ID = 0x43545245
+const LOCK_RETRY_INTERVAL_MS = 10
 const migrationFolder = isStandaloneExecutable ? join(dirname(process.execPath), "migrations") : new URL("./migrations", import.meta.url).pathname
 export const initialMigrationHash = createHash("sha256").update(initialSql).digest("hex")
 
@@ -114,9 +115,9 @@ export function openStateDatabase(stateHome: string, requireExisting = false, po
         const schemaGate = yield* Effect.tryPromise({ try: () => platform.openLock(`${path}.schema.lock`), catch: (e) => e })
         gate = schemaGate
         const acquire = Effect.gen(function*() {
-          while (!lock(startup.fd, 2 | 4)) yield* Effect.sleep(10)
-          while (!lock(schemaGate.fd, 1 | 4)) yield* Effect.sleep(10)
-        }).pipe(Effect.timeoutOrElse({ duration: 2_000, orElse: () => Effect.fail(new Error("State schema is being upgraded; retry after other invocations exit")) }))
+          while (!lock(startup.fd, 2 | 4)) yield* Effect.sleep(LOCK_RETRY_INTERVAL_MS)
+          while (!lock(schemaGate.fd, 1 | 4)) yield* Effect.sleep(LOCK_RETRY_INTERVAL_MS)
+        })
         yield* restore(acquire)
         return yield* Effect.tryPromise({ try: async () => {
           let exists = true
@@ -200,12 +201,12 @@ export function validateMigrationHistory(db: Database, policy: DatabaseSchemaPol
 export function sqliteTransaction<A>(db: Database, run: () => A): Effect.Effect<A, unknown> {
   const attempt = Effect.try({ try: () => db.transaction(run).immediate(), catch: (e) => e })
   return Effect.gen(function*() {
-    for (let tries = 0; ; tries++) {
+    while (true) {
       const result = yield* Effect.result(attempt)
       if (result._tag === "Success") return result.success
       const code = (result.failure as { code?: string })?.code
-      if ((code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED") || tries >= 100) return yield* Effect.fail(result.failure)
-      yield* Effect.sleep(10)
+      if (code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED") return yield* Effect.fail(result.failure)
+      yield* Effect.sleep(LOCK_RETRY_INTERVAL_MS)
     }
   })
 }

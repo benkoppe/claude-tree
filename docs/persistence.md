@@ -18,6 +18,8 @@ Known schema versions upgrade through committed migrations. Close active invocat
 
 Upgrades create a private pre-upgrade snapshot, then apply pending SQL and migration-history entries in one transaction. Application identity, schema version, migration history, and foreign keys are checked before commit; a failed check rolls back the upgrade. Startup failure or cancellation finalizes its lock descriptors. A failed database close retains the schema gate until closure succeeds; cleanup remains retryable and process exit releases OS locks.
 
+Ordinary startup-lock and SQLite write contention waits without a fixed deadline, yielding between attempts. These waits can be interrupted; non-contention errors still fail immediately. Upgrades still refuse to proceed while other invocations hold shared schema access. Worker shutdown retains its bounded cleanup observation and drains already admitted commands rather than killing transactions.
+
 Projects have stable IDs; paths are mutable associations. Automatic rename detection, project relinking commands, and provider-side relocation are not implemented yet.
 
 Session guards live separately at `$XDG_STATE_HOME/claude-tree/session-guards/<provider>/<session-hash>/`. They coordinate live invocations across project paths; they are not SQLite metadata or process-recovery records. On access, unlocked crash-leftover claim files are removed under the session admission lock. Admission files and directories intentionally remain, and must not be deleted while applications are running.
