@@ -242,6 +242,10 @@ Avoid intercepting ordinary agent keys. Host shortcuts should be mode-specific, 
 
 Terminal mode keeps a persistent bottom bar with left-aligned `c/t · Ctrl+Space back`, using the navigator footer's text styling and full-width background. The keybinding is clickable. Reserve that row in the emulator and PTY dimensions, including for hidden terminals and on resize, so the control never covers provider output.
 
+## Releases Are Compiled npm Packages And GitHub Downloads
+
+Binary releases use an explicitly dispatched workflow with a version input, not tag/push triggers. Build from one pinned source commit, run the existing regression suite without separate release smoke tests, and package all supported platforms before publication. Preserve executable permissions inside tarballs. The publisher validates source/version identities and checksums, creates the tag and draft GitHub Release, publishes exact-version platform packages before the npm launcher, promotes the launcher channel last, and then exposes the GitHub Release. Partial failures resume using the same artifacts; never overwrite published bytes or move release tags. Nix remains a separate optional source installation, not the release pipeline. Provider executables remain external dependencies.
+
 ## Shared Working Tree Is Deliberate
 
 Every agent process starts in the same project directory. This allows branches to observe and build on the same filesystem state, but it also permits simultaneous edits and conflicts. The application should communicate status accurately and must not claim branch-level file isolation or silently create worktrees.
