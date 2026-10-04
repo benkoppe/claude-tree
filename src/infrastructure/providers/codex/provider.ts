@@ -85,7 +85,6 @@ export type CodexAppServerFactory = () => Effect.Effect<
 >
 
 export interface CodexObservedServices {
-  readonly resources?: CodexSidecar["resources"]
   readonly remoteUrl: string
   readonly bearerToken: string
   readonly transitions: PubSub.PubSub<CodexTuiProxyTransitionRequest>
@@ -777,7 +776,6 @@ export class CodexProvider implements AgentProviderApi {
       }
       return {
         launch,
-        ...(observed.resources === undefined ? {} : { resources: observed.resources }),
         close: observed.close().pipe(
           Effect.mapError((cause) => new ProviderCleanupError({
             providerId: this.id,
@@ -1227,7 +1225,6 @@ export function makeObservedServices(
     })
     return {
       remoteUrl: proxy.remoteUrl,
-      ...(sidecar.resources === undefined ? {} : { resources: sidecar.resources }),
       bearerToken: sidecar.bearerToken,
       transitions: proxy.transitions,
       providerEvents: proxy.providerEvents,

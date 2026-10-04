@@ -28,6 +28,15 @@ describe("CLI options", () => {
     expect(() => parseCliArguments(["one", "two"])).toThrow("Unexpected project path: two")
   })
 
+  test("parses workspace resume for either provider and rejects incomplete or conflicting options", () => {
+    expect(parseCliArguments(["--resume", "workspace", "project"])).toEqual({ command: "run", provider: "claude", project: "project", resumeWorkspaceId: "workspace" })
+    expect(parseCliArguments(["--codex", "project", "--resume", "workspace"])).toEqual({ command: "run", provider: "codex", project: "project", resumeWorkspaceId: "workspace" })
+    expect(() => parseCliArguments(["--resume"])).toThrow("requires a workspace ID")
+    expect(() => parseCliArguments(["--resume", "--codex"])).toThrow("requires a workspace ID")
+    expect(() => parseCliArguments(["--resume", "one", "--resume", "two"])).toThrow("only once")
+    expect(() => parseCliArguments(["--resume", "one", "--diagnose-history", "two"])).toThrow("cannot be combined")
+  })
+
   test("parses a single read-only history diagnostic with an optional project", () => {
     expect(parseCliArguments(["--diagnose-history", "session"])).toEqual({ command: "diagnose-history", provider: "claude", sessionId: "session", project: "." })
     expect(parseCliArguments(["project", "--diagnose-history", "session"])).toEqual({ command: "diagnose-history", provider: "claude", sessionId: "session", project: "project" })

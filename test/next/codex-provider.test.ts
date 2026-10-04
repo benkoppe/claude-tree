@@ -606,7 +606,6 @@ describe("Effect Codex provider", () => {
 
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const acquired = yield* prepared.acquireLaunch
-      expect(acquired.resources).toEqual({ kind: "codex", sidecarProcessGroupId: 404 })
       expect(acquired.launch.command).toEqual([
         "/usr/bin/codex",
         "--remote",

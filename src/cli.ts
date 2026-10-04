@@ -13,6 +13,7 @@ import { makeAppRuntime } from "./application"
 import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
 import { makeNavigationPersistenceWorker } from "./infrastructure/metadata/navigation-persistence"
 import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
+import { makeSessionGuard } from "./infrastructure/session-guard"
 import { UNKNOWN_BUILD } from "./build-info"
 import { HistoryDiagnosticReportSchema, HistoryTrace, type HistoryDiagnosticReport } from "./diagnostics/history-trace"
 import {
@@ -121,12 +122,13 @@ export function composeProductionApplication(
     })
     const provider = yield* makeProvider(options.provider, projectPath)
     const renderer = yield* makeOpenTuiRenderer()
-    const persistenceOptions = { projectDirectory: projectPath, providerId: provider.id }
+    const persistenceOptions = { projectDirectory: projectPath, providerId: provider.id,
+      ...(options.resumeWorkspaceId ? { resumeWorkspaceId: options.resumeWorkspaceId } : {}) }
     const repository = yield* makeProviderStateRepository(persistenceOptions).pipe(
       Effect.provideService(PersistencePlatform, nativePersistencePlatform),
     )
-    yield* repository.recoverOrphanedOwners()
-    const navigation = yield* makeNavigationPersistenceWorker({ ...persistenceOptions,
+    yield* repository.saveNavigation((yield* repository.loadMetadata).navigation ?? { view: "roots", selectedSessionId: null })
+    const navigation = yield* makeNavigationPersistenceWorker({ providerId: provider.id,
       projectDirectory: repository.projectPath,
       instanceId: repository.instanceId,
       stateHome: nativePersistencePlatform.stateHome(),
@@ -136,7 +138,8 @@ export function composeProductionApplication(
     const terminals = yield* makeTerminalSupervisor({
       renderer: new OpenTuiTerminalRenderer(renderer),
       processes: new BunPtyProcessFactory(),
-      ownership: repository,
+      guard: makeSessionGuard(repository.statePath, provider.id),
+      metadata: repository,
       events: bridge.events,
     })
     yield* composeApplicationLifecycle(
@@ -144,8 +147,10 @@ export function composeProductionApplication(
         closeNavigationPersistence: navigation.close }),
       (appRuntime) => {
         bridge.bind(appRuntime.terminalEvents)
-        return reportApplicationToHerdr(herdr, appRuntime.viewModels).pipe(
-          Effect.andThen(makeOpenTuiPresentation(renderer, appRuntime, provider, { setProcessTitle })),
+        const resumeArgv = [PROGRAM_NAME, ...(options.provider === "codex" ? ["--codex"] : []), "--resume", repository.instanceId, projectPath]
+        return reportApplicationToHerdr(herdr, appRuntime.viewModels, { workspaceId: repository.instanceId, argv: resumeArgv }).pipe(
+          Effect.andThen(makeOpenTuiPresentation(renderer, appRuntime, provider, { setProcessTitle,
+            resumeCommand: resumeArgv.map((argument) => /^[a-zA-Z0-9_./:-]+$/.test(argument) ? argument : `'${argument.replaceAll("'", "'\\''")}'`).join(" ") })),
         )
       },
     )
