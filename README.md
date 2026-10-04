@@ -46,17 +46,6 @@ If provider CLIs are already installed separately, use `#unwrapped` to keep the 
 nix run github:benkoppe/claude-tree#unwrapped
 ```
 
-## Application state
-
-Application metadata uses a centralized SQLite database with stable project identities and forward schema migrations. Provider transcripts remain provider-owned. Existing JSON state requires an explicit import after closing old invocations:
-
-```sh
-claude-tree state import-json /path/to/project
-claude-tree state import-json --codex /path/to/project
-```
-
-See [persistence](docs/persistence.md) for backup, inspection, and compatibility rules, and [distribution](docs/distribution.md) for compiled npm packaging.
-
 ## Development
 
 The development shell includes Bun and the validated provider CLIs available for the platform:
