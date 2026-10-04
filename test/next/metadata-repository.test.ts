@@ -1,16 +1,16 @@
 import { afterEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { cp, mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { Database } from "bun:sqlite"
-import { Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 
 import type { BranchRelation } from "../../src/domain/persistence"
 import { PersistencePlatform, nativePersistencePlatform } from "../../src/infrastructure/metadata/platform"
 import { makeProviderStateRepository, type ProviderStateRepositoryApi, type ProviderStateRepositoryOptions } from "../../src/services/provider-state-repository"
 import { makeMetadataWorker } from "../../src/infrastructure/metadata/worker-service"
 import { runStateCommand } from "../../src/infrastructure/metadata/state-commands"
-import { openStateDatabase, type DatabaseSchemaPolicy } from "../../src/infrastructure/metadata/database"
+import { databasePath, nativeStateDatabasePlatform, openStateDatabase, type DatabaseSchemaPolicy, type StateDatabasePlatform } from "../../src/infrastructure/metadata/database"
 import { readMigrationFiles } from "drizzle-orm/migrator"
 
 const directories: string[] = []
@@ -177,14 +177,14 @@ test("backup contains committed WAL data and exports private metadata", async ()
   } finally { if (previous === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previous }
 })
 
-async function upgradePolicy(options: Awaited<ReturnType<typeof fixture>>, fail = false): Promise<DatabaseSchemaPolicy> {
+async function upgradePolicy(options: Awaited<ReturnType<typeof fixture>>, fail = false, extraSql = ""): Promise<DatabaseSchemaPolicy> {
   const folder = join(options.stateHome, "upgrade-migrations")
   await cp("src/infrastructure/metadata/migrations", folder, { recursive: true })
   const journalPath = join(folder, "meta/_journal.json")
   const journal = JSON.parse(await readFile(journalPath, "utf8"))
   journal.entries.push({ idx: 1, version: "6", when: journal.entries[0].when + 1, tag: "0001_upgrade", breakpoints: true })
   await writeFile(journalPath, JSON.stringify(journal))
-  await writeFile(join(folder, "0001_upgrade.sql"), `CREATE TABLE upgrade_marker (value TEXT NOT NULL) STRICT;\n--> statement-breakpoint\n${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('upgraded');"}\n--> statement-breakpoint\nPRAGMA user_version = 2;`)
+  await writeFile(join(folder, "0001_upgrade.sql"), `CREATE TABLE upgrade_marker (value TEXT NOT NULL) STRICT;\n--> statement-breakpoint\n${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('upgraded');"}\n--> statement-breakpoint\nPRAGMA user_version = 2;\n--> statement-breakpoint\n${extraSql}`)
   return { version: 2, folder, migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
 }
 
@@ -210,6 +210,213 @@ test("failed forward migration rolls back DDL, ledger, and compatibility version
   using db = new Database(reopened.statePath, { readonly: true })
   expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
   expect(db.query("SELECT name FROM sqlite_master WHERE name = 'upgrade_marker'").all()).toEqual([])
+})
+
+for (const [name, sql, error] of [
+  ["foreign keys", "CREATE TABLE upgrade_child (parent TEXT REFERENCES projects(project_id) DEFERRABLE INITIALLY DEFERRED) STRICT;\n--> statement-breakpoint\nINSERT INTO upgrade_child VALUES ('missing');", "foreign key integrity"],
+  ["schema version", "PRAGMA user_version = 3;", "schema version"],
+  ["migration history", "UPDATE __drizzle_migrations SET hash = 'invalid';", "migration history"],
+  ["application identity", "PRAGMA application_id = 123;", "application identity"],
+] as const) test(`migration validation of ${name} rolls back before commit`, async () => {
+  const options = await fixture(); const repository = await open(options)
+  await run(repository.saveRelation(relation("retained")))
+  const path = repository.statePath
+  await run(repository.close)
+  using before = new Database(path, { readonly: true })
+  const history = before.query("SELECT * FROM __drizzle_migrations").all()
+  const identity = before.query("PRAGMA application_id").get()
+  await expect(run(openStateDatabase(options.stateHome, true, await upgradePolicy(options, false, sql)))).rejects.toThrow(error)
+  using after = new Database(path, { readonly: true })
+  expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
+  expect(after.query("PRAGMA application_id").get()).toEqual(identity)
+  expect(after.query("SELECT * FROM __drizzle_migrations").all()).toEqual(history)
+  expect(after.query("SELECT name FROM sqlite_master WHERE name LIKE 'upgrade_%'").all()).toEqual([])
+  expect((await run((await open(options)).loadMetadata)).relations).toEqual([relation("retained")])
+  const backups = (await readdir(join(options.stateHome, "claude-tree"))).filter((entry) => entry.includes("before-v2"))
+  expect(backups).toHaveLength(1)
+})
+
+test("startup close failure runs its backstop and closes the database and schema gate", async () => {
+  const options = await fixture(); await run((await open(options)).close)
+  let startupCloses = 0; let gateCloses = 0; let databaseCloses = 0
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    openLock: async (path) => {
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => {
+        if (path.endsWith("startup.lock")) {
+          if (++startupCloses === 1) throw new Error("startup close failed")
+        } else gateCloses++
+        await handle.close()
+      } }
+    },
+    connect: (path) => {
+      const connected = nativeStateDatabasePlatform.connect(path)
+      return { db: connected.db, close: () => { databaseCloses++; connected.close() } }
+    },
+  }
+  await expect(run(openStateDatabase(options.stateHome, true, undefined, platform))).rejects.toThrow("startup close failed")
+  expect(startupCloses).toBe(2); expect(databaseCloses).toBe(1); expect(gateCloses).toBe(1)
+  const upgraded = await run(openStateDatabase(options.stateHome, true, await upgradePolicy(options)))
+  await upgraded.close()
+})
+
+test("schema gate close failure remains retryable and concurrent closes share one attempt", async () => {
+  const options = await fixture(); await run((await open(options)).close)
+  let gateCloses = 0; let databaseCloses = 0
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    openLock: async (path) => {
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => {
+        if (path.endsWith("schema.lock") && ++gateCloses === 1) throw new Error("gate close failed")
+        await handle.close()
+      } }
+    },
+    connect: (path) => {
+      const connected = nativeStateDatabasePlatform.connect(path)
+      return { db: connected.db, close: () => { databaseCloses++; connected.close() } }
+    },
+  }
+  const database = await run(openStateDatabase(options.stateHome, true, undefined, platform))
+  const first = database.close(); const concurrent = database.close()
+  expect(first).toBe(concurrent)
+  await expect(first).rejects.toThrow("gate close failed")
+  expect(databaseCloses).toBe(1); expect(gateCloses).toBe(1)
+  await database.close(); await database.close()
+  expect(databaseCloses).toBe(1); expect(gateCloses).toBe(2)
+})
+
+test("failed database close retains the schema gate until a successful retry", async () => {
+  const options = await fixture(); await run((await open(options)).close)
+  let databaseCloses = 0; let gateCloses = 0
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    openLock: async (path) => {
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => { if (path.endsWith("schema.lock")) gateCloses++; await handle.close() } }
+    },
+    connect: (path) => {
+      const connected = nativeStateDatabasePlatform.connect(path)
+      const close = connected.db.close.bind(connected.db)
+      connected.db.close = (...args) => { if (++databaseCloses === 1) throw new Error("database close failed"); close(...args) }
+      return connected
+    },
+  }
+  const database = await run(openStateDatabase(options.stateHome, true, undefined, platform))
+  await expect(database.close()).rejects.toThrow("Unable to close state database")
+  expect(gateCloses).toBe(0)
+  const gate = await openFile(`${databasePath(options.stateHome)}.schema.lock`, "a")
+  try { expect(nativeStateDatabasePlatform.fileLocker()(gate.fd, 2 | 4)).toBe(false) } finally { await gate.close() }
+  await database.close()
+  expect(databaseCloses).toBe(2); expect(gateCloses).toBe(1)
+})
+
+for (const fail of [false, true]) test(`skipped-version migrations ${fail ? "roll back the entire chain on failure" : "apply together"}`, async () => {
+  const options = await fixture(); const repository = await open(options); await run(repository.close)
+  const second = await upgradePolicy(options)
+  const journalPath = join(second.folder, "meta/_journal.json")
+  const journal = JSON.parse(await readFile(journalPath, "utf8"))
+  journal.entries.push({ idx: 2, version: "6", when: journal.entries[1].when + 1, tag: "0002_upgrade", breakpoints: true })
+  await writeFile(journalPath, JSON.stringify(journal))
+  await writeFile(join(second.folder, "0002_upgrade.sql"), `${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('third');"}\n--> statement-breakpoint\nPRAGMA user_version = 3;`)
+  const policy: DatabaseSchemaPolicy = { version: 3, folder: second.folder,
+    migrations: readMigrationFiles({ migrationsFolder: second.folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
+  if (fail) {
+    await expect(run(openStateDatabase(options.stateHome, true, policy))).rejects.toThrow("NOT NULL")
+    using db = new Database(repository.statePath, { readonly: true })
+    expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
+    expect(db.query("SELECT count(*) AS count FROM __drizzle_migrations").get()).toEqual({ count: 1 })
+    expect(db.query("SELECT name FROM sqlite_master WHERE name = 'upgrade_marker'").all()).toEqual([])
+  } else {
+    const database = await run(openStateDatabase(options.stateHome, true, policy))
+    try {
+      expect(database.db.query("PRAGMA user_version").get()).toEqual({ user_version: 3 })
+      expect(database.db.query("SELECT count(*) AS count FROM __drizzle_migrations").get()).toEqual({ count: 3 })
+      expect(database.db.query("SELECT value FROM upgrade_marker ORDER BY rowid").all()).toEqual([{ value: "upgraded" }, { value: "third" }])
+    } finally { await database.close() }
+  }
+})
+
+test("failed initial validation rolls back the ledger and leaves a pristine database", async () => {
+  const options = await fixture()
+  const folder = join(options.stateHome, "initial-migrations")
+  await cp("src/infrastructure/metadata/migrations", folder, { recursive: true })
+  const sqlPath = join(folder, "0000_initial.sql")
+  await writeFile(sqlPath, (await readFile(sqlPath, "utf8")).replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;"))
+  const policy: DatabaseSchemaPolicy = { version: 1, folder,
+    migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
+  await expect(run(openStateDatabase(options.stateHome, false, policy))).rejects.toThrow("schema version")
+  using db = new Database(databasePath(options.stateHome), { readonly: true })
+  expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 0 })
+  expect(db.query("PRAGMA application_id").get()).toEqual({ application_id: 0 })
+  expect(db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all()).toEqual([])
+  await run((await open(options)).close)
+})
+
+test("interrupted schema-lock waiting finalizes both descriptors", async () => {
+  const options = await fixture()
+  const waiting = Deferred.makeUnsafe<void>()
+  const closed: string[] = []
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    fileLocker: () => {
+      const lock = nativeStateDatabasePlatform.fileLocker()
+      return (fd, operation) => {
+        if (operation === (1 | 4)) { Deferred.doneUnsafe(waiting, Effect.void); return false }
+        return lock(fd, operation)
+      }
+    },
+    openLock: async (path) => {
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => { await handle.close(); closed.push(path) } }
+    },
+  }
+  await run(Effect.gen(function*() {
+    const fiber = yield* Effect.forkChild(openStateDatabase(options.stateHome, false, undefined, platform))
+    yield* Deferred.await(waiting)
+    yield* Fiber.interrupt(fiber)
+  }))
+  expect(closed).toHaveLength(2)
+  expect(closed.some((path) => path.endsWith("startup.lock"))).toBe(true)
+  expect(closed.some((path) => path.endsWith("schema.lock"))).toBe(true)
+  const database = await run(openStateDatabase(options.stateHome))
+  await database.close()
+})
+
+test("failed schema-handle acquisition still finalizes the startup handle", async () => {
+  const options = await fixture()
+  let startupCloses = 0
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    openLock: async (path) => {
+      if (path.endsWith("schema.lock")) throw new Error("schema open failed")
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => { startupCloses++; await handle.close() } }
+    },
+  }
+  await expect(run(openStateDatabase(options.stateHome, false, undefined, platform))).rejects.toThrow("schema open failed")
+  expect(startupCloses).toBe(1)
+})
+
+test("startup failure retries database cleanup and retains the original failure", async () => {
+  const options = await fixture(); const repository = await open(options); await run(repository.close)
+  using invalid = new Database(repository.statePath)
+  invalid.run("PRAGMA user_version = 99")
+  let databaseCloses = 0; let gateCloses = 0
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    connect: (path) => {
+      const connected = nativeStateDatabasePlatform.connect(path)
+      return { db: connected.db, close: () => { if (++databaseCloses === 1) throw new Error("close failure"); connected.close() } }
+    },
+    openLock: async (path) => {
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => { if (path.endsWith("schema.lock")) gateCloses++; await handle.close() } }
+    },
+  }
+  const exit = await Effect.runPromiseExit(openStateDatabase(options.stateHome, true, undefined, platform))
+  expect(exit._tag).toBe("Failure")
+  if (exit._tag === "Failure") {
+    const messages = exit.cause.reasons.map((reason) => reason._tag === "Fail" ? String(reason.error) : "")
+    expect(messages.join("\n")).toContain("Unsupported state database schema 99")
+    expect(messages.join("\n")).toContain("close failure")
+  }
+  expect(databaseCloses).toBe(2); expect(gateCloses).toBe(1)
 })
 
 test("independent processes serialize metadata writes without losing relationships", async () => {
