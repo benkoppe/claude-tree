@@ -242,9 +242,9 @@ Avoid intercepting ordinary agent keys. Host shortcuts should be mode-specific, 
 
 Terminal mode keeps a persistent bottom bar with left-aligned `c/t · Ctrl+Space back`, using the navigator footer's text styling and full-width background. The keybinding is clickable. Reserve that row in the emulator and PTY dimensions, including for hidden terminals and on resize, so the control never covers provider output.
 
-## Releases Are Compiled npm Packages And GitHub Downloads
+## Releases Are Compiled npm Packages
 
-Binary releases use an explicitly dispatched workflow with a version input, not tag/push triggers. Build from one pinned source commit, run the existing regression suite without separate release smoke tests, and package all supported platforms before publication. Preserve executable permissions inside tarballs. The publisher validates source/version identities and checksums, creates the tag and draft GitHub Release, publishes exact-version platform packages before the npm launcher, promotes the launcher channel last, and then exposes the GitHub Release. Partial failures resume using the same artifacts; never overwrite published bytes or move release tags. Nix remains a separate optional source installation, not the release pipeline. Provider executables remain external dependencies.
+Binary releases use one build/package script and an explicitly dispatched workflow with a version input. Run the existing regression suite without release smoke tests, package all supported platforms, publish their npm tarballs before the exact-version launcher, then create the Git tag at the dispatched source commit. Retain basic version/tag conflict checks, not custom publication recovery, artifact manifests, GitHub Release staging, or standalone downloads. Never overwrite npm versions or move release tags; inspect partial publications before releasing a new version. Nix remains a separate optional source installation, not the release pipeline. Provider executables remain external dependencies.
 
 ## Shared Working Tree Is Deliberate
 
