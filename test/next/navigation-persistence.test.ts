@@ -13,7 +13,7 @@ import type { NavigationWorkerRequest } from "../../src/infrastructure/metadata/
 import { nativePersistencePlatform, PersistencePlatform } from "../../src/infrastructure/metadata/platform"
 import { makeProviderStateRepository } from "../../src/services/provider-state-repository"
 
-test("navigation worker preserves shared metadata, terminal owners, and other instances' cursors", async () => {
+test("navigation worker preserves shared metadata and other instances' cursors", async () => {
   const directory = await mkdtemp(join(tmpdir(), "claude-tree-navigation-worker-"))
   const projectDirectory = join(directory, "project")
   await mkdir(projectDirectory)
@@ -27,7 +27,6 @@ test("navigation worker preserves shared metadata, terminal owners, and other in
       const relation = { parentSessionId: "parent", childSessionId: "child", sourceMessageId: "message",
         sharedMessages: [{ parentMessageId: "message", childMessageId: "copy" }], createdAt: "2026-09-11T00:00:00.000Z" }
       yield* repository.updateMetadata((state) => ({ ...state, relations: [relation] }))
-      const owner = yield* repository.reserve("live-session")
       const worker = yield* makeNavigationPersistenceWorker(options)
       const navigation = { view: "roots" as const, selectedSessionId: "parent" }
       yield* worker.saveNavigation(navigation)
@@ -36,12 +35,10 @@ test("navigation worker preserves shared metadata, terminal owners, and other in
       yield* worker.close
       const saved = yield* repository.load
       expect(saved.relations).toEqual([relation])
-      expect(saved.terminalOwners).toEqual([owner])
       expect((yield* repository.loadMetadata).navigation).toEqual({ view: "roots", selectedSessionId: "child" })
       expect((yield* other.loadMetadata).navigation).toEqual(otherNavigation)
       const closed = yield* Effect.flip(worker.saveNavigation(navigation))
       expect(closed.message).toContain("closing")
-      yield* repository.release(owner)
     }).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform))))
   } finally {
     await rm(directory, { recursive: true, force: true })

@@ -1,163 +1,71 @@
-import {
-  Cause,
-  Clock,
-  Context,
-  Data,
-  Deferred,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  PubSub,
-  Queue,
-  Scope,
-  Semaphore,
-} from "effect"
-
+import { Cause, Clock, Context, Data, Deferred, Effect, Exit, Fiber, Layer, PubSub, Queue, Scope, Semaphore } from "effect"
 import { Osc52Forwarder } from "../clipboard"
 import { describeError, errorDetails, type ErrorDescription } from "../error-format"
-import type {
-  AgentActivity,
-  AgentSession,
-  BranchDerivation,
-  DraftPreview,
-  TerminalObservation,
-} from "../domain/model"
-import type {
-  BranchRelation,
-  IdentityTransitionKind,
-  TerminalOwner as PersistedTerminalOwner,
-} from "../domain/persistence"
-import {
-  PersistenceError,
-  TerminalError,
-  type ProviderError,
-  ProviderProtocolError,
-  SessionOwnedError,
-  SessionRemovedError,
-} from "../domain/errors"
-import {
-  cleanupProcessGroup,
-  type ProcessGroupCleanupIssue,
-} from "../infrastructure/process-group"
-import type {
-  AcquiredTerminalLaunch,
-  PreparedTerminal,
-  TerminalLaunch,
-  TerminalTransitionRequest,
-  ProviderTerminalEvent,
-} from "./provider"
-import { TerminalLaunchDirectory } from "./provider"
+import type { AgentActivity, BranchDerivation, DraftPreview, TerminalObservation } from "../domain/model"
+import type { BranchRelation, IdentityTransitionKind } from "../domain/persistence"
+import { PersistenceError, ProviderProtocolError, SessionOwnedError, SessionRemovedError, TerminalError, type ProviderError } from "../domain/errors"
+import { cleanupProcessGroup } from "../infrastructure/process-group"
+import type { SessionClaim, SessionGuard } from "../infrastructure/session-guard"
+import type { TerminalProcess, TerminalProcessFactory, TerminalRenderer, TerminalSurface } from "../infrastructure/terminal"
+import type { AcquiredTerminalLaunch, PreparedTerminal, TerminalLaunch, TerminalTransitionRequest, ProviderTerminalEvent } from "./provider"
+import type { ProviderStateRepositoryApi } from "./provider-state-repository"
 import { makeKeyedSerialExecutor, type KeyedSerialExecutor } from "./keyed-serial-executor"
 import { PROVIDER_SUPERVISOR_CLEANUP_TIMEOUT_MS } from "./lifecycle-policy"
 import { optionalOperationTimeout, withOperationTimeout } from "./operation-deadline"
-import type {
-  TerminalProcess,
-  TerminalProcessFactory,
-  TerminalRenderer,
-  TerminalSurface,
-} from "../infrastructure/terminal"
-import { TerminalSpawnCleanupError } from "../infrastructure/terminal"
-import type { ProviderStateRepositoryApi } from "./provider-state-repository"
-import type { PersistencePhase } from "../infrastructure/metadata/storage"
 
-const DEFAULT_GRACE_PERIOD_MS = 200
-const DEFAULT_KILL_PERIOD_MS = 200
-const PTY_DRAIN_PERIOD_MS = 250
-const HERDR_SHUTDOWN_PERIOD_MS = 500
-const PROVIDER_CLEANUP_ATTEMPTS = 3
-const PROVIDER_CLEANUP_RETRY_DELAY_MS = 10
-const PROVIDER_CLEANUP_TIMEOUT_MS = PROVIDER_SUPERVISOR_CLEANUP_TIMEOUT_MS
-const PERSISTENCE_TIMEOUT_MS = 500
-const RECOVERY_APPLICATION_ACKNOWLEDGMENT_TIMEOUT_MS = 10_000
+const GRACE_PERIOD_MS = 200
+const KILL_PERIOD_MS = 200
 const ACTIVITY_PROBE_INTERVAL_MS = 2_000
 const ACTIVITY_CONFIRMATION_DELAY_MS = 100
+const PTY_DRAIN_PERIOD_MS = 250
 
 export type TerminalOwnerState = "running" | "stopping" | "cleanup-incomplete"
-
 export interface TerminalCleanupIssue {
   readonly ownerId: string
   readonly sessionId: string
-  readonly stage: "term" | "wait" | "kill" | "verify" | "provider" | "runtime" | "lease" | "pty" | "ui"
+  readonly stage: "term" | "wait" | "kill" | "verify" | "provider" | "runtime" | "guard" | "pty" | "ui"
   readonly message: string
   readonly cause?: unknown
 }
-
 export class TerminalCleanupError extends Data.TaggedError("TerminalCleanupError")<{
   readonly operation: "stop" | "shutdown" | "natural-exit" | "acquire-rollback"
   readonly issues: readonly TerminalCleanupIssue[]
   readonly ownershipReleased?: true
 }> {
-  override get message(): string {
-    return errorDetails(this)
-  }
-
+  override get message(): string { return errorDetails(this) }
   [describeError](): ErrorDescription {
-    return {
-      message: `Terminal ${this.operation} cleanup failed${this.issues.length === 0 ? " (no issue details available)" : ":"}`,
-      children: this.issues.map((issue) => ({
-        label: `${issue.sessionId ? `session ${issue.sessionId}` : issue.ownerId} [${issue.stage}]`,
-        error: { message: issue.message || "Cleanup issue (no message)", cause: issue.cause },
-      })),
-    }
+    return { message: `Terminal ${this.operation} cleanup failed${this.issues.length ? ":" : " (no issue details available)"}`, children: this.issues.map((issue) => ({
+      label: `${issue.sessionId ? `session ${issue.sessionId}` : issue.ownerId} [${issue.stage}]`, error: { message: issue.message, cause: issue.cause },
+    })) }
   }
 }
-
-interface SequencedTerminalEvent {
-  readonly ownerId: string
-  readonly sequenceId: number
-}
-
+interface SequencedTerminalEvent { readonly ownerId: string; readonly sequenceId: number }
 export interface TerminalExitEvent extends SequencedTerminalEvent {
-  readonly sessionId: string
-  readonly exitCode: number
-  readonly wasActive: boolean
-  readonly draftPreview?: DraftPreview
-  readonly outputTail?: string
-  readonly cleanupError?: TerminalCleanupError
-  readonly ownershipReleased?: true
+  readonly sessionId: string; readonly exitCode: number; readonly wasActive: boolean
+  readonly draftPreview?: DraftPreview; readonly outputTail?: string
+  readonly cleanupError?: TerminalCleanupError; readonly ownershipReleased?: true
 }
-
 export interface TerminalActivityEvent extends SequencedTerminalEvent {
-  readonly sessionId: string
-  readonly activity: AgentActivity
-  readonly wasActive: boolean
+  readonly sessionId: string; readonly activity: AgentActivity; readonly wasActive: boolean
 }
-
 export interface TerminalObservationEvent extends SequencedTerminalEvent {
-  readonly sessionId: string
-  readonly wasActive: boolean
-  readonly observation: TerminalObservation
+  readonly sessionId: string; readonly wasActive: boolean; readonly observation: TerminalObservation
 }
-
 export interface TerminalSessionChangedEvent extends SequencedTerminalEvent {
   readonly previousSessionId: string
   readonly kind: IdentityTransitionKind
-  readonly session: AgentSession
+  readonly session: PreparedTerminal["session"]
   readonly wasActive: boolean
   readonly adoptionToken: string
   readonly relation?: BranchRelation
-  /** The application completes this only after projection and durable journal acknowledgment. */
   readonly acknowledgment?: Deferred.Deferred<void, unknown>
-  /** @deprecated Derivation is completed before the durable identity commit. */
-  readonly derivation?: Effect.Effect<
-    BranchDerivation | undefined,
-    ProviderError | ProviderProtocolError
-  >
+  readonly derivation?: Effect.Effect<BranchDerivation | undefined, ProviderError | ProviderProtocolError>
 }
-
 export interface TerminalSessionTransitionErrorEvent extends SequencedTerminalEvent {
   readonly sessionId: string
-  readonly error:
-    | TerminalError
-    | ProviderError
-    | ProviderProtocolError
-    | PersistenceError
-    | SessionOwnedError
-    | SessionRemovedError
+  readonly error: TerminalError | ProviderError | ProviderProtocolError | PersistenceError | SessionOwnedError | SessionRemovedError
   readonly wasActive: boolean
 }
-
 export interface TerminalSupervisorEvents {
   readonly onObservation?: (event: TerminalObservationEvent) => void
   readonly onProcessExited?: (event: TerminalExitEvent) => void
@@ -166,78 +74,31 @@ export interface TerminalSupervisorEvents {
   readonly onSessionTransitionError?: (event: TerminalSessionTransitionErrorEvent) => void
   readonly onCleanupError?: (error: TerminalCleanupError) => void
 }
-
-export interface TerminalHerdrReporter {
-  report(activity: AgentActivity): void
-  shutdown: Effect.Effect<void, unknown>
-}
-
-export const NULL_TERMINAL_HERDR_REPORTER: TerminalHerdrReporter = {
-  report() {},
-  shutdown: Effect.void,
-}
-
-export interface TerminalOwnershipRepository extends Pick<
-  ProviderStateRepositoryApi,
-  "load" | "reserve" | "attach" | "mark" | "release" | "commitIdentity" | "ack" | "launchDirectory"
-> {}
-
 export interface TerminalSupervisorDependencies {
   readonly renderer: TerminalRenderer
   readonly processes: TerminalProcessFactory
-  readonly ownership: TerminalOwnershipRepository
+  readonly guard: SessionGuard
+  readonly metadata: Pick<ProviderStateRepositoryApi, "replaceIdentity">
   readonly events?: TerminalSupervisorEvents
-  readonly herdr?: TerminalHerdrReporter
   readonly gracePeriodMs?: number
   readonly killPeriodMs?: number
-  readonly providerCleanupAttempts?: number
-  readonly providerCleanupRetryDelayMs?: number
   readonly providerCleanupTimeoutMs?: number
-  readonly persistenceTimeoutMs?: number
-  /** Optional productive-operation budgets; omitted budgets wait until cancellation. */
-  readonly launchPersistenceTimeoutMs?: number
   readonly transitionDerivationTimeoutMs?: number
   readonly applicationAcknowledgmentTimeoutMs?: number
   readonly acquisitionTimeoutMs?: number
 }
-
 export interface TerminalOwnershipSnapshot {
-  readonly ownerId: string
-  readonly sessionId: string
-  readonly processGroupId: number
-  readonly state: TerminalOwnerState
-  readonly active: boolean
-  readonly activity: AgentActivity
-  readonly exitCode: number | null
+  readonly ownerId: string; readonly sessionId: string; readonly processGroupId: number
+  readonly state: TerminalOwnerState; readonly active: boolean; readonly activity: AgentActivity; readonly exitCode: number | null
 }
-
 export interface TerminalActivityCheck {
-  readonly ownerId: string
-  readonly sessionId: string
-  readonly sequenceId: number
-  readonly activity?: AgentActivity
-  readonly issue?: "unrecognized-screen" | "observer-failed"
+  readonly ownerId: string; readonly sessionId: string; readonly sequenceId: number
+  readonly activity?: AgentActivity; readonly issue?: "unrecognized-screen" | "observer-failed"
 }
-
 export interface TerminalSupervisorApi {
-  readonly show: (
-    prepared: PreparedTerminal,
-  ) => Effect.Effect<
-    string,
-    | ProviderError
-    | ProviderProtocolError
-    | PersistenceError
-    | SessionOwnedError
-    | SessionRemovedError
-    | TerminalError
-    | TerminalCleanupError
-  >
+  readonly show: (prepared: PreparedTerminal) => Effect.Effect<string, ProviderError | ProviderProtocolError | PersistenceError | SessionOwnedError | SessionRemovedError | TerminalError | TerminalCleanupError>
   readonly hideActive: Effect.Effect<string | null>
-  readonly stopSession: (
-    sessionId: string,
-    gracePeriodMs?: number,
-    expectedOwnerId?: string,
-  ) => Effect.Effect<boolean, TerminalCleanupError>
+  readonly stopSession: (sessionId: string, gracePeriodMs?: number, expectedOwnerId?: string) => Effect.Effect<boolean, TerminalCleanupError>
   readonly shutdown: (gracePeriodMs?: number) => Effect.Effect<void, TerminalCleanupError>
   readonly activeSessionId: Effect.Effect<string | null>
   readonly ownsInput: Effect.Effect<boolean>
@@ -249,3039 +110,570 @@ export interface TerminalSupervisorApi {
   readonly ownershipSnapshot: Effect.Effect<readonly TerminalOwnershipSnapshot[]>
   readonly reconcileActivity: Effect.Effect<readonly TerminalActivityCheck[]>
 }
+export class TerminalSupervisor extends Context.Service<TerminalSupervisor, TerminalSupervisorApi>()("claude-tree/TerminalSupervisor") {}
 
-export class TerminalSupervisor extends Context.Service<
-  TerminalSupervisor,
-  TerminalSupervisorApi
->()("claude-tree/TerminalSupervisor") {}
-
-export const makeTerminalSupervisor = (
-  dependencies: TerminalSupervisorDependencies,
-): Effect.Effect<TerminalSupervisorApi, never, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.gen(function*() {
-      const launches = yield* makeKeyedSerialExecutor<string>()
-      return new TerminalSupervisorImpl(dependencies, launches)
-    }),
-    (supervisor) =>
-      supervisor.shutdown().pipe(
-        Effect.catch((error) => Effect.sync(() => supervisor.reportCleanupError(error))),
-      ),
-  )
-
-export const terminalSupervisorLayer = (
-  dependencies: TerminalSupervisorDependencies,
-): Layer.Layer<TerminalSupervisor> =>
+export const makeTerminalSupervisor = (dependencies: TerminalSupervisorDependencies): Effect.Effect<TerminalSupervisorApi, never, Scope.Scope> =>
+  Effect.acquireRelease(Effect.gen(function*() {
+    const launches = yield* makeKeyedSerialExecutor<string>()
+    return new TerminalSupervisorImpl(dependencies, launches)
+  }), (supervisor) => supervisor.shutdown().pipe(Effect.catch((error) => Effect.sync(() => supervisor.reportCleanupError(error)))))
+export const terminalSupervisorLayer = (dependencies: TerminalSupervisorDependencies): Layer.Layer<TerminalSupervisor> =>
   Layer.effect(TerminalSupervisor, makeTerminalSupervisor(dependencies))
 
-interface LedgerEntry {
-  readonly ownerId: string
-  state: TerminalOwnerState
-}
-
-interface PendingIdentity {
-  readonly previousSessionId: string
-  readonly session: AgentSession
-  readonly kind: IdentityTransitionKind
-  readonly relation?: BranchRelation
-  readonly mutationToken: string
-}
-
-interface MutationTokens {
-  readonly attach: string
-  readonly stopping: string
-  readonly cleanupIncomplete: string
-  readonly release: string
-}
-
-interface SequenceAllocator {
-  next: number
-}
-
+type SemanticEvent =
+  | { readonly _tag: "Observation"; readonly observation: TerminalObservation; readonly sequenceId: number }
+  | { readonly _tag: "Activity"; readonly activity: AgentActivity; readonly sequenceId: number; readonly provider?: true }
+  | { readonly _tag: "Provider"; readonly event: ProviderTerminalEvent; readonly sequenceId: number }
+  | { readonly _tag: "Exited"; readonly exitCode: number; readonly sequenceId: number }
+  | { readonly _tag: "Transition"; readonly request: TerminalTransitionRequest; readonly sequenceId: number }
+type UnsequencedEvent = SemanticEvent extends infer Event ? Event extends SemanticEvent ? Omit<Event, "sequenceId"> : never : never
+interface PendingLaunch { readonly ownerId: string; readonly done: Deferred.Deferred<void>; readonly cancelled: Deferred.Deferred<void> }
 interface TerminalOwner {
   readonly ownerId: string
-  readonly launchRegistered: Deferred.Deferred<void>
-  readonly lifecycleGate: Semaphore.Semaphore
-  readonly cleanupRequested: Deferred.Deferred<void>
   sessionId: string
-  readonly providerScope: Scope.Closeable
-  readonly providerClose: AcquiredTerminalLaunch["close"]
-  readonly launchResources: AcquiredTerminalLaunch["resources"]
-  readonly eventQueue: Queue.Queue<SemanticEvent>
-  readonly pendingTransitions: Set<TerminalTransitionRequest>
-  readonly sequence: SequenceAllocator
-  cleanupResult: Deferred.Deferred<void, TerminalCleanupError>
+  state: TerminalOwnerState
+  readonly scope: Scope.Closeable
+  readonly close: AcquiredTerminalLaunch["close"]
+  claim: SessionClaim
+  readonly claims: Set<SessionClaim>
+  readonly process: TerminalProcess
+  readonly surface: TerminalSurface
   readonly observer: TerminalLaunch["observer"]
   readonly failureDetails?: TerminalLaunch["failureDetails"]
-  readonly process: TerminalProcess
-  readonly processGroupId: number
-  readonly surface: TerminalSurface
-  ownership: PersistedTerminalOwner
-  awaitingTemporaryAdoption: boolean
-  readonly mutationTokens: MutationTokens
-  semanticFiber?: Fiber.Fiber<void, never>
-  transitionFiber?: Fiber.Fiber<void, never>
-  activityFiber?: Fiber.Fiber<void, never>
-  activityHintFiber?: Fiber.Fiber<void, never>
-  providerEventFiber?: Fiber.Fiber<void, never>
-  providerActivity?: AgentActivity | undefined
-  readonly activityProbeGate: Semaphore.Semaphore
-  lastQueuedActivity: AgentActivity
+  readonly queue: Queue.Queue<SemanticEvent>
+  readonly ready: Deferred.Deferred<void>
+  readonly cancelled: Deferred.Deferred<void>
+  readonly gate: Semaphore.Semaphore
+  readonly probeGate: Semaphore.Semaphore
+  readonly pendingTransitions: Set<TerminalTransitionRequest>
+  readonly fibers: Fiber.Fiber<void, never>[]
+  sequence: number
   activity: AgentActivity
-  exitCode: number | null
-  draftPreview?: DraftPreview
+  lastQueuedActivity: AgentActivity
+  providerActivity?: AgentActivity | undefined
+  draft?: DraftPreview
+  draftKey?: string
   inputObserved: boolean
-  lastDraftKey?: string
-  selectionClearPending: boolean
+  transient: boolean
+  transitioning: boolean
+  exitCode: number | null
+  cleanup?: Deferred.Deferred<void, TerminalCleanupError>
   uiReleased: boolean
-  ptyClosed: boolean
   providerClosed: boolean
-  providerScopeClosed: boolean
-  providerScopeCloseUncertain: boolean
-  providerScopeCloseCause?: unknown
-  leaseReleased: boolean
-  processDetached: boolean
-  stoppingPersisted: boolean
-  processRegistrationUncertain: boolean
-  pendingIdentity?: PendingIdentity
-  pendingAdoptionToken?: string
-  adoptionApplicationAcknowledged: boolean
-  cleanupStarted: boolean
-  cleanupInProgress: boolean
-  cleanupNotificationSent: boolean
-  exitNotificationSent: boolean
+  scopeClosed: boolean
+  ptyClosed: boolean
+  detached: boolean
+  claimReleased: boolean
+  exitNotified: boolean
 }
-
-interface TrackedPersistence {
-  readonly fiber: Fiber.Fiber<unknown, unknown>
-  readonly operation: string
-  readonly sessionId: string
-  readonly ownerId?: string
-  readonly mutationToken?: string
-  readonly mutationKey?: string
-  abandoned: boolean
-  observedByCaller: boolean
-  reported: boolean
-  exit?: Exit.Exit<unknown, unknown>
-  readonly progress?: { phase?: PersistencePhase }
-}
-
-interface PersistenceTracking {
-  readonly ownerId?: string
-  readonly mutationToken?: string
-  readonly mutationStage?: string
-  readonly progress?: { phase?: PersistencePhase }
-}
-
-interface PendingReservation {
-  readonly ownerId: string
-  readonly sessionId: string
-  readonly releaseMutationToken: string
-  readonly reserve: TrackedPersistence
-  ownership?: PersistedTerminalOwner
-  release?: TrackedPersistence
-}
-
-type SemanticEvent =
-  | { readonly _tag: "Observation"; readonly sequenceId: number; readonly observation: TerminalObservation }
-  | { readonly _tag: "Exited"; readonly sequenceId: number; readonly exitCode: number }
-  | { readonly _tag: "Activity"; readonly sequenceId: number; readonly activity: AgentActivity; readonly provider?: true }
-  | { readonly _tag: "Provider"; readonly sequenceId: number; readonly event: ProviderTerminalEvent }
-  | {
-      readonly _tag: "Transition"
-      readonly sequenceId: number
-      readonly request: TerminalTransitionRequest
-    }
-
-interface CleanupPlan {
-  readonly owner: TerminalOwner
-  readonly result: Deferred.Deferred<void, TerminalCleanupError>
-  readonly operation: TerminalCleanupError["operation"]
-  readonly gracePeriodMs: number
-  readonly naturalExit?: { readonly exitCode: number; readonly sequenceId: number; readonly wasActive: boolean }
-  readonly forcedExit?: { readonly wasActive: boolean }
-  readonly failureDetails?: string
-}
-
-type CleanupDecision =
-  | { readonly _tag: "Missing" }
-  | { readonly _tag: "Wait"; readonly owner: TerminalOwner }
-  | { readonly _tag: "Start"; readonly plan: CleanupPlan }
 
 class TerminalSupervisorImpl implements TerminalSupervisorApi {
-  private readonly ledger = new Map<string, LedgerEntry>()
   private readonly owners = new Map<string, TerminalOwner>()
+  private readonly launches = new Map<string, PendingLaunch>()
   private readonly gate = Semaphore.makeUnsafe(1)
-  private readonly runtimeScope = Scope.makeUnsafe("parallel")
+  private readonly scope = Scope.makeUnsafe("parallel")
+  private readonly stopping = Deferred.makeUnsafe<void>()
   private readonly events: TerminalSupervisorEvents
-  private readonly herdr: TerminalHerdrReporter
-  private readonly gracePeriodMs: number
-  private readonly killPeriodMs: number
-  private readonly providerCleanupAttempts: number
-  private readonly providerCleanupRetryDelayMs: number
-  private readonly providerCleanupTimeoutMs: number
-  private readonly persistenceTimeoutMs: number
-  private readonly launchPersistenceTimeoutMs: number | undefined
-  private readonly transitionDerivationTimeoutMs: number | undefined
-  private readonly applicationAcknowledgmentTimeoutMs: number | undefined
-  private nextOwnerId = 1
-  private activeOwnerId: string | null = null
+  private readonly unsubscribe: () => void
+  private active: TerminalOwner | undefined
   private shuttingDown = false
+  private nextOwner = 1
   private shutdownResult: Deferred.Deferred<void, TerminalCleanupError> | undefined
-  private readonly shutdownRequested = Deferred.makeUnsafe<void>()
-  private runtimeScopeClosed = false
-  private runtimeScopeCloseUncertain = false
-  private runtimeScopeCloseCause: unknown
-  private readonly persistenceFibers = new Set<TrackedPersistence>()
-  private readonly persistenceMutations = new Map<string, TrackedPersistence>()
-  private readonly pendingReservations = new Map<string, PendingReservation>()
-  private readonly launches = new Map<string, {
-    readonly ownerId: string
-    readonly done: Deferred.Deferred<void>
-    readonly cancelled: Deferred.Deferred<void>
-  }>()
-  private readonly incompleteRollbacks = new Map<string, TerminalCleanupError>()
-  private readonly unsubscribeSelection: () => void
+  private readonly graceMs: number
+  private readonly killMs: number
+  private readonly closeMs: number
 
-  constructor(
-    private readonly dependencies: TerminalSupervisorDependencies,
-    private readonly launchExecutor: KeyedSerialExecutor<string>,
-  ) {
+  constructor(private readonly dependencies: TerminalSupervisorDependencies, private readonly executor: KeyedSerialExecutor<string>) {
     this.events = dependencies.events ?? {}
-    this.herdr = dependencies.herdr ?? NULL_TERMINAL_HERDR_REPORTER
-    this.gracePeriodMs = dependencies.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
-    this.killPeriodMs = dependencies.killPeriodMs ?? DEFAULT_KILL_PERIOD_MS
-    this.providerCleanupAttempts = Math.max(
-      1,
-      dependencies.providerCleanupAttempts ?? PROVIDER_CLEANUP_ATTEMPTS,
-    )
-    this.providerCleanupRetryDelayMs = dependencies.providerCleanupRetryDelayMs ??
-      PROVIDER_CLEANUP_RETRY_DELAY_MS
-    this.providerCleanupTimeoutMs = dependencies.providerCleanupTimeoutMs ??
-      PROVIDER_CLEANUP_TIMEOUT_MS
-    this.persistenceTimeoutMs = dependencies.persistenceTimeoutMs ?? PERSISTENCE_TIMEOUT_MS
+    this.graceMs = dependencies.gracePeriodMs ?? GRACE_PERIOD_MS
+    this.killMs = dependencies.killPeriodMs ?? KILL_PERIOD_MS
+    this.closeMs = dependencies.providerCleanupTimeoutMs ?? PROVIDER_SUPERVISOR_CLEANUP_TIMEOUT_MS
     optionalOperationTimeout(dependencies.acquisitionTimeoutMs)
-    this.launchPersistenceTimeoutMs = optionalOperationTimeout(dependencies.launchPersistenceTimeoutMs)
-    this.transitionDerivationTimeoutMs = optionalOperationTimeout(dependencies.transitionDerivationTimeoutMs)
-    this.applicationAcknowledgmentTimeoutMs = optionalOperationTimeout(dependencies.applicationAcknowledgmentTimeoutMs)
-    this.unsubscribeSelection = dependencies.renderer.onSelection((surface, text) => {
-      this.ignoreCallback(() => {
-        const active = this.activeOwner()
-        if (active?.surface === surface) dependencies.renderer.copyToClipboard(text)
-      })
+    optionalOperationTimeout(dependencies.transitionDerivationTimeoutMs)
+    optionalOperationTimeout(dependencies.applicationAcknowledgmentTimeoutMs)
+    this.unsubscribe = dependencies.renderer.onSelection((surface, text) => {
+      if (this.active?.surface === surface) this.ignore(() => dependencies.renderer.copyToClipboard(text))
     })
-    this.reportHerdr("idle")
   }
 
-  readonly show: TerminalSupervisorApi["show"] = (prepared) =>
-    this.launchExecutor.withLock(prepared.session.id, Effect.acquireUseRelease(
-      Effect.sync(() => {
-        const launch = {
-          ownerId: `terminal-owner-${this.nextOwnerId++}`,
-          done: Deferred.makeUnsafe<void>(),
-          cancelled: Deferred.makeUnsafe<void>(),
+  readonly show: TerminalSupervisorApi["show"] = (prepared) => this.executor.withLock(prepared.session.id,
+    Effect.acquireUseRelease(Effect.sync(() => {
+      const launch = { ownerId: `terminal-owner-${this.nextOwner++}`, done: Deferred.makeUnsafe<void>(), cancelled: Deferred.makeUnsafe<void>() }
+      this.launches.set(prepared.session.id, launch)
+      return launch
+    }), (pending) => Effect.uninterruptibleMask((restore) => Effect.gen({ self: this }, function*() {
+      if (this.shuttingDown) return yield* Effect.fail(this.error("show", prepared.session.id, "Cannot open a session during shutdown"))
+      const existing = this.owners.get(prepared.session.id)
+      if (existing) {
+        if (existing.state !== "running" || existing.transitioning) return yield* Effect.fail(this.error("show", existing.sessionId, "Session is stopping or switching identity"))
+        yield* this.gate.withPermit(this.activate(existing))
+        return existing.ownerId
+      }
+      const claim = yield* restore(this.untilCancelled(this.dependencies.guard.acquire(prepared.session.id, prepared.allowDuplicate), pending.cancelled))
+      const scope = yield* Scope.make("sequential")
+      let acquired: AcquiredTerminalLaunch | undefined
+      let owner: TerminalOwner | undefined
+      const opened = yield* Effect.exit(Effect.gen({ self: this }, function*() {
+        acquired = yield* restore(this.untilCancelled(Scope.provide(withOperationTimeout(prepared.acquireLaunch, this.dependencies.acquisitionTimeoutMs,
+          () => Effect.fail(this.error("acquire", prepared.session.id, "Provider acquisition timed out"))), scope), pending.cancelled))
+        if (acquired.launch.sessionId !== prepared.session.id) return yield* Effect.fail(this.error("acquire", prepared.session.id, "Provider acquired a different session"))
+        if (this.shuttingDown || (yield* Deferred.isDone(pending.cancelled))) return yield* Effect.fail(this.error("acquire", prepared.session.id, "Launch cancelled"))
+        const transitions = acquired.launch.transitions ? yield* Scope.provide(PubSub.subscribe(acquired.launch.transitions), scope) : undefined
+        const hints = acquired.launch.activityHints ? yield* Scope.provide(PubSub.subscribe(acquired.launch.activityHints), scope) : undefined
+        const providerEvents = acquired.launch.providerEvents ? yield* Scope.provide(PubSub.subscribe(acquired.launch.providerEvents), scope) : undefined
+        owner = yield* this.createOwner(pending.ownerId, acquired, scope, claim, prepared.session.transient === true)
+        this.owners.set(owner.sessionId, owner)
+        const current = owner
+        void current.process.exited.then((exitCode) => {
+          Deferred.doneUnsafe(current.cancelled, Effect.void)
+          this.offer(current, { _tag: "Exited", exitCode })
+        })
+        current.fibers.push(yield* Effect.forkIn(Deferred.await(current.ready).pipe(Effect.andThen(this.semanticLoop(current))), this.scope))
+        current.fibers.push(yield* Effect.forkIn(Effect.forever(Effect.sleep(ACTIVITY_PROBE_INTERVAL_MS).pipe(
+          Effect.andThen(Effect.suspend(() => current.lastQueuedActivity === "idle" ? Effect.void : this.probe(current).pipe(Effect.asVoid))))), this.scope))
+        if (transitions) current.fibers.push(yield* Effect.forkIn(Effect.forever(PubSub.take(transitions).pipe(Effect.andThen((request) => Effect.sync(() => {
+          current.pendingTransitions.add(request)
+          this.offer(current, { _tag: "Transition", request })
+        })))), this.scope))
+        if (hints) current.fibers.push(yield* Effect.forkIn(Effect.forever(PubSub.take(hints).pipe(Effect.andThen(this.probe(current)), Effect.asVoid)), this.scope))
+        if (providerEvents) current.fibers.push(yield* Effect.forkIn(Effect.forever(PubSub.take(providerEvents).pipe(Effect.andThen((event) => Effect.sync(() => {
+          this.offer(current, { _tag: "Provider", event })
+        })))), this.scope))
+        yield* this.gate.withPermit(Effect.suspend(() => this.shuttingDown || current.state !== "running" || current.process.exitCode !== null || Deferred.isDoneUnsafe(pending.cancelled)
+          ? Effect.fail(this.error("activate", current.sessionId, "Terminal stopped before activation")) : this.activate(current)))
+        Deferred.doneUnsafe(current.ready, Effect.void)
+        return current.ownerId
+      }))
+      if (Exit.isSuccess(opened)) return opened.value
+      if (owner) {
+        const failureOutput = this.failureOutput(owner)
+        yield* this.cleanup(owner, "acquire-rollback", this.graceMs)
+        const cause = Cause.squash(opened.cause)
+        if (failureOutput && owner.process.exitCode !== null && owner.process.exitCode !== 0) return yield* Effect.fail(this.error("acquire", owner.sessionId, `Agent exited with code ${owner.process.exitCode}\n\n${failureOutput}`, cause))
+      } else {
+        const issues: TerminalCleanupIssue[] = []
+        for (const [stage, effect] of [["provider", acquired?.close ?? Effect.void], ["provider", Scope.close(scope, Exit.void)], ["guard", claim.release]] as const) {
+          const exit = yield* Effect.exit(this.bounded(effect as Effect.Effect<void, unknown>))
+          if (Exit.isFailure(exit)) issues.push({ ownerId: pending.ownerId, sessionId: prepared.session.id, stage, message: "Launch rollback failed", cause: Cause.squash(exit.cause) })
         }
-        this.launches.set(prepared.session.id, launch)
-        return launch
-      }),
-      (admittedLaunch) => Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function* (this: TerminalSupervisorImpl) {
-          if (this.shuttingDown) {
-            return yield* Effect.fail(new TerminalError({
-              operation: "show",
-              sessionId: prepared.session.id,
-              message: "Cannot open an agent session while claude-tree is shutting down",
-            }))
-          }
-
-          const pendingReservation = this.pendingReservations.get(prepared.session.id)
-          if (pendingReservation) {
-            const compensationExit = yield* Effect.exit(
-              this.reconcilePendingReservation(pendingReservation, true),
-            )
-            if (Exit.isFailure(compensationExit)) {
-              return yield* Effect.failCause(compensationExit.cause)
-            }
-          }
-
-          const existingEntry = this.ledger.get(prepared.session.id)
-          if (existingEntry) {
-            const existing = this.owners.get(existingEntry.ownerId)
-            if (!existing || existingEntry.state !== "running" || existing.exitCode !== null) {
-              return yield* Effect.fail(new TerminalError({
-                operation: "show",
-                sessionId: prepared.session.id,
-                message: `Agent session ${prepared.session.id} is still ${existingEntry.state}`,
-              }))
-            }
-            yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-              return yield* (this.shuttingDown || !this.isRunningOwner(existing) ||
-                (yield* Deferred.isDone(existing.cleanupRequested)) ||
-                existing.sessionId !== prepared.session.id || existing.pendingIdentity !== undefined
-                ? Effect.fail(new TerminalError({
-                    operation: "activate", sessionId: prepared.session.id,
-                    message: "Terminal owner stopped before activation",
-                  }))
-                 : this.activate(existing))
-            }.bind(this)))
-            return existing.ownerId
-          }
-
-          const ownerId = admittedLaunch.ownerId
-          const lifecycleToken = crypto.randomUUID()
-          const reserveMutationToken = `${lifecycleToken}:reserve`
-          const mutationTokens: MutationTokens = {
-            attach: `${lifecycleToken}:attach`,
-            stopping: `${lifecycleToken}:stopping`,
-            cleanupIncomplete: `${lifecycleToken}:cleanup-incomplete`,
-            release: `${lifecycleToken}:release`,
-          }
-          const reserveExit = yield* Effect.exit(this.reserveOwnership(
-            ownerId,
-            prepared.session.id,
-            reserveMutationToken,
-            mutationTokens.release,
-          ))
-          if (Exit.isFailure(reserveExit)) return yield* Effect.failCause(reserveExit.cause)
-          const ownership = reserveExit.value
-          const providerScope = yield* Scope.make("sequential")
-          const acquiredExit = yield* Effect.exit(
-            restore(Effect.raceFirst(Scope.provide(prepared.acquireLaunch.pipe(Effect.provideService(
-              TerminalLaunchDirectory, this.dependencies.ownership.launchDirectory(ownership),
-            )).pipe((effect) => withOperationTimeout(effect, this.dependencies.acquisitionTimeoutMs,
-              () => Effect.fail(new TerminalError({
-                operation: "acquire", sessionId: prepared.session.id,
-                message: `Provider acquisition exceeded ${this.dependencies.acquisitionTimeoutMs}ms`,
-              })))), providerScope), Effect.raceFirst(Deferred.await(this.shutdownRequested), Deferred.await(admittedLaunch.cancelled)).pipe(
-              Effect.andThen(Effect.fail(new TerminalError({
-                operation: "acquire", sessionId: prepared.session.id,
-                message: "Terminal launch cancelled by stop or shutdown",
-              }))),
-            ))),
-          )
-          if (Exit.isFailure(acquiredExit)) {
-            const issues = yield* this.rollbackBeforeOwner(
-              ownerId,
-              prepared.session.id,
-              ownership,
-              providerScope,
-              mutationTokens,
-            )
-            if (issues.length > 0) {
-              return yield* Effect.fail(new TerminalCleanupError({
-                operation: "acquire-rollback",
-                issues,
-              }))
-            }
-            return yield* Effect.failCause(acquiredExit.cause)
-          }
-
-          const acquired = acquiredExit.value
-          const launch = acquired.launch
-          if (launch.sessionId !== prepared.session.id || this.shuttingDown || (yield* Deferred.isDone(admittedLaunch.cancelled))) {
-            const issues = yield* this.rollbackBeforeOwner(
-              ownerId,
-              prepared.session.id,
-              ownership,
-              providerScope,
-              mutationTokens,
-              acquired,
-            )
-            if (issues.length > 0) {
-              return yield* Effect.fail(new TerminalCleanupError({
-                operation: "acquire-rollback",
-                issues,
-              }))
-            }
-            return yield* Effect.fail(new TerminalError({
-              operation: "acquire",
-              sessionId: prepared.session.id,
-              message: this.shuttingDown || (yield* Deferred.isDone(admittedLaunch.cancelled)) ? "Terminal launch cancelled by stop or shutdown"
-                : `Prepared terminal acquired a launch for ${launch.sessionId}`,
-            }))
-          }
-
-          const subscription = launch.transitions
-            ? yield* Scope.provide(PubSub.subscribe(launch.transitions), providerScope)
-            : undefined
-          const activityHints = launch.activityHints
-            ? yield* Scope.provide(PubSub.subscribe(launch.activityHints), providerScope)
-            : undefined
-          const providerEvents = launch.providerEvents
-            ? yield* Scope.provide(PubSub.subscribe(launch.providerEvents), providerScope)
-            : undefined
-          const ownerExit = yield* Effect.exit(
-            this.createOwner(
-              ownerId,
-              acquired,
-              providerScope,
-              ownership,
-              prepared.session.transient === true,
-              mutationTokens,
-            ),
-          )
-          if (Exit.isFailure(ownerExit)) {
-            const error = Cause.squash(ownerExit.cause) as TerminalError | TerminalCleanupError
-            const spawnFailure = terminalSpawnCleanupError(error)
-            const issues = yield* this.rollbackBeforeOwner(
-              ownerId,
-              prepared.session.id,
-              ownership,
-              providerScope,
-              mutationTokens,
-              acquired,
-              spawnFailure,
-              error instanceof TerminalCleanupError ? error.issues : [],
-            )
-            if (issues.length > 0 || spawnFailure) {
-              return yield* Effect.fail(new TerminalCleanupError({
-                operation: "acquire-rollback",
-                issues: spawnFailure && issues.length === 0
-                  ? [{
-                      ownerId,
-                      sessionId: prepared.session.id,
-                      stage: "verify",
-                      message: `Unable to verify process group ${spawnFailure.processGroupId} exited`,
-                      cause: spawnFailure,
-                    }]
-                  : issues,
-              }))
-            }
-            return yield* Effect.fail(error as TerminalError)
-          }
-
-          const owner = ownerExit.value
-          // No asynchronous boundary is allowed between spawn and ownership registration.
-          this.owners.set(owner.ownerId, owner)
-          this.ledger.set(owner.sessionId, { ownerId, state: "running" })
-          void owner.process.exited.then((exitCode) => {
-            // Exit cleanup must not queue behind this owner's productive transition.
-            Deferred.doneUnsafe(owner.cleanupRequested, Effect.void)
-            this.offerEvent(owner, { _tag: "Exited", exitCode })
-          })
-          owner.semanticFiber = yield* Effect.forkIn(
-            Deferred.await(owner.launchRegistered).pipe(Effect.andThen(this.semanticLoop(owner))),
-            this.runtimeScope,
-          )
-          owner.activityFiber = yield* Effect.forkIn(Effect.forever(
-            Effect.sleep(ACTIVITY_PROBE_INTERVAL_MS).pipe(Effect.andThen(Effect.suspend(() =>
-              owner.lastQueuedActivity === "idle" ? Effect.void : this.probeActivity(owner).pipe(Effect.asVoid)))),
-          ), this.runtimeScope)
-          if (activityHints) {
-            owner.activityHintFiber = yield* Effect.forkIn(Effect.forever(
-              PubSub.take(activityHints).pipe(Effect.andThen(this.probeActivity(owner)), Effect.asVoid),
-            ), this.runtimeScope)
-          }
-          if (subscription) {
-            owner.transitionFiber = yield* Effect.forkIn(
-              this.transitionLoop(owner, subscription),
-              this.runtimeScope,
-            )
-          }
-          if (providerEvents) owner.providerEventFiber = yield* Effect.forkIn(Effect.forever(
-            PubSub.take(providerEvents).pipe(Effect.flatMap((event) => Effect.sync(() => {
-              this.offerEvent(owner, { _tag: "Provider", event })
-            }))),
-          ), this.runtimeScope)
-
-          const registrationProgress: { phase?: PersistencePhase } = {}
-          const registrationExit = yield* owner.lifecycleGate.withPermit(Effect.exit(
-            this.boundedPersistence(Effect.suspend(() =>
-              this.dependencies.ownership.attach(owner.ownership, owner.processGroupId, {
-                mutationToken: owner.mutationTokens.attach,
-                onPhase: (phase) => { registrationProgress.phase = phase },
-                ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
-              })), "attach terminal process group", owner.sessionId, {
-              ownerId: owner.ownerId,
-              mutationToken: owner.mutationTokens.attach,
-              mutationStage: "attach",
-              progress: registrationProgress,
-            }, "productive"),
-          ).pipe(Effect.tap((exit) => Effect.sync(() => {
-            if (Exit.isSuccess(exit)) owner.ownership = exit.value
-            else owner.processRegistrationUncertain = true
-          }))))
-          if (Exit.isFailure(registrationExit)) {
-            const registrationError = Cause.squash(registrationExit.cause) as PersistenceError
-            return yield* this.failAcquisition(owner, registrationError)
-          }
-
-          const activationExit = yield* Effect.exit(this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-            return yield* (this.shuttingDown || !this.isRunningOwner(owner) || (yield* Deferred.isDone(admittedLaunch.cancelled))
-              ? Effect.fail(new TerminalError({
-                  operation: "activate", sessionId: owner.sessionId,
-                  message: "Terminal owner stopped before activation",
-                }))
-               : this.activate(owner))
-          }.bind(this))))
-          if (Exit.isFailure(activationExit)) {
-            const error = Cause.squash(activationExit.cause) as TerminalError
-            return yield* this.failAcquisition(owner, error)
-          }
-          Deferred.doneUnsafe(owner.launchRegistered, Effect.void)
-          return owner.ownerId
-        }.bind(this)),
-      ),
-      (launch) => Effect.sync(() => {
-        if (this.launches.get(prepared.session.id) === launch) this.launches.delete(prepared.session.id)
-        Deferred.doneUnsafe(launch.done, Effect.void)
-      }),
-    ))
-
-  readonly hideActive: Effect.Effect<string | null> = this.gate.withPermit(
-    Effect.sync(() => {
-      const active = this.activeOwner()
-      this.activeOwnerId = null
-      this.ignoreCallback(() => this.dependencies.renderer.clearSelection())
-      if (active) {
-        this.captureDraft(active)
-        this.ignoreCallback(() => active.surface.blur())
-        this.ignoreCallback(() => active.surface.setActive(false))
+        if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation: "acquire-rollback", issues }))
       }
-      this.reportHerdr("idle")
-      return active?.sessionId ?? null
-    }),
-  )
+      return yield* Effect.failCause(opened.cause)
+    })), (pending) => Effect.sync(() => {
+      if (this.launches.get(prepared.session.id) === pending) this.launches.delete(prepared.session.id)
+      Deferred.doneUnsafe(pending.done, Effect.void)
+    })))
 
-  readonly stopSession: TerminalSupervisorApi["stopSession"] = (
-    sessionId,
-    gracePeriodMs = this.gracePeriodMs,
-    expectedOwnerId,
-  ) => Effect.uninterruptible(Effect.suspend(() => {
-    const launch = this.launches.get(sessionId)
-    const ownerId = expectedOwnerId ?? this.ledger.get(sessionId)?.ownerId ?? launch?.ownerId ??
-      this.pendingReservations.get(sessionId)?.ownerId ?? [...this.incompleteRollbacks.entries()]
-        .find(([, error]) => error.issues.some((issue) => issue.sessionId === sessionId))?.[0]
-    if (ownerId === undefined) return Effect.succeed(false)
-    const cancelledLaunch = launch?.ownerId === ownerId
-    const owner = this.owners.get(ownerId)
-    if (!cancelledLaunch && !owner && !this.incompleteRollbacks.has(ownerId) &&
-      ![...this.pendingReservations.values()].some((pending) => pending.ownerId === ownerId)) {
-      return Effect.succeed(false)
+  readonly hideActive = this.gate.withPermit(Effect.sync(() => {
+    const active = this.active
+    this.active = undefined
+    this.ignore(() => this.dependencies.renderer.clearSelection())
+    if (active) {
+      this.captureDraft(active)
+      this.ignore(() => active.surface.blur())
+      this.ignore(() => active.surface.setActive(false))
     }
-    if (cancelledLaunch) Deferred.doneUnsafe(launch.cancelled, Effect.void)
-    if (owner) Deferred.doneUnsafe(owner.cleanupRequested, Effect.void)
-    const cleanup = Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const pending = [...this.pendingReservations.values()].find((reservation) => reservation.ownerId === ownerId)
-      if (pending) {
-        yield* this.reconcilePendingReservation(pending, true).pipe(Effect.mapError((cause) => new TerminalCleanupError({
-          operation: "stop", issues: [{
-            ownerId: pending.ownerId, sessionId: pending.sessionId, stage: "lease",
-            message: `Terminal reservation cleanup remains unresolved for ${pending.sessionId}`, cause,
-          }],
-        })))
-        return true
-      }
-      const rollback = this.incompleteRollbacks.get(ownerId)
-      if (rollback) return yield* Effect.fail(rollback)
-      const decision = yield* this.gate.withPermit(
-        Effect.sync(() => {
-          const owner = this.owners.get(ownerId)
-          if (!owner) return { _tag: "Missing" } as const
-          return owner.cleanupInProgress ? { _tag: "Wait", owner } as const
-            : { _tag: "Start", plan: this.beginCleanup(owner, "stop", gracePeriodMs) } as const
-        }),
-      )
-      if (decision._tag === "Missing") return cancelledLaunch
-      if (decision._tag === "Wait") {
-        yield* Deferred.await(decision.owner.cleanupResult)
-        return true
-      }
-      yield* this.runCleanupPlan(decision.plan)
-      return true
-    }.bind(this))
-    return cancelledLaunch
-      ? Effect.interruptible(Deferred.await(launch.done)).pipe(Effect.timeoutOrElse({
-          duration: this.launchRollbackTimeoutMs,
-          orElse: () => Effect.fail(new TerminalCleanupError({
-            operation: "stop", issues: [{
-              ownerId, sessionId, stage: "provider",
-              message: "Terminal launch rollback remains incomplete",
-            }],
-          })),
-        }), Effect.andThen(cleanup))
-      : this.launchExecutor.withLock(sessionId, cleanup)
+    return active?.sessionId ?? null
+  }))
+  readonly activeSessionId = Effect.sync(() => this.active?.sessionId ?? null)
+  readonly ownsInput = Effect.sync(() => this.active !== undefined)
+  readonly runningSessionIds = this.sessionIds((owner) => owner.state === "running" && owner.exitCode === null)
+  readonly ownedSessionIds = Effect.sync(() => new Set([...this.owners.keys(), ...this.launches.keys()]))
+  readonly nonIdleSessionIds = this.sessionIds((owner) => owner.state === "running" && owner.exitCode === null && owner.activity !== "idle")
+  readonly activitySessionIds = (activity: AgentActivity) => this.sessionIds((owner) => owner.state === "running" && owner.exitCode === null && owner.activity === activity)
+  readonly draftPreviews = Effect.sync(() => new Map([...new Set(this.owners.values())].flatMap((owner) =>
+    owner.state === "running" && owner.draft ? [[owner.sessionId, owner.draft] as const] : [])))
+  readonly ownershipSnapshot = Effect.sync(() => [...new Set(this.owners.values())].map((owner): TerminalOwnershipSnapshot => ({
+    ownerId: owner.ownerId, sessionId: owner.sessionId, processGroupId: owner.process.processGroupId, state: owner.state,
+    active: this.active === owner, activity: owner.activity, exitCode: owner.exitCode,
+  })))
+  readonly reconcileActivity = Effect.suspend(() => Effect.forEach([...new Set(this.owners.values())], (owner) => this.probe(owner), { concurrency: "unbounded" }).pipe(
+    Effect.map((checks) => checks.filter((check): check is TerminalActivityCheck => check !== undefined))))
+
+  readonly stopSession: TerminalSupervisorApi["stopSession"] = (sessionId, graceMs = this.graceMs, expectedOwnerId) => Effect.uninterruptible(Effect.suspend(() => {
+    const owner = this.owners.get(sessionId)
+    const pending = this.launches.get(sessionId)
+    const ownerId = expectedOwnerId ?? owner?.ownerId ?? pending?.ownerId
+    if (!ownerId) return Effect.succeed(false)
+    if (owner?.ownerId === ownerId) Deferred.doneUnsafe(owner.cancelled, Effect.void)
+    if (pending?.ownerId === ownerId) Deferred.doneUnsafe(pending.cancelled, Effect.void)
+    return Effect.gen({ self: this }, function*() {
+      if (pending?.ownerId === ownerId) yield* this.bounded(Deferred.await(pending.done)).pipe(Effect.mapError((cause) => this.cleanupFailure("stop", sessionId, cause)))
+      const current = [...this.owners.values()].find((candidate) => candidate.ownerId === ownerId)
+      if (current) yield* this.cleanup(current, "stop", graceMs)
+      return current !== undefined || pending?.ownerId === ownerId
+    })
   }))
 
-  readonly shutdown: TerminalSupervisorApi["shutdown"] = (
-    gracePeriodMs = this.gracePeriodMs,
-  ) => Effect.uninterruptible(Effect.suspend(() => {
+  readonly shutdown: TerminalSupervisorApi["shutdown"] = (graceMs = this.graceMs) => Effect.uninterruptible(Effect.suspend(() => {
     if (this.shutdownResult) return Deferred.await(this.shutdownResult)
     this.shuttingDown = true
-    Deferred.doneUnsafe(this.shutdownRequested, Effect.void)
+    Deferred.doneUnsafe(this.stopping, Effect.void)
     const result = Deferred.makeUnsafe<void, TerminalCleanupError>()
     this.shutdownResult = result
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const exit = yield* Effect.exit(this.performShutdown(gracePeriodMs))
-      if (Exit.isSuccess(exit)) {
-        yield* Deferred.succeed(result, undefined)
-        return
-      }
-      const error = this.cleanupErrorFromCause("shutdown", Cause.squash(exit.cause))
-      this.shutdownResult = undefined
-      yield* Deferred.fail(result, error)
-      return yield* Effect.fail(error)
-    }.bind(this))
+    return Effect.gen({ self: this }, function*() {
+      const exit = yield* Effect.exit(Effect.gen({ self: this }, function*() {
+        this.ignore(this.unsubscribe)
+        for (const owner of new Set(this.owners.values())) this.releaseUi(owner)
+        const first = yield* Effect.forEach([...new Set(this.owners.values())], (owner) => Effect.exit(this.cleanup(owner, "shutdown", graceMs)), { concurrency: "unbounded" })
+        const launches = yield* Effect.exit(this.bounded(Effect.all([...this.launches.values()].map((pending) => Deferred.await(pending.done)), { concurrency: "unbounded", discard: true })))
+        const late = yield* Effect.forEach([...new Set(this.owners.values())], (owner) => Effect.exit(this.cleanup(owner, "shutdown", graceMs)), { concurrency: "unbounded" })
+        const closed = yield* Effect.exit(this.bounded(Scope.close(this.scope, Exit.void)))
+        const issues = [...first, ...late].flatMap((exit) => Exit.isFailure(exit) ? this.cleanupFailure("shutdown", "", Cause.squash(exit.cause)).issues : [])
+        for (const exit of [launches, closed]) if (Exit.isFailure(exit)) issues.push(...this.cleanupFailure("shutdown", "", Cause.squash(exit.cause)).issues)
+        if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation: "shutdown", issues }))
+      }))
+      Deferred.doneUnsafe(result, exit)
+      if (Exit.isFailure(exit)) { this.shutdownResult = undefined; return yield* Effect.failCause(exit.cause) }
+    })
   }))
 
-  readonly activeSessionId: Effect.Effect<string | null> = Effect.sync(
-    () => this.activeOwner()?.sessionId ?? null,
-  )
-
-  readonly ownsInput: Effect.Effect<boolean> = Effect.sync(() => this.activeOwnerId !== null)
-
-  readonly runningSessionIds = this.sessionIdSet(
-    (entry, owner, sessionId) =>
-      sessionId === owner.sessionId && entry.state === "running" && owner.exitCode === null,
-  )
-
-  readonly ownedSessionIds: Effect.Effect<ReadonlySet<string>> = Effect.sync(
-    () => new Set([...this.ledger.keys(), ...this.pendingReservations.keys(), ...this.launches.keys(),
-      ...[...this.incompleteRollbacks.values()].flatMap((error) => error.issues.map((issue) => issue.sessionId))]),
-  )
-
-  readonly nonIdleSessionIds = this.sessionIdSet(
-    (entry, owner, sessionId) =>
-      sessionId === owner.sessionId &&
-      entry.state === "running" &&
-      owner.exitCode === null &&
-      owner.activity !== "idle",
-  )
-
-  readonly activitySessionIds: TerminalSupervisorApi["activitySessionIds"] = (activity) =>
-    this.sessionIdSet(
-      (entry, owner, sessionId) =>
-        sessionId === owner.sessionId &&
-        entry.state === "running" &&
-        owner.exitCode === null &&
-        owner.activity === activity,
-    )
-
-  readonly draftPreviews: Effect.Effect<ReadonlyMap<string, DraftPreview>> = Effect.sync(
-    () => new Map([...this.owners.values()].flatMap((owner) => {
-      const entry = this.ledger.get(owner.sessionId)
-      return entry?.state === "running" && owner.exitCode === null && owner.draftPreview !== undefined
-        ? [[owner.sessionId, owner.draftPreview] as const]
-        : []
-    })),
-  )
-
-  readonly ownershipSnapshot: Effect.Effect<readonly TerminalOwnershipSnapshot[]> = Effect.sync(
-    () => [...this.owners.values()].map((owner) => ({
-      ownerId: owner.ownerId,
-      sessionId: owner.sessionId,
-      processGroupId: owner.processGroupId,
-      state: this.ledger.get(owner.sessionId)?.state ?? "cleanup-incomplete",
-      active: this.activeOwnerId === owner.ownerId,
-      activity: owner.activity,
-      exitCode: owner.exitCode,
-    })),
-  )
-
-  readonly reconcileActivity: TerminalSupervisorApi["reconcileActivity"] = Effect.suspend(() =>
-    Effect.forEach([...this.owners.values()], (owner) => this.probeActivity(owner), { concurrency: "unbounded" }).pipe(
-      Effect.map((checks) => checks.filter((check): check is TerminalActivityCheck => check !== undefined)),
-    ))
-
-  private probeActivity(owner: TerminalOwner): Effect.Effect<TerminalActivityCheck | undefined> {
-    return owner.activityProbeGate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-      if (!this.canProbeActivity(owner)) return undefined
-      if (owner.providerActivity !== undefined) return {
-        ownerId: owner.ownerId, sessionId: owner.sessionId,
-        sequenceId: owner.sequence.next - 1, activity: owner.providerActivity,
-      }
-      const sessionId = owner.sessionId
-      const sample = (phase: "sample" | "confirm"): TerminalActivityCheck => {
-        try {
-          const screen = owner.surface.screen()
-          const activity = owner.observer.reconcileScreen
-            ? owner.observer.reconcileScreen(screen, phase)
-            : owner.observer.observeScreen(screen)
-          const draft = owner.observer.observeDraft(screen)
-          this.takeObservations(owner)
-          this.recordDraft(owner, draft)
-          if (activity !== undefined) this.offerEvent(owner, { _tag: "Activity", activity })
-          return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence.next - 1, ...(activity === undefined
-            ? { issue: "unrecognized-screen" as const } : { activity }) }
-        } catch {
-          return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence.next - 1, issue: "observer-failed" }
-        }
-      }
-      const first = sample("sample")
-      if (first.activity !== undefined || first.issue === "observer-failed") return first
-      yield* Effect.sleep(ACTIVITY_CONFIRMATION_DELAY_MS)
-      if (!this.canProbeActivity(owner) || owner.sessionId !== sessionId) return undefined
-      return sample("confirm")
-    }.bind(this)))
-  }
-
-  private canProbeActivity(owner: TerminalOwner): boolean {
-    return !this.shuttingDown && this.owners.get(owner.ownerId) === owner && !owner.cleanupStarted &&
-      !owner.uiReleased && !owner.pendingIdentity && !owner.pendingAdoptionToken &&
-      owner.exitCode === null && this.ledger.get(owner.sessionId)?.state === "running"
-  }
-
-  reportCleanupError(error: TerminalCleanupError): void {
-    this.ignoreCallback(() => this.events.onCleanupError?.(error))
-  }
-
-  private createOwner(
-    ownerId: string,
-    acquired: AcquiredTerminalLaunch,
-    providerScope: Scope.Closeable,
-    ownership: PersistedTerminalOwner,
-    awaitingTemporaryAdoption: boolean,
-    mutationTokens: MutationTokens,
-  ): Effect.Effect<TerminalOwner, TerminalError | TerminalCleanupError> {
-    const launch = acquired.launch
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const eventQueue = yield* Queue.unbounded<SemanticEvent>()
-      const osc52 = new Osc52Forwarder()
+  private createOwner(ownerId: string, acquired: AcquiredTerminalLaunch, scope: Scope.Closeable, claim: SessionClaim, transient: boolean): Effect.Effect<TerminalOwner, TerminalError> {
+    return Effect.gen({ self: this }, function*() {
+      const launch = acquired.launch
+      const queue = yield* Queue.unbounded<SemanticEvent>()
       let owner: TerminalOwner | undefined
-      let process: TerminalProcess | undefined
-      const sequence: SequenceAllocator = { next: 1 }
-      let lastQueuedActivity: AgentActivity = "idle"
-      const offer = (
-        event:
-          | { readonly _tag: "Exited"; readonly exitCode: number }
-          | { readonly _tag: "Activity"; readonly activity: AgentActivity }
-          | { readonly _tag: "Observation"; readonly observation: TerminalObservation }
-          | { readonly _tag: "Transition"; readonly request: TerminalTransitionRequest },
-      ) => Queue.offerUnsafe(eventQueue, { ...event, sequenceId: sequence.next++ })
-      const offerActivities = (activities: readonly AgentActivity[]) => {
-        for (const activity of activities) {
-          if (owner) {
-            this.offerEvent(owner, { _tag: "Activity", activity })
-            continue
-          }
-          if (activity === lastQueuedActivity) continue
-          lastQueuedActivity = activity
-          offer({ _tag: "Activity", activity })
-        }
+      let child: TerminalProcess | undefined
+      let sequence = 1
+      let lastActivity: AgentActivity = "idle"
+      const osc52 = new Osc52Forwarder()
+      const offer = (event: UnsequencedEvent) => {
+        if (owner) return this.offer(owner, event)
+        if (event._tag === "Activity") { if (event.activity === lastActivity) return; lastActivity = event.activity }
+        Queue.offerUnsafe(queue, { ...event, sequenceId: sequence++ })
       }
-
-      const surface = yield* this.attempt("create-emulator", launch.sessionId, () =>
-        this.dependencies.renderer.createSurface(`agent-owner-${encodeURIComponent(ownerId)}`, {
-          onData: (data, source) => {
-            const current = owner
-            if (current && !this.acceptsTerminalData(current)) return
-            this.ignoreCallback(() => {
-              if (source === "input" && current) {
-                // Observe pending output before Escape can arm cancellation.
-                this.captureDraft(current)
-                current.inputObserved = true
-                const observation = launch.observer.observeInput?.(data)
-                this.takeObservations(current)
-                if (observation) {
-                  delete current.draftPreview
-                  delete current.lastDraftKey
-                  offer({ _tag: "Observation", observation })
-                }
-              }
+      const observations = () => { for (const observation of launch.observer.takeObservations?.() ?? []) offer({ _tag: "Observation", observation }) }
+      const surface = yield* this.attempt("create-emulator", launch.sessionId, () => this.dependencies.renderer.createSurface(`agent-owner-${ownerId}`, {
+        onData: (data, source) => {
+          if (owner && owner.state !== "running") return
+          this.ignore(() => {
+            if (source === "input" && owner) {
+              this.captureDraft(owner)
+              owner.inputObserved = true
+              const observation = launch.observer.observeInput?.(data)
+              observations()
+              if (observation) { delete owner.draft; delete owner.draftKey; offer({ _tag: "Observation", observation }) }
+            }
+          })
+          this.ignore(() => child?.write(data))
+        },
+        onResize: (columns, rows) => { if (!owner || owner.state === "running") this.ignore(() => child?.resize(columns, rows)) },
+        onScreenChange: () => {
+          if (owner && owner.state !== "running") return
+          this.ignore(() => {
+            const screen = surface.screen()
+            const activity = launch.observer.observeScreen(screen)
+            const draft = launch.observer.observeDraft(screen)
+            observations()
+            if (owner) this.recordDraft(owner, draft)
+            if (activity !== undefined) offer({ _tag: "Activity", activity })
+          })
+        },
+      }))
+      const spawned = yield* Effect.exit(this.attempt("spawn", launch.sessionId, () => this.dependencies.processes.spawn(launch,
+        { columns: Math.max(1, this.dependencies.renderer.columns), rows: Math.max(1, this.dependencies.renderer.rows) }, {
+          onOutput: (data) => {
+            if (owner && owner.state !== "running") return
+            this.ignore(() => {
+              for (const activity of launch.observer.observeOutput(data)) offer({ _tag: "Activity", activity })
+              observations()
             })
-            this.ignoreCallback(() => process?.write(data))
-          },
-          onResize: (columns, rows) => {
-            const current = owner
-            if (current && !this.acceptsTerminalData(current)) return
-            this.ignoreCallback(() => process?.resize(columns, rows))
-          },
-          onScreenChange: () => {
-            const current = owner
-            if (current && !this.acceptsTerminalData(current)) return
-            this.ignoreCallback(() => {
-              const screen = surface.screen()
-              const activity = launch.observer.observeScreen(screen)
-              const draft = launch.observer.observeDraft(screen)
-              if (current) {
-                this.takeObservations(current)
-                this.recordDraft(current, draft)
-              } else {
-                for (const observation of launch.observer.takeObservations?.() ?? []) offer({ _tag: "Observation", observation })
-              }
-              if (activity !== undefined) offerActivities([activity])
+            this.ignore(() => {
+              for (const text of osc52.observe(data)) if (this.active?.ownerId === ownerId) this.dependencies.renderer.copyToClipboard(text)
             })
-          },
-        }),
-      )
-
-      const processExit = yield* Effect.exit(this.attempt("spawn", launch.sessionId, () => {
-        if (this.shuttingDown) throw new Error("Terminal launch cancelled by shutdown before spawn")
-        return this.dependencies.processes.spawn(
-          launch,
-          {
-            columns: Math.max(1, this.dependencies.renderer.columns),
-            rows: Math.max(1, this.dependencies.renderer.rows),
-          },
-          {
-            onOutput: (data) => {
-              const current = owner
-              if (current && !this.acceptsTerminalData(current)) return
-              this.ignoreCallback(() => {
-                const activities = launch.observer.observeOutput(data)
-                if (current) this.takeObservations(current)
-                else for (const observation of launch.observer.takeObservations?.() ?? []) offer({ _tag: "Observation", observation })
-                offerActivities(activities)
-              })
-              this.ignoreCallback(() => {
-                if (this.activeOwnerId === ownerId) {
-                  for (const text of osc52.observe(data)) {
-                    this.dependencies.renderer.copyToClipboard(text)
-                  }
-                } else {
-                  osc52.observe(data)
-                }
-              })
-              this.ignoreCallback(() => surface.write(data))
-            },
-            onPtyClosed() {},
-          },
-        )
-      }
-      ))
-      if (Exit.isFailure(processExit)) {
-        const spawnError = Cause.squash(processExit.cause) as TerminalError
-        try {
-          surface.release()
-        } catch (cause) {
-          const spawnFailure = terminalSpawnCleanupError(spawnError)
-          return yield* Effect.fail(new TerminalCleanupError({
-            operation: "acquire-rollback",
-            issues: [
-              ...(spawnFailure === undefined
-                ? []
-                : [{
-                    ownerId,
-                    sessionId: launch.sessionId,
-                    stage: "verify" as const,
-                    message: `Unable to verify process group ${spawnFailure.processGroupId} exited`,
-                    cause: spawnFailure,
-                  }]),
-              {
-                ownerId,
-                sessionId: launch.sessionId,
-                stage: "ui",
-                message: `Unable to release terminal surface for ${launch.sessionId}`,
-                cause,
-              },
-            ],
-          }))
-        }
-        return yield* Effect.fail(spawnError)
-      }
-      process = processExit.value
-
+            this.ignore(() => surface.write(data))
+          }, onPtyClosed() {},
+        })))
+      if (Exit.isFailure(spawned)) { this.ignore(() => surface.release()); return yield* Effect.failCause(spawned.cause) }
+      child = spawned.value
       owner = {
-        ownerId,
-        launchRegistered: Deferred.makeUnsafe<void>(),
-        lifecycleGate: Semaphore.makeUnsafe(1),
-        cleanupRequested: Deferred.makeUnsafe<void>(),
-        sessionId: launch.sessionId,
-        providerScope,
-        providerClose: acquired.close,
-        launchResources: acquired.resources,
-        eventQueue,
-        pendingTransitions: new Set(),
-        sequence,
-        cleanupResult: Deferred.makeUnsafe<void, TerminalCleanupError>(),
-        observer: launch.observer,
-        ...(launch.failureDetails === undefined ? {} : { failureDetails: launch.failureDetails }),
-        process,
-        processGroupId: process.processGroupId,
-        surface,
-        ownership,
-        awaitingTemporaryAdoption,
-        mutationTokens,
-        activityProbeGate: Semaphore.makeUnsafe(1),
-        lastQueuedActivity,
-        activity: "idle",
-        exitCode: null,
-        ...(launch.initialDraft === undefined ? {} : { draftPreview: launch.initialDraft }),
-        inputObserved: false,
-        selectionClearPending: false,
-        uiReleased: false,
-        ptyClosed: false,
-        providerClosed: false,
-        providerScopeClosed: false,
-        providerScopeCloseUncertain: false,
-        leaseReleased: false,
-        processDetached: false,
-        stoppingPersisted: false,
-        processRegistrationUncertain: false,
-        adoptionApplicationAcknowledged: false,
-        cleanupStarted: false,
-        cleanupInProgress: false,
-        cleanupNotificationSent: false,
-        exitNotificationSent: false,
+        ownerId, sessionId: launch.sessionId, state: "running", scope, close: acquired.close, claim, claims: new Set([claim]), process: child, surface,
+        observer: launch.observer, ...(launch.failureDetails ? { failureDetails: launch.failureDetails } : {}), queue,
+        ready: Deferred.makeUnsafe<void>(), cancelled: Deferred.makeUnsafe<void>(), gate: Semaphore.makeUnsafe(1), probeGate: Semaphore.makeUnsafe(1),
+        pendingTransitions: new Set(), fibers: [], sequence, activity: "idle", lastQueuedActivity: lastActivity,
+        ...(launch.initialDraft ? { draft: launch.initialDraft } : {}), inputObserved: false, transient, transitioning: false, exitCode: null,
+        uiReleased: false, providerClosed: false, scopeClosed: false, ptyClosed: false, detached: false, claimReleased: false, exitNotified: false,
       }
-      owner.lastQueuedActivity = lastQueuedActivity
       return owner
-    }.bind(this))
-  }
-
-  private offerEvent(
-    owner: TerminalOwner,
-    event:
-      | { readonly _tag: "Exited"; readonly exitCode: number }
-      | { readonly _tag: "Activity"; readonly activity: AgentActivity }
-      | { readonly _tag: "Observation"; readonly observation: TerminalObservation }
-      | { readonly _tag: "Provider"; readonly event: ProviderTerminalEvent }
-      | { readonly _tag: "Transition"; readonly request: TerminalTransitionRequest },
-  ): boolean {
-    if (event._tag === "Activity") {
-      if (event.activity === owner.lastQueuedActivity) return true
-      owner.lastQueuedActivity = event.activity
-    }
-    return Queue.offerUnsafe(owner.eventQueue, { ...event, sequenceId: owner.sequence.next++ })
-  }
-
-  private semanticLoop(owner: TerminalOwner): Effect.Effect<void> {
-    return Effect.forever(
-      Queue.take(owner.eventQueue).pipe(
-        Effect.flatMap((event) => Effect.suspend(() =>
-          this.handleSemanticEvent(owner, event)).pipe(
-            Effect.catchCause((cause) => this.containSemanticEventDefect(owner, event, cause)),
-            Effect.ensuring(Effect.sync(() => {
-              if (event._tag === "Transition") owner.pendingTransitions.delete(event.request)
-            })),
-          )),
-      ),
-    )
-  }
-
-  private transitionLoop(
-    owner: TerminalOwner,
-    subscription: PubSub.Subscription<TerminalTransitionRequest>,
-  ): Effect.Effect<void> {
-    return Effect.forever(
-      PubSub.take(subscription).pipe(
-        Effect.flatMap((request) => Effect.sync(() => {
-          owner.pendingTransitions.add(request)
-          if (!this.offerEvent(owner, { _tag: "Transition", request })) {
-            throw new Error(`Terminal event queue for ${owner.sessionId} is unavailable`)
-          }
-        }).pipe(
-          Effect.catchCause((cause) => this.containTransitionDefect(owner, request, cause)),
-        )),
-      ),
-    )
-  }
-
-  private containSemanticEventDefect(
-    owner: TerminalOwner,
-    event: SemanticEvent,
-    cause: Cause.Cause<unknown>,
-  ): Effect.Effect<void> {
-    if (event._tag === "Activity" || event._tag === "Observation" || event._tag === "Provider") return Effect.void
-    if (event._tag === "Transition") {
-      return this.containTransitionDefect(owner, event.request, cause)
-    }
-    return this.superviseDefectCleanup(owner, "natural-exit", {
-      exitCode: event.exitCode,
-      sequenceId: event.sequenceId,
-      wasActive: this.activeOwnerId === owner.ownerId,
     })
   }
 
-  private containTransitionDefect(
-    owner: TerminalOwner,
-    request: TerminalTransitionRequest,
-    cause: Cause.Cause<unknown>,
-  ): Effect.Effect<void> {
-    const error = this.transitionErrorFromCause(owner.sessionId, cause)
-    Deferred.doneUnsafe(request.acknowledgment, Effect.fail(error))
-    this.emitTransitionError(owner, owner.sequence.next++, error)
-    return this.superviseDefectCleanup(owner, "stop", undefined, true)
+  private offer(owner: TerminalOwner, event: UnsequencedEvent): void {
+    if (event._tag === "Activity") {
+      if (event.activity === owner.lastQueuedActivity) return
+      owner.lastQueuedActivity = event.activity
+    }
+    Queue.offerUnsafe(owner.queue, { ...event, sequenceId: owner.sequence++ })
   }
-
-  private superviseDefectCleanup(
-    owner: TerminalOwner,
-    operation: TerminalCleanupError["operation"],
-    naturalExit?: CleanupPlan["naturalExit"],
-    forcedExit = false,
-  ): Effect.Effect<void> {
-    return Effect.uninterruptible(Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const decisionExit = yield* Effect.exit(Effect.suspend(() => this.gate.withPermit(
-        Effect.sync((): CleanupDecision => {
-          if (naturalExit) owner.exitCode = naturalExit.exitCode
-          if (owner.cleanupInProgress) return { _tag: "Wait", owner }
-          if (this.owners.get(owner.ownerId) !== owner) return { _tag: "Missing" }
-          return {
-            _tag: "Start",
-            plan: this.beginCleanup(owner, operation, this.gracePeriodMs, naturalExit, forcedExit),
-          }
-        }),
-      )))
-      if (Exit.isFailure(decisionExit)) {
-        this.settleDefectiveCleanup(owner, operation, Cause.squash(decisionExit.cause))
-        return
-      }
-      const decision = decisionExit.value
-      if (decision._tag === "Missing") return
-      yield* Effect.exit(decision._tag === "Start"
-        ? this.runCleanupPlan(decision.plan)
-        : Deferred.await(decision.owner.cleanupResult))
-    }.bind(this))).pipe(Effect.catchCause((cleanupCause) => Effect.sync(() => {
-      this.settleDefectiveCleanup(owner, operation, Cause.squash(cleanupCause))
-    })))
+  private semanticLoop(owner: TerminalOwner): Effect.Effect<void> {
+    return Effect.forever(Queue.take(owner.queue).pipe(Effect.andThen((event) => Effect.suspend(() => this.handleEvent(owner, event)).pipe(
+      Effect.catchCause((cause) => {
+        if (event._tag === "Activity" || event._tag === "Observation" || event._tag === "Provider") return Effect.void
+        if (event._tag === "Transition") Deferred.doneUnsafe(event.request.acknowledgment, Effect.fail(this.error("transition", owner.sessionId, "Session transition failed", Cause.squash(cause))))
+        return this.cleanup(owner, "stop", this.graceMs).pipe(Effect.catch((error) => Effect.sync(() => this.reportCleanupError(error))))
+      }), Effect.ensuring(Effect.sync(() => { if (event._tag === "Transition") owner.pendingTransitions.delete(event.request) })),
+    ))))
   }
-
-  private handleSemanticEvent(owner: TerminalOwner, event: SemanticEvent): Effect.Effect<void> {
-    return Effect.uninterruptible(Effect.gen(function* (this: TerminalSupervisorImpl) {
-      if (event._tag === "Exited") yield* this.waitForPtyDrain(owner.process)
-      const plan = event._tag === "Transition"
-        ? yield* this.applyTransition(owner, event)
-        : yield* this.gate.withPermit(Effect.sync(() => this.applyLocalEvent(owner, event)))
-      if (event._tag === "Provider" && event.event._tag === "Unavailable" &&
-        event.event.sessionId === owner.sessionId) yield* this.probeActivity(owner)
-      if (plan) yield* this.runCleanupPlan(plan).pipe(Effect.catch(() => Effect.void))
-    }.bind(this)))
-  }
-
-  private applyLocalEvent(
-    owner: TerminalOwner,
-    event: Exclude<SemanticEvent, { readonly _tag: "Transition" }>,
-  ): CleanupPlan | undefined {
-    const entry = this.ledger.get(owner.sessionId)
-    if (
-      this.owners.get(owner.ownerId) !== owner ||
-      !entry ||
-      entry.ownerId !== owner.ownerId ||
-      entry.state !== "running"
-    ) return undefined
-
+  private handleEvent(owner: TerminalOwner, event: SemanticEvent): Effect.Effect<void, TerminalCleanupError> {
+    if (this.owners.get(owner.sessionId) !== owner || owner.state !== "running") {
+      if (event._tag === "Transition") Deferred.doneUnsafe(event.request.acknowledgment, Effect.fail(this.error("transition", owner.sessionId, "Terminal stopped")))
+      return Effect.void
+    }
+    if (event._tag === "Transition") return this.transition(owner, event)
+    if (event._tag === "Exited") return Effect.uninterruptible(Effect.gen({ self: this }, function*() {
+      yield* Effect.promise(() => Promise.race([owner.process.ptyDrained, Bun.sleep(PTY_DRAIN_PERIOD_MS)]))
+      owner.exitCode = event.exitCode
+      const wasActive = this.active === owner
+      const outputTail = event.exitCode !== 0 ? this.failureOutput(owner) : undefined
+      const cleaned = yield* Effect.exit(this.cleanup(owner, "natural-exit", this.graceMs))
+      this.notifyExit(owner, event.sequenceId, wasActive, Exit.isFailure(cleaned) ? Cause.squash(cleaned.cause) as TerminalCleanupError : undefined, outputTail)
+    }))
     if (event._tag === "Provider") {
-      if (event.event.sessionId !== owner.sessionId) return undefined
+      if (event.event.sessionId !== owner.sessionId) return Effect.void
       if (event.event._tag === "Unavailable") {
         owner.providerActivity = undefined
         owner.lastQueuedActivity = owner.activity
-        return undefined
+        return this.probe(owner).pipe(Effect.asVoid)
       }
       if (event.event._tag === "Activity") {
         owner.providerActivity = event.event.activity
         owner.lastQueuedActivity = event.event.activity
-        return this.applyLocalEvent(owner, {
-          _tag: "Activity", sequenceId: event.sequenceId, activity: event.event.activity, provider: true,
-        })
+        return this.handleEvent(owner, { _tag: "Activity", sequenceId: event.sequenceId, activity: event.event.activity, provider: true })
       }
-      return this.applyLocalEvent(owner, {
-        _tag: "Observation", sequenceId: event.sequenceId, observation: event.event.observation,
-      })
+      return this.handleEvent(owner, { _tag: "Observation", sequenceId: event.sequenceId, observation: event.event.observation })
     }
-
-    if (event._tag === "Observation") {
-      this.ignoreCallback(() => this.events.onObservation?.({
-        ownerId: owner.ownerId,
-        sequenceId: event.sequenceId,
-        sessionId: owner.sessionId,
-        wasActive: this.activeOwnerId === owner.ownerId,
-        observation: event.observation,
-      }))
-      return undefined
-    }
-
-    if (event._tag === "Activity") {
-      if (!event.provider && owner.providerActivity !== undefined && owner.providerActivity !== event.activity) {
-        owner.lastQueuedActivity = owner.activity
-        return undefined
+    return Effect.sync(() => {
+      const common = { ownerId: owner.ownerId, sessionId: owner.sessionId, sequenceId: event.sequenceId, wasActive: this.active === owner }
+      if (event._tag === "Observation") this.ignore(() => this.events.onObservation?.({ ...common, observation: event.observation }))
+      else {
+        if (!event.provider && owner.providerActivity !== undefined && owner.providerActivity !== event.activity) { owner.lastQueuedActivity = owner.activity; return }
+        if (owner.activity === event.activity) return
+        owner.activity = event.activity
+        this.ignore(() => this.events.onActivityChanged?.({ ...common, activity: event.activity }))
       }
-      if (owner.activity === event.activity) return undefined
-      owner.activity = event.activity
-      const wasActive = this.activeOwnerId === owner.ownerId
-      this.ignoreCallback(() => this.events.onActivityChanged?.({
-        ownerId: owner.ownerId,
-        sequenceId: event.sequenceId,
-        sessionId: owner.sessionId,
-        activity: event.activity,
-        wasActive,
-      }))
-      if (wasActive) this.reportHerdr(event.activity)
-      return undefined
-    }
-
-    owner.exitCode = event.exitCode
-    const wasActive = this.activeOwnerId === owner.ownerId
-    return this.beginCleanup(owner, "natural-exit", this.gracePeriodMs, {
-      exitCode: event.exitCode,
-      sequenceId: event.sequenceId,
-      wasActive,
     })
   }
 
-  private applyTransition(
-    owner: TerminalOwner,
-    semantic: Extract<SemanticEvent, { readonly _tag: "Transition" }>,
-  ): Effect.Effect<CleanupPlan | undefined> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const { request, sequenceId } = semantic
-      const running = yield* this.gate.withPermit(Effect.sync(() => this.isRunningOwner(owner)))
-      if (!running) {
-        yield* Deferred.fail(request.acknowledgment, new TerminalError({
-          operation: "native-session-transition",
-          sessionId: owner.sessionId,
-          message: `Terminal owner ${owner.ownerId} is stale`,
-        }))
-        return undefined
-      }
-
-      const transition = request.event
-      if (transition._tag === "TransitionFailed") {
-        return yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-          if (!this.isRunningOwner(owner)) {
-            yield* Deferred.fail(request.acknowledgment, transition.error)
-            return undefined
-          }
-          this.emitTransitionError(owner, sequenceId, transition.error)
-          yield* Deferred.succeed(request.acknowledgment, undefined)
-          return this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true)
-        }.bind(this)))
-      }
-
+  private transition(owner: TerminalOwner, event: Extract<SemanticEvent, { _tag: "Transition" }>): Effect.Effect<void, TerminalCleanupError> {
+    return owner.gate.withPermit(Effect.gen({ self: this }, function*() {
+      const request = event.request
       const previousSessionId = owner.sessionId
-      const sessionId = transition.session.id
-      if (sessionId === previousSessionId) {
-        yield* Deferred.succeed(request.acknowledgment, undefined)
-        return undefined
-      }
-      const kind = transition.kind
-      const expectedKind: IdentityTransitionKind = owner.awaitingTemporaryAdoption
-        ? "temporary-adoption"
-        : "native-fork"
-      if (kind !== expectedKind) {
-        const error = new TerminalError({
-          operation: "native-session-transition",
-          sessionId: previousSessionId,
-          message: `Provider reported a ${kind} transition while ${expectedKind} was required`,
-        })
-        return yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-          if (!this.isRunningOwner(owner)) {
-            yield* Deferred.fail(request.acknowledgment, error)
-            return undefined
-          }
-          this.emitTransitionError(owner, sequenceId, error)
-          yield* Deferred.fail(request.acknowledgment, error)
-          return this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true)
-        }.bind(this)))
-      }
-      const relationExit = yield* Effect.exit(this.deriveRelation(
-        owner,
-        previousSessionId,
-        sessionId,
-        kind,
-        transition.derivation,
-      ))
-      if (Exit.isFailure(relationExit)) {
-        const error = this.transitionErrorFromCause(previousSessionId, relationExit.cause)
-        return yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-          if (!this.isRunningOwner(owner)) {
-            yield* Deferred.fail(request.acknowledgment, error)
-            return undefined
-          }
-          this.emitTransitionError(owner, sequenceId, error)
-          yield* Deferred.fail(request.acknowledgment, error)
-          return this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true)
-        }.bind(this)))
-      }
-      return yield* owner.lifecycleGate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const relation = relationExit.value
-      const mutationToken = `${crypto.randomUUID()}:identity`
-
-      const claim = yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-        if (!this.isRunningOwner(owner)) {
-          const error = new TerminalError({
-            operation: "native-session-transition",
-            sessionId: previousSessionId,
-            message: `Terminal owner ${owner.ownerId} stopped while deriving its transition`,
-          })
-          yield* Deferred.fail(request.acknowledgment, error)
-          return { cleanup: undefined, error } as const
-        }
-        const existing = this.ledger.get(sessionId)
-        if ((existing && existing.ownerId !== owner.ownerId) || this.launches.has(sessionId)) {
-          const error = new TerminalError({
-            operation: "native-session-transition",
-            sessionId: previousSessionId,
-            message: `Agent session ${sessionId} already has an owned terminal; stopped the duplicate process`,
-          })
-          this.emitTransitionError(owner, sequenceId, error)
-          yield* Deferred.fail(request.acknowledgment, error)
-          return {
-            cleanup: this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true),
-            error,
-          } as const
-        }
-
-        owner.pendingIdentity = {
-          previousSessionId, session: transition.session, kind, mutationToken,
-          ...(relation === undefined ? {} : { relation }),
-        }
-        this.reserveAlias(owner, sessionId)
-        return { _tag: "Claimed" as const }
-      }.bind(this)))
-      if ("cleanup" in claim) return claim.cleanup
-
-      const replacementExit = yield* Effect.exit(
-          this.boundedPersistence(Effect.suspend(() =>
-            this.dependencies.ownership.commitIdentity({
-              owner: owner.ownership,
-              sessionId,
-              kind,
-              mutationToken,
-              ...(relation === undefined ? {} : { relation }),
-            })), "commit terminal identity", previousSessionId, {
-            ownerId: owner.ownerId,
-            mutationToken,
-            mutationStage: "identity",
-          }, "productive"),
-        )
-      const published = yield* this.gate.withPermit(Effect.gen(function* (this: TerminalSupervisorImpl) {
-        if (Exit.isFailure(replacementExit)) {
-          const error = this.transitionErrorFromCause(previousSessionId, replacementExit.cause)
-          if (error._tag !== "PersistenceError" && !replacementExit.cause.reasons.some(Cause.isDieReason)) {
-            delete owner.pendingIdentity
-            if (this.ledger.get(sessionId)?.ownerId === owner.ownerId) this.ledger.delete(sessionId)
-          }
-          this.emitTransitionError(owner, sequenceId, error)
-          yield* Deferred.fail(request.acknowledgment, error)
-          return {
-            cleanup: owner.cleanupInProgress ? undefined
-              : this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true),
-            error,
-          } as const
-        }
-
-        this.commitIdentity(owner, previousSessionId, sessionId, replacementExit.value.owner)
-        delete owner.pendingIdentity
-        owner.pendingAdoptionToken = replacementExit.value.adoption.adoptionToken
-        return { value: replacementExit.value } as const
-      }.bind(this)))
-      if ("cleanup" in published) return published.cleanup
-
-      const applicationAcknowledgment = Deferred.makeUnsafe<void, unknown>()
-      const applicationEvent: TerminalSessionChangedEvent = {
-        ownerId: owner.ownerId,
-        sequenceId,
-        previousSessionId,
-        kind,
-        session: transition.session,
-        wasActive: this.activeOwnerId === owner.ownerId,
-        adoptionToken: published.value.adoption.adoptionToken,
-        acknowledgment: applicationAcknowledgment,
-        ...(relation === undefined ? {} : { relation }),
-      }
-      const applicationListener = this.events.onSessionChanged
-      if (applicationListener === undefined) {
-        yield* Deferred.fail(applicationAcknowledgment, new Error(
-          "No application session-transition listener is installed",
-        ))
-      } else {
-        try {
-          applicationListener(applicationEvent)
-        } catch (cause) {
-          yield* Deferred.fail(applicationAcknowledgment, cause)
-        }
-      }
-
-      const applicationExit = yield* Effect.exit(
-        this.observeProductive(owner, withOperationTimeout(
-          Effect.interruptible(Deferred.await(applicationAcknowledgment)),
-          this.applicationAcknowledgmentTimeoutMs,
-          () => Effect.fail(new Error(
-              `Application did not acknowledge session ${sessionId}`,
-          )),
-        )),
-      )
-      const journalExit = Exit.isSuccess(applicationExit)
-        ? yield* Effect.exit(Effect.sync(() => {
-            owner.adoptionApplicationAcknowledged = true
-          }).pipe(Effect.andThen(
-            this.boundedPersistence(
-              Effect.suspend(() =>
-                  this.dependencies.ownership.ack(published.value.adoption.adoptionToken)),
-              "acknowledge terminal identity",
-              sessionId,
-              {
-                ownerId: owner.ownerId,
-                mutationToken: published.value.adoption.adoptionToken,
-                mutationStage: "ack",
-              }, "productive",
-            ),
-          )))
-        : applicationExit
-      if (Exit.isFailure(journalExit)) {
-        const error = new TerminalError({
-          operation: "native-session-transition",
-          sessionId,
-          message: `Application did not complete session transition to ${sessionId}`,
-          cause: Cause.squash(journalExit.cause),
-        })
-        const plan = yield* this.gate.withPermit(Effect.sync(() => {
-          const errorSequenceId = owner.sequence.next++
-          this.emitTransitionError(owner, errorSequenceId, error)
-          return owner.cleanupStarted
-            ? undefined
-            : this.beginCleanup(owner, "stop", this.gracePeriodMs, undefined, true)
-        }))
-        yield* Deferred.fail(request.acknowledgment, error)
-        return plan
-      }
-
-      delete owner.pendingAdoptionToken
-      owner.adoptionApplicationAcknowledged = false
-      yield* Deferred.succeed(request.acknowledgment, undefined)
-      return undefined
-    }.bind(this)))
-    }.bind(this))
-  }
-
-  private emitTransitionError(
-    owner: TerminalOwner,
-    sequenceId: number,
-    error: TerminalSessionTransitionErrorEvent["error"],
-  ): void {
-    this.ignoreCallback(() => this.events.onSessionTransitionError?.({
-      ownerId: owner.ownerId,
-      sequenceId,
-      sessionId: owner.sessionId,
-      error,
-      wasActive: this.activeOwnerId === owner.ownerId,
-    }))
-  }
-
-  private observeProductive<A, E>(
-    owner: TerminalOwner,
-    effect: Effect.Effect<A, E>,
-  ): Effect.Effect<A, E | TerminalError> {
-    return Effect.interruptible(Effect.raceFirst(effect,
-      Effect.raceFirst(Deferred.await(this.shutdownRequested), Deferred.await(owner.cleanupRequested)).pipe(
-        Effect.andThen(Effect.fail(new TerminalError({
-          operation: "native-session-transition", sessionId: owner.sessionId,
-          message: "Terminal operation cancelled by cleanup",
-        }))),
-      )))
-  }
-
-  private deriveRelation(
-    owner: TerminalOwner,
-    previousSessionId: string,
-    sessionId: string,
-    kind: IdentityTransitionKind,
-    derivation: Effect.Effect<
-      BranchDerivation | undefined,
-      ProviderError | ProviderProtocolError
-    > | undefined,
-  ): Effect.Effect<BranchRelation | undefined, TerminalError | ProviderError | ProviderProtocolError> {
-    if (derivation === undefined) return Effect.succeed(undefined)
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const derived = yield* this.observeProductive(owner, withOperationTimeout(
-        Effect.interruptible(derivation), this.transitionDerivationTimeoutMs,
-        () => Effect.fail(new TerminalError({
-          operation: "native-session-transition",
-          sessionId,
-          message: `Timed out deriving branch metadata for ${sessionId}`,
-        })),
-      ))
-      if (derived === undefined) return undefined
-      yield* Effect.try({
-        try: () => validateBranchDerivation(derived, previousSessionId, sessionId, kind),
-        catch: (cause) => new TerminalError({
-          operation: "native-session-transition",
-          sessionId,
-          message: cause instanceof Error ? cause.message : String(cause),
-          cause,
-        }),
-      })
-      const now = yield* Clock.currentTimeMillis
-      return { ...derived, createdAt: new Date(now).toISOString() }
-    }.bind(this))
-  }
-
-  private completeRecoveredIdentity(
-    owner: TerminalOwner,
-    pending: PendingIdentity,
-    adoptionToken: string,
-  ): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const acknowledgment = Deferred.makeUnsafe<void, unknown>()
-      const listener = this.events.onSessionChanged
-      const event: TerminalSessionChangedEvent = {
-        ownerId: owner.ownerId,
-        sequenceId: owner.sequence.next++,
-        previousSessionId: pending.previousSessionId,
-        kind: pending.kind,
-        session: pending.session,
-        wasActive: this.activeOwnerId === owner.ownerId,
-        adoptionToken,
-        acknowledgment,
-        ...(pending.relation === undefined ? {} : { relation: pending.relation }),
-      }
-      if (listener === undefined) {
-        yield* Deferred.fail(acknowledgment, new Error(
-          "No application session-transition listener is installed",
-        ))
-      } else {
-        try {
-          listener(event)
-        } catch (cause) {
-          yield* Deferred.fail(acknowledgment, cause)
-        }
-      }
-      const applicationExit = yield* Effect.exit(
-        Effect.interruptible(Deferred.await(acknowledgment)).pipe(
-          Effect.timeoutOrElse({
-            duration: this.applicationAcknowledgmentTimeoutMs !== undefined && Number.isFinite(this.applicationAcknowledgmentTimeoutMs)
-              ? this.applicationAcknowledgmentTimeoutMs : RECOVERY_APPLICATION_ACKNOWLEDGMENT_TIMEOUT_MS,
-            orElse: () => Effect.fail(new Error(
-              `Application did not acknowledge recovered session ${pending.session.id}`,
-            )),
-          }),
-        ),
-      )
-      if (Exit.isFailure(applicationExit)) {
-        return [this.issue(
-          owner,
-          "lease",
-          `Application did not project recovered session ${pending.session.id}`,
-          Cause.squash(applicationExit.cause),
-        )]
-      }
-      owner.adoptionApplicationAcknowledged = true
-      const acknowledgmentExit = yield* Effect.exit(this.boundedPersistence(
-        Effect.suspend(() => this.dependencies.ownership.ack(adoptionToken)),
-        "acknowledge recovered terminal identity",
-        owner.sessionId,
-        { ownerId: owner.ownerId, mutationToken: adoptionToken, mutationStage: "ack" },
-      ))
-      if (Exit.isFailure(acknowledgmentExit)) {
-        return [this.issue(
-          owner,
-          "lease",
-          `Unable to acknowledge recovered session ${pending.session.id}`,
-          Cause.squash(acknowledgmentExit.cause),
-        )]
-      }
-      delete owner.pendingAdoptionToken
-      owner.adoptionApplicationAcknowledged = false
-      return []
-    }.bind(this))
-  }
-
-  private cleanupDecision(
-    sessionId: string,
-    operation: TerminalCleanupError["operation"],
-    gracePeriodMs: number,
-  ): CleanupDecision {
-    const owner = this.ownerForSession(sessionId)
-    if (!owner) return { _tag: "Missing" }
-    if (owner.cleanupInProgress) return { _tag: "Wait", owner }
-    return { _tag: "Start", plan: this.beginCleanup(owner, operation, gracePeriodMs) }
-  }
-
-  private failAcquisition(
-    owner: TerminalOwner,
-    error: TerminalError | PersistenceError,
-  ): Effect.Effect<never, TerminalError | PersistenceError | TerminalCleanupError> {
-    return Effect.gen({ self: this }, function*() {
-      const exitCode = owner.process.exitCode
-      const failedExit = exitCode !== null && exitCode !== 0
-      const details = failedExit ? this.captureFailureDetails(owner) : undefined
-      const decision = yield* this.gate.withPermit(Effect.sync(() =>
-        this.cleanupDecision(owner.sessionId, "acquire-rollback", this.gracePeriodMs)))
-      if (decision._tag === "Start") yield* this.runCleanupPlan(decision.plan)
-      else if (decision._tag === "Wait") yield* Deferred.await(decision.owner.cleanupResult)
-      if (!failedExit) return yield* Effect.fail(error)
-      const output = this.failureOutput(owner, details)
-      return yield* Effect.fail(new TerminalError({
-        operation: "acquire", sessionId: owner.sessionId, cause: error,
-        message: [`Agent session exited with code ${exitCode}`, error.message,
-          output ? `Terminal output:\n${output}` : undefined].filter(Boolean).join("\n\n"),
+      const changed = yield* Effect.exit(Effect.gen({ self: this }, function*() {
+        if (request.event._tag === "TransitionFailed") return yield* Effect.fail(request.event.error)
+        const transition = request.event
+        if (transition.session.id === previousSessionId) return
+        const expectedKind = owner.transient ? "temporary-adoption" : "native-fork"
+        if (transition.kind !== expectedKind) return yield* Effect.fail(this.error("transition", previousSessionId, `Expected ${expectedKind}, received ${transition.kind}`))
+        const destination = transition.session.id
+        if (this.owners.has(destination) || this.launches.has(destination)) return yield* Effect.fail(this.error("transition", destination, "Session already has a terminal in this invocation"))
+        owner.transitioning = true
+        this.owners.set(destination, owner)
+        const derived = transition.derivation ? yield* this.untilCancelled(withOperationTimeout(transition.derivation, this.dependencies.transitionDerivationTimeoutMs,
+          () => Effect.fail(this.error("transition", destination, "Branch derivation timed out"))), owner.cancelled) : undefined
+        if (derived) yield* this.attempt("transition", destination, () => validateBranchDerivation(derived, previousSessionId, destination, transition.kind))
+        const now = yield* Clock.currentTimeMillis
+        const relation = derived ? { ...derived, createdAt: new Date(now).toISOString() } : undefined
+        const claim = yield* this.untilCancelled(this.dependencies.guard.acquire(destination), owner.cancelled)
+        owner.claims.add(claim)
+        const committed = yield* Effect.exit(this.dependencies.metadata.replaceIdentity(previousSessionId, destination, { kind: transition.kind, ...(relation ? { relation } : {}) }))
+        if (Exit.isFailure(committed)) return yield* Effect.failCause(committed.cause)
+        yield* owner.claim.release
+        owner.claims.delete(owner.claim)
+        owner.claim = claim
+        this.owners.delete(previousSessionId)
+        owner.sessionId = destination
+        owner.transient = false
+        owner.providerActivity = undefined
+        const acknowledgment = Deferred.makeUnsafe<void, unknown>()
+        const applicationEvent: TerminalSessionChangedEvent = { ownerId: owner.ownerId, sequenceId: event.sequenceId,
+          previousSessionId, session: transition.session, kind: transition.kind, wasActive: this.active === owner,
+          adoptionToken: crypto.randomUUID(), acknowledgment, ...(relation ? { relation } : {}) }
+        yield* Effect.try({ try: () => {
+          if (!this.events.onSessionChanged) throw new Error("No application session-transition listener is installed")
+          this.events.onSessionChanged(applicationEvent)
+        }, catch: (cause) => this.error("transition", destination, "Unable to publish session identity", cause) })
+        yield* this.untilCancelled(withOperationTimeout(Deferred.await(acknowledgment), this.dependencies.applicationAcknowledgmentTimeoutMs,
+          () => Effect.fail(this.error("transition", destination, "Application did not acknowledge session identity"))), owner.cancelled)
+        owner.transitioning = false
       }))
-    })
-  }
-
-  private captureFailureDetails(owner: TerminalOwner): string | undefined {
-    let details: string | undefined
-    this.ignoreCallback(() => { details = owner.failureDetails?.()?.slice(-8 * 1_024) })
-    return details
-  }
-
-  private failureOutput(owner: TerminalOwner, details?: string): string {
-    let output: string | undefined
-    this.ignoreCallback(() => { output = owner.process.outputTail })
-    return [output, details].filter(Boolean).join("\n\n")
-  }
-
-  private beginCleanup(
-    owner: TerminalOwner,
-    operation: TerminalCleanupError["operation"],
-    gracePeriodMs: number,
-    naturalExit?: CleanupPlan["naturalExit"],
-    forcedExit = false,
-  ): CleanupPlan {
-    const failureDetails = naturalExit && naturalExit.exitCode !== 0 ? this.captureFailureDetails(owner) : undefined
-    Deferred.doneUnsafe(owner.cleanupRequested, Effect.void)
-    owner.cleanupStarted = true
-    owner.cleanupInProgress = true
-    owner.cleanupResult = Deferred.makeUnsafe<void, TerminalCleanupError>()
-    this.setOwnerState(owner, "stopping")
-    return {
-      owner,
-      result: owner.cleanupResult,
-      operation,
-      gracePeriodMs,
-      ...(failureDetails ? { failureDetails } : {}),
-      ...(naturalExit === undefined ? {} : { naturalExit }),
-      ...(forcedExit
-        ? {
-            forcedExit: {
-              wasActive: this.activeOwnerId === owner.ownerId,
-            },
-          }
-        : {}),
-    }
-  }
-
-  private runCleanupPlan(
-    plan: CleanupPlan,
-  ): Effect.Effect<void, TerminalCleanupError> {
-    const outcome = Effect.suspend(() => this.cleanupPlanOutcome(plan)).pipe(
-      Effect.catchCause((cause) => Effect.succeed(
-        this.cleanupPlanError(plan, "Unexpected terminal cleanup failure", Cause.squash(cause)),
-      )),
-    )
-    return Effect.uninterruptible(outcome.pipe(
-      Effect.flatMap((error) => Effect.sync(() => {
-        this.settleCleanupPlan(plan, error)
-      }).pipe(Effect.andThen(error === undefined ? Effect.void : Effect.fail(error)))),
-    ))
-  }
-
-  private cleanupPlanOutcome(
-    plan: CleanupPlan,
-  ): Effect.Effect<TerminalCleanupError | undefined> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const cleanupExit = yield* Effect.exit(plan.owner.lifecycleGate.withPermit(Effect.suspend(() =>
-        this.cleanupOwnerResources(plan.owner, plan.gracePeriodMs))))
-      const issues = Exit.isSuccess(cleanupExit)
-        ? [...cleanupExit.value]
-        : [this.issue(
-            plan.owner,
-            "verify",
-            "Unexpected terminal resource cleanup failure",
-            Cause.squash(cleanupExit.cause),
-          )]
-
-      if (issues.length > 0 && !plan.owner.leaseReleased) {
-        const persistExit = yield* Effect.exit(Effect.suspend(() =>
-          this.persistCleanupIncomplete(plan.owner)))
-        if (Exit.isSuccess(persistExit)) {
-          issues.push(...persistExit.value)
-        } else {
-          issues.push(this.issue(
-            plan.owner,
-            "lease",
-            `Unable to persist incomplete cleanup ownership for ${plan.owner.sessionId}`,
-            Cause.squash(persistExit.cause),
-          ))
-        }
-      }
-
-      let error = issues.length === 0
-        ? undefined
-        : new TerminalCleanupError({ operation: plan.operation, issues })
-      const finalizeExit = yield* Effect.exit(Effect.suspend(() => {
-        const finalize = Effect.sync(() => this.finalizeCleanupPlan(plan, error))
-        return this.gate.withPermit(finalize)
-      }))
-      if (Exit.isFailure(finalizeExit)) {
-        error = this.cleanupPlanError(
-          plan,
-          "Unable to finalize terminal cleanup",
-          Cause.squash(finalizeExit.cause),
-          error?.issues,
-        )
-      }
-      return error !== undefined && plan.owner.leaseReleased && !this.owners.has(plan.owner.ownerId)
-        ? new TerminalCleanupError({ operation: error.operation, issues: error.issues, ownershipReleased: true })
-        : error
-    }.bind(this))
-  }
-
-  private finalizeCleanupPlan(
-    plan: CleanupPlan,
-    error: TerminalCleanupError | undefined,
-  ): void {
-    this.settlePendingTransitions(plan.owner)
-    if (error && !plan.owner.leaseReleased) {
-      this.markLocalCleanupIncomplete(plan.owner)
-    } else {
-      this.deleteOwner(plan.owner)
-    }
-    this.emitCleanupExit(plan, error)
-  }
-
-  private settleCleanupPlan(
-    plan: CleanupPlan,
-    error: TerminalCleanupError | undefined,
-  ): void {
-    this.settlePendingTransitions(plan.owner)
-    this.emitCleanupExit(plan, error)
-    if (error) {
-      if (this.owners.has(plan.owner.ownerId)) this.markLocalCleanupIncomplete(plan.owner)
-      this.reportOwnerCleanupError(plan.owner, error)
-      Deferred.doneUnsafe(plan.result, Effect.fail(error))
-      return
-    }
-    Deferred.doneUnsafe(plan.result, Effect.void)
-  }
-
-  private settleDefectiveCleanup(
-    owner: TerminalOwner,
-    operation: TerminalCleanupError["operation"],
-    cause: unknown,
-  ): void {
-    const error = new TerminalCleanupError({
-      operation,
-      issues: [this.issue(owner, "verify", "Unexpected terminal cleanup failure", cause)],
-    })
-    this.settlePendingTransitions(owner)
-    this.markLocalCleanupIncomplete(owner)
-    this.reportOwnerCleanupError(owner, error)
-    Deferred.doneUnsafe(owner.cleanupResult, Effect.fail(error))
-  }
-
-  private markLocalCleanupIncomplete(owner: TerminalOwner): void {
-    try {
-      this.owners.set(owner.ownerId, owner)
-      if (![...this.ledger.values()].some((entry) => entry.ownerId === owner.ownerId)) {
-        this.ledger.set(owner.sessionId, { ownerId: owner.ownerId, state: "cleanup-incomplete" })
-      }
-      this.setOwnerState(owner, "cleanup-incomplete")
-    } catch {
-      // The owner object remains the final fail-closed source if local indexing itself defects.
-    }
-    owner.cleanupStarted = true
-    owner.cleanupInProgress = false
-  }
-
-  private settlePendingTransitions(owner: TerminalOwner): void {
-    const error = new TerminalError({
-      operation: "native-session-transition",
-      sessionId: owner.sessionId,
-      message: `Terminal owner ${owner.ownerId} stopped while deriving its transition`,
-    })
-    for (const request of owner.pendingTransitions) {
+      if (Exit.isSuccess(changed)) { Deferred.doneUnsafe(request.acknowledgment, Effect.void); return false }
+      const cause = Cause.squash(changed.cause)
+      const error = cause instanceof TerminalError || cause instanceof ProviderProtocolError || cause instanceof PersistenceError || cause instanceof SessionOwnedError || cause instanceof SessionRemovedError
+        ? cause : this.error("transition", owner.sessionId, "Session transition failed", cause)
       Deferred.doneUnsafe(request.acknowledgment, Effect.fail(error))
-    }
-    owner.pendingTransitions.clear()
+      this.ignore(() => this.events.onSessionTransitionError?.({ ownerId: owner.ownerId, sessionId: owner.sessionId,
+        sequenceId: owner.sequence++, error, wasActive: this.active === owner }))
+      return true
+    })).pipe(Effect.andThen((failed) => failed ? this.cleanup(owner, "stop", this.graceMs, true) : Effect.void))
   }
 
-  private reportOwnerCleanupError(owner: TerminalOwner, error: TerminalCleanupError): void {
-    if (owner.cleanupNotificationSent) return
-    owner.cleanupNotificationSent = true
-    this.reportCleanupError(error)
-  }
-
-  private emitCleanupExit(
-    plan: CleanupPlan,
-    error: TerminalCleanupError | undefined,
-  ): void {
-    if (plan.owner.exitNotificationSent) return
-    const exitNotification = plan.naturalExit ?? (plan.forcedExit === undefined
-      ? undefined
-      : { ...plan.forcedExit, sequenceId: plan.owner.sequence.next++ })
-    if (!exitNotification) return
-    const outputTail = plan.naturalExit && plan.naturalExit.exitCode !== 0
-      ? this.failureOutput(plan.owner, plan.failureDetails) : undefined
-    plan.owner.exitNotificationSent = true
-    this.ignoreCallback(() => this.events.onProcessExited?.({
-      ownerId: plan.owner.ownerId,
-      sequenceId: exitNotification.sequenceId,
-      sessionId: plan.owner.sessionId,
-      exitCode: plan.naturalExit?.exitCode ?? plan.owner.process.exitCode ?? 1,
-      wasActive: exitNotification.wasActive,
-      ...(outputTail ? { outputTail } : {}),
-      ...(plan.owner.draftPreview === undefined
-        ? {}
-        : { draftPreview: plan.owner.draftPreview }),
-      ...(error === undefined ? {} : { cleanupError: error }),
-      ...(plan.owner.leaseReleased && !this.owners.has(plan.owner.ownerId) ? { ownershipReleased: true as const } : {}),
+  private cleanup(owner: TerminalOwner, operation: TerminalCleanupError["operation"], graceMs: number, notify = false): Effect.Effect<void, TerminalCleanupError> {
+    return Effect.uninterruptible(Effect.suspend(() => {
+      if (owner.cleanup) return Deferred.await(owner.cleanup)
+      const result = Deferred.makeUnsafe<void, TerminalCleanupError>()
+      owner.cleanup = result
+      owner.state = "stopping"
+      Deferred.doneUnsafe(owner.cancelled, Effect.void)
+      const wasActive = this.active === owner
+      return Effect.gen({ self: this }, function*() {
+        const exit = yield* Effect.exit(owner.gate.withPermit(Effect.gen({ self: this }, function*() {
+          const issues = [...this.releaseUi(owner)]
+          const stopped = yield* cleanupProcessGroup(owner.process, { gracePeriodMs: graceMs, killPeriodMs: this.killMs })
+          if (stopped.status !== "absent") issues.push(...stopped.issues.map((issue) => ({ ...issue, ownerId: owner.ownerId, sessionId: owner.sessionId })))
+          const close = asyncEffectStage.bind(this, owner, issues)
+          if (!owner.providerClosed) owner.providerClosed = yield* close("provider", "Unable to close provider resources", owner.close)
+          if (!owner.scopeClosed) owner.scopeClosed = yield* close("provider", "Unable to close provider scope", Scope.close(owner.scope, Exit.void))
+          if (!owner.ptyClosed) owner.ptyClosed = yield* close("pty", "Unable to close PTY", Effect.sync(() => owner.process.closePty()))
+          if (!owner.detached) owner.detached = yield* close("pty", "Unable to detach process", Effect.sync(() => owner.process.unref()))
+          if (stopped.status === "absent" && owner.providerClosed && owner.scopeClosed && owner.ptyClosed && owner.detached && owner.uiReleased) {
+            for (const claim of owner.claims) {
+              if (yield* close("guard", "Unable to release session guard", claim.release)) owner.claims.delete(claim)
+            }
+            owner.claimReleased = owner.claims.size === 0
+          }
+          if (owner.claimReleased) {
+            for (const [id, current] of this.owners) if (current === owner) this.owners.delete(id)
+            for (const fiber of owner.fibers) fiber.interruptUnsafe()
+          } else owner.state = "cleanup-incomplete"
+          for (const pending of owner.pendingTransitions) Deferred.doneUnsafe(pending.acknowledgment, Effect.fail(this.error("transition", owner.sessionId, "Terminal stopped")))
+          owner.pendingTransitions.clear()
+          if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation, issues, ...(owner.claimReleased ? { ownershipReleased: true as const } : {}) }))
+        })))
+        Deferred.doneUnsafe(result, exit)
+        if (notify) this.notifyExit(owner, owner.sequence++, wasActive, Exit.isFailure(exit) ? Cause.squash(exit.cause) as TerminalCleanupError : undefined)
+        if (Exit.isFailure(exit)) {
+          delete owner.cleanup
+          const error = this.cleanupFailure(operation, owner.sessionId, Cause.squash(exit.cause))
+          this.reportCleanupError(error)
+          return yield* Effect.fail(error)
+        }
+      })
     }))
-  }
 
-  private cleanupPlanError(
-    plan: CleanupPlan,
-    message: string,
-    cause: unknown,
-    priorIssues: readonly TerminalCleanupIssue[] = [],
-  ): TerminalCleanupError {
-    return new TerminalCleanupError({
-      operation: plan.operation,
-      issues: [...priorIssues, this.issue(plan.owner, "verify", message, cause)],
-    })
-  }
-
-  private cleanupOwnerResources(
-    owner: TerminalOwner,
-    gracePeriodMs: number,
-  ): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const issues: TerminalCleanupIssue[] = []
-      issues.push(...this.releaseOwnerUi(owner))
-      issues.push(...yield* this.persistStopping(owner))
-      const processResult = yield* cleanupProcessGroup(owner.process, {
-        gracePeriodMs,
-        killPeriodMs: this.killPeriodMs,
-      })
-      if (processResult.status !== "absent") {
-        issues.push(...processResult.issues.map((issue) => this.processIssue(owner, issue)))
-      }
-
-      const providerIssues = yield* this.releaseProvider(owner)
-      issues.push(...providerIssues)
-      issues.push(...this.closePty(owner))
-      issues.push(...this.unref(owner))
-
-      if (processResult.status === "absent") {
-        issues.push(...yield* this.stabilizeLease(owner))
-      }
-      if (
-        processResult.status === "absent" &&
-        owner.providerClosed &&
-        owner.providerScopeClosed &&
-        owner.uiReleased &&
-        owner.ptyClosed &&
-        owner.processDetached &&
-        owner.pendingIdentity === undefined &&
-        owner.pendingAdoptionToken === undefined &&
-        !owner.processRegistrationUncertain &&
-        owner.stoppingPersisted
-      ) {
-        issues.push(...yield* this.releaseOwnerLease(owner))
-      }
-      if (owner.pendingAdoptionToken !== undefined) {
-        issues.push(this.issue(
-          owner,
-          "lease",
-          `Session identity journal ${owner.pendingAdoptionToken} is still pending`,
-        ))
-      }
-      return issues
-    }.bind(this))
-  }
-
-  private persistStopping(owner: TerminalOwner): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    if (owner.stoppingPersisted) return Effect.succeed([])
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const issues: TerminalCleanupIssue[] = []
-      if (owner.processRegistrationUncertain) {
-        const attachExit = yield* Effect.exit(this.boundedPersistence(
-          Effect.suspend(() => this.dependencies.ownership.attach(
-            owner.ownership,
-            owner.processGroupId,
-            {
-              mutationToken: owner.mutationTokens.attach,
-              ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
-            },
-          )),
-          "reconcile terminal process group",
-          owner.sessionId,
-          {
-            ownerId: owner.ownerId,
-            mutationToken: owner.mutationTokens.attach,
-            mutationStage: "attach",
-          },
-        ))
-        if (Exit.isSuccess(attachExit)) {
-          owner.ownership = attachExit.value
-          owner.processRegistrationUncertain = false
-        }
-      }
-      const markExit = yield* Effect.exit(this.boundedPersistence(
-        Effect.suspend(() => this.dependencies.ownership.mark(
-          owner.ownership,
-          "stopping",
-          {
-            processGroupId: owner.processGroupId,
-            mutationToken: owner.mutationTokens.stopping,
-            ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
-          },
-        )),
-        "persist stopping terminal ownership",
-        owner.sessionId,
-        {
-          ownerId: owner.ownerId,
-          mutationToken: owner.mutationTokens.stopping,
-          mutationStage: "stopping",
-        },
-      ))
-      if (Exit.isSuccess(markExit)) {
-        owner.ownership = markExit.value
-        owner.processRegistrationUncertain = false
-        owner.stoppingPersisted = true
-      } else {
-        issues.push(this.issue(
-          owner,
-          "lease",
-          `Unable to persist stopping ownership for ${owner.sessionId}`,
-          Cause.squash(markExit.cause),
-        ))
-      }
-      return issues
-    }.bind(this))
-  }
-
-  private persistCleanupIncomplete(
-    owner: TerminalOwner,
-  ): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    const persist = this.boundedPersistence(
-      Effect.suspend(() => this.dependencies.ownership.mark(
-        owner.ownership,
-        "cleanup-incomplete",
-        {
-          processGroupId: owner.processGroupId,
-          mutationToken: owner.mutationTokens.cleanupIncomplete,
-        },
-      )),
-      "persist incomplete terminal cleanup",
-      owner.sessionId,
-      {
-        ownerId: owner.ownerId,
-        mutationToken: owner.mutationTokens.cleanupIncomplete,
-        mutationStage: "cleanup-incomplete",
-      },
-    )
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const exit = yield* Effect.exit(persist)
-      if (Exit.isSuccess(exit)) {
-        owner.ownership = exit.value
-        owner.stoppingPersisted = false
-        return []
-      }
-      return [this.issue(
-        owner,
-        "lease",
-        `Unable to persist incomplete cleanup ownership for ${owner.sessionId}`,
-        Cause.squash(exit.cause),
-      )]
-    }.bind(this))
-  }
-
-  private stabilizeLease(owner: TerminalOwner): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const issues: TerminalCleanupIssue[] = []
-      let registrationCause: unknown
-      if (owner.processRegistrationUncertain) {
-        const updateExit = yield* Effect.exit(
-          this.boundedPersistence(
-            Effect.suspend(() =>
-              this.dependencies.ownership.attach(owner.ownership, owner.processGroupId, {
-                mutationToken: owner.mutationTokens.attach,
-                ...(owner.launchResources === undefined ? {} : { resources: owner.launchResources }),
-              })),
-            "confirm terminal process group",
-            owner.sessionId,
-            {
-              ownerId: owner.ownerId,
-              mutationToken: owner.mutationTokens.attach,
-              mutationStage: "attach",
-            },
-          ),
-        )
-        if (Exit.isSuccess(updateExit)) {
-          owner.ownership = updateExit.value
-          owner.processRegistrationUncertain = false
-        } else {
-          registrationCause = Cause.squash(updateExit.cause)
-        }
-      }
-
-      if (owner.pendingIdentity) {
-        const pending = owner.pendingIdentity
-        const replacementExit = yield* Effect.exit(
-          this.boundedPersistence(
-            Effect.suspend(() => this.dependencies.ownership.commitIdentity({
-              owner: owner.ownership,
-              sessionId: pending.session.id,
-              kind: pending.kind,
-              mutationToken: pending.mutationToken,
-              ...(pending.relation === undefined ? {} : { relation: pending.relation }),
-            })),
-            "confirm terminal identity",
-            owner.sessionId,
-            {
-              ownerId: owner.ownerId,
-              mutationToken: pending.mutationToken,
-              mutationStage: "identity",
-            },
-          ),
-        )
-        if (Exit.isSuccess(replacementExit)) {
-          this.commitIdentity(
-            owner,
-            pending.previousSessionId,
-            pending.session.id,
-            replacementExit.value.owner,
-          )
-          delete owner.pendingIdentity
-          owner.pendingAdoptionToken = replacementExit.value.adoption.adoptionToken
-          if (replacementExit.value.owner.processGroupId === owner.processGroupId) {
-            owner.processRegistrationUncertain = false
-          }
-          issues.push(...yield* this.completeRecoveredIdentity(
-            owner,
-            pending,
-            replacementExit.value.adoption.adoptionToken,
-          ))
-        } else {
-          issues.push(this.issue(
-            owner,
-            "lease",
-            `Unable to confirm session ownership transition to ${pending.session.id}`,
-            Cause.squash(replacementExit.cause),
-          ))
-        }
-      }
-      if (owner.pendingAdoptionToken !== undefined && owner.adoptionApplicationAcknowledged) {
-        const adoptionToken = owner.pendingAdoptionToken
-        const acknowledgmentExit = yield* Effect.exit(
-          this.boundedPersistence(
-            Effect.suspend(() => this.dependencies.ownership.ack(adoptionToken)),
-            "reconcile terminal identity acknowledgment",
-            owner.sessionId,
-            { ownerId: owner.ownerId, mutationToken: adoptionToken, mutationStage: "ack" },
-          ),
-        )
-        if (Exit.isSuccess(acknowledgmentExit)) {
-          delete owner.pendingAdoptionToken
-          owner.adoptionApplicationAcknowledged = false
-        } else {
-          issues.push(this.issue(
-            owner,
-            "lease",
-            `Unable to reconcile identity acknowledgment ${adoptionToken}`,
-            Cause.squash(acknowledgmentExit.cause),
-          ))
-        }
-      }
-      if (owner.processRegistrationUncertain) {
-        issues.push(this.issue(
-          owner,
-          "lease",
-          `Unable to confirm process group ${owner.processGroupId} on the session lease`,
-          registrationCause,
-        ))
-      }
-      return issues
-    }.bind(this))
-  }
-
-  private releaseProvider(owner: TerminalOwner): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const issues: TerminalCleanupIssue[] = []
-      if (!owner.providerClosed) {
-        let lastCause: unknown
-        for (let attempt = 0; attempt < this.providerCleanupAttempts; attempt += 1) {
-          const closeExit = yield* Effect.exit(
-            Effect.interruptible(Effect.suspend(() => owner.providerClose)).pipe(
-              Effect.timeoutOrElse({
-                duration: this.providerCleanupTimeoutMs,
-                orElse: () => Effect.fail(new Error("Provider cleanup timed out")),
-              }),
-            ),
-          )
-          if (Exit.isSuccess(closeExit)) {
-            owner.providerClosed = true
-            break
-          }
-          lastCause = Cause.squash(closeExit.cause)
-          if (attempt + 1 < this.providerCleanupAttempts) {
-            yield* Effect.sleep(this.providerCleanupRetryDelayMs)
-          }
-        }
-        if (!owner.providerClosed) {
-          issues.push(this.issue(
-            owner,
-            "provider",
-            `Unable to clean up provider resources for ${owner.sessionId}`,
-            lastCause,
-          ))
-        }
-      }
-
-      if (owner.providerScopeCloseUncertain) {
-        issues.push(this.issue(
-          owner,
-          "provider",
-          `Provider scope cleanup remains uncertain for ${owner.sessionId}`,
-          owner.providerScopeCloseCause,
-        ))
-      } else if (!owner.providerScopeClosed) {
-        owner.transitionFiber?.interruptUnsafe()
-        const scopeExit = yield* this.closeProviderScope(owner.providerScope)
-        if (Exit.isFailure(scopeExit)) {
-          owner.providerScopeCloseUncertain = true
-          owner.providerScopeCloseCause = Cause.squash(scopeExit.cause)
-          issues.push(this.issue(
-            owner,
-            "provider",
-            `Provider scope cleanup is uncertain for ${owner.sessionId}`,
-            owner.providerScopeCloseCause,
-          ))
-        } else {
-          owner.providerScopeClosed = true
-        }
-      }
-      return issues
-    }.bind(this))
-  }
-
-  private releaseOwnerLease(owner: TerminalOwner): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    if (owner.leaseReleased) return Effect.succeed([])
-    if (owner.pendingAdoptionToken !== undefined) {
-      return Effect.succeed([this.issue(
-        owner,
-        "lease",
-        `Cannot release ownership while identity journal ${owner.pendingAdoptionToken} is pending`,
-      )])
+    function asyncEffectStage(this: TerminalSupervisorImpl, owner: TerminalOwner, issues: TerminalCleanupIssue[], stage: TerminalCleanupIssue["stage"], message: string, effect: Effect.Effect<void, unknown>): Effect.Effect<boolean> {
+      return Effect.exit(this.bounded(effect)).pipe(Effect.map((exit) => {
+        if (Exit.isSuccess(exit)) return true
+        issues.push({ ownerId: owner.ownerId, sessionId: owner.sessionId, stage, message, cause: Cause.squash(exit.cause) })
+        return false
+      }))
     }
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const drainIssues = yield* this.drainOwnerPersistence(owner)
-      if (drainIssues.length > 0) return drainIssues
-      const exit = yield* Effect.exit(this.boundedPersistence(
-        Effect.suspend(() => this.dependencies.ownership.release(owner.ownership, {
-          mutationToken: owner.mutationTokens.release,
-        })),
-        "release terminal ownership",
-        owner.sessionId,
-        {
-          ownerId: owner.ownerId,
-          mutationToken: owner.mutationTokens.release,
-          mutationStage: "release",
-        },
-      ))
-      if (Exit.isSuccess(exit)) {
-        owner.leaseReleased = true
-        return []
-      }
-      return [this.issue(
-        owner,
-        "lease",
-        `Unable to release session lease for ${owner.sessionId}`,
-        Cause.squash(exit.cause),
-      )]
-    }.bind(this))
   }
-
-  private rollbackBeforeOwner(
-    ownerId: string,
-    sessionId: string,
-    ownership: PersistedTerminalOwner,
-    providerScope: Scope.Closeable,
-    mutationTokens: MutationTokens,
-    acquired?: AcquiredTerminalLaunch,
-    spawnFailure?: TerminalSpawnCleanupError,
-    priorIssues: readonly TerminalCleanupIssue[] = [],
-  ): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const issues: TerminalCleanupIssue[] = [...priorIssues]
-      let currentOwnership = ownership
-      if (acquired) {
-        const closeExit = yield* this.retryProviderClose(acquired.close)
-        if (Exit.isFailure(closeExit)) {
-          issues.push({
-            ownerId,
-            sessionId,
-            stage: "provider",
-            message: `Unable to roll back provider resources for ${sessionId}`,
-            cause: Cause.squash(closeExit.cause),
-          })
-        }
-      }
-      const scopeExit = yield* this.closeProviderScope(providerScope)
-      if (Exit.isFailure(scopeExit)) {
-        issues.push({
-          ownerId,
-          sessionId,
-          stage: "provider",
-          message: `Unable to roll back provider scope for ${sessionId}`,
-          cause: Cause.squash(scopeExit.cause),
-        })
-      }
-      if (spawnFailure) {
-        const updateExit = yield* Effect.exit(
-          this.boundedPersistence(
-            Effect.suspend(() =>
-              this.dependencies.ownership.attach(ownership, spawnFailure.processGroupId, {
-                mutationToken: mutationTokens.attach,
-              })),
-            "record unverified terminal process group",
-            sessionId,
-            { ownerId, mutationToken: mutationTokens.attach, mutationStage: "attach" },
-          ),
-        )
-        issues.push({
-          ownerId,
-          sessionId,
-          stage: "verify",
-          message: `Unable to verify process group ${spawnFailure.processGroupId} exited`,
-          cause: spawnFailure,
-        })
-        if (Exit.isFailure(updateExit)) {
-          issues.push({
-            ownerId,
-            sessionId,
-            stage: "lease",
-            message: `Unable to record unverified process group ${spawnFailure.processGroupId}`,
-            cause: Cause.squash(updateExit.cause),
-          })
-        } else {
-          currentOwnership = updateExit.value
-        }
-      } else if (issues.length === 0) {
-        issues.push(...yield* this.drainPersistence(ownerId, sessionId))
-      }
-      if (!spawnFailure && issues.length === 0) {
-        const releaseExit = yield* Effect.exit(this.boundedPersistence(
-          Effect.suspend(() => this.dependencies.ownership.release(ownership, {
-            mutationToken: mutationTokens.release,
-          })),
-          "release rolled back terminal ownership",
-          sessionId,
-          { ownerId, mutationToken: mutationTokens.release, mutationStage: "release" },
-        ))
-        if (Exit.isFailure(releaseExit)) {
-          issues.push({
-            ownerId,
-            sessionId,
-            stage: "lease",
-            message: `Unable to release session lease for ${sessionId}`,
-            cause: Cause.squash(releaseExit.cause),
-          })
-        }
-      }
-      if (issues.length > 0) {
-        const incompleteExit = yield* Effect.exit(this.boundedPersistence(
-          Effect.suspend(() => this.dependencies.ownership.mark(
-            currentOwnership,
-            "cleanup-incomplete",
-            {
-              ...(spawnFailure === undefined ? {} : { processGroupId: spawnFailure.processGroupId }),
-              mutationToken: mutationTokens.cleanupIncomplete,
-            },
-          )),
-          "persist incomplete terminal rollback",
-          sessionId,
-          {
-            ownerId,
-            mutationToken: mutationTokens.cleanupIncomplete,
-            mutationStage: "cleanup-incomplete",
-          },
-        ))
-        if (Exit.isFailure(incompleteExit)) {
-          issues.push({
-            ownerId,
-            sessionId,
-            stage: "lease",
-            message: `Unable to persist incomplete rollback ownership for ${sessionId}`,
-            cause: Cause.squash(incompleteExit.cause),
-          })
-        }
-        this.incompleteRollbacks.set(ownerId, new TerminalCleanupError({
-          operation: "acquire-rollback", issues,
-        }))
-      }
-      return issues
-    }.bind(this))
+  private notifyExit(owner: TerminalOwner, sequenceId: number, wasActive: boolean, cleanupError?: TerminalCleanupError, outputTail?: string): void {
+    if (owner.exitNotified) return
+    owner.exitNotified = true
+    this.ignore(() => this.events.onProcessExited?.({ ownerId: owner.ownerId, sessionId: owner.sessionId, sequenceId,
+      wasActive, exitCode: owner.process.exitCode ?? 1, ...(owner.draft ? { draftPreview: owner.draft } : {}),
+      ...(cleanupError ? { cleanupError } : {}), ...(outputTail ? { outputTail } : {}), ...(owner.claimReleased ? { ownershipReleased: true as const } : {}) }))
   }
-
-  private retryProviderClose(
-    close: AcquiredTerminalLaunch["close"],
-  ): Effect.Effect<Exit.Exit<void, unknown>> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      let lastExit: Exit.Exit<void, unknown> = Exit.void
-      for (let attempt = 0; attempt < this.providerCleanupAttempts; attempt += 1) {
-        lastExit = yield* Effect.exit(
-          Effect.interruptible(Effect.suspend(() => close)).pipe(
-            Effect.timeoutOrElse({
-              duration: this.providerCleanupTimeoutMs,
-              orElse: () => Effect.fail(new Error("Provider cleanup timed out")),
-            }),
-          ),
-        )
-        if (Exit.isSuccess(lastExit)) return lastExit
-        if (attempt + 1 < this.providerCleanupAttempts) {
-          yield* Effect.sleep(this.providerCleanupRetryDelayMs)
-        }
+  private releaseUi(owner: TerminalOwner): readonly TerminalCleanupIssue[] {
+    const issues: TerminalCleanupIssue[] = []
+    if (this.active === owner) { this.active = undefined; this.ignore(() => this.dependencies.renderer.clearSelection()) }
+    this.captureDraft(owner)
+    if (!owner.uiReleased) {
+      try { owner.surface.release(); owner.uiReleased = true } catch (cause) {
+        issues.push({ ownerId: owner.ownerId, sessionId: owner.sessionId, stage: "ui", message: "Unable to release terminal surface", cause })
       }
-      return lastExit
-    }.bind(this))
+    }
+    return issues
   }
-
-  private closeProviderScope(
-    scope: Scope.Closeable,
-  ): Effect.Effect<Exit.Exit<void, unknown>> {
-    return Effect.exit(
-      Effect.interruptible(Effect.suspend(() => Scope.close(scope, Exit.void))).pipe(
-        Effect.timeoutOrElse({
-          duration: this.providerCleanupTimeoutMs,
-          orElse: () => Effect.fail(new Error("Provider scope cleanup timed out")),
-        }),
-      ),
-    )
-  }
-
-  private closeRuntimeScope(): Effect.Effect<Exit.Exit<void, unknown>> {
-    return Effect.exit(
-      Effect.interruptible(Effect.suspend(() => Scope.close(this.runtimeScope, Exit.void))).pipe(
-        Effect.timeoutOrElse({
-          duration: this.providerCleanupTimeoutMs,
-          orElse: () => Effect.fail(new Error("Terminal runtime scope cleanup timed out")),
-        }),
-      ),
-    )
-  }
-
-  private get launchRollbackTimeoutMs(): number {
-    return this.providerCleanupTimeoutMs * (this.providerCleanupAttempts + 2) + this.persistenceTimeoutMs * 3
-  }
-
-  private performShutdown(gracePeriodMs: number): Effect.Effect<void, TerminalCleanupError> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const launchIssues: TerminalCleanupIssue[] = []
-      const awaitLaunches = Effect.interruptible(Effect.all(
-        [...this.launches.values()].map((launch) => Deferred.await(launch.done)),
-        { concurrency: "unbounded" },
-      )).pipe(Effect.timeoutOrElse({
-        duration: this.launchRollbackTimeoutMs,
-        orElse: () => Effect.sync(() => {
-          for (const sessionId of this.launches.keys()) launchIssues.push({
-            ownerId: "terminal-supervisor", sessionId, stage: "provider",
-            message: "Terminal launch rollback remains incomplete",
-          })
-        }),
-      }))
-      const decisions = yield* this.gate.withPermit(Effect.sync(() => {
-        this.shuttingDown = true
-        this.ignoreCallback(this.unsubscribeSelection)
-        const active = this.activeOwner()
-        if (active) active.selectionClearPending = true
-        this.activeOwnerId = null
-        for (const owner of this.owners.values()) launchIssues.push(...this.releaseOwnerUi(owner))
-        return [...this.owners.values()].map((owner): CleanupDecision =>
-          owner.cleanupInProgress
-            ? { _tag: "Wait", owner }
-            : {
-                _tag: "Start",
-                plan: this.beginCleanup(owner, "shutdown", gracePeriodMs),
-              }
-        )
-      }))
-      this.reportHerdr("idle")
-
-      const cleanup = Effect.all(decisions.map((decision) =>
-        Effect.exit(decision._tag === "Start"
-          ? this.runCleanupPlan(decision.plan)
-          : decision._tag === "Wait"
-          ? Deferred.await(decision.owner.cleanupResult)
-          : Effect.void)
-      ), { concurrency: "unbounded" })
-      const [cleanupExits] = yield* Effect.all([cleanup, awaitLaunches], { concurrency: "unbounded" })
-      const initialOwners = new Set(decisions.filter((decision) => decision._tag !== "Missing")
-        .map((decision) => decision._tag === "Start" ? decision.plan.owner : decision.owner))
-      const latePlans = yield* this.gate.withPermit(Effect.sync(() => [...this.owners.values()]
-        .filter((owner) => !initialOwners.has(owner))
-        .map((owner): CleanupDecision => owner.cleanupInProgress
-          ? { _tag: "Wait", owner }
-          : { _tag: "Start", plan: this.beginCleanup(owner, "shutdown", gracePeriodMs) })))
-      const lateExits = yield* Effect.all(latePlans.map((decision) => Effect.exit(
-        decision._tag === "Start" ? this.runCleanupPlan(decision.plan)
-          : decision._tag === "Wait" ? Deferred.await(decision.owner.cleanupResult) : Effect.void,
-      )), { concurrency: "unbounded" })
-      const issues = [...launchIssues, ...[...this.incompleteRollbacks.values()].flatMap((error) => error.issues),
-        ...[...cleanupExits, ...lateExits].flatMap((exit) => Exit.isSuccess(exit)
-        ? []
-        : this.cleanupErrorFromCause("shutdown", Cause.squash(exit.cause)).issues)]
-      const pendingReservations = [...this.pendingReservations.values()]
-      const reservationExits = yield* Effect.all(
-        pendingReservations.map((pending) =>
-          Effect.exit(this.reconcilePendingReservation(pending, true))),
-        { concurrency: "unbounded" },
-      )
-      issues.push(...reservationExits.flatMap((exit, index) => {
-        if (Exit.isSuccess(exit)) return []
-        const pending = pendingReservations[index]
-        if (pending === undefined) return []
-        return [{
-          ownerId: pending.ownerId,
-          sessionId: pending.sessionId,
-          stage: "lease" as const,
-          message: `Late terminal reservation cleanup remains incomplete for ${pending.sessionId}`,
-          cause: Cause.squash(exit.cause),
-        }]
-      }))
-
-      const herdrFiber = yield* Effect.forkDetach(Effect.exit(this.herdr.shutdown), {
-        startImmediately: true,
-        uninterruptible: false,
-      })
-      yield* Effect.interruptible(Fiber.await(herdrFiber)).pipe(
-        Effect.timeoutOrElse({
-          duration: HERDR_SHUTDOWN_PERIOD_MS,
-          orElse: () => Effect.sync(() => herdrFiber.interruptUnsafe()),
-        }),
-      )
-      if (this.runtimeScopeCloseUncertain) {
-        issues.push({
-          ownerId: "terminal-supervisor",
-          sessionId: "",
-          stage: "runtime",
-          message: "Terminal runtime scope cleanup remains uncertain",
-          ...(this.runtimeScopeCloseCause === undefined
-            ? {}
-            : { cause: this.runtimeScopeCloseCause }),
-        })
-      } else if (!this.runtimeScopeClosed) {
-        const runtimeScopeExit = yield* this.closeRuntimeScope()
-        if (Exit.isSuccess(runtimeScopeExit)) {
-          this.runtimeScopeClosed = true
-        } else {
-          this.runtimeScopeCloseUncertain = true
-          this.runtimeScopeCloseCause = Cause.squash(runtimeScopeExit.cause)
-          issues.push({
-            ownerId: "terminal-supervisor",
-            sessionId: "",
-            stage: "runtime",
-            message: "Terminal runtime scope cleanup is uncertain",
-            cause: this.runtimeScopeCloseCause,
-          })
-        }
-      }
-      if (issues.length > 0) {
-        return yield* Effect.fail(new TerminalCleanupError({ operation: "shutdown", issues }))
-      }
-    }.bind(this))
-  }
-
   private activate(owner: TerminalOwner): Effect.Effect<void, TerminalError> {
     return this.attempt("focus", owner.sessionId, () => {
-      if (this.shuttingDown) throw new Error("Cannot focus an agent terminal during shutdown")
-      if (owner.process.exitCode !== null) throw new Error("Cannot focus an exited agent terminal")
-      const previous = this.activeOwner()
+      if (this.shuttingDown || owner.state !== "running" || owner.process.exitCode !== null) throw new Error("Cannot focus a stopped terminal")
+      const previous = this.active
       this.dependencies.renderer.clearSelection()
       try {
         owner.surface.setActive(true)
         owner.surface.focus()
-        if (previous && previous !== owner) {
-          this.captureDraft(previous)
-          previous.surface.blur()
-          previous.surface.setActive(false)
-        }
-        this.activeOwnerId = owner.ownerId
-        this.reportHerdr(owner.activity)
+        if (previous && previous !== owner) { this.captureDraft(previous); previous.surface.blur(); previous.surface.setActive(false) }
+        this.active = owner
       } catch (cause) {
-        this.ignoreCallback(() => owner.surface.blur())
-        this.ignoreCallback(() => owner.surface.setActive(false))
-        if (previous && previous !== owner) {
-          this.ignoreCallback(() => previous.surface.setActive(true))
-          this.ignoreCallback(() => previous.surface.focus())
-          this.activeOwnerId = previous.ownerId
-          this.reportHerdr(previous.activity)
-        } else {
-          this.activeOwnerId = previous?.ownerId ?? null
-          if (!previous) this.reportHerdr("idle")
-        }
+        this.ignore(() => owner.surface.setActive(false))
+        if (previous) { this.ignore(() => previous.surface.setActive(true)); this.ignore(() => previous.surface.focus()) }
+        this.active = previous
         throw cause
       }
     })
   }
-
   private captureDraft(owner: TerminalOwner): void {
-    try {
+    this.ignore(() => {
       const screen = owner.surface.screen()
       const activity = owner.observer.observeScreen(screen)
-      const observed = owner.observer.observeDraft(screen)
       this.takeObservations(owner)
-      this.recordDraft(owner, observed)
-      if (activity !== undefined) this.offerEvent(owner, { _tag: "Activity", activity })
-    } catch {
-      // Observer defects must not block process cleanup.
-    } finally {
-      owner.inputObserved = false
-    }
+      this.recordDraft(owner, owner.observer.observeDraft(screen))
+      if (activity !== undefined) this.offer(owner, { _tag: "Activity", activity })
+    })
+    owner.inputObserved = false
   }
-
   private takeObservations(owner: TerminalOwner): void {
     for (const observation of owner.observer.takeObservations?.() ?? []) {
-      if (observation._tag === "Rewind") {
-        delete owner.draftPreview
-        delete owner.lastDraftKey
-      }
-      this.offerEvent(owner, { _tag: "Observation", observation })
+      if (observation._tag === "Rewind") { delete owner.draft; delete owner.draftKey }
+      this.offer(owner, { _tag: "Observation", observation })
     }
   }
-
   private recordDraft(owner: TerminalOwner, draft: DraftPreview | null | undefined): void {
     if (draft === undefined) return
-    if (draft === null) delete owner.draftPreview
-    else if (owner.inputObserved || !owner.draftPreview?.exact) {
-      // The supervisor keeps only presentation text, never rewind semantics.
-      owner.draftPreview = { text: draft.text, exact: draft.exact }
-    }
+    if (draft === null) delete owner.draft
+    else if (owner.inputObserved || !owner.draft?.exact) owner.draft = { text: draft.text, exact: draft.exact }
     const key = JSON.stringify(draft)
-    if (key === owner.lastDraftKey) return
-    owner.lastDraftKey = key
-    this.offerEvent(owner, { _tag: "Observation", observation: { _tag: "Draft", draft } })
+    if (key === owner.draftKey) return
+    owner.draftKey = key
+    this.offer(owner, { _tag: "Observation", observation: { _tag: "Draft", draft } })
   }
-
-  private releaseOwnerUi(owner: TerminalOwner): readonly TerminalCleanupIssue[] {
-    const issues: TerminalCleanupIssue[] = []
-    const release = (message: string, run: () => void) => {
-      try {
-        run()
-      } catch (cause) {
-        issues.push(this.issue(owner, "ui", message, cause))
+  private probe(owner: TerminalOwner): Effect.Effect<TerminalActivityCheck | undefined> {
+    return owner.probeGate.withPermit(Effect.gen({ self: this }, function*() {
+      const sessionId = owner.sessionId
+      const usable = () => !this.shuttingDown && owner.state === "running" && !owner.uiReleased && !owner.transitioning && owner.sessionId === sessionId && this.owners.get(sessionId) === owner
+      if (!usable()) return
+      if (owner.providerActivity !== undefined) return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence - 1, activity: owner.providerActivity }
+      const sample = (phase: "sample" | "confirm"): TerminalActivityCheck => {
+        try {
+          const screen = owner.surface.screen()
+          const activity = owner.observer.reconcileScreen ? owner.observer.reconcileScreen(screen, phase) : owner.observer.observeScreen(screen)
+          this.takeObservations(owner)
+          this.recordDraft(owner, owner.observer.observeDraft(screen))
+          if (activity !== undefined) this.offer(owner, { _tag: "Activity", activity })
+          return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence - 1, ...(activity === undefined ? { issue: "unrecognized-screen" as const } : { activity }) }
+        } catch { return { ownerId: owner.ownerId, sessionId, sequenceId: owner.sequence - 1, issue: "observer-failed" } }
       }
-    }
-    if (this.activeOwnerId === owner.ownerId) {
-      this.activeOwnerId = null
-      owner.selectionClearPending = true
-      this.reportHerdr("idle")
-    }
-    if (owner.selectionClearPending) {
-      release("Unable to clear terminal selection", () => {
-        this.dependencies.renderer.clearSelection()
-        owner.selectionClearPending = false
-      })
-    }
-    this.captureDraft(owner)
-    if (!owner.uiReleased) {
-      release(`Unable to release terminal surface for ${owner.sessionId}`, () => {
-        owner.surface.release()
-        owner.uiReleased = true
-      })
-    }
-    return issues
-  }
-
-  private closePty(owner: TerminalOwner): readonly TerminalCleanupIssue[] {
-    if (owner.ptyClosed) return []
-    try {
-      owner.process.closePty()
-      owner.ptyClosed = true
-      return []
-    } catch (cause) {
-      return [this.issue(owner, "pty", `Unable to close PTY for ${owner.sessionId}`, cause)]
-    }
-  }
-
-  private waitForPtyDrain(process: TerminalProcess): Effect.Effect<void> {
-    return Effect.promise(async () => {
-      let timeout: ReturnType<typeof setTimeout> | undefined
-      await Promise.race([
-        process.ptyDrained,
-        new Promise<void>((resolve) => {
-          timeout = setTimeout(resolve, PTY_DRAIN_PERIOD_MS)
-        }),
-      ]).catch(() => {})
-      if (timeout) clearTimeout(timeout)
-    })
-  }
-
-  private unref(owner: TerminalOwner): readonly TerminalCleanupIssue[] {
-    if (owner.processDetached) return []
-    try {
-      owner.process.unref()
-      owner.processDetached = true
-      return []
-    } catch (cause) {
-      return [this.issue(owner, "pty", `Unable to detach process ${owner.process.pid}`, cause)]
-    }
-  }
-
-  private processIssue(
-    owner: TerminalOwner,
-    issue: ProcessGroupCleanupIssue,
-  ): TerminalCleanupIssue {
-    return this.issue(owner, issue.stage, issue.message, issue.cause)
-  }
-
-  private commitIdentity(
-    owner: TerminalOwner,
-    previousSessionId: string,
-    sessionId: string,
-    ownership: PersistedTerminalOwner,
-  ): void {
-    const entry = this.ledger.get(previousSessionId) ?? this.ledger.get(sessionId)
-    for (const [key, candidate] of this.ledger) {
-      if (candidate.ownerId === owner.ownerId) this.ledger.delete(key)
-    }
-    owner.ownership = ownership
-    owner.sessionId = sessionId
-    owner.providerActivity = undefined
-    owner.awaitingTemporaryAdoption = false
-    if (entry) this.ledger.set(sessionId, entry)
-  }
-
-  private reserveAlias(owner: TerminalOwner, sessionId: string): void {
-    const entry = this.ledger.get(owner.sessionId)
-    if (entry) this.ledger.set(sessionId, entry)
-  }
-
-  private setOwnerState(owner: TerminalOwner, state: TerminalOwnerState): void {
-    for (const entry of this.ledger.values()) {
-      if (entry.ownerId === owner.ownerId) entry.state = state
-    }
-  }
-
-  private deleteOwner(owner: TerminalOwner): void {
-    for (const [sessionId, entry] of this.ledger) {
-      if (entry.ownerId === owner.ownerId) this.ledger.delete(sessionId)
-    }
-    this.owners.delete(owner.ownerId)
-    owner.cleanupInProgress = false
-    owner.semanticFiber?.interruptUnsafe()
-    owner.transitionFiber?.interruptUnsafe()
-    owner.activityFiber?.interruptUnsafe()
-    owner.activityHintFiber?.interruptUnsafe()
-    owner.providerEventFiber?.interruptUnsafe()
-    this.clearPersistenceOwner(owner.ownerId)
-  }
-
-  private clearPersistenceOwner(ownerId: string): void {
-    for (const [mutationToken, tracked] of this.persistenceMutations) {
-      if (tracked.ownerId === ownerId && tracked.exit !== undefined) {
-        this.persistenceMutations.delete(mutationToken)
-      }
-    }
-  }
-
-  private ownerForSession(sessionId: string): TerminalOwner | undefined {
-    const entry = this.ledger.get(sessionId)
-    return entry ? this.owners.get(entry.ownerId) : undefined
-  }
-
-  private activeOwner(): TerminalOwner | undefined {
-    return this.activeOwnerId ? this.owners.get(this.activeOwnerId) : undefined
-  }
-
-  private sessionIdSet(
-    predicate: (entry: LedgerEntry, owner: TerminalOwner, sessionId: string) => boolean,
-  ): Effect.Effect<ReadonlySet<string>> {
-    return Effect.sync(() => {
-      const sessionIds = new Set<string>()
-      for (const [sessionId, entry] of this.ledger) {
-        const owner = this.owners.get(entry.ownerId)
-        if (owner && predicate(entry, owner, sessionId)) sessionIds.add(sessionId)
-      }
-      return sessionIds
-    })
-  }
-
-  private attempt<A>(
-    operation: string,
-    sessionId: string,
-    run: () => A,
-  ): Effect.Effect<A, TerminalError> {
-    return Effect.try({
-      try: run,
-      catch: (cause) => new TerminalError({
-        operation,
-        sessionId,
-        message: cause instanceof Error ? cause.message : String(cause),
-        cause,
-      }),
-    })
-  }
-
-  private reserveOwnership(
-    ownerId: string,
-    sessionId: string,
-    reserveMutationToken: string,
-    releaseMutationToken: string,
-  ): Effect.Effect<
-    PersistedTerminalOwner,
-    PersistenceError | SessionOwnedError | SessionRemovedError
-  > {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const progress: { phase?: PersistencePhase } = {}
-      const tracked = yield* this.trackPersistence(
-        Effect.suspend(() => this.dependencies.ownership.reserve(sessionId, {
-          mutationToken: reserveMutationToken,
-          onPhase: (phase) => { progress.phase = phase },
-        })),
-        "reserve terminal ownership",
-        sessionId,
-        { ownerId, mutationToken: reserveMutationToken, mutationStage: "reserve", progress },
-      )
-      const exit = yield* Effect.exit(this.awaitPersistence<
-        PersistedTerminalOwner,
-        PersistenceError | SessionOwnedError | SessionRemovedError
-      >(tracked, "productive"))
-      if (Exit.isSuccess(exit)) return exit.value
-      if (!tracked.observedByCaller || !(Cause.squash(exit.cause) instanceof SessionOwnedError ||
-        Cause.squash(exit.cause) instanceof SessionRemovedError)) {
-        const pending: PendingReservation = {
-          ownerId,
-          sessionId,
-          releaseMutationToken,
-          reserve: tracked,
-        }
-        this.pendingReservations.set(sessionId, pending)
-        yield* Effect.forkDetach(this.observePendingReservation(pending), {
-          startImmediately: true,
-          uninterruptible: false,
-        })
-      }
-      return yield* Effect.failCause(exit.cause)
-    }.bind(this))
-  }
-
-  private observePendingReservation(pending: PendingReservation): Effect.Effect<void> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const reserveExit = pending.reserve.exit ?? (yield* Fiber.await(pending.reserve.fiber))
-      const ownership = yield* this.reservationOwner(pending, reserveExit)
-      if (ownership === undefined) {
-        this.deletePendingReservation(pending)
-        return
-      }
-      pending.ownership = ownership
-      const release = yield* this.pendingReservationRelease(pending, false)
-      const boundedExit = yield* Effect.exit(this.awaitPersistence<void>(release))
-      if (Exit.isFailure(boundedExit) && !release.observedByCaller) {
-        this.reportPendingReservationIssue(
-          pending,
-          `Compensating ownership release timed out for ${pending.sessionId}`,
-          Cause.squash(boundedExit.cause),
-          release,
-        )
-      }
-      const releaseExit = release.exit ?? (yield* Fiber.await(release.fiber))
-      if (Exit.isSuccess(releaseExit)) {
-        this.deletePendingReservation(pending)
-      } else {
-        this.reportPendingReservationIssue(
-          pending,
-          `Unable to compensate late terminal reservation for ${pending.sessionId}`,
-          Cause.squash(releaseExit.cause),
-          release,
-        )
-      }
-    }.bind(this)).pipe(Effect.catchCause((cause) => Effect.sync(() => {
-      this.reportPendingReservationIssue(pending,
-        `Failed terminal reservation remains unresolved for ${pending.sessionId}`,
-        Cause.squash(cause), pending.reserve)
-    })))
-  }
-
-  private reconcilePendingReservation(
-    pending: PendingReservation,
-    retryFailedRelease: boolean,
-  ): Effect.Effect<void, PersistenceError> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const reserveExit = yield* Effect.exit(
-        this.awaitPersistence<
-          PersistedTerminalOwner,
-          PersistenceError | SessionOwnedError | SessionRemovedError
-        >(pending.reserve),
-      )
-      if (Exit.isFailure(reserveExit)) {
-        if (pending.reserve.exit === undefined) {
-          return yield* Effect.failCause(reserveExit.cause as Cause.Cause<PersistenceError>)
-        }
-        const ownership = yield* this.reservationOwner(pending, pending.reserve.exit)
-        if (ownership === undefined) {
-          this.deletePendingReservation(pending)
-          return
-        }
-        pending.ownership = ownership
-      } else pending.ownership = reserveExit.value
-      const release = yield* this.pendingReservationRelease(pending, retryFailedRelease)
-      const releaseExit = yield* Effect.exit(this.awaitPersistence<void, PersistenceError>(release))
-      if (Exit.isFailure(releaseExit)) return yield* Effect.failCause(releaseExit.cause)
-      this.deletePendingReservation(pending)
-    }.bind(this))
-  }
-
-  private reservationOwner(
-    pending: PendingReservation,
-    exit: Exit.Exit<unknown, unknown>,
-  ): Effect.Effect<PersistedTerminalOwner | undefined, PersistenceError> {
-    if (Exit.isSuccess(exit)) return Effect.succeed(exit.value as PersistedTerminalOwner)
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const state = yield* this.boundedPersistence(this.dependencies.ownership.load,
-        "inspect failed terminal reservation", pending.sessionId, { ownerId: pending.ownerId })
-      const owner = state.terminalOwners.find((candidate) => candidate.ownerToken === pending.reserve.mutationToken)
-      if (owner && (owner.sessionId !== pending.sessionId || owner.resources.kind !== "acquiring" ||
-        owner.processGroupId !== undefined || owner.lastMutationToken !== pending.reserve.mutationToken)) {
-        return yield* Effect.fail(new PersistenceError({
-          operation: "inspect failed terminal reservation", path: pending.sessionId,
-          message: "Failed reservation ownership changed before compensation",
-        }))
-      }
-      return owner
-    }.bind(this))
-  }
-
-  private pendingReservationRelease(
-    pending: PendingReservation,
-    retryFailed: boolean,
-  ): Effect.Effect<TrackedPersistence> {
-    const existing = pending.release
-    if (
-      existing !== undefined &&
-      (!retryFailed || existing.exit === undefined || Exit.isSuccess(existing.exit))
-    ) return Effect.succeed(existing)
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const ownership = pending.ownership
-      if (ownership === undefined) {
-        return yield* Effect.die(new Error("Cannot compensate an unresolved terminal reservation"))
-      }
-      const release = yield* this.trackPersistence(
-        Effect.suspend(() => this.dependencies.ownership.release(ownership, {
-          mutationToken: pending.releaseMutationToken,
-        })),
-        "compensate late terminal reservation",
-        pending.sessionId,
-        {
-          ownerId: pending.ownerId,
-          mutationToken: pending.releaseMutationToken,
-          mutationStage: "release",
-        },
-      )
-      pending.release = release
-      return release
-    }.bind(this))
-  }
-
-  private deletePendingReservation(pending: PendingReservation): void {
-    if (this.pendingReservations.get(pending.sessionId) !== pending) return
-    this.pendingReservations.delete(pending.sessionId)
-    this.clearPersistenceOwner(pending.ownerId)
-  }
-
-  private reportPendingReservationIssue(
-    pending: PendingReservation,
-    message: string,
-    cause: unknown,
-    tracked: TrackedPersistence,
-  ): void {
-    if (tracked.reported) return
-    tracked.reported = true
-    this.reportCleanupError(new TerminalCleanupError({
-      operation: "acquire-rollback",
-      issues: [{
-        ownerId: pending.ownerId,
-        sessionId: pending.sessionId,
-        stage: "lease",
-        message,
-        cause,
-      }],
+      const first = sample("sample")
+      if (first.activity !== undefined || first.issue === "observer-failed") return first
+      yield* Effect.sleep(ACTIVITY_CONFIRMATION_DELAY_MS)
+      return usable() ? sample("confirm") : undefined
     }))
   }
-
-  private drainOwnerPersistence(owner: TerminalOwner): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return this.drainPersistence(owner.ownerId, owner.sessionId).pipe(
-      Effect.map((issues) => issues.map((issue) => this.issue(
-        owner,
-        "lease",
-        issue.message,
-        issue.cause,
-      ))),
-    )
+  private sessionIds(predicate: (owner: TerminalOwner) => boolean): Effect.Effect<ReadonlySet<string>> {
+    return Effect.sync(() => new Set([...new Set(this.owners.values())].filter(predicate).map((owner) => owner.sessionId)))
   }
-
-  private drainPersistence(
-    ownerId: string,
-    sessionId: string,
-  ): Effect.Effect<readonly TerminalCleanupIssue[]> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const pending = [...this.persistenceFibers].filter((tracked) => tracked.ownerId === ownerId)
-      if (pending.length === 0) return []
-      yield* Effect.interruptible(Effect.all(
-        pending.map((tracked) => Fiber.await(tracked.fiber)),
-        { concurrency: "unbounded" },
-      )).pipe(Effect.timeoutOrElse({
-        duration: this.persistenceTimeoutMs,
-        orElse: () => Effect.void,
-      }))
-      const unresolved = [...this.persistenceFibers].filter((tracked) => tracked.ownerId === ownerId)
-      if (unresolved.length === 0) return []
-      return [{
-        ownerId,
-        sessionId,
-        stage: "lease" as const,
-        message: `Persistence cleanup remains unresolved for ${sessionId}: ${unresolved.map((tracked) =>
-          tracked.operation).join(", ")}`,
-      }]
-    }.bind(this))
+  private untilCancelled<A, E>(effect: Effect.Effect<A, E>, cancelled: Deferred.Deferred<void>): Effect.Effect<A, E | TerminalError> {
+    return Effect.raceFirst(effect, Effect.raceFirst(Deferred.await(this.stopping), Deferred.await(cancelled)).pipe(
+      Effect.andThen(Effect.fail(this.error("acquire", "", "Terminal operation cancelled by stop or shutdown")))))
   }
-
-  private boundedPersistence<A, E>(
-    effect: Effect.Effect<A, E>,
-    operation: string,
-    sessionId: string,
-    tracking: PersistenceTracking = {},
-    mode: "productive" | "cleanup" = "cleanup",
-  ): Effect.Effect<A, E | PersistenceError> {
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const tracked = yield* this.trackPersistence(effect, operation, sessionId, tracking)
-      return yield* this.awaitPersistence<A, E>(tracked, mode)
-    }.bind(this))
+  private bounded<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E | Error> {
+    return Effect.interruptible(effect).pipe(Effect.timeoutOrElse({ duration: this.closeMs, orElse: () => Effect.fail(new Error("Resource cleanup timed out")) }))
   }
-
-  private trackPersistence<A, E>(
-    effect: Effect.Effect<A, E>,
-    operation: string,
-    sessionId: string,
-    tracking: PersistenceTracking,
-  ): Effect.Effect<TrackedPersistence> {
-    const mutationKey = tracking.mutationToken === undefined
-      ? undefined
-      : `${tracking.mutationStage ?? operation}:${tracking.mutationToken}`
-    const existing = mutationKey === undefined
-      ? undefined
-      : this.persistenceMutations.get(mutationKey)
-    if (existing !== undefined && (existing.exit === undefined || Exit.isSuccess(existing.exit))) {
-      return Effect.succeed(existing)
-    }
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-      const fiber = yield* Effect.forkDetach(effect, {
-        startImmediately: true,
-        uninterruptible: false,
-      })
-      const tracked: TrackedPersistence = {
-        fiber: fiber as Fiber.Fiber<unknown, unknown>,
-        operation,
-        sessionId,
-        ...tracking,
-        ...(mutationKey === undefined ? {} : { mutationKey }),
-        abandoned: false,
-        observedByCaller: false,
-        reported: false,
-      }
-      this.persistenceFibers.add(tracked)
-      if (mutationKey !== undefined) {
-        this.persistenceMutations.set(mutationKey, tracked)
-      }
-      fiber.addObserver((exit) => {
-        tracked.exit = exit as Exit.Exit<unknown, unknown>
-        this.persistenceFibers.delete(tracked)
-        if (
-          Exit.isFailure(exit) &&
-          tracked.mutationKey !== undefined &&
-          this.persistenceMutations.get(tracked.mutationKey) === tracked
-        ) this.persistenceMutations.delete(tracked.mutationKey)
-        this.reportAbandonedPersistenceFailure(tracked)
-      })
-      return tracked
-    }.bind(this))
+  private failureOutput(owner: TerminalOwner): string {
+    let details: string | undefined
+    this.ignore(() => { details = owner.failureDetails?.()?.slice(-8 * 1_024) })
+    return [owner.process.outputTail, details].filter(Boolean).join("\n\n")
   }
-
-  private awaitPersistence<A, E = unknown>(
-    tracked: TrackedPersistence,
-    mode: "productive" | "cleanup" = "cleanup",
-  ): Effect.Effect<A, E | PersistenceError> {
-    const timeoutMs = mode === "productive" ? this.launchPersistenceTimeoutMs : this.persistenceTimeoutMs
-    const owner = tracked.ownerId === undefined ? undefined : this.owners.get(tracked.ownerId)
-    const shutdownStarted = () => mode === "productive" && (this.shuttingDown || owner?.cleanupStarted === true)
-    const launch = [...this.launches.values()].find((candidate) => candidate.ownerId === tracked.ownerId)
-    const awaited = tracked.exit === undefined
-      ? withOperationTimeout(Effect.interruptible(Fiber.await(tracked.fiber)).pipe(
-        Effect.map((exit): { readonly _tag: "Completed"; readonly exit: Exit.Exit<unknown, unknown> } |
-          { readonly _tag: "TimedOut" } => ({ _tag: "Completed", exit })),
-      ), timeoutMs, () => Effect.succeed({ _tag: "TimedOut" as const }))
-      : Effect.succeed({ _tag: "Completed" as const, exit: tracked.exit })
-    return Effect.gen(function* (this: TerminalSupervisorImpl) {
-        const ownerCancellation = owner === undefined ? Deferred.await(this.shutdownRequested)
-          : Effect.raceFirst(Deferred.await(this.shutdownRequested), Deferred.await(owner.cleanupRequested))
-        const cancellation = launch === undefined ? ownerCancellation
-          : Effect.raceFirst(ownerCancellation, Deferred.await(launch.cancelled))
-        const result = yield* (mode === "productive"
-          ? Effect.raceFirst(awaited, cancellation.pipe(
-              Effect.as({ _tag: "Shutdown" as const }),
-            ))
-          : awaited)
-        if (result._tag === "Shutdown" || shutdownStarted()) {
-          return yield* Effect.fail(new PersistenceError({
-            operation: tracked.operation,
-            path: tracked.sessionId,
-            message: `${tracked.operation} cancelled during ${this.shuttingDown ? "shutdown" : "terminal cleanup"} for ${tracked.sessionId}`,
-          }))
-        }
-        if (result._tag === "TimedOut") {
-          return yield* Effect.fail(new PersistenceError({
-            operation: tracked.operation,
-            path: tracked.sessionId,
-            message: `${tracked.operation} timed out after ${timeoutMs}ms for ${tracked.sessionId}` +
-              (tracked.progress?.phase === undefined ? "" : ` (phase: ${tracked.progress.phase})`),
-          }))
-        }
-        tracked.observedByCaller = true
-        if (Exit.isFailure(result.exit)) {
-          return yield* Effect.failCause(result.exit.cause as Cause.Cause<E>)
-        }
-        return result.exit.value as A
-      }.bind(this)).pipe(Effect.onExit((exit) => Effect.sync(() => {
-        if (Exit.isFailure(exit) && !tracked.observedByCaller) {
-          tracked.abandoned = true
-          this.reportAbandonedPersistenceFailure(tracked)
-        }
-      })))
+  private attempt<A>(operation: string, sessionId: string, run: () => A): Effect.Effect<A, TerminalError> {
+    return Effect.try({ try: run, catch: (cause) => this.error(operation, sessionId, cause instanceof Error ? cause.message : String(cause), cause) })
   }
-
-  private reportAbandonedPersistenceFailure(tracked: TrackedPersistence): void {
-    if (
-      tracked.reported ||
-      !tracked.abandoned ||
-      tracked.exit === undefined ||
-      Exit.isSuccess(tracked.exit) ||
-      Cause.hasInterruptsOnly(tracked.exit.cause)
-    ) return
-    tracked.reported = true
-    this.reportCleanupError(new TerminalCleanupError({
-      operation: "shutdown",
-      issues: [{
-        ownerId: "terminal-supervisor",
-        sessionId: tracked.sessionId,
-        stage: "lease",
-        message: `${tracked.operation} failed after its caller stopped waiting`,
-        cause: Cause.squash(tracked.exit.cause),
-      }],
-    }))
+  private error(operation: string, sessionId: string, message: string, cause?: unknown): TerminalError {
+    return new TerminalError({ operation, sessionId, message, ...(cause === undefined ? {} : { cause }) })
   }
-
-  private acceptsTerminalData(owner: TerminalOwner): boolean {
-    if (owner.uiReleased || owner.cleanupStarted) return false
-    const entry = this.ledger.get(owner.sessionId)
-    return entry === undefined || (entry.ownerId === owner.ownerId && entry.state === "running")
+  private cleanupFailure(operation: TerminalCleanupError["operation"], sessionId: string, cause: unknown): TerminalCleanupError {
+    return cause instanceof TerminalCleanupError ? cause : new TerminalCleanupError({ operation,
+      issues: [{ ownerId: "terminal-supervisor", sessionId, stage: "runtime", message: "Terminal cleanup failed", cause }] })
   }
-
-  private isRunningOwner(owner: TerminalOwner): boolean {
-    const entry = this.ledger.get(owner.sessionId)
-    return this.owners.get(owner.ownerId) === owner &&
-      entry?.ownerId === owner.ownerId &&
-      entry.state === "running"
-  }
-
-  private cleanupErrorFromCause(
-    operation: TerminalCleanupError["operation"],
-    cause: unknown,
-  ): TerminalCleanupError {
-    if (cause instanceof TerminalCleanupError) return cause
-    return new TerminalCleanupError({
-      operation,
-      issues: [{
-        ownerId: "terminal-supervisor",
-        sessionId: "",
-        stage: "verify",
-        message: "Unexpected terminal cleanup failure",
-        cause,
-      }],
-    })
-  }
-
-  private transitionErrorFromCause(
-    sessionId: string,
-    cause: Cause.Cause<unknown>,
-  ): TerminalSessionTransitionErrorEvent["error"] {
-    const error = Cause.squash(cause)
-    if (error instanceof TerminalError || error instanceof ProviderProtocolError) return error
-    if (!cause.reasons.some(Cause.isDieReason) && isTerminalTransitionError(error)) return error
-    return new TerminalError({
-      operation: "native-session-transition",
-      sessionId,
-      message: `Unexpected terminal session transition failure for ${sessionId}`,
-      cause: error,
-    })
-  }
-
-  private ignoreCallback(run: () => void): void {
-    try {
-      run()
-    } catch {
-      // External callbacks must not alter terminal lifecycle state.
-    }
-  }
-
-  private issue(
-    owner: TerminalOwner,
-    stage: TerminalCleanupIssue["stage"],
-    message: string,
-    cause?: unknown,
-  ): TerminalCleanupIssue {
-    return {
-      ownerId: owner.ownerId,
-      sessionId: owner.sessionId,
-      stage,
-      message,
-      ...(cause === undefined ? {} : { cause }),
-    }
-  }
-
-  private reportHerdr(activity: AgentActivity): void {
-    try {
-      this.herdr.report(activity)
-    } catch {
-      // Reporting is optional and must never alter terminal ownership.
-    }
-  }
+  reportCleanupError(error: TerminalCleanupError): void { this.ignore(() => this.events.onCleanupError?.(error)) }
+  private ignore(run: () => void): void { try { run() } catch { /* External callbacks cannot change lifecycle outcomes. */ } }
 }
 
-function isTerminalTransitionError(
-  error: unknown,
-): error is TerminalSessionTransitionErrorEvent["error"] {
-  if (typeof error !== "object" || error === null || !("_tag" in error)) return false
-  return [
-    "TerminalError",
-    "ProviderError",
-    "ProviderProtocolError",
-    "PersistenceError",
-    "SessionOwnedError",
-    "SessionRemovedError",
-  ].includes(String(error._tag))
-}
-
-function terminalSpawnCleanupError(error: unknown): TerminalSpawnCleanupError | undefined {
-  if (error instanceof TerminalSpawnCleanupError) return error
-  if (error instanceof TerminalError) return terminalSpawnCleanupError(error.cause)
-  if (error instanceof TerminalCleanupError) {
-    for (const issue of error.issues) {
-      const spawnFailure = terminalSpawnCleanupError(issue.cause)
-      if (spawnFailure) return spawnFailure
-    }
-  }
-  return undefined
-}
-
-function validateBranchDerivation(
-  derivation: BranchDerivation,
-  previousSessionId: string,
-  sessionId: string,
-  kind: IdentityTransitionKind,
-): void {
-  if (derivation.childSessionId !== sessionId) {
-    throw new Error("Provider returned branch metadata for a different child session")
-  }
-  if (kind === "native-fork" && derivation.parentSessionId !== previousSessionId) {
-    throw new Error("Native fork metadata does not preserve the source session")
-  }
-  for (const [label, value] of [
-    ["child session ID", derivation.childSessionId],
-    ["parent session ID", derivation.parentSessionId],
-    ["source message ID", derivation.sourceMessageId],
-  ] as const) {
-    if (value.length === 0) throw new Error(`Branch ${label} cannot be empty`)
-  }
-  if (derivation.childSessionId === derivation.parentSessionId) {
-    throw new Error("A branch session cannot be its own parent")
-  }
-  const parentIds = derivation.sharedMessages.map((mapping) => mapping.parentMessageId)
-  const childIds = derivation.sharedMessages.map((mapping) => mapping.childMessageId)
-  if (parentIds.some((id) => id.length === 0) || childIds.some((id) => id.length === 0)) {
-    throw new Error("Shared message IDs cannot be empty")
-  }
-  if (new Set(parentIds).size !== parentIds.length || new Set(childIds).size !== childIds.length) {
-    throw new Error("Shared message mappings must be unique")
-  }
+function validateBranchDerivation(derivation: BranchDerivation, previousSessionId: string, sessionId: string, kind: IdentityTransitionKind): void {
+  if (derivation.childSessionId !== sessionId || (kind === "native-fork" && derivation.parentSessionId !== previousSessionId)) throw new Error("Provider returned branch metadata for different sessions")
+  if (!derivation.parentSessionId || !derivation.childSessionId || !derivation.sourceMessageId || derivation.parentSessionId === derivation.childSessionId) throw new Error("Invalid branch session identity")
+  const parents = derivation.sharedMessages.map((entry) => entry.parentMessageId)
+  const children = derivation.sharedMessages.map((entry) => entry.childMessageId)
+  if (parents.some((id) => !id) || children.some((id) => !id) || new Set(parents).size !== parents.length || new Set(children).size !== children.length) throw new Error("Invalid shared message mappings")
 }

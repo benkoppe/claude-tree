@@ -42,7 +42,6 @@ import {
 } from "../../src/domain/model"
 import type {
   BranchRelation,
-  PendingIdentityAdoption,
   ProjectState,
 } from "../../src/domain/persistence"
 import {
@@ -60,6 +59,23 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  test("duplicate-session warning can be cancelled or explicitly bypassed", async () => {
+    const fixture = makeFixture()
+    const terminals: TerminalSupervisorApi = {
+      ...fixture.options.terminals,
+      show: (prepared) => prepared.allowDuplicate ? fixture.options.terminals.show(prepared)
+        : Effect.fail(new SessionOwnedError({ providerId: "test", sessionId: prepared.session.id, ownerPid: 202 })),
+    }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals })
+      expect(Exit.isFailure(yield* Effect.exit(runtime.resumeSession(ROOT)))).toBeTrue()
+      expect((yield* runtime.getState).modal).toEqual({ _tag: "ConfirmOpenSession", sessionId: ROOT, ownerPid: 202 })
+      yield* runtime.closeModal
+      expect((yield* runtime.getState).terminals.has(ROOT)).toBeFalse()
+      yield* runtime.resumeSession(ROOT, true)
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: ROOT })
+    })))
+  })
   for (const { target, streaming } of (["wrapped identifier", "unknown", "unreadable", "duplicate"] as const).flatMap((target) =>
     (target === "wrapped identifier" ? [false] : [false, true]).map((streaming) => ({ target, streaming })))) {
     test(`SDK-backed native fork rewind reconciles a ${target} target before the replacement answer (streaming: ${streaming})`, async () => {
@@ -945,10 +961,8 @@ describe("application actor", () => {
     })
   })
 
-  test("buffers one owner transition while another owner continues", async () => {
+  test("one owner transition does not block another owner's observations", async () => {
     const fixture = makeFixture()
-    const ackStarted = Deferred.makeUnsafe<void>()
-    const ackRelease = Deferred.makeUnsafe<void>()
     let metadataUpdates = 0
     const metadata = {
       ...fixture.options.metadata,
@@ -956,11 +970,6 @@ describe("application actor", () => {
         metadataUpdates += 1
         return fixture.options.metadata.updateMetadata(transform)
       },
-      ack: (token: string) => Effect.gen(function*() {
-        fixture.acked.push(token)
-        yield* Deferred.succeed(ackStarted, undefined)
-        yield* Deferred.await(ackRelease)
-      }),
     }
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
@@ -983,17 +992,15 @@ describe("application actor", () => {
         relation: relation("adopted", ROOT),
       })
       expect(accepted).toBeTrue()
-      yield* Deferred.await(ackStarted)
+      yield* Deferred.await(acknowledgment)
       const buffered = yield* Effect.forkScoped(
         runtime.handleTerminalActivity(activity("owner-1", 2, "adopted", "working")),
       )
       expect(yield* runtime.handleTerminalActivity(activity("owner-2", 1, CHILD, "blocked"))).toBeTrue()
       expect((yield* runtime.getState).terminals.get(CHILD)?.activity).toBe("blocked")
       expect((yield* runtime.getState).terminals.has("adopted")).toBeTrue()
-      expect(Option.isNone(yield* Deferred.poll(acknowledgment))).toBeTrue()
       expect(metadataUpdates).toBe(updatesBeforeTransition)
 
-      yield* Deferred.succeed(ackRelease, undefined)
       yield* Deferred.await(acknowledgment)
       expect(yield* Fiber.join(buffered)).toBeTrue()
       return yield* runtime.getState
@@ -1003,7 +1010,6 @@ describe("application actor", () => {
     expect(state.provider.sessions.has(ROOT)).toBeTrue()
     expect(state.local.sessions.has("adopted")).toBeTrue()
     expect(state.relations).toContainEqual(relation("adopted", ROOT))
-    expect(fixture.acked).toContain("adoption")
   })
 
   test("uses the terminal transition kind instead of inferring it from local temporary IDs", async () => {
@@ -1307,12 +1313,10 @@ describe("application actor", () => {
     })
   }
 
-  test("fails the terminal barrier when adoption acknowledgment fails", async () => {
+  test("acknowledges a projected identity without a persistence journal", async () => {
     const fixture = makeFixture()
-    const failure = persistenceFailure("ack failed")
-    const metadata = { ...fixture.options.metadata, ack: () => Effect.fail(failure) }
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
+      const runtime = yield* makeAppRuntime(fixture.options)
       yield* runtime.resumeSession(ROOT)
       const acknowledgment = yield* Deferred.make<void, unknown>()
       const accepted = yield* runtime.handleTerminalSessionChanged({
@@ -1329,24 +1333,15 @@ describe("application actor", () => {
       return { accepted, barrier, state: yield* runtime.getState }
     })))
     expect(result.accepted).toBeTrue()
-    expect(Exit.isFailure(result.barrier)).toBeTrue()
+    expect(Exit.isSuccess(result.barrier)).toBeTrue()
     expect(result.state.terminals.has("adopted")).toBeTrue()
-    expect(result.state.modal).toEqual({
-      _tag: "Error",
-      message: "Acknowledge session identity: ack failed",
-    })
+    expect(result.state.modal).toBeNull()
   })
 
-  test("contains a synchronous adoption acknowledgment defect and drains the owner", async () => {
+  test("drains owner events after acknowledging an identity projection", async () => {
     const fixture = makeFixture()
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      ack: () => {
-        throw new Error("ack constructor defect")
-      },
-    }
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
+      const runtime = yield* makeAppRuntime(fixture.options)
       yield* runtime.resumeSession(ROOT)
       const acknowledgment = yield* Deferred.make<void, unknown>()
       const accepted = yield* runtime.handleTerminalSessionChanged({
@@ -1365,10 +1360,10 @@ describe("application actor", () => {
     })))
 
     expect(result.accepted).toBeTrue()
-    expect(Exit.isFailure(result.barrier)).toBeTrue()
+    expect(Exit.isSuccess(result.barrier)).toBeTrue()
     expect(result.later).toBeTrue()
     expect(result.state.terminals.get("adopted")?.activity).toBe("working")
-    expect(result.state.modal?._tag === "Error" ? result.state.modal.message : "").toContain("ack constructor defect")
+    expect(result.state.modal).toBeNull()
   })
 
   test("fails a defective transition projection without terminating the actor", async () => {
@@ -1450,31 +1445,21 @@ describe("application actor", () => {
     expect(Exit.isFailure(result.barrier)).toBeTrue()
   })
 
-  test("applies a queued identity acknowledgment completion before shutdown", async () => {
+  test("applies an identity projection acknowledgment before shutdown", async () => {
     const fixture = makeFixture()
     const acknowledgment = Deferred.makeUnsafe<void, unknown>()
-    const metadataAcknowledged = Deferred.makeUnsafe<void>()
-    let journalPresent = true
     let terminalReleased = false
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      ack: () => Effect.gen(function*() {
-        journalPresent = false
-        yield* Deferred.succeed(metadataAcknowledged, undefined)
-      }),
-    }
     const terminals: TerminalSupervisorApi = {
       ...fixture.options.terminals,
       shutdown: () => Effect.gen(function*() {
         fixture.shutdowns += 1
         yield* Deferred.await(acknowledgment).pipe(Effect.orDie)
-        if (journalPresent) return yield* Effect.die("identity journal was not removed")
         terminalReleased = true
       }),
     }
 
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata, terminals })
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals })
       yield* runtime.resumeSession(ROOT)
       const accepted = yield* runtime.handleTerminalSessionChanged({
         ownerId: "owner-1",
@@ -1486,9 +1471,7 @@ describe("application actor", () => {
         wasActive: true,
         acknowledgment,
       })
-      yield* Deferred.await(metadataAcknowledged)
-      expect(journalPresent).toBeFalse()
-      expect(Option.isNone(yield* Deferred.poll(acknowledgment))).toBeTrue()
+      yield* Deferred.await(acknowledgment)
 
       const shutdown = yield* Effect.exit(runtime.shutdown)
       return {
@@ -1504,212 +1487,6 @@ describe("application actor", () => {
     expect(Exit.isSuccess(result.barrier)).toBeTrue()
     expect(terminalReleased).toBeTrue()
     expect(result.state.shutdown).toBe("stopped")
-    expect(fixture.shutdowns).toBe(1)
-  })
-
-  test("waits for a blocked identity acknowledgment before terminal shutdown", async () => {
-    const fixture = makeFixture()
-    const acknowledgment = Deferred.makeUnsafe<void, unknown>()
-    const acknowledgmentStarted = Deferred.makeUnsafe<void>()
-    const releaseAcknowledgment = Deferred.makeUnsafe<void>()
-    const terminalShutdownStarted = Deferred.makeUnsafe<void>()
-    const order: string[] = []
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      ack: () => Effect.gen(function*() {
-        yield* Deferred.succeed(acknowledgmentStarted, undefined)
-        yield* Deferred.await(releaseAcknowledgment)
-        order.push("acknowledged")
-      }),
-    }
-    const terminals: TerminalSupervisorApi = {
-      ...fixture.options.terminals,
-      shutdown: () => Effect.gen(function*() {
-        fixture.shutdowns += 1
-        yield* Deferred.succeed(terminalShutdownStarted, undefined)
-        yield* Deferred.await(acknowledgment).pipe(Effect.orDie)
-        order.push("terminals-shut-down")
-      }),
-    }
-
-    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata, terminals })
-      yield* runtime.resumeSession(ROOT)
-      fixture.adoptOwner(ROOT, "adopted")
-      expect(yield* runtime.handleTerminalSessionChanged({
-        ownerId: "owner-1",
-        sequenceId: 1,
-        previousSessionId: ROOT,
-        session: session("adopted", "Adopted"),
-        kind: "native-fork",
-        adoptionToken: "blocked-during-shutdown",
-        wasActive: true,
-        acknowledgment,
-        relation: {
-          ...relation("adopted", ROOT),
-          sharedMessages: [{ parentMessageId: "q", childMessageId: "cq" }],
-        },
-      })).toBeTrue()
-      yield* Deferred.await(acknowledgmentStarted)
-
-      const shuttingDown = yield* Effect.forkScoped(Effect.exit(runtime.shutdown))
-      yield* waitForState(runtime, (state) => state.shutdown === "shutting-down")
-      expect(Option.isNone(yield* Deferred.poll(terminalShutdownStarted))).toBeTrue()
-      expect(Option.isNone(yield* Deferred.poll(acknowledgment))).toBeTrue()
-      expect(shuttingDown.pollUnsafe()).toBeUndefined()
-
-      yield* Deferred.succeed(releaseAcknowledgment, undefined)
-      return {
-        shutdown: yield* Fiber.join(shuttingDown),
-        barrier: yield* Effect.exit(Deferred.await(acknowledgment)),
-        state: yield* runtime.getState,
-      }
-    })))
-
-    expect(Exit.isSuccess(result.shutdown)).toBeTrue()
-    expect(Exit.isSuccess(result.barrier)).toBeTrue()
-    expect(order).toEqual(["acknowledged", "terminals-shut-down"])
-    expect(result.state.shutdown).toBe("stopped")
-    expect(fixture.shutdowns).toBe(1)
-  })
-
-  test("drains a transition callback admitted immediately before shutdown", async () => {
-    const fixture = makeFixture()
-    const acknowledgment = Deferred.makeUnsafe<void, unknown>()
-    const acknowledgmentStarted = Deferred.makeUnsafe<void>()
-    const releaseAcknowledgment = Deferred.makeUnsafe<void>()
-    const terminalShutdownStarted = Deferred.makeUnsafe<void>()
-    const order: string[] = []
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      ack: () => Effect.gen(function*() {
-        order.push("ack-started")
-        yield* Deferred.succeed(acknowledgmentStarted, undefined)
-        yield* Deferred.await(releaseAcknowledgment)
-        order.push("acknowledged")
-      }),
-    }
-    const terminals: TerminalSupervisorApi = {
-      ...fixture.options.terminals,
-      shutdown: () => Effect.gen(function*() {
-        fixture.shutdowns += 1
-        order.push("terminals-shut-down")
-        yield* Deferred.succeed(terminalShutdownStarted, undefined)
-      }),
-    }
-
-    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata, terminals })
-      yield* runtime.resumeSession(ROOT)
-      fixture.adoptOwner(ROOT, "adopted")
-      const activityObserved = yield* Effect.forkScoped(
-        runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", true)),
-        { startImmediately: true },
-      )
-      const changing = yield* Effect.forkScoped(runtime.handleTerminalSessionChanged({
-        ownerId: "owner-1",
-        sequenceId: 2,
-        previousSessionId: ROOT,
-        session: session("adopted", "Adopted"),
-        kind: "native-fork",
-        adoptionToken: "queued-before-shutdown",
-        wasActive: true,
-        acknowledgment,
-        relation: {
-          ...relation("adopted", ROOT),
-          sharedMessages: [{ parentMessageId: "q", childMessageId: "cq" }],
-        },
-      }), { startImmediately: true })
-      const shuttingDown = yield* Effect.forkScoped(Effect.exit(runtime.shutdown), {
-        startImmediately: true,
-      })
-
-      yield* Deferred.await(acknowledgmentStarted)
-      expect(Option.isNone(yield* Deferred.poll(terminalShutdownStarted))).toBeTrue()
-      yield* Deferred.succeed(releaseAcknowledgment, undefined)
-      return {
-        activityAccepted: yield* Fiber.join(activityObserved),
-        accepted: yield* Fiber.join(changing),
-        shutdown: yield* Fiber.join(shuttingDown),
-        barrier: yield* Effect.exit(Deferred.await(acknowledgment)),
-        state: yield* runtime.getState,
-      }
-    })))
-
-    expect(result.activityAccepted).toBeTrue()
-    expect(result.accepted).toBeTrue()
-    expect(Exit.isSuccess(result.shutdown)).toBeTrue()
-    expect(Exit.isSuccess(result.barrier)).toBeTrue()
-    expect(order).toEqual(["ack-started", "acknowledged", "terminals-shut-down"])
-    expect(result.state.local.sessions.has("adopted")).toBeTrue()
-    expect(result.state.shutdown).toBe("stopped")
-    expect(fixture.shutdowns).toBe(1)
-  })
-
-  test("bounds a stuck identity acknowledgment and fails shutdown closed", async () => {
-    const fixture = makeFixture()
-    const acknowledgment = Deferred.makeUnsafe<void, unknown>()
-    const acknowledgmentStarted = Deferred.makeUnsafe<void>()
-    const terminalShutdownStarted = Deferred.makeUnsafe<void>()
-    let terminalObservedFailedBarrier = false
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      ack: () => Effect.gen(function*() {
-        yield* Deferred.succeed(acknowledgmentStarted, undefined)
-        yield* Effect.never
-      }),
-    }
-    const terminals: TerminalSupervisorApi = {
-      ...fixture.options.terminals,
-      shutdown: () => Effect.gen(function*() {
-        fixture.shutdowns += 1
-        yield* Deferred.succeed(terminalShutdownStarted, undefined)
-        terminalObservedFailedBarrier = Exit.isFailure(yield* Effect.exit(Deferred.await(acknowledgment)))
-      }),
-    }
-    let shutdownExit: Exit.Exit<void, ApplicationShutdownError> | undefined
-    let shutdownState: ApplicationState | undefined
-    let barrierExit: Exit.Exit<void, unknown> | undefined
-
-    const scopedExit = await Effect.runPromiseExit(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({
-        ...fixture.options,
-        metadata,
-        terminals,
-        shutdownTransitionTimeoutMs: 100,
-      })
-      yield* runtime.resumeSession(ROOT)
-      fixture.adoptOwner(ROOT, "adopted")
-      const changing = yield* Effect.forkScoped(runtime.handleTerminalSessionChanged({
-        ownerId: "owner-1",
-        sequenceId: 1,
-        previousSessionId: ROOT,
-        session: session("adopted", "Adopted"),
-        kind: "native-fork",
-        adoptionToken: "stuck-during-shutdown",
-        wasActive: true,
-        acknowledgment,
-        relation: {
-          ...relation("adopted", ROOT),
-          sharedMessages: [{ parentMessageId: "q", childMessageId: "cq" }],
-        },
-      }), { startImmediately: true })
-      const shuttingDown = yield* Effect.forkScoped(runtime.shutdown, { startImmediately: true })
-      expect(yield* Fiber.join(changing)).toBeTrue()
-      yield* Deferred.await(acknowledgmentStarted)
-      yield* waitForState(runtime, (state) => state.shutdown === "shutting-down")
-      expect(Option.isNone(yield* Deferred.poll(terminalShutdownStarted))).toBeTrue()
-      yield* TestClock.adjust(100)
-      shutdownExit = yield* Fiber.await(shuttingDown)
-      barrierExit = yield* Effect.exit(Deferred.await(acknowledgment))
-      shutdownState = yield* runtime.getState
-    }).pipe(Effect.provide(TestClock.layer()))))
-
-    expect(Exit.isFailure(scopedExit)).toBeTrue()
-    expect(shutdownExit && Exit.isFailure(shutdownExit)).toBeTrue()
-    expect(barrierExit && Exit.isFailure(barrierExit)).toBeTrue()
-    expect(terminalObservedFailedBarrier).toBeTrue()
-    expect(shutdownState?.shutdown).toBe("cleanup-incomplete")
     expect(fixture.shutdowns).toBe(1)
   })
 
@@ -2751,11 +2528,10 @@ describe("application actor", () => {
     expect(fixture.shutdowns).toBe(1)
   })
 
-  test("projects current-instance pending adoptions before acknowledging startup", async () => {
+  test("restores a saved graph destination without identity recovery", async () => {
     const fixture = makeFixture()
     const adopted = "adopted"
     const adoptedRelation = relation(adopted, ROOT)
-    const adoption = pendingAdoption("startup-adoption", ROOT, adopted, adoptedRelation)
     const order: string[] = []
     const projectState: ProjectState = {
       relations: [adoptedRelation],
@@ -2780,8 +2556,6 @@ describe("application actor", () => {
     const metadata: ApplicationMetadataFacet = {
       ...fixture.options.metadata,
       loadMetadata: Effect.succeed(projectState),
-      pendingAdoptions: Effect.succeed([adoption]),
-      ack: (token) => Effect.sync(() => order.push(`ack:${token}`)),
     }
 
     const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -2789,7 +2563,7 @@ describe("application actor", () => {
       return yield* runtime.getState
     })))
 
-    expect(order).toEqual(["snapshot", "ack:startup-adoption"])
+    expect(order).toEqual(["snapshot"])
     expect(state.provider.sessions.has(adopted)).toBeTrue()
     expect(state.relations).toContainEqual(adoptedRelation)
     expect(state.surface).toMatchObject({
@@ -2835,73 +2609,6 @@ describe("application actor", () => {
       familySessionId: ROOT,
     })
     expect(metadataState.navigation).toMatchObject({ view: "graph", familySessionId: ROOT })
-  })
-
-  test("reports and preserves a pending adoption absent from the startup snapshot", async () => {
-    const fixture = makeFixture()
-    const acked: string[] = []
-    const adoption = pendingAdoption("missing-adoption", ROOT, "missing")
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      pendingAdoptions: Effect.succeed([adoption]),
-      ack: (token) => Effect.sync(() => acked.push(token)),
-    }
-    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
-      return yield* waitForState(runtime, (candidate) => candidate.modal?._tag === "Error")
-    })))
-    expect(acked).toEqual([])
-    expect(state.modal?._tag === "Error" ? state.modal.message : "").toContain(
-      "absent from the provider snapshot",
-    )
-  })
-
-  test("surfaces current-instance startup acknowledgment failures in actor state", async () => {
-    const fixture = makeFixture()
-    const adopted = "adopted"
-    const adoption = pendingAdoption("failing-adoption", ROOT, adopted)
-    fixture.snapshot = snapshot(
-      [session(ROOT, "Root"), session(adopted, "Adopted")],
-      new Map([[ROOT, []], [adopted, []]]),
-    )
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      pendingAdoptions: Effect.succeed([adoption]),
-      ack: () => Effect.fail(persistenceFailure("startup ack failed")),
-    }
-    const state = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
-      return yield* waitForState(runtime, (candidate) =>
-        candidate.modal?._tag === "Error" && candidate.modal.message.includes("startup ack failed"))
-    })))
-    expect(state.modal?._tag === "Error" ? state.modal.message : "").toContain("startup ack failed")
-  })
-
-  test("reconciles reported foreign orphan journals before provider startup", async () => {
-    const fixture = makeFixture()
-    const orphan = pendingAdoption("orphan", ROOT, CHILD)
-    const order: string[] = []
-    const metadata: ApplicationMetadataFacet = {
-      ...fixture.options.metadata,
-      orphanedAdoptions: Effect.sync(() => {
-        order.push("list-orphans")
-        return [orphan]
-      }),
-      reconcileOrphanedAdoption: (token) => Effect.sync(() => {
-        order.push(`reconcile:${token}`)
-      }),
-    }
-    const provider: AgentProviderApi = {
-      ...fixture.options.provider,
-      loadSessionSnapshot: Effect.sync(() => {
-        order.push("snapshot")
-        return fixture.snapshot
-      }),
-    }
-    await Effect.runPromise(Effect.scoped(
-      makeAppRuntime({ ...fixture.options, metadata, provider }),
-    ))
-    expect(order.slice(0, 3)).toEqual(["list-orphans", "reconcile:orphan", "snapshot"])
   })
 
   test("subtree removal selects and persists the nearest surviving parent", async () => {
@@ -3004,8 +2711,6 @@ describe("application actor", () => {
     const fixture = makeFixture()
     const staleStopStarted = Deferred.makeUnsafe<void>()
     const releaseStaleStop = Deferred.makeUnsafe<void>()
-    const acknowledgmentStarted = Deferred.makeUnsafe<void>()
-    const releaseAcknowledgment = Deferred.makeUnsafe<void>()
     const persisted = "persisted"
     const order: string[] = []
     let committedRemoval: ProjectState["removals"][number] | undefined
@@ -3023,11 +2728,6 @@ describe("application actor", () => {
     }
     const metadata: ApplicationMetadataFacet = {
       ...fixture.options.metadata,
-      ack: () => Effect.gen(function*() {
-        yield* Deferred.succeed(acknowledgmentStarted, undefined)
-        yield* Deferred.await(releaseAcknowledgment)
-        order.push("acknowledged")
-      }),
       commitRemoval: (removal, affectedSessionIds) => Effect.sync(() => {
         order.push("committed")
         committedRemoval = removal
@@ -3059,19 +2759,14 @@ describe("application actor", () => {
         wasActive: true,
         acknowledgment,
       })).toBeTrue()
-      yield* Deferred.await(acknowledgmentStarted)
+      yield* Deferred.await(acknowledgment)
       yield* Deferred.succeed(releaseStaleStop, undefined)
       yield* TestClock.adjust(0)
-      expect(order).toEqual(["stop:temporary"])
-      expect(removing.pollUnsafe()).toBeUndefined()
-
-      yield* Deferred.succeed(releaseAcknowledgment, undefined)
-      yield* Deferred.await(acknowledgment)
       yield* Fiber.join(removing)
       return yield* runtime.getState
     }).pipe(Effect.provide(TestClock.layer()))))
 
-    expect(order).toEqual(["stop:temporary", "acknowledged", "committed"])
+    expect(order).toEqual(["stop:temporary", "committed"])
     expect(fixture.calls.filter((call) => call.startsWith("stop:"))).toEqual(["stop:temporary"])
     expect(committedRemoval).toEqual({
       ...removal,
@@ -3161,11 +2856,7 @@ describe("application actor", () => {
         mutationTokens.push(mutationToken ?? "")
         expect(affectedSessionIds).toEqual([ROOT, CHILD])
         expect(fixture.calls).toContain("stop:root")
-        return Effect.fail(new SessionOwnedError({
-          providerId: "test",
-          sessionId: CHILD,
-          ownerPid: 202,
-        }))
+        return Effect.fail(persistenceFailure("Removal write failed"))
       },
     }
 
@@ -3185,10 +2876,7 @@ describe("application actor", () => {
       const error = Exit.findErrorOption(result.exit).pipe(Option.getOrThrow)
       expect(error).toBeInstanceOf(RemovalOperationError)
       expect((error as RemovalOperationError).stoppedSessionIds).toEqual([ROOT])
-      expect((error as RemovalOperationError).cause).toBeInstanceOf(SessionOwnedError)
-      expect(String((error as RemovalOperationError).cause)).toContain(CHILD)
-      expect(String((error as RemovalOperationError).cause)).toContain("PID 202")
-      expect(String((error as RemovalOperationError).cause)).toContain("already owned")
+      expect((error as RemovalOperationError).cause).toBeInstanceOf(PersistenceError)
     }
     expect(mutationTokens).toHaveLength(1)
     expect(mutationTokens[0]).not.toBe("")
@@ -3289,7 +2977,7 @@ describe("application actor", () => {
       const fixture = makeFixture()
       const lockFailure = new Error("state lock timed out")
       const terminalFailure = new TerminalCleanupError({ operation: "shutdown", issues: [
-        { ownerId: "owner-1", sessionId: ROOT, stage: "lease", message: "Unable to release ownership", cause: lockFailure },
+        { ownerId: "owner-1", sessionId: ROOT, stage: "guard", message: "Unable to release ownership", cause: lockFailure },
         { ownerId: "owner-2", sessionId: CHILD, stage: "verify", message: "Process group 123 did not stop" },
       ] })
       const navigationFailure = new PersistenceError({ operation: "save navigation", path: "/state", message: "navigation save failed" })
@@ -3320,7 +3008,7 @@ describe("application actor", () => {
       expect(failure).toBeInstanceOf(ApplicationShutdownError)
       expect(output).toHaveLength(1)
       expect(output[0]).toStartWith(`${PROGRAM_NAME}: Application shutdown failed: `)
-      expect(output[0]).toContain(`session ${ROOT} [lease]: Unable to release ownership`)
+      expect(output[0]).toContain(`session ${ROOT} [guard]: Unable to release ownership`)
       expect(output[0]).toContain(`session ${CHILD} [verify]: Process group 123 did not stop`)
       expect(output[0]?.split("state lock timed out")).toHaveLength(2)
       expect(terminalFailure.issues[0]?.cause).toBe(lockFailure)
@@ -3589,7 +3277,6 @@ interface Fixture {
   options: Parameters<typeof makeAppRuntime>[0]
   readonly calls: string[]
   readonly incrementalReads: string[][]
-  readonly acked: string[]
   snapshot: AgentSessionSnapshot
   branchOutcome: BranchOutcome
   fullSnapshot: () => Effect.Effect<AgentSessionSnapshot, ProviderError>
@@ -3601,7 +3288,6 @@ interface Fixture {
 function makeFixture(): Fixture {
   const calls: string[] = []
   const incrementalReads: string[][] = []
-  const acked: string[] = []
   const owned = new Map<string, string>()
   let activeSessionId: string | null = null
   let state: ProjectState = { relations: [], removals: [] }
@@ -3610,7 +3296,6 @@ function makeFixture(): Fixture {
     options: undefined as never,
     calls,
     incrementalReads,
-    acked,
     snapshot: snapshot(
       [session(ROOT, "Root"), session(CHILD, "Child")],
       new Map([
@@ -3653,12 +3338,6 @@ function makeFixture(): Fixture {
         state = { ...state, removals: [...state.removals, removal] }
       }
       return removal
-    }),
-    pendingAdoptions: Effect.succeed([]),
-    orphanedAdoptions: Effect.succeed([]),
-    reconcileOrphanedAdoption: () => Effect.void,
-    ack: (token) => Effect.sync(() => {
-      acked.push(token)
     }),
   }
   const provider: AgentProviderApi = {
@@ -3804,26 +3483,6 @@ function relation(childSessionId: string, parentSessionId: string): BranchRelati
     sourceMessageId: "q",
     sharedMessages: [],
     createdAt: "2026-09-01T00:00:00.000Z",
-  }
-}
-
-function pendingAdoption(
-  adoptionToken: string,
-  previousSessionId: string,
-  sessionId: string,
-  adoptionRelation?: BranchRelation,
-): PendingIdentityAdoption {
-  return {
-    adoptionToken,
-    kind: "native-fork",
-    instanceId: "instance",
-    ownerToken: `owner:${adoptionToken}`,
-    ownerPid: 1,
-    processGroupId: 1,
-    previousSessionId,
-    sessionId,
-    createdAt: "2026-09-01T00:00:00.000Z",
-    ...(adoptionRelation === undefined ? {} : { relation: adoptionRelation }),
   }
 }
 

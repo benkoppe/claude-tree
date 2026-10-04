@@ -16,6 +16,7 @@ import type { TerminalProcess, TerminalProcessCallbacks, TerminalRenderer } from
 import { makeProviderStateRepository } from "../../src/services/provider-state-repository"
 import type { ProviderTerminalEvent } from "../../src/services/provider"
 import { makeTerminalSupervisor, type TerminalActivityEvent } from "../../src/services/terminal-supervisor"
+import { makeSessionGuard } from "../../src/infrastructure/session-guard"
 import { stopTestServer } from "./helpers/stop-test-server"
 
 test("agent management replay: hidden completion, stale evidence, and verified durable owner release", async () => {
@@ -27,11 +28,7 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       const repository = yield* makeProviderStateRepository({
         projectDirectory: directory, providerId: "codex", stateHome: join(directory, "state"),
         instanceId: "replay",
-      }).pipe(Effect.provideService(PersistencePlatform, {
-        ...nativePersistencePlatform,
-        processGroupLiveness: async (group) =>
-          (group === 42002 ? !providerClosed : pty.isGroupAlive()) ? "alive" : "absent",
-      }))
+      }).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform))
       let connected = yield* Deferred.make<Bun.ServerWebSocket<undefined>>()
       const upstreamClients = new Set<Bun.ServerWebSocket<undefined>>()
       const upstream = Bun.serve<undefined>({
@@ -102,7 +99,7 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       let app!: AppRuntime
       const activities: TerminalActivityEvent[] = []
       const supervisor = yield* makeTerminalSupervisor({
-        renderer, ownership: repository,
+        renderer, metadata: repository, guard: makeSessionGuard(repository.statePath, "codex"),
         processes: { spawn(launch, _dimensions, callbacks) {
           expect(launch.cwd).toBe(directory)
           expect(launch.command).toContain("resume")
@@ -121,9 +118,8 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       app = yield* makeAppRuntime({ provider, metadata: repository, terminals: supervisor, completionDelaysMs: [0] })
       yield* app.enterRoot("root")
       yield* app.resumeSession("root")
-      const owner = (yield* repository.load).terminalOwners[0]!
-      expect(owner).toMatchObject({ sessionId: "root", status: "running", processGroupId: pty.pid,
-        resources: { kind: "codex", sidecarProcessGroupId: 42002 } })
+      const owner = (yield* supervisor.ownershipSnapshot)[0]!
+      expect(owner).toMatchObject({ sessionId: "root", state: "running", processGroupId: pty.pid })
       yield* app.returnFromTerminal
       yield* settled(app)
       expect(yield* supervisor.activeSessionId).toBeNull()
@@ -199,7 +195,7 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       yield* replay("turn/completed", "root", "two", "completed")
       yield* settled(app)
       expect(reads).toBe(readsBeforeDuplicate)
-      expect((yield* repository.load).terminalOwners[0]?.ownerToken).toBe(owner.ownerToken)
+      expect((yield* supervisor.ownershipSnapshot)[0]?.ownerId).toBe(owner.ownerId)
 
       // Reconnect misses a start frame; new-connection evidence cannot be vetoed
       // by the previous connection's settled or active-turn correlation.
@@ -228,18 +224,18 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       yield* replay("turn/completed", "root", "three", "completed")
       yield* until(app, (state) => previews(state).includes("Answer three") && state.pendingCompletions.size === 0)
 
-      // Signaling alone is not release: keep the durable owner until exit verification settles.
+      // Keep the runtime owner and its guard until exit verification settles.
       const verifying = yield* Deferred.make<void>()
       const verified = yield* Deferred.make<void>()
       pty.verification = { entered: verifying, release: verified }
       const stopping = yield* Effect.forkChild(app.stopSession("root"))
       yield* Deferred.await(verifying)
-      const stoppingOwner = (yield* repository.load).terminalOwners[0]
+      const stoppingOwner = (yield* supervisor.ownershipSnapshot)[0]
       const closedBeforeVerification = providerClosed
       const openBeforeVerification = pty.ptyOpen
       yield* Deferred.succeed(verified, undefined)
       expect(stoppingOwner).toMatchObject({
-        ownerToken: owner.ownerToken, status: "stopping",
+        ownerId: owner.ownerId, state: "stopping",
       })
       expect(closedBeforeVerification).toBeFalse()
       expect(openBeforeVerification).toBeTrue()
@@ -251,7 +247,7 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       expect(pty.detached).toBeTrue()
       expect(providerClosed).toBeTrue()
       expect(surfaceReleased).toBeTrue()
-      expect((yield* repository.load).terminalOwners).toEqual([])
+      expect(yield* supervisor.ownershipSnapshot).toEqual([])
       expect([...yield* supervisor.ownedSessionIds]).toEqual([])
       expect((yield* app.getState).terminals.has("root")).toBeFalse()
       expect((yield* app.getState).unviewedSessionIds.has("root")).toBeFalse()
@@ -261,7 +257,7 @@ test("agent management replay: hidden completion, stale evidence, and verified d
         projectDirectory: directory, providerId: "codex", stateHome: join(directory, "state"),
         instanceId: "replay-check", requireExisting: true,
       }).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform))
-      expect((yield* reopened.load).terminalOwners).toEqual([])
+      expect(yield* reopened.load).not.toHaveProperty("terminalOwners")
       yield* app.shutdown
     })))
   } finally {

@@ -4,7 +4,7 @@
 
 Follow general code best practices, such as:
 
-- IMPORTANT: Always aim for the most correct design rather than preserving accidental behavior. Snowcloud is in alpha, so internal compatibility is not a requirement unless explicitly documented. Do not add legacy behavior, migrations, or version increments merely because an internal representation changes. Strict recovery and ownership safety still apply: incompatible persisted state must fail closed rather than being silently ignored or recreated.
+- IMPORTANT: Always aim for the most correct design rather than preserving accidental behavior. claude-tree is in alpha, so internal compatibility is not a requirement unless explicitly documented. Do not add legacy behavior, migrations, or version increments merely because an internal representation changes. Incompatible persisted state must be rejected rather than silently ignored or recreated.
 - Avoid redundant duplication: if a string or a magic number is being duplicated multiple times, extract it to a single shared place.
 - Use descriptive and well-chosen names for variables, functions, and classes.
 - Each function should do one 'job' and do it well.
@@ -16,15 +16,15 @@ Follow general code best practices, such as:
 - Keep `effect`, `@effect/platform-bun`, and `@effect/platform-node-shared` pinned to the same tested release. The shared adapter needs an explicit runtime dependency because the Bun adapter's prerelease range can resolve an incompatible newer adapter when installing the packed application without the repository lockfile.
 - Model long-lived processes, scopes, subscriptions, temporary files, and terminal surfaces as acquired resources with explicit, idempotent cleanup. Finalizers are mandatory backstops, not substitutes for a lifecycle API that can report incomplete cleanup.
 - Keep application-state mutation behind the application actor. Asynchronous commands and callbacks should return typed events carrying stable owner and sequence identities rather than retaining mutable state references.
-- Make shutdown and rollback uninterruptible only around the ownership transition that must be atomic. Keep external waits individually bounded, verify the resulting state, and preserve ownership when absence cannot be proven.
+- Keep normal resource cleanup bounded and idempotent. Cleanup state is process-local; do not introduce persisted orphan recovery. OS-held session guards are advisory across invocations, with a user-confirmed override, and release automatically when the application exits.
 - Test timeouts, retries, heartbeats, and escalation with Effect's `TestClock` or controlled deferred values. Do not add real sleeps to deterministic unit tests.
 
 ## Persistence
 
 - Provider state schema v3 is strict and reset-only. Do not add implicit migration, deletion, quarantine, fallback parsing, or automatic recreation for incompatible persisted state.
-- Write related metadata, per-instance navigation, terminal ownership, and identity-adoption changes through the unified provider-state transaction when they must remain atomic.
+- Write related metadata and per-instance navigation through the unified provider-state transaction when they must remain atomic. Workspace resume copies the requested navigation into a fresh invocation; it never shares a navigation writer with the original workspace.
 - Treat provider mutations as ambiguous after they may have been sent and their response is unavailable. Do not retry or infer success; reconcile from a full provider snapshot.
-- Provider launches must report their externally surviving resources and use the owner-scoped launch directory for capability artifacts. Keep acquisition incomplete until that inventory and the PTY group are recorded together. Never recover an owner from its status or a missing application PID alone; use the shared resource-liveness checks and exact-owner transaction revalidation.
+- Never persist terminal owners, launch-resource inventories, or identity-adoption journals. Provider sidecars and temporary capability artifacts have ordinary scoped cleanup, not startup recovery.
 
 ## Agents
 

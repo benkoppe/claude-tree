@@ -20,8 +20,6 @@ export type PersistencePhase =
   | "reading-state"
   | "validating-state"
   | "checking-ownership"
-  | "checking-orphan-processes"
-  | "cleaning-orphan-artifacts"
   | "committing-state"
   | "releasing-lock"
 
@@ -249,21 +247,6 @@ export function removeDurably(
       if (!(await pathIsMissing(platform, path))) throw error
     }
     await syncParentDirectory(platform, path)
-  })
-}
-
-export function removeDirectoryDurably(
-  platform: PersistencePlatformApi,
-  path: string,
-): Effect.Effect<void, unknown> {
-  return promiseEffect(async () => {
-    await platform.remove(path, { recursive: true, force: true })
-    try {
-      await syncParentDirectory(platform, path)
-    } catch (error) {
-      // No launch directory was ever created, or a concurrent cleanup removed its parent.
-      if (!isErrorCode(error, "ENOENT")) throw error
-    }
   })
 }
 
