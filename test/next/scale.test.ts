@@ -131,7 +131,8 @@ test("a session-local refresh never compares unrelated transcript content", () =
   let guarded = false
   const unrelated = new Proxy(history(100, 10), {
     get(target, key, receiver) {
-      if (guarded && (key === Symbol.iterator || key === "filter" || key === "every")) throw new Error("Scanned unrelated history")
+      if (guarded && (key === Symbol.iterator || key === "filter" || key === "every" ||
+        (typeof key === "string" && /^(0|[1-9]\d*)$/.test(key)))) throw new Error("Scanned unrelated history")
       return Reflect.get(target, key, receiver)
     },
   })

@@ -4,14 +4,16 @@ import { join } from "node:path"
 import { Worker } from "node:worker_threads"
 
 import { createTestRenderer } from "@opentui/core/testing"
-import { Effect, Fiber } from "effect"
+import { Effect, Fiber, Stream } from "effect"
 
 import { makeAppRuntime, type AppRuntime } from "../src/application/runtime"
+import type { ApplicationViewModel } from "../src/application/view-model"
 import { makeNavigationPersistenceWorker } from "../src/infrastructure/metadata/navigation-persistence"
 import { nativePersistencePlatform, PersistencePlatform } from "../src/infrastructure/metadata/platform"
 import { makeProviderReads, withProviderReads } from "../src/infrastructure/providers/read-service"
 import { makeProjectionService } from "../src/infrastructure/projection/service"
 import { makeOpenTuiPresentation } from "../src/presentation/open-tui-presentation"
+import { presentationTheme } from "../src/presentation/theme"
 import { makeProviderStateRepository } from "../src/services/provider-state-repository"
 import type { TerminalSupervisorApi } from "../src/services/terminal-supervisor"
 
@@ -59,34 +61,71 @@ function summary(samples: number[]) {
   return { samples: sorted.length, p50Ms: at(.5), p95Ms: at(.95), maxMs: at(1) }
 }
 
-async function measure(runtime: AppRuntime, setup: Awaited<ReturnType<typeof createTestRenderer>>) {
+interface SelectionMonitor {
+  requestedId: string | undefined
+  deliveredView: ApplicationViewModel | undefined
+}
+
+const pace = () => new Promise<void>((resolve) => setTimeout(resolve, 16))
+
+async function measure(runtime: AppRuntime, setup: Awaited<ReturnType<typeof createTestRenderer>>, monitor: SelectionMonitor) {
   const latencies: number[] = []
   const frameIntervals: number[] = []
-  let previousFrameStarted: number | undefined
-  let frameChanges = 0
-  let previous = ""
+  let previousAcknowledgedFrame: number | undefined
+  let pair: readonly [string, string] | undefined
   const started = performance.now()
   while (true) {
     const state = await Effect.runPromise(runtime.getState)
     const done = !state.refresh.initialPending && state.refresh.active.size === 0
     if (done && latencies.length >= 10) break
     const view = await Effect.runPromise(runtime.getViewModel)
-    if ((view.surface._tag === "Roots" && view.surface.roots.length > 1) || (view.surface._tag === "Graph" && view.surface.nodes.length > 1)) {
+    const surface = view.surface
+    const identities = surface._tag === "Roots" ? surface.roots.map((root) => root.sessionId)
+      : surface._tag === "Graph" ? surface.nodes.map((node) => node.id) : []
+    if (identities.length > 1) {
+      pair ??= [identities[0]!, identities[1]!]
+      const selected = surface._tag === "Roots" ? surface.selectedSessionId
+        : surface._tag === "Graph" ? surface.selectedNodeId : null
+      // Fixture roots are stable in recency order; graph fixtures are one linear chain.
+      // The first movement from an unset root cursor selects the second row.
+      const down = selected === null || selected === pair[0]
+      if (selected !== null && selected !== pair[0] && selected !== pair[1]) throw new Error("Cursor left benchmark pair")
+      const expected = pair[down ? 1 : 0]
+      const expectedNode = surface._tag === "Graph" ? surface.nodes.find((node) => node.id === expected) : undefined
+      const label = surface._tag === "Roots" ? surface.roots.find((root) => root.sessionId === expected)?.title
+        : expectedNode?._tag === "Message" ? expectedNode.preview : undefined
+      if (!label) throw new Error("Expected a labelled benchmark selection")
+      const oldId = view.selectionId
+      monitor.requestedId = undefined
       const start = performance.now()
-      if (previousFrameStarted !== undefined) frameIntervals.push(start - previousFrameStarted)
-      previousFrameStarted = start
-      setup.mockInput.pressArrow(latencies.length % 2 ? "up" : "down")
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      await setup.renderOnce()
-      const frame = setup.captureCharFrame()
-      if (frame !== previous) frameChanges++
-      previous = frame
-      latencies.push(performance.now() - start)
+      setup.mockInput.pressArrow(down ? "down" : "up")
+      while (true) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        const actorView = await Effect.runPromise(runtime.getViewModel)
+        await setup.renderOnce()
+        const delivered = monitor.deliveredView
+        const acknowledged = monitor.requestedId !== undefined && monitor.requestedId !== oldId &&
+          actorView.selectionId === monitor.requestedId && delivered?.selectionId === monitor.requestedId
+        const deliveredSelection = delivered?.surface._tag === "Roots" ? delivered.surface.selectedSessionId
+          : delivered?.surface._tag === "Graph" ? delivered.surface.selectedNodeId : null
+        const actorSelection = actorView.surface._tag === "Roots" ? actorView.surface.selectedSessionId
+          : actorView.surface._tag === "Graph" ? actorView.surface.selectedNodeId : null
+        const visible = setup.captureSpans().lines.some((line) => line.spans
+          .filter((span) => span.bg.equals(presentationTheme.selected)).map((span) => span.text).join("").includes(label.slice(0, 12)))
+        if (acknowledged && actorSelection === expected && deliveredSelection === expected && visible) {
+          const acknowledgedAt = performance.now()
+          latencies.push(acknowledgedAt - start)
+          if (previousAcknowledgedFrame !== undefined) frameIntervals.push(acknowledgedAt - previousAcknowledgedFrame)
+          previousAcknowledgedFrame = acknowledgedAt
+          break
+        }
+        if (performance.now() - start > 60_000) throw new Error("Selection was not acknowledged in a matching visible frame within 60 seconds")
+      }
     }
     // Pacing belongs to this benchmark, not deterministic regression tests.
-    await new Promise<void>((resolve) => setTimeout(resolve, 16))
+    await pace()
   }
-  return { durationMs: Math.round(performance.now() - started), frameChanges, inputToFrame: summary(latencies), frameIntervals: summary(frameIntervals) }
+  return { durationMs: Math.round(performance.now() - started), inputToVisibleSelection: summary(latencies), sampledAcknowledgedFrameIntervals: summary(frameIntervals) }
 }
 
 try {
@@ -109,17 +148,32 @@ try {
       closeNavigationPersistence: navigation.close, ...(reads ? { closeProviderReads: reads.close } : {}),
       ...(projection ? { prepareProjection: projection.prepare, closeProjection: projection.close } : {}),
     })
-    const presentation = yield* makeOpenTuiPresentation(setup.renderer, runtime, provider)
+    const monitor: SelectionMonitor = { requestedId: undefined, deliveredView: undefined }
+    const observedRuntime: AppRuntime = { ...runtime,
+      selectRoot: (sessionId, selectionId) => {
+        monitor.requestedId = selectionId
+        return runtime.selectRoot(sessionId, selectionId)
+      },
+      selectGraph: (familySessionId, target, selectionId) => {
+        monitor.requestedId = selectionId
+        return runtime.selectGraph(familySessionId, target, selectionId)
+      },
+      viewModels: runtime.viewModels.pipe(Stream.tap((view) => Effect.sync(() => { monitor.deliveredView = view }))),
+    }
+    const presentation = yield* makeOpenTuiPresentation(setup.renderer, observedRuntime, provider)
     yield* presentation.run
-    const startup = yield* Effect.promise(() => measure(runtime, setup))
+    const startup = yield* Effect.promise(() => measure(runtime, setup, monitor))
     const refresh = yield* Effect.forkChild(runtime.refresh())
     yield* Effect.yieldNow
-    const manualRefresh = yield* Effect.promise(() => measure(runtime, setup))
+    const manualRefresh = yield* Effect.promise(() => measure(runtime, setup, monitor))
     yield* Fiber.join(refresh)
     const roots = yield* runtime.getViewModel
     if (roots.surface._tag !== "Roots" || !roots.surface.roots[0]) return yield* Effect.die("Expected fixture roots")
     const sessionId = roots.surface.roots[0].sessionId
     yield* runtime.enterRoot(sessionId)
+    const graph = yield* runtime.getViewModel
+    if (graph.surface._tag !== "Graph" || !graph.surface.nodes[0]) return yield* Effect.die("Expected fixture graph")
+    yield* runtime.selectGraph(sessionId, graph.surface.nodes[0].target)
     const uuid = crypto.randomUUID()
     yield* Effect.promise(() => appendFile(join(transcriptDirectory, `${sessionId}.jsonl`), JSON.stringify({
       type: "user", uuid, parentUuid: lastIds.get(sessionId), sessionId, cwd: projectPath, isSidechain: false,
@@ -127,7 +181,7 @@ try {
     }) + "\n"))
     const graphRead = yield* Effect.forkChild(runtime.refresh())
     yield* Effect.yieldNow
-    const graphRefresh = yield* Effect.promise(() => measure(runtime, setup))
+    const graphRefresh = yield* Effect.promise(() => measure(runtime, setup, monitor))
     yield* Fiber.join(graphRead)
     yield* presentation.stop
     return { mode: inline ? "inline" : "isolated", sessions: count, recordsPerSession: records, startup, manualRefresh, graphRefresh }

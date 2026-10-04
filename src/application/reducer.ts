@@ -1136,7 +1136,7 @@ function stoppedSessionSurface(state: ApplicationState, sessionId: string): Navi
   return state.surface
 }
 
-export function repairNavigatorSurface(
+function repairNavigatorSurface(
   state: ApplicationState,
   preferred?: NavigatorSurface,
 ): ApplicationState {
