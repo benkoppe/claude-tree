@@ -481,6 +481,25 @@ test("a stalled manual refresh does not block navigation or forking", async () =
   }
 })
 
+test("a pending terminal open leaves movement and back navigation available", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const initial = linearGraph("root-1", "Pending open", "question")
+  const running = await startPresentation(setup.renderer, initial, new Map(), undefined, Effect.succeed(true), {
+    openEndpoint: () => Effect.never,
+  })
+  try {
+    await frame(setup, (value) => value.includes("question"))
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.some((call) => call.startsWith("open:")))
+    setup.mockInput.pressArrow("down")
+    await waitFor(() => running.harness.calls.some((call) => call.startsWith("select-graph:")))
+    setup.mockInput.pressKey("q")
+    await waitFor(() => running.harness.calls.some((call) => call.startsWith("select-root:")))
+  } finally {
+    await running.stop()
+  }
+})
+
 test("root key repeats coalesce and stale publications cannot rewind the local cursor", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const initial = rootsView()
@@ -918,7 +937,7 @@ test("runs an action and accepts later input when its pending render defects", a
   }
 })
 
-test("hides roots immediately while a new terminal is opening", async () => {
+test("keeps roots available while a new terminal is opening", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const release = await Effect.runPromise(Deferred.make<void>())
   const running = await startPresentation(
@@ -934,15 +953,17 @@ test("hides roots immediately while a new terminal is opening", async () => {
     await frame(setup, (value) => value.includes("Conversation roots"))
     setup.mockInput.pressKey("n")
     await waitFor(() => running.harness.calls.includes("new"))
-    const opening = await frame(setup, (value) => !value.includes("Conversation roots"))
-    expect(opening).not.toContain("First conversation")
+    const opening = await frame(setup, (value) => value.includes("Conversation roots"))
+    expect(opening).toContain("First conversation")
+    setup.mockInput.pressArrow("down")
+    await waitFor(() => running.harness.calls.includes("select-root:root-2"))
     await Effect.runPromise(Deferred.succeed(release, undefined))
   } finally {
     await running.stop()
   }
 })
 
-test("keeps graph updates hidden while an endpoint terminal is opening", async () => {
+test("keeps graph updates visible while an endpoint terminal is opening", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const release = await Effect.runPromise(Deferred.make<void>())
   const graph = linearGraph("root-1", "Opening conversation", "question")
@@ -961,8 +982,8 @@ test("keeps graph updates hidden while an endpoint terminal is opening", async (
     await waitFor(() => running.harness.calls.includes("open:root-1"))
     const updated = linearGraph("root-1", "Opening conversation", "draft created during open")
     await Effect.runPromise(running.harness.update(updated))
-    const opening = await frame(setup, (value) => !value.includes("Message tree"))
-    expect(opening).not.toContain("draft created during open")
+    const opening = await frame(setup, (value) => value.includes("draft created during open"))
+    expect(opening).toContain("draft created during open")
     await Effect.runPromise(Deferred.succeed(release, undefined))
   } finally {
     await running.stop()

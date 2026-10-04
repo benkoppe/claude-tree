@@ -227,6 +227,10 @@ export class ClaudeProvider implements AgentProviderApi {
 
   }
 
+  observeSessionSummaries(sessions: readonly AgentSession[]): void {
+    this.sessionTitles = new Map([...this.sessionTitles, ...sessions.map((session) => [session.id, session.title] as const)])
+  }
+
   readTranscripts(
     sessionIds: readonly string[],
     trace?: HistoryTrace,

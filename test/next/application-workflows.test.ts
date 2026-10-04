@@ -14,6 +14,8 @@ import { makeShutdownSignals, reportCliFailures, runPresentationLifecycle, runSc
 import { PROGRAM_NAME } from "../../src/program"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
+import { selectConversationForest } from "../../src/application/selectors"
+import { available } from "../../src/application/state"
 
 import {
   ApplicationShutdownError,
@@ -401,7 +403,8 @@ describe("application actor", () => {
       yield* waitForState(runtime, (state) => !state.refresh.initialPending)
       yield* runtime.selectRoot(ROOT)
       yield* Deferred.await(started)
-      for (let index = 0; index < 100; index++) yield* runtime.selectRoot(index % 2 ? ROOT : CHILD)
+      yield* runtime.selectRoot(CHILD)
+      yield* runtime.selectRoot(ROOT)
       yield* runtime.enterRoot(ROOT)
       const opening = yield* Effect.forkChild(runtime.openEndpoint(ROOT))
       yield* waitForState(runtime, (state) => state.surface._tag === "Terminal")
@@ -455,6 +458,147 @@ describe("application actor", () => {
       yield* runtime.enterRoot(ROOT)
       expect((yield* runtime.getState).surface._tag).toBe("Graph")
       expect(fixture.incrementalReads).toEqual([])
+    })))
+  })
+
+  test("terminal return and reopening do not wait for refresh or navigation persistence", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const releaseSave = yield* Deferred.make<void>()
+      const saveStarted = yield* Deferred.make<void>()
+      const releaseRead = yield* Deferred.make<AgentSessionSnapshot>()
+      const readStarted = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options,
+        metadata: { ...fixture.options.metadata, saveNavigation: () =>
+          Deferred.succeed(saveStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseSave))) },
+        provider: { ...fixture.options.provider, loadSessionSnapshotFor: () =>
+          Deferred.succeed(readStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseRead))) },
+      })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.openEndpoint(ROOT)
+      yield* Deferred.await(saveStarted)
+      yield* runtime.returnFromTerminal
+      yield* Deferred.await(readStarted)
+      yield* runtime.selectRoot(CHILD)
+      expect((yield* runtime.getState).surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      yield* runtime.enterRoot(ROOT)
+      yield* runtime.openEndpoint(ROOT)
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: ROOT })
+      yield* Deferred.succeed(releaseRead, fixture.snapshot)
+      yield* Deferred.succeed(releaseSave, undefined)
+    })))
+  })
+
+  test("a delayed fork retains its child without stealing newer navigator focus", async () => {
+    const fixture = makeFixture()
+    const childHistory = [message("copied-q", "user", "question", 0)]
+    const derivation = { childSessionId: "fork-child", parentSessionId: ROOT, sourceMessageId: "q",
+      sharedMessages: [{ parentMessageId: "q", childMessageId: "copied-q" }] }
+    fixture.branchOutcome = { _tag: "ValidatedBranch", ...prepared("fork-child", "Fork child"),
+      transcript: available(childHistory), derivation }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const release = yield* Deferred.make<BranchOutcome>()
+      const started = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider: { ...fixture.options.provider,
+        branchFrom: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.enterRoot(ROOT)
+      const fork = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
+      yield* Deferred.await(started)
+      yield* runtime.selectRoot(CHILD)
+      yield* Deferred.succeed(release, fixture.branchOutcome)
+      const result = yield* Fiber.join(fork)
+      expect(Exit.isFailure(result)).toBeTrue()
+      const state = yield* runtime.getState
+      expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      if (fixture.branchOutcome._tag !== "ValidatedBranch") throw new Error("Expected validated branch")
+      expect(state.relations).toHaveLength(1)
+      expect(state.relations[0]).toMatchObject(derivation)
+      expect(state.local.sessions.get("fork-child")).toEqual(fixture.branchOutcome.session)
+      expect(selectProjectedTranscript(state, "fork-child")).toEqual(childHistory)
+      expect((yield* fixture.options.metadata.loadMetadata).relations).toEqual(state.relations)
+      const forest = selectConversationForest(state)
+      expect(forest.graphBySessionId.get("fork-child")).toBeDefined()
+      expect(forest.graphBySessionId.get("fork-child")).toBe(forest.graphBySessionId.get(ROOT))
+      expect(fixture.calls.some((call) => call.startsWith("show:"))).toBeFalse()
+    })))
+  })
+
+  test("refresh projection never holds the actor and preserves newer cursor and modal state", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let stall = false
+      const runtime = yield* makeAppRuntime({ ...fixture.options, prepareProjection: () => stall
+        ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))) : Effect.void })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      stall = true
+      const refresh = yield* Effect.forkChild(runtime.refresh())
+      yield* Deferred.await(started)
+      yield* runtime.selectRoot(ROOT)
+      yield* runtime.selectRoot(CHILD)
+      yield* runtime.openModal({ _tag: "About" })
+      expect((yield* runtime.getState).surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(refresh)
+      const state = yield* runtime.getState
+      expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      expect(state.modal).toEqual({ _tag: "About" })
+    })))
+  })
+
+  test.each(["success", "failure"] as const)("a late terminal acquisition keeps newer terminal focus (%s)", async (outcome) => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const show = fixture.options.terminals.show
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: { ...fixture.options.terminals,
+        show: (prepared, shouldActivate) => prepared.session.id === ROOT
+          ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)),
+            Effect.andThen(outcome === "success" ? show(prepared, shouldActivate) : Effect.fail(new ProviderError({
+              providerId: "test", operation: "acquire", message: "late acquisition failure",
+            }))))
+          : show(prepared, shouldActivate),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      const slow = yield* Effect.forkChild(Effect.exit(runtime.openEndpoint(ROOT)))
+      yield* Deferred.await(started)
+      yield* runtime.selectRoot(CHILD)
+      yield* runtime.openEndpoint(CHILD)
+      yield* Deferred.succeed(release, undefined)
+      const result = yield* Fiber.join(slow)
+      expect(Exit.isSuccess(result)).toBe(outcome === "success")
+      const state = yield* runtime.getState
+      expect(state.surface).toMatchObject({ _tag: "Terminal", sessionId: CHILD })
+      expect(state.terminals.get(ROOT)?.phase).toBe(outcome === "success" ? "running" : undefined)
+      expect(yield* fixture.options.terminals.activeSessionId).toBe(CHILD)
+    })))
+  })
+
+  test("new terminal evidence invalidates prepared refresh history before publication", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let stall = false
+      const runtime = yield* makeAppRuntime({ ...fixture.options, prepareProjection: () => stall
+        ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))) : Effect.void })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.openEndpoint(ROOT)
+      const ownerId = (yield* runtime.getState).terminals.get(ROOT)!.ownerId!
+      fixture.snapshot = snapshot(fixture.snapshot.sessions, new Map([[ROOT, [message("q", "user", "question", 0),
+        message("answer", "agent", "obsolete answer", 1)]], [CHILD, [message("cq", "user", "child question", 0)]]]))
+      stall = true
+      const refresh = yield* Effect.forkChild(runtime.refresh())
+      yield* Deferred.await(started)
+      expect(yield* runtime.handleTerminalObservation({ ownerId, sequenceId: 1, sessionId: ROOT, wasActive: true,
+        observation: { _tag: "Submission", text: "new submission" } })).toBeTrue()
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(refresh)
+      expect(selectProjectedTranscript(yield* runtime.getState, ROOT).map((message) => message.id)).toEqual(["q"])
     })))
   })
 
@@ -977,6 +1121,7 @@ describe("application actor", () => {
       yield* runtime.returnFromTerminal
       yield* runtime.resumeSession(CHILD)
       yield* runtime.returnFromTerminal
+      yield* waitForState(runtime, () => metadataUpdates >= 4)
       const updatesBeforeTransition = metadataUpdates
 
       const acknowledgment = yield* Deferred.make<void, unknown>()
@@ -3372,16 +3517,16 @@ function makeFixture(): Fixture {
     branchFrom: () => Effect.succeed(fixture.branchOutcome),
   }
   const terminals: TerminalSupervisorApi = {
-    show: (terminal) => Effect.sync(() => {
+    show: (terminal, shouldActivate = () => true) => Effect.sync(() => {
       calls.push(`show:${terminal.session.id}`)
       const existing = owned.get(terminal.session.id)
       if (existing) {
-        activeSessionId = terminal.session.id
+        if (shouldActivate()) activeSessionId = terminal.session.id
         return existing
       }
       const ownerId = `owner-${nextOwner++}`
       owned.set(terminal.session.id, ownerId)
-      activeSessionId = terminal.session.id
+      if (shouldActivate()) activeSessionId = terminal.session.id
       return ownerId
     }),
     hideActive: Effect.sync(() => {

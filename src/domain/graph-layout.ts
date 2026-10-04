@@ -6,6 +6,7 @@ import type {
 import { isMaterializedForkEndpoint } from "./conversation-graph"
 
 export const GRAPH_NODE_HEIGHT = 2
+export const DEFAULT_GRAPH_VIEWPORT_WIDTH = 80
 export const GRAPH_HORIZONTAL_GAP = 4
 export const GRAPH_VERTICAL_GAP = 2
 

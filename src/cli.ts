@@ -12,6 +12,8 @@ import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import { makeAppRuntime } from "./application"
 import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
 import { makeNavigationPersistenceWorker } from "./infrastructure/metadata/navigation-persistence"
+import { makeProviderReads, withProviderReads } from "./infrastructure/providers/read-service"
+import { makeProjectionService } from "./infrastructure/projection/service"
 import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
 import { makeSessionGuard } from "./infrastructure/session-guard"
 import { UNKNOWN_BUILD } from "./build-info"
@@ -120,7 +122,10 @@ export function composeProductionApplication(
       try: () => resolveProjectDirectory(options.project),
       catch: toError,
     })
-    const provider = yield* makeProvider(options.provider, projectPath)
+    const localProvider = yield* makeProvider(options.provider, projectPath)
+    const reads = yield* makeProviderReads({ providerId: options.provider, projectPath })
+    const provider = withProviderReads(localProvider, reads)
+    const projection = yield* makeProjectionService()
     const renderer = yield* makeOpenTuiRenderer()
     const persistenceOptions = { projectDirectory: projectPath, providerId: provider.id,
       ...(options.resumeWorkspaceId ? { resumeWorkspaceId: options.resumeWorkspaceId } : {}) }
@@ -144,7 +149,8 @@ export function composeProductionApplication(
     })
     yield* composeApplicationLifecycle(
       makeAppRuntime({ provider, metadata: { ...repository, saveNavigation: navigation.saveNavigation }, terminals,
-        closeNavigationPersistence: navigation.close }),
+        closeNavigationPersistence: navigation.close, closeProviderReads: reads.close,
+        prepareProjection: projection.prepare, closeProjection: projection.close }),
       (appRuntime) => {
         bridge.bind(appRuntime.terminalEvents)
         const resumeArgv = [PROGRAM_NAME, ...(options.provider === "codex" ? ["--codex"] : []), "--resume", repository.instanceId, projectPath]

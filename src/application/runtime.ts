@@ -105,6 +105,9 @@ export interface AppRuntimeOptions {
   readonly shutdownTransitionTimeoutMs?: number
   readonly navigationSaveIntervalMs?: number
   readonly closeNavigationPersistence?: Effect.Effect<void, unknown>
+  readonly closeProviderReads?: Effect.Effect<void, unknown>
+  readonly prepareProjection?: (state: ApplicationState) => Effect.Effect<void, unknown>
+  readonly closeProjection?: Effect.Effect<void, unknown>
 }
 
 export interface AppRuntime {
@@ -152,7 +155,7 @@ type LifecycleControlMessage =
   | { readonly _tag: "FinishShutdown"; readonly error?: ApplicationShutdownError; readonly reply: DeferredType.Deferred<void> }
 
 type ActorMessage =
-  | Extract<StateEvent, { readonly _tag: "RefreshProgress" }>
+  | (Extract<StateEvent, { readonly _tag: "RefreshProgress" }> & { readonly acknowledgment?: DeferredType.Deferred<void> })
   | { readonly _tag: "Startup"; readonly reply: DeferredType.Deferred<void> }
   | IntentEnvelope
   | StateQueryEnvelope
@@ -162,15 +165,22 @@ type ActorMessage =
   | { readonly _tag: "TerminalCleanupError"; readonly error: TerminalCleanupError }
   | { readonly _tag: "BackgroundFailure"; readonly operation: string; readonly cause: unknown }
   | { readonly _tag: "BranchMutationReconciliation"; readonly outcome: AmbiguousBranchMutation }
+  | { readonly _tag: "RefreshPrepared"; readonly original: RefreshPublicationMessage; readonly base: ApplicationState; readonly candidate: ApplicationState; readonly exit: Exit.Exit<void, unknown> }
+
+type RefreshPublicationMessage =
+  | (Extract<StateEvent, { readonly _tag: "RefreshProgress" }> & { readonly acknowledgment?: DeferredType.Deferred<void> })
+  | (CommandCompletedMessage & { readonly command: Extract<ActorCommand, { readonly _tag: "Refresh" }> })
+
+type PreparedRefreshPublication = Extract<StateEvent, { readonly _tag: "PreparedRefreshPublished" }>
 
 type ActorControlMessage = LifecycleControlMessage | CommandCompletedMessage
 
 type ActorCommand =
   | { readonly _tag: "Refresh"; readonly refresh: ActiveRefresh; readonly reply?: IntentEnvelope["reply"]; readonly enterRoot?: { readonly sessionId: string; readonly requestGeneration: number } }
-  | { readonly _tag: "PrepareNew"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "PrepareResume"; readonly session: AgentSession; readonly reportFailure: boolean; readonly allowDuplicate?: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Branch"; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Show"; readonly prepared: PreparedTerminal; readonly identityGeneration: number; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "PrepareNew"; readonly requestGeneration: number; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "PrepareResume"; readonly requestGeneration: number; readonly session: AgentSession; readonly reportFailure: boolean; readonly allowDuplicate?: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "Branch"; readonly requestGeneration: number; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
+  | { readonly _tag: "Show"; readonly requestGeneration: number; readonly prepared: PreparedTerminal; readonly identityGeneration: number; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Hide"; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Stop"; readonly sessionId: string; readonly ownerId: string; readonly identityGeneration: number; readonly reply: IntentEnvelope["reply"] }
   | {
@@ -492,10 +502,12 @@ export function makeAppRuntime(
       }, Effect.gen(function*(): Effect.gen.Return<RefreshResult, unknown> {
         const activityChecks = reason === "manual" ? yield* operations.reconcileActivity : []
         if (reason === "reconciliation") yield* Effect.sleep(TRANSCRIPT_CONFIRMATION_DELAY_MS)
-        const snapshot = yield* reason === "initial" && options.provider.loadSessionSnapshotProgressively
-          ? options.provider.loadSessionSnapshotProgressively((snapshot) => Queue.offer(inbox, {
-            _tag: "RefreshProgress", key, generation, snapshot,
-          }).pipe(Effect.asVoid))
+        const snapshot = yield* (reason === "initial" || reason === "manual") && options.provider.loadSessionSnapshotProgressively
+          ? options.provider.loadSessionSnapshotProgressively((snapshot) => Effect.gen(function*() {
+            const acknowledgment = yield* Deferred.make<void>()
+            yield* Queue.offer(inbox, { _tag: "RefreshProgress", key, generation, snapshot, acknowledgment })
+            yield* Deferred.await(acknowledgment)
+          }))
           : operations.loadSnapshot(mode, [...sessionIds])
         return { snapshot, activityChecks }
       }))
@@ -626,10 +638,16 @@ export function makeAppRuntime(
       restoreTo: NavigatorSurface,
       reply: IntentEnvelope["reply"],
       reportFailure: boolean,
+      requestGeneration: number,
       rollbackRelation?: BranchRelation,
       persistFailureFallback = false,
     ): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
-      if (activeCommands.has("terminal:show")) {
+      if (requestGeneration !== navigatorRequestGeneration) {
+        yield* reject(reply, "OpenEndpoint", "superseded", "A newer navigation superseded this terminal open")
+        return
+      }
+      const showKey = `terminal:show:${prepared.session.id}`
+      if (activeCommands.has(showKey)) {
         yield* reject(reply, "OpenEndpoint", "busy", "Another terminal is still opening")
         return
       }
@@ -644,13 +662,15 @@ export function makeAppRuntime(
         },
       })
       yield* publish({ _tag: "TerminalShowStarted", sessionId: prepared.session.id })
+      const shouldActivate = () => accepting && requestGeneration === navigatorRequestGeneration
       const show = rollbackRelation === undefined
-        ? operations.show(prepared)
-        : operations.show(prepared).pipe(
+        ? operations.show(prepared, shouldActivate)
+        : operations.show(prepared, shouldActivate).pipe(
             Effect.tapError(() => rollbackPersistedBranch(options.metadata, rollbackRelation)),
           )
-      yield* launch("terminal:show", {
+      yield* launch(showKey, {
         _tag: "Show",
+        requestGeneration,
         identityGeneration,
         prepared,
         restoreTo,
@@ -680,6 +700,7 @@ export function makeAppRuntime(
       const reply = yield* Deferred.make<void, ApplicationIntentError>()
       yield* launch(`prepare:startup:${navigationState.sessionId}`, {
         _tag: "PrepareResume",
+        requestGeneration: navigatorRequestGeneration,
         session,
         reportFailure: true,
         startupRestore: true,
@@ -888,6 +909,7 @@ export function makeAppRuntime(
 
     const completeCommand = (
       message: Extract<ActorMessage, { readonly _tag: "CommandCompleted" }>,
+      prepared?: PreparedRefreshPublication,
     ): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
       const active = activeCommands.get(message.key)
       if (!active || active.token !== message.token) return
@@ -900,7 +922,7 @@ export function makeAppRuntime(
         const invalidatedSessionIds = refresh ? invalidatedRefreshSessionIds(state, refresh) : new Set<string>()
         if (Exit.isSuccess(exit)) {
           const previousModal = state.modal
-          yield* publish({
+          yield* publish(prepared ?? {
             _tag: "RefreshSucceeded",
             key: command.refresh.key,
             generation: command.refresh.generation,
@@ -1040,14 +1062,14 @@ export function makeAppRuntime(
         }
         const prepared = exit.value as PreparedTerminal
         yield* publish({ _tag: "LocalSessionProjected", session: prepared.session, temporary: true })
-        yield* startShow(prepared, command.restoreTo, command.reply, true)
+        yield* startShow(prepared, command.restoreTo, command.reply, true, command.requestGeneration)
         return
       }
 
       if (command._tag === "PrepareResume") {
         if (Exit.isFailure(exit)) {
           yield* failReply(command.reply, "ResumeSession", "Resume session", Cause.squash(exit.cause), command.reportFailure)
-          if (command.startupRestore) yield* startNavigation(command.restoreTo)
+          if (command.startupRestore && command.requestGeneration === navigatorRequestGeneration) yield* startNavigation(command.restoreTo)
           return
         }
         yield* startShow(
@@ -1055,6 +1077,7 @@ export function makeAppRuntime(
           command.restoreTo,
           command.reply,
           command.reportFailure,
+          command.requestGeneration,
           undefined,
           command.startupRestore,
         )
@@ -1079,6 +1102,7 @@ export function makeAppRuntime(
             command.restoreTo,
             command.reply,
             true,
+            command.requestGeneration,
             outcome.prepared.session.transient ? outcome.relation : undefined,
           )
           return
@@ -1109,7 +1133,7 @@ export function makeAppRuntime(
           yield* startShow({
             session: outcome.outcome.session,
             acquireLaunch: outcome.outcome.acquireLaunch,
-          }, command.restoreTo, command.reply, true)
+          }, command.restoreTo, command.reply, true, command.requestGeneration)
         } else {
           yield* failReply(command.reply, "BranchFrom", "Create branch", outcome.outcome.reason, false)
         }
@@ -1124,14 +1148,14 @@ export function makeAppRuntime(
           yield* publish({
             _tag: "TerminalShowFailed",
             sessionId: command.prepared.session.id,
-            restoreTo: command.restoreTo,
+            restoreTo: command.requestGeneration === navigatorRequestGeneration ? command.restoreTo : state.surface,
             ...(command.reportFailure && !(failure instanceof SessionOwnedError) ? { message: errorMessage(failure) } : {}),
           })
           if (command.prepared.session.transient) {
             yield* publish({
               _tag: "TransientSessionRolledBack",
               sessionId: command.prepared.session.id,
-              restoreTo: command.restoreTo,
+              restoreTo: command.requestGeneration === navigatorRequestGeneration ? command.restoreTo : state.surface,
             })
           }
           if (command.persistFailureFallback) yield* startNavigation(state.surface)
@@ -1154,7 +1178,8 @@ export function makeAppRuntime(
           : command.restoreTo._tag === "Roots" && returnNavigation.view === "roots"
             ? { _tag: "Roots", selectedSessionId: returnNavigation.selectedSessionId }
             : command.restoreTo
-        yield* publish({ _tag: "TerminalShown", sessionId, ownerId, returnTo })
+        const focus = command.requestGeneration === navigatorRequestGeneration
+        yield* publish({ _tag: "TerminalShown", sessionId, ownerId, returnTo, focus })
         const cursor = owners.get(ownerId) ?? {
           sessionId,
           lastSequenceId: 0,
@@ -1167,7 +1192,8 @@ export function makeAppRuntime(
         owners.set(ownerId, cursor)
         yield* claimBufferedOwnerEvents(ownerId)
         yield* rejectUnclaimedSessionEvents(command.prepared.session.id)
-        yield* startNavigation(state.surface, command.reply)
+        if (focus) yield* startNavigation(state.surface)
+        yield* Deferred.succeed(command.reply, undefined)
         return
       }
 
@@ -1189,7 +1215,8 @@ export function makeAppRuntime(
         })
         const ownerId = state.terminals.get(hidden.sessionId)?.ownerId
         yield* startRefresh("terminal-return", new Set([hidden.sessionId]), ownerId)
-        yield* startNavigation(state.surface, command.reply)
+        yield* startNavigation(state.surface)
+        yield* Deferred.succeed(command.reply, undefined)
         return
       }
 
@@ -1384,6 +1411,10 @@ export function makeAppRuntime(
             return
           }
         }
+        if (intent._tag === "BranchFrom" && ["stopping", "cleanup-incomplete"].includes(state.terminals.get(intent.target.sessionId)?.phase ?? "")) {
+          yield* reject(envelope.reply, intent._tag, "busy", "This session is stopping")
+          return
+        }
         if (
           intent._tag === "SelectRoot" || intent._tag === "EnterRoot" ||
           intent._tag === "SelectGraph" || intent._tag === "NewSession" ||
@@ -1447,6 +1478,7 @@ export function makeAppRuntime(
             const restoreTo = navigatorSurface()
             yield* launch(`prepare:new:${envelope.correlationId}`, {
               _tag: "PrepareNew",
+              requestGeneration: navigatorRequestGeneration,
               restoreTo,
               reply: envelope.reply,
             }, operations.prepareNew, false)
@@ -1464,6 +1496,7 @@ export function makeAppRuntime(
             }
             yield* launch(`prepare:resume:${envelope.correlationId}`, {
               _tag: "PrepareResume",
+              requestGeneration: navigatorRequestGeneration,
               session,
               reportFailure: intent.reportFailure,
               ...(intent.allowDuplicate ? { allowDuplicate: true } : {}),
@@ -1480,7 +1513,7 @@ export function makeAppRuntime(
                 yield* reject(envelope.reply, intent._tag, "invalid", `No prepared terminal is available for ${intent.sessionId}`)
                 return
               }
-              yield* startShow(prepared, navigatorSurface(intent.sessionId), envelope.reply, true)
+              yield* startShow(prepared, navigatorSurface(intent.sessionId), envelope.reply, true, navigatorRequestGeneration)
               return
             }
             if (running) {
@@ -1498,6 +1531,7 @@ export function makeAppRuntime(
             }
             yield* launch(`prepare:resume:${envelope.correlationId}`, {
               _tag: "PrepareResume",
+              requestGeneration: navigatorRequestGeneration,
               session,
               reportFailure: true,
               restoreTo: navigatorSurface(session.id),
@@ -1512,6 +1546,7 @@ export function makeAppRuntime(
             }
             yield* launch(`branch:${envelope.correlationId}`, {
               _tag: "Branch",
+              requestGeneration: navigatorRequestGeneration,
               restoreTo: navigatorSurface(intent.target.sessionId),
               reply: envelope.reply,
             }, operations.branch(intent.target), false)
@@ -1584,8 +1619,51 @@ export function makeAppRuntime(
         }
       })
 
+    const acceptRefreshPublication = (
+      message: RefreshPublicationMessage,
+      prepared?: PreparedRefreshPublication,
+    ): Effect.Effect<void, never, Scope.Scope> => message._tag === "CommandCompleted"
+      ? completeCommand(message, prepared)
+      : publish(prepared ?? message).pipe(Effect.ensuring(
+          message.acknowledgment ? Deferred.succeed(message.acknowledgment, undefined) : Effect.void,
+        ))
+
+    const prepareRefreshPublication = (message: RefreshPublicationMessage): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
+      const event = refreshPublicationEvent(message)
+      if (!options.prepareProjection || !event) {
+        yield* acceptRefreshPublication(message)
+        return
+      }
+      const base = state
+      const candidate = reduceApplicationState(base, event, true)
+      if (candidate === base) {
+        yield* acceptRefreshPublication(message)
+        return
+      }
+      yield* Effect.forkIn(options.prepareProjection(candidate).pipe(Effect.onExit((exit) =>
+        Queue.offer(inbox, { _tag: "RefreshPrepared", original: message, base, candidate, exit })), Effect.exit, Effect.asVoid), commandScope)
+    })
+
     const processMessage = (message: ActorMessage): Effect.Effect<void, never, Scope.Scope> => {
-      if (message._tag === "RefreshProgress") return publish(message)
+      if (message._tag === "RefreshPrepared") return Effect.gen(function*() {
+        if (state.shutdown !== "running") {
+          if (message.original._tag === "RefreshProgress" && message.original.acknowledgment) yield* Deferred.succeed(message.original.acknowledgment, undefined)
+          return
+        }
+        if (!sameOperationalState(state, message.base)) {
+          yield* prepareRefreshPublication(message.original)
+          return
+        }
+        if (Exit.isFailure(message.exit)) {
+          if (message.original._tag === "RefreshProgress" && message.original.acknowledgment) yield* Deferred.succeed(message.original.acknowledgment, undefined)
+          yield* containMessageDefect(message.original, message.exit.cause as Cause.Cause<never>)
+          return
+        }
+        yield* acceptRefreshPublication(message.original, {
+          _tag: "PreparedRefreshPublished", base: message.base, candidate: message.candidate,
+        })
+      })
+      if (isRefreshPublicationMessage(message)) return prepareRefreshPublication(message)
       if (message._tag === "Startup") {
         return Effect.gen(function*() {
           if (accepting && state.shutdown === "running") {
@@ -1721,6 +1799,10 @@ export function makeAppRuntime(
       message: ActorMessage,
       failure: ApplicationOperationError,
     ): Effect.Effect<void> => Effect.gen(function*() {
+      if (message._tag === "RefreshPrepared") {
+        yield* settleMessageDefect(message.original, failure)
+        return
+      }
       if (message._tag === "Startup") {
         if (!Deferred.isDoneUnsafe(message.reply)) yield* Deferred.succeed(message.reply, undefined)
         return
@@ -1743,6 +1825,10 @@ export function makeAppRuntime(
         ) yield* Deferred.fail(message.command.event.acknowledgment, failure)
         return
       }
+      if (message._tag === "RefreshProgress") {
+        if (message.acknowledgment) yield* Deferred.succeed(message.acknowledgment, undefined)
+        return
+      }
       if (
         message._tag === "BeginShutdown" ||
         message._tag === "AbortTransitionAcknowledgments" ||
@@ -1750,7 +1836,7 @@ export function makeAppRuntime(
       ) return
       if (
         message._tag === "TerminalCleanupError" || message._tag === "BackgroundFailure" ||
-        message._tag === "BranchMutationReconciliation" || message._tag === "RefreshProgress"
+        message._tag === "BranchMutationReconciliation"
       ) return
       if (message._tag === "TerminalSessionChanged") {
         unregisterTerminalBarrier(message)
@@ -1768,6 +1854,7 @@ export function makeAppRuntime(
       message: ActorMessage,
       cause: Cause.Cause<never>,
     ): Effect.Effect<void, never, Scope.Scope> => {
+      if (message._tag === "RefreshPrepared") return containMessageDefect(message.original, cause)
       if (
         Cause.hasInterrupts(cause) || message._tag === "BeginShutdown" ||
         message._tag === "AbortTransitionAcknowledgments" ||
@@ -1886,7 +1973,8 @@ export function makeAppRuntime(
           pending._tag !== "CommandCompleted" && pending._tag !== "TerminalCleanupError"
           && pending._tag !== "BackgroundFailure"
           && pending._tag !== "BranchMutationReconciliation"
-          && pending._tag !== "RefreshProgress"
+           && pending._tag !== "RefreshProgress"
+           && pending._tag !== "RefreshPrepared"
           && pending._tag !== "BeginShutdown"
           && pending._tag !== "AbortTransitionAcknowledgments"
           && pending._tag !== "FinishShutdown"
@@ -2090,11 +2178,13 @@ export function makeAppRuntime(
         if (Exit.isFailure(navigationExit)) yield* Effect.failCause(navigationExit.cause)
         if (Exit.isFailure(closeExit)) yield* Effect.failCause(closeExit.cause)
       })
-      const [lifecycleExit, terminalExit] = yield* Effect.all([
+      const [lifecycleExit, terminalExit, readsExit, projectionExit] = yield* Effect.all([
         Effect.exit(lifecycleShutdown),
         Effect.exit(Effect.suspend(() => options.terminals.shutdown())),
+        Effect.exit(options.closeProviderReads ?? Effect.void),
+        Effect.exit(options.closeProjection ?? Effect.void),
       ], { concurrency: "unbounded" })
-      const failures = [lifecycleExit, terminalExit].flatMap((exit) =>
+      const failures = [lifecycleExit, terminalExit, readsExit, projectionExit].flatMap((exit) =>
         Exit.isFailure(exit) ? causeFailures(exit.cause) : [])
       if (Exit.isFailure(transitionExit)) failures.unshift(...causeFailures(transitionExit.cause))
       if (transitionAbortError) failures.unshift(transitionAbortError)
@@ -2232,6 +2322,22 @@ function commandIntent(command: ActorCommand): ApplicationIntent["_tag"] {
     case "SubmissionTimer": return "Refresh"
     case "AcknowledgeTransition": return "OpenEndpoint"
   }
+}
+
+function isRefreshPublicationMessage(message: ActorMessage): message is RefreshPublicationMessage {
+  return message._tag === "RefreshProgress" || (message._tag === "CommandCompleted" && message.command._tag === "Refresh")
+}
+
+function refreshPublicationEvent(message: RefreshPublicationMessage): Extract<StateEvent, { _tag: "RefreshProgress" | "RefreshSucceeded" }> | undefined {
+  if (message._tag === "RefreshProgress") return message
+  if (Exit.isFailure(message.exit)) return undefined
+  return { _tag: "RefreshSucceeded", key: message.command.refresh.key, generation: message.command.refresh.generation,
+    snapshot: (message.exit.value as RefreshResult).snapshot }
+}
+
+function sameOperationalState(left: ApplicationState, right: ApplicationState): boolean {
+  return (Object.keys(left) as Array<keyof ApplicationState>).every((key) =>
+    key === "surface" || key === "modal" || key === "selectionId" || left[key] === right[key])
 }
 
 function messageFailureContext(message: ActorMessage): {
