@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { EventEmitter } from "node:events"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Worker } from "node:worker_threads"
@@ -129,7 +129,7 @@ test("interruption during worker creation installs cleanup and waits for provide
 })
 
 test("production worker reads real SDK transcripts, flushes a partial batch, and closes", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "claude-tree-read-worker-"))
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-read-worker-")))
   const projectPath = join(directory, "project")
   const config = join(directory, "claude")
   const projectKey = projectPath.replaceAll("/", "-")

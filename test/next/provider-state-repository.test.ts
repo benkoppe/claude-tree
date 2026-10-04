@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect } from "effect"
 import { PersistenceError } from "../../src/domain/errors"
@@ -12,7 +13,7 @@ afterEach(async () => { await Promise.all(directories.splice(0).map((directory) 
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 const open = (options: ProviderStateRepositoryOptions) => run(makeProviderStateRepository(options).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform)))
 async function fixture() {
-  const directory = await mkdtemp("/tmp/opencode/workspace-test-")
+  const directory = await mkdtemp(join(tmpdir(), "workspace-test-"))
   directories.push(directory)
   return { projectDirectory: directory, providerId: "claude", stateHome: join(directory, "state"), instanceId: "original" }
 }

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Worker } from "node:worker_threads"
@@ -21,7 +21,7 @@ const inline = process.argv.includes("--inline")
 const count = Number(process.env.BENCHMARK_SESSIONS ?? 200)
 const records = Number(process.env.BENCHMARK_RECORDS ?? 200)
 if (!Number.isSafeInteger(count) || count < 2 || !Number.isSafeInteger(records) || records < 2) throw new Error("Invalid fixture size")
-const directory = await mkdtemp(join(tmpdir(), "claude-tree-responsiveness-"))
+const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-responsiveness-")))
 const projectPath = join(directory, "project")
 const config = join(directory, "claude")
 const projectKey = projectPath.replaceAll("/", "-")
