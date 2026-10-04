@@ -4,13 +4,14 @@ import { cp, mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, 
 import { join } from "node:path"
 import { Database } from "bun:sqlite"
 import { Deferred, Effect, Fiber } from "effect"
+import { TestClock } from "effect/testing"
 
 import type { BranchRelation } from "../../src/domain/persistence"
 import { PersistencePlatform, nativePersistencePlatform } from "../../src/infrastructure/metadata/platform"
 import { makeProviderStateRepository, type ProviderStateRepositoryApi, type ProviderStateRepositoryOptions } from "../../src/services/provider-state-repository"
 import { makeMetadataWorker } from "../../src/infrastructure/metadata/worker-service"
 import { runStateCommand } from "../../src/infrastructure/metadata/state-commands"
-import { databasePath, nativeStateDatabasePlatform, openStateDatabase, type DatabaseSchemaPolicy, type StateDatabasePlatform } from "../../src/infrastructure/metadata/database"
+import { databasePath, nativeStateDatabasePlatform, openStateDatabase, sqliteTransaction, type DatabaseSchemaPolicy, type StateDatabasePlatform } from "../../src/infrastructure/metadata/database"
 import { readMigrationFiles } from "drizzle-orm/migrator"
 
 const directories: string[] = []
@@ -417,6 +418,105 @@ test("startup failure retries database cleanup and retains the original failure"
     expect(messages.join("\n")).toContain("close failure")
   }
   expect(databaseCloses).toBe(2); expect(gateCloses).toBe(1)
+})
+
+for (const stage of ["startup", "schema"] as const) test(`slow ${stage} lock acquisition waits without a deadline and remains cancellable`, async () => {
+  const options = await fixture(); await run((await open(options)).close)
+  let blocked = true; let closes = 0
+  const entered = Deferred.makeUnsafe<void>()
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    fileLocker: () => {
+      const lock = nativeStateDatabasePlatform.fileLocker()
+      return (fd, operation) => {
+        if (blocked && operation === (stage === "startup" ? 2 | 4 : 1 | 4)) {
+          Deferred.doneUnsafe(entered, Effect.void); return false
+        }
+        return lock(fd, operation)
+      }
+    },
+    openLock: async (path) => {
+      const handle = await nativeStateDatabasePlatform.openLock(path)
+      return { fd: handle.fd, close: async () => { await handle.close(); closes++ } }
+    },
+  }
+  await run(Effect.gen(function*() {
+    const pending = yield* Effect.forkChild(openStateDatabase(options.stateHome, true, undefined, platform))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(120_000)
+    expect(pending.pollUnsafe()).toBeUndefined()
+    expect(closes).toBe(0)
+    yield* Fiber.interrupt(pending)
+    expect(closes).toBe(2)
+    blocked = false
+    const database = yield* openStateDatabase(options.stateHome, true, undefined, platform)
+    yield* Effect.promise(database.close)
+  }).pipe(Effect.provide(TestClock.layer())))
+  expect(closes).toBe(4)
+})
+
+test("slow startup proceeds when contention clears rather than requiring a restart", async () => {
+  const options = await fixture(); await run((await open(options)).close)
+  let blocked = true
+  const entered = Deferred.makeUnsafe<void>()
+  const platform: StateDatabasePlatform = { ...nativeStateDatabasePlatform,
+    fileLocker: () => {
+      const lock = nativeStateDatabasePlatform.fileLocker()
+      return (fd, operation) => {
+        if (blocked && operation === (2 | 4)) { Deferred.doneUnsafe(entered, Effect.void); return false }
+        return lock(fd, operation)
+      }
+    },
+  }
+  await run(Effect.gen(function*() {
+    const pending = yield* Effect.forkChild(openStateDatabase(options.stateHome, true, undefined, platform))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(120_000)
+    expect(pending.pollUnsafe()).toBeUndefined()
+    blocked = false
+    yield* TestClock.adjust(10)
+    const database = yield* Fiber.join(pending)
+    yield* Effect.promise(database.close)
+  }).pipe(Effect.provide(TestClock.layer())))
+})
+
+for (const code of ["SQLITE_BUSY", "SQLITE_LOCKED"]) test(`${code} retries past the old limit without partial writes and can be interrupted`, async () => {
+  using db = new Database(":memory:")
+  db.run("CREATE TABLE writes (value TEXT NOT NULL) STRICT")
+  let blocked = true; let attempts = 0
+  const entered = Deferred.makeUnsafe<void>()
+  const write = sqliteTransaction(db, () => {
+    attempts++
+    db.query("INSERT INTO writes VALUES ('committed')").run()
+    if (blocked) { Deferred.doneUnsafe(entered, Effect.void); throw Object.assign(new Error("contended"), { code }) }
+    return "saved"
+  })
+  await run(Effect.gen(function*() {
+    const cancelled = yield* Effect.forkChild(write)
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(120_000)
+    expect(cancelled.pollUnsafe()).toBeUndefined()
+    expect(attempts).toBeGreaterThan(100)
+    expect(db.query("SELECT count(*) AS count FROM writes").get()).toEqual({ count: 0 })
+    yield* Fiber.interrupt(cancelled)
+    const before = attempts
+    yield* TestClock.adjust(100)
+    expect(attempts).toBe(before)
+    const waiting = yield* Effect.forkChild(write)
+    yield* TestClock.adjust(120_000)
+    expect(waiting.pollUnsafe()).toBeUndefined()
+    blocked = false
+    yield* TestClock.adjust(10)
+    expect(yield* Fiber.join(waiting)).toBe("saved")
+    expect(db.query("SELECT count(*) AS count FROM writes").get()).toEqual({ count: 1 })
+  }).pipe(Effect.provide(TestClock.layer())))
+})
+
+test("non-contention SQLite errors fail immediately rather than retrying forever", async () => {
+  using db = new Database(":memory:")
+  db.run("CREATE TABLE writes (value TEXT NOT NULL) STRICT")
+  let attempts = 0
+  await expect(run(sqliteTransaction(db, () => { attempts++; db.query("INSERT INTO writes VALUES (NULL)").run() }))).rejects.toThrow("NOT NULL")
+  expect(attempts).toBe(1)
 })
 
 test("independent processes serialize metadata writes without losing relationships", async () => {
