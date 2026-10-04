@@ -99,7 +99,7 @@ test("agent management replay: hidden completion, stale evidence, and verified d
       let app!: AppRuntime
       const activities: TerminalActivityEvent[] = []
       const supervisor = yield* makeTerminalSupervisor({
-        renderer, metadata: repository, guard: makeSessionGuard(repository.statePath, "codex"),
+        renderer, metadata: repository, guard: makeSessionGuard(join(directory, "session-guards"), "codex"),
         processes: { spawn(launch, _dimensions, callbacks) {
           expect(launch.cwd).toBe(directory)
           expect(launch.command).toContain("resume")

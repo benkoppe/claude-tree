@@ -1,836 +1,237 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { join } from "node:path"
+import { Database } from "bun:sqlite"
+import { Effect } from "effect"
 
-import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
-import { TestClock } from "effect/testing"
-
-import { PersistenceError } from "../../src/domain/errors"
-import type { NavigationState } from "../../src/domain/model"
 import type { BranchRelation } from "../../src/domain/persistence"
-import {
-  PersistencePlatform,
-  nativePersistencePlatform,
-  type PersistencePlatformApi,
-} from "../../src/infrastructure/metadata/platform"
-import {
-  makeProviderStateRepository,
-  type ProviderStateRepositoryApi,
-} from "../../src/services/provider-state-repository"
-import { withTransactionLock } from "../../src/infrastructure/metadata/storage"
+import { PersistencePlatform, nativePersistencePlatform } from "../../src/infrastructure/metadata/platform"
+import { makeProviderStateRepository, type ProviderStateRepositoryApi, type ProviderStateRepositoryOptions } from "../../src/services/provider-state-repository"
+import { makeMetadataWorker } from "../../src/infrastructure/metadata/worker-service"
+import { runStateCommand } from "../../src/infrastructure/metadata/state-commands"
+import { openStateDatabase, type DatabaseSchemaPolicy } from "../../src/infrastructure/metadata/database"
+import { readMigrationFiles } from "drizzle-orm/migrator"
 
-const temporaryDirectories: string[] = []
-
+const directories: string[] = []
+const repositories: ProviderStateRepositoryApi[] = []
 afterEach(async () => {
-  await Promise.all(temporaryDirectories.splice(0).map((path) =>
-    rm(path, { recursive: true, force: true })))
+  for (const repository of repositories.splice(0)) await run(repository.close)
+  for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true })
+})
+const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
+async function fixture() {
+  await mkdir("/tmp/opencode", { recursive: true })
+  const directory = await realpath(await mkdtemp("/tmp/opencode/sqlite-test-"))
+  directories.push(directory)
+  const projectDirectory = join(directory, "project"); await mkdir(projectDirectory)
+  return { projectDirectory, stateHome: join(directory, "state"), providerId: "claude", instanceId: "one" }
+}
+async function open(options: ProviderStateRepositoryOptions) {
+  const repository = await run(makeProviderStateRepository(options).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform)))
+  repositories.push(repository); return repository
+}
+const relation = (child: string, parent = "root"): BranchRelation => ({ childSessionId: child, parentSessionId: parent,
+  sourceMessageId: "z", sharedMessages: [{ parentMessageId: "b", childMessageId: "copy-b" }, { parentMessageId: "a", childMessageId: "copy-a" }, { parentMessageId: "z", childMessageId: "copy-z" }], createdAt: "2026-01-01T00:00:00.000Z" })
+
+test("one private STRICT database stores separate project/provider scopes and ordered mappings", async () => {
+  const options = await fixture(); const first = await open(options)
+  const second = await open({ ...options, providerId: "codex" })
+  expect(first.statePath).toBe(second.statePath)
+  expect(first.projectId).toBe(second.projectId)
+  expect(first.scopeId).not.toBe(second.scopeId)
+  await run(first.saveRelation(relation("child")))
+  expect((await run(first.loadMetadata)).relations).toEqual([relation("child")])
+  expect((await run(second.loadMetadata)).relations).toEqual([])
+  expect((await stat(first.statePath)).mode & 0o777).toBe(0o600)
+  using db = new Database(first.statePath, { readonly: true })
+  expect(db.query<{ strict: number; name: string }, []>("PRAGMA table_list").all().filter((row) => !row.name.startsWith("sqlite_") && row.name !== "__drizzle_migrations").every((row) => row.strict === 1)).toBe(true)
+  expect(db.query("SELECT name FROM sqlite_master WHERE name LIKE '%transcript%' OR name LIKE '%owner%'").all()).toEqual([])
 })
 
-describe("ProviderStateRepository schema v3", () => {
-  test("creates one strict provider state in the existing location", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const persisted = JSON.parse(await readFile(repository.statePath, "utf8"))
-    const manifestPath = projectManifestPath(repository.statePath)
-
-    expect(repository.statePath).toContain("/claude-tree/v2/projects/")
-    expect(JSON.parse(await readFile(manifestPath, "utf8"))).toEqual({
-      schemaVersion: 3,
-      projectPath: repository.projectPath,
-    })
-    expect(persisted).toEqual({
-      schemaVersion: 3,
-      relations: [],
-      removals: [],
-      navigations: [],
-    })
-    expect((await stat(repository.statePath)).mode & 0o777).toBe(0o600)
-    expect((await stat(manifestPath)).mode & 0o777).toBe(0o600)
-  })
-
-  test("durably creates every missing state directory boundary", async () => {
-    const { project, state } = await fixture()
-    const syncedDirectories: string[] = []
-    const openHandles = new Set<object>()
-    const platform = testPlatform({
-      open: async (path, flags, mode) => {
-        const handle = await nativePersistencePlatform.open(path, flags, mode)
-        openHandles.add(handle)
-        return {
-          ...handle,
-          sync: async () => {
-            await handle.sync()
-            if (flags === "r") syncedDirectories.push(path)
-          },
-          close: async () => { await handle.close(); openHandles.delete(handle) },
-        }
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    const providerDirectory = dirname(repository.statePath)
-    const projectDirectory = dirname(dirname(providerDirectory))
-
-    expect(syncedDirectories).toEqual(expect.arrayContaining([
-      dirname(state),
-      state,
-      join(state, "claude-tree"),
-      join(state, "claude-tree", "v2"),
-      join(state, "claude-tree", "v2", "projects"),
-      projectDirectory,
-      join(projectDirectory, "providers"),
-      providerDirectory,
-    ]))
-    expect(openHandles.size).toBe(0)
-  })
-
-  test("strictly rejects v2 state in place without changing or deleting it", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const v2 = `${JSON.stringify({ schemaVersion: 2, relations: [], removals: [] })}\n`
-    await writeFile(repository.statePath, v2)
-
-    const error = await rejected(openRepositoryEffect(project, state))
-    expect(error).toBeInstanceOf(PersistenceError)
-    expect((error as PersistenceError).message).toContain("reset-only schema v3")
-    expect((error as PersistenceError).message).toContain("Move or remove")
-    expect((error as PersistenceError).message).toContain("automatic migration and deletion are disabled")
-    expect(await readFile(repository.statePath, "utf8")).toBe(v2)
-  })
-
-  test("strictly rejects the separate v2 lease layout without deleting it", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const leasesDirectory = join(dirname(repository.statePath), "leases")
-    const marker = join(leasesDirectory, "old-lease.json")
-    await mkdir(leasesDirectory)
-    await writeFile(marker, "v2 lease")
-
-    const error = await rejected(openRepositoryEffect(project, state))
-    expect(error).toBeInstanceOf(PersistenceError)
-    expect((error as PersistenceError).message).toContain("separate session lease layout")
-    expect(await readFile(marker, "utf8")).toBe("v2 lease")
-  })
-
-  test("keeps navigation independently for each application instance", async () => {
-    const { project, state } = await fixture()
-    const first = await openRepository(project, state, testPlatform({ instanceId: "instance-a" }))
-    const second = await openRepository(project, state, testPlatform({ instanceId: "instance-b" }))
-
-    await saveNavigationState(first, { view: "terminal", sessionId: "session-a" })
-    await saveNavigationState(second, {
-      view: "roots",
-      selectedSessionId: "session-b",
-    })
-    await saveRelation(first, relation("child", "root"))
-
-    expect((await run(first.loadMetadata)).navigation).toEqual({
-      view: "terminal",
-      sessionId: "session-a",
-    })
-    expect((await run(second.loadMetadata)).navigation).toEqual({
-      view: "roots",
-      selectedSessionId: "session-b",
-    })
-    expect((await run(second.loadMetadata)).relations).toHaveLength(1)
-
-    const persisted = JSON.parse(await readFile(first.statePath, "utf8"))
-    expect(persisted.navigations).toEqual([
-      {
-        instanceId: "instance-a",
-        navigation: { view: "terminal", sessionId: "session-a" },
-      },
-      {
-        instanceId: "instance-b",
-        navigation: { view: "roots", selectedSessionId: "session-b" },
-      },
-    ])
-  })
-
-  test("serializes concurrent metadata writers against the unified document", async () => {
-    const { project, state } = await fixture()
-    const first = await openRepository(project, state, testPlatform({ instanceId: "one" }))
-    const second = await openRepository(project, state, testPlatform({ instanceId: "two" }))
-
-    await Promise.all(Array.from({ length: 16 }, (_, index) =>
-      saveRelation(
-        index % 2 === 0 ? first : second,
-        relation(`child-${index}`, "root"),
-      )))
-
-    expect((await run(first.loadMetadata)).relations).toHaveLength(16)
-  })
-
-  test("each execution of a reusable transaction Effect has a distinct lock token", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    const platform = testPlatform({ pid: 9002 })
-    const owners: { ownerToken: string; ownerPid: number }[] = []
-    const transaction = withTransactionLock(platform, lockPath, Effect.promise(async () => {
-      owners.push(JSON.parse(await readFile(lockPath, "utf8")))
-    }))
-
-    await run(transaction)
-    await run(transaction)
-
-    expect(owners).toHaveLength(2)
-    expect(owners[0]!.ownerToken).not.toBe(owners[1]!.ownerToken)
-    expect(owners.map((owner) => owner.ownerPid)).toEqual([platform.pid, platform.pid])
-    expect(await exists(lockPath)).toBeFalse()
-  })
-
-  test("a delayed local recovery cannot unlink a replacement acquired by re-executing the original Effect", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    const delayedRecovery = deferred()
-    const resumeRecovery = deferred()
-    const winnerEntered = deferred()
-    const delayedObservedWinner = deferred()
-    const finishWinner = deferred()
-    let failedRelease = false
-    const failedPlatform = testPlatform({
-      remove: async (path, options) => {
-        if (path === lockPath && !failedRelease) {
-          failedRelease = true
-          throw new Error("injected lock release failure")
-        }
-        await nativePersistencePlatform.remove(path, options)
-      },
-    })
-
-    let delayed = false
-    const delayRecovery = async () => {
-      if (delayed) return
-      delayed = true
-      delayedRecovery.resolve()
-      await resumeRecovery.promise
-    }
-    const delayedPlatform = testPlatform({
-      link: async (from, to) => {
-        if (to.includes(".reclaim-")) await delayRecovery()
-        await nativePersistencePlatform.link(from, to)
-      },
-      remove: async (path, options) => {
-        // Also intercept the former unguarded unlink, so this regression fails on it.
-        if (path === lockPath) await delayRecovery()
-        await nativePersistencePlatform.remove(path, options)
-      },
-      processLiveness: async () => {
-        delayedObservedWinner.resolve()
-        return "alive"
-      },
-    })
-    let activeTransactions = 0
-    let overlappingTransactions = false
-    const use = (entered: () => void, wait: Promise<void>) => Effect.promise(async () => {
-      activeTransactions++
-      overlappingTransactions ||= activeTransactions > 1
-      try {
-        entered()
-        await wait
-      } finally {
-        activeTransactions--
-      }
-    })
-    let holdWinner = false
-    const originalEffect = withTransactionLock(failedPlatform, lockPath, Effect.suspend(() =>
-      holdWinner ? use(winnerEntered.resolve, finishWinner.promise) : Effect.void))
-    await expect(run(originalEffect)).rejects.toThrow("injected lock release failure")
-    const failedOwner = JSON.parse(await readFile(lockPath, "utf8"))
-
-    const delayedWrite = run(withTransactionLock(delayedPlatform, lockPath,
-      use(delayedObservedWinner.resolve, Promise.resolve())))
-    void delayedWrite.catch(() => undefined)
-    let winningWrite: Promise<void> | undefined
-    try {
-      await boundedBarrier(delayedRecovery.promise, "delayed local recovery")
-      holdWinner = true
-      winningWrite = run(originalEffect)
-      void winningWrite.catch(() => undefined)
-      await boundedBarrier(winnerEntered.promise, "winning replacement transaction")
-      const winningLock = await readFile(lockPath, "utf8")
-      expect(JSON.parse(winningLock).ownerToken).not.toBe(failedOwner.ownerToken)
-      resumeRecovery.resolve()
-      await boundedBarrier(delayedObservedWinner.promise, "delayed contender observing replacement")
-      expect(overlappingTransactions).toBeFalse()
-      expect(await readFile(lockPath, "utf8")).toBe(winningLock)
-      finishWinner.resolve()
-      await Promise.all([winningWrite, delayedWrite])
-      expect(overlappingTransactions).toBeFalse()
-      expect(activeTransactions).toBe(0)
-      expect(await exists(lockPath)).toBeFalse()
-    } finally {
-      resumeRecovery.resolve()
-      finishWinner.resolve()
-      await Promise.allSettled([delayedWrite, ...(winningWrite ? [winningWrite] : [])])
-    }
-  })
-
-  test("only the winning stale-lock reclaimer unlinks before a replacement lock", async () => {
-    const { project, state } = await fixture()
-    let interceptRace = false
-    let staleRemoved = false
-    let replacementHeld = false
-    let winnerRemovedReplacement = false
-    const claimCreated = deferred()
-    const allowStaleRemoval = deferred()
-    const replacementCreated = deferred()
-    const allowReplacementRelease = deferred()
-    const winnerCleanedClaim = deferred()
-    const firstPlatform = testPlatform({
-      pid: 9002,
-      instanceId: "first-reclaimer",
-      processLiveness: async (pid) => pid === 9001 ? "absent" : "alive",
-      link: async (existingPath, newPath) => {
-        await nativePersistencePlatform.link(existingPath, newPath)
-        if (interceptRace && newPath.includes(".reclaim-")) {
-          claimCreated.resolve()
-          await allowStaleRemoval.promise
-        }
-      },
-      remove: async (path, options) => {
-        if (interceptRace && path.endsWith("state.lock") && !staleRemoved) {
-          await nativePersistencePlatform.remove(path, options)
-          staleRemoved = true
-          await replacementCreated.promise
-          return
-        }
-        if (replacementHeld && path.endsWith("state.lock")) winnerRemovedReplacement = true
-        await nativePersistencePlatform.remove(path, options)
-        if (interceptRace && path.includes(".reclaim-")) winnerCleanedClaim.resolve()
-      },
-    })
-    const secondPlatform = testPlatform({
-      pid: 9003,
-      instanceId: "second-reclaimer",
-      processLiveness: async (pid) => pid === 9001 ? "absent" : "alive",
-      link: async (existingPath, newPath) => {
-        await nativePersistencePlatform.link(existingPath, newPath)
-        if (interceptRace && staleRemoved && newPath.endsWith("state.lock")) {
-          replacementHeld = true
-          replacementCreated.resolve()
-          await allowReplacementRelease.promise
-          replacementHeld = false
-        }
-      },
-    })
-    const first = await openRepository(project, state, firstPlatform)
-    const second = await openRepository(project, state, secondPlatform)
-    const lockPath = join(dirname(first.statePath), "state.lock")
-    const lockOwner = {
-      schemaVersion: 3,
-      ownerToken: "stale-owner",
-      ownerPid: 9001,
-      createdAt: timestamp(0),
-    }
-    await writeFile(lockPath, `${JSON.stringify(lockOwner)}\n`, { mode: 0o600 })
-    interceptRace = true
-
-    const firstWrite = run(saveRelationEffect(first, relation("first-child", "root")))
-    void firstWrite.catch(() => undefined)
-    let secondWrite: Promise<unknown> | undefined
-    try {
-      await boundedBarrier(claimCreated.promise, "reclaim claim")
-      secondWrite = run(saveRelationEffect(second, relation("second-child", "root")))
-      void secondWrite.catch(() => undefined)
-      allowStaleRemoval.resolve()
-      await boundedBarrier(replacementCreated.promise, "replacement lock")
-      await boundedBarrier(winnerCleanedClaim.promise, "reclaim cleanup")
-
-      expect(JSON.parse(await readFile(lockPath, "utf8")).ownerPid).toBe(9003)
-      expect(winnerRemovedReplacement).toBeFalse()
-      allowReplacementRelease.resolve()
-      await Promise.all([firstWrite, secondWrite])
-    } finally {
-      allowStaleRemoval.resolve()
-      replacementCreated.resolve()
-      allowReplacementRelease.resolve()
-      await Promise.allSettled([firstWrite, ...(secondWrite ? [secondWrite] : [])])
-    }
-    expect((await run(first.loadMetadata)).relations).toHaveLength(2)
-  })
-
-  test("fails closed after a bounded wait for an abandoned matching reclaim claim", async () => {
-    const { project, state } = await fixture()
-    const platform = testPlatform({
-      pid: 9002,
-      instanceId: "blocked-reclaimer",
-      processLiveness: async (pid) => pid === 9001 ? "absent" : "alive",
-    })
-    const repository = await openRepository(project, state, platform)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    const ownerToken = "abandoned-owner"
-    const reclaimPath = `${lockPath}.reclaim-${createHash("sha256").update(ownerToken).digest("hex")}`
-    await writeFile(lockPath, `${JSON.stringify({
-      schemaVersion: 3,
-      ownerToken,
-      ownerPid: 9001,
-      createdAt: timestamp(0),
-    })}\n`)
-    await nativePersistencePlatform.link(lockPath, reclaimPath)
-
-    const result = await run(Effect.gen(function*() {
-      const fiber = yield* Effect.forkChild(Effect.exit(
-        saveRelationEffect(repository, relation("child", "root")),
-      ))
-      yield* TestClock.adjust(2_000)
-      return yield* Fiber.join(fiber)
-    }).pipe(Effect.provide(TestClock.layer())))
-
-    expect(Exit.isFailure(result)).toBeTrue()
-    const error = Exit.isFailure(result) ? Cause.squash(result.cause) : undefined
-    expect(error).toBeInstanceOf(PersistenceError)
-    expect((error as PersistenceError).message).toContain("may have been abandoned")
-    expect((error as PersistenceError).message).toContain("Automatic takeover is disabled")
-    expect((error as PersistenceError).message).toContain(reclaimPath)
-    expect(await exists(lockPath)).toBeTrue()
-    expect(await exists(reclaimPath)).toBeTrue()
-  })
-
-  test("propagates stale-lock reclaimer cleanup failure", async () => {
-    const { project, state } = await fixture()
-    let failReclaimCleanup = false
-    const platform = testPlatform({
-      pid: 9002,
-      processLiveness: async (pid) => pid === 9001 ? "absent" : "alive",
-      remove: async (path, options) => {
-        if (failReclaimCleanup && path.includes(".reclaim-")) {
-          throw Object.assign(new Error("injected reclaimer cleanup failure"), { code: "EIO" })
-        }
-        await nativePersistencePlatform.remove(path, options)
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    await writeFile(lockPath, `${JSON.stringify({
-      schemaVersion: 3,
-      ownerToken: "stale-owner",
-      ownerPid: 9001,
-      createdAt: timestamp(0),
-    })}\n`)
-    failReclaimCleanup = true
-
-    const error = await rejected(saveRelationEffect(repository, relation("child", "root")))
-    expect(error).toBeInstanceOf(PersistenceError)
-    expect((error as PersistenceError).message).toContain("injected reclaimer cleanup failure")
-    expect((await run(repository.loadMetadata)).relations).toEqual([])
-  })
-
-  test.each(["alive", "unknown"] as const)("waits beyond two seconds for a %s lock, then completes after release", async (liveness) => {
-    const { project, state } = await fixture()
-    const checkingLiveness = Deferred.makeUnsafe<void>()
-    const platform = testPlatform({
-      processLiveness: async () => {
-        Deferred.doneUnsafe(checkingLiveness, Effect.void)
-        return liveness
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    const lock = JSON.stringify({ schemaVersion: 3, ownerToken: "held-owner", ownerPid: 9001, createdAt: timestamp(0) })
-    await writeFile(lockPath, lock)
-    await run(Effect.gen(function*() {
-      const fiber = yield* Effect.forkChild(saveRelationEffect(repository, relation("child", "root")))
-      yield* Deferred.await(checkingLiveness)
-      yield* TestClock.adjust(3_000)
-      expect(yield* Effect.promise(() => readFile(lockPath, "utf8"))).toBe(lock)
-      yield* Effect.promise(() => rm(lockPath))
-      yield* TestClock.adjust(10)
-      yield* Fiber.join(fiber)
-    }).pipe(Effect.provide(TestClock.layer())))
-    expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
-  })
-
-  test.each([false, true])("slow contention reads remain interruptible without a 250ms cutoff (interrupt=%s)", async (interrupt) => {
-    const { project, state } = await fixture()
-    const readingLock = Deferred.makeUnsafe<void>()
-    const releaseRead = deferred()
-    let blockRead = false
-    const platform = testPlatform({
-      processLiveness: async () => "alive",
-      readFile: async (path) => {
-        if (blockRead && path.endsWith("state.lock")) {
-          blockRead = false
-          Deferred.doneUnsafe(readingLock, Effect.void)
-          await releaseRead.promise
-        }
-        return nativePersistencePlatform.readFile(path)
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    const lock = JSON.stringify({ schemaVersion: 3, ownerToken: "slow-read-owner", ownerPid: 9001, createdAt: timestamp(0) })
-    await writeFile(lockPath, lock)
-    blockRead = true
-    try {
-      await run(Effect.gen(function*() {
-        const fiber = yield* Effect.forkChild(repository.loadMetadata)
-        yield* Deferred.await(readingLock)
-        yield* TestClock.adjust(1_000)
-        if (interrupt) {
-          yield* Fiber.interrupt(fiber)
-          const exit = yield* Fiber.await(fiber)
-          expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
-          expect(yield* Effect.promise(() => readFile(lockPath, "utf8"))).toBe(lock)
-        } else {
-          yield* Effect.promise(() => rm(lockPath))
-          releaseRead.resolve()
-          expect((yield* Fiber.join(fiber)).relations).toEqual([])
-        }
-      }).pipe(Effect.provide(TestClock.layer())))
-    } finally {
-      releaseRead.resolve()
-    }
-  })
-
-  test("reconciles exact lock ownership after a lost exclusive-link acknowledgment", async () => {
-    const { project, state } = await fixture()
-    let loseAcknowledgment = false
-    const platform = testPlatform({
-      link: async (from, to) => {
-        await nativePersistencePlatform.link(from, to)
-        if (loseAcknowledgment && to.endsWith("state.lock")) {
-          loseAcknowledgment = false
-          throw Object.assign(new Error("lost exclusive-link acknowledgment"), { code: "EIO" })
-        }
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    loseAcknowledgment = true
-    await run(saveRelationEffect(repository, relation("child", "root")))
-    expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
-    expect(await exists(join(dirname(repository.statePath), "state.lock"))).toBeFalse()
-  })
-
-  test("waiting for a live lock is interruptible", async () => {
-    const { project, state } = await fixture()
-    const checkingLiveness = Deferred.makeUnsafe<void>()
-    const platform = testPlatform({
-      pid: 9002,
-      processLiveness: async () => {
-        Effect.runSync(Deferred.succeed(checkingLiveness, undefined))
-        return "alive"
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    await writeFile(lockPath, `${JSON.stringify({
-      schemaVersion: 3,
-      ownerToken: "live-owner",
-      ownerPid: 9001,
-      createdAt: timestamp(0),
-    })}\n`)
-
-    const before = await readFile(lockPath, "utf8")
-    await run(Effect.gen(function*() {
-      const fiber = yield* Effect.forkChild(saveRelationEffect(repository, relation("child", "root")))
-      yield* Deferred.await(checkingLiveness)
-      yield* Fiber.interrupt(fiber)
-      const exit = yield* Fiber.await(fiber)
-      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
-    }))
-    expect(await readFile(lockPath, "utf8")).toBe(before)
-    await rm(lockPath, { force: true })
-    expect((await run(repository.loadMetadata)).relations).toEqual([])
-  })
-
-  test("public reads lock and can interrupt a blocked liveness check", async () => {
-    const { project, state } = await fixture()
-    const checkingLiveness = Deferred.makeUnsafe<void>()
-    const releaseLiveness = deferred()
-    const platform = testPlatform({
-      pid: 9002,
-      processLiveness: async () => {
-        Effect.runSync(Deferred.succeed(checkingLiveness, undefined))
-        await releaseLiveness.promise
-        return "unknown"
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    const lockPath = join(dirname(repository.statePath), "state.lock")
-    await writeFile(lockPath, `${JSON.stringify({
-      schemaVersion: 3,
-      ownerToken: "unknown-owner",
-      ownerPid: 9001,
-      createdAt: timestamp(0),
-    })}\n`)
-
-    const before = await readFile(lockPath, "utf8")
-    try {
-      await run(Effect.gen(function*() {
-        const fiber = yield* Effect.forkChild(repository.loadMetadata)
-        yield* Deferred.await(checkingLiveness)
-        yield* Fiber.interrupt(fiber)
-        const exit = yield* Fiber.await(fiber)
-        expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
-      }))
-      expect(await readFile(lockPath, "utf8")).toBe(before)
-    } finally {
-      releaseLiveness.resolve()
-    }
-    await rm(lockPath)
-  })
-
-  test("recovers one failed same-process lock release without manual deletion", async () => {
-    const { project, state } = await fixture()
-    let failRelease = false
-    const platform = testPlatform({
-      remove: async (path, options) => {
-        if (failRelease && path.endsWith("state.lock")) {
-          failRelease = false
-          throw Object.assign(new Error("injected lock release failure"), { code: "EIO" })
-        }
-        await nativePersistencePlatform.remove(path, options)
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    failRelease = true
-
-    const error = await rejected(saveRelationEffect(repository, relation("child", "root")))
-    expect(error).toBeInstanceOf(PersistenceError)
-    expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
-    expect(await exists(join(dirname(repository.statePath), "state.lock"))).toBeFalse()
-  })
-
-  test("propagates file and directory fsync failures", async () => {
-    const { project, state } = await fixture()
-    let failure: "file" | "directory" | undefined
-    let stateRenamed = false
-    const openHandles = new Set<object>()
-    const platform = testPlatform({
-      rename: async (oldPath, newPath) => {
-        await nativePersistencePlatform.rename(oldPath, newPath)
-        if (newPath.endsWith("state.json")) stateRenamed = true
-      },
-      open: async (path, flags, mode) => {
-        const handle = await nativePersistencePlatform.open(path, flags, mode)
-        const isDirectory = flags === "r"
-        openHandles.add(handle)
-        return {
-          ...handle,
-          close: async () => { await handle.close(); openHandles.delete(handle) },
-          sync: async () => {
-            if (
-              (failure === "file" && path.includes("/state.json.") && path.endsWith(".tmp")) ||
-              (failure === "directory" && stateRenamed && isDirectory && path.endsWith("test-provider"))
-            ) {
-              throw Object.assign(new Error(`injected ${failure} fsync failure`), { code: "EIO" })
-            }
-            await handle.sync()
-          },
-        }
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    stateRenamed = false
-
-    failure = "file"
-    const fileError = await rejected(saveRelationEffect(repository, relation("file", "root")))
-    expect(fileError).toBeInstanceOf(PersistenceError)
-    expect(openHandles.size).toBe(0)
-    failure = undefined
-    expect((await run(repository.loadMetadata)).relations).toEqual([])
-
-    stateRenamed = false
-    failure = "directory"
-    const directoryError = await rejected(saveRelationEffect(repository, relation("directory", "root")))
-    expect(directoryError).toBeInstanceOf(PersistenceError)
-    expect(openHandles.size).toBe(0)
-    failure = undefined
-    expect((await run(repository.loadMetadata)).relations.map((item) => item.childSessionId)).toEqual([
-      "directory",
-    ])
-  })
-
-  test("ignores only a known unsupported directory fsync result", async () => {
-    const { project, state } = await fixture()
-    let unsupported = false
-    const platform = testPlatform({
-      open: async (path, flags, mode) => {
-        const handle = await nativePersistencePlatform.open(path, flags, mode)
-        return flags === "r"
-          ? {
-              ...handle,
-              sync: async () => {
-                if (unsupported) {
-                  throw Object.assign(new Error("directory fsync unsupported"), {
-                    code: "EINVAL",
-                  })
-                }
-                await handle.sync()
-              },
-            }
-          : handle
-      },
-    })
-    const repository = await openRepository(project, state, platform)
-    unsupported = true
-
-    await saveRelation(repository, relation("child", "root"))
-    expect((await run(repository.loadMetadata)).relations).toHaveLength(1)
-  })
-
-  for (const corruption of ["extra field", "cycle", "source mismatch", "noncanonical", "v2", "unknown version"] as const) {
-    test(`rejects ${corruption} in place before another write`, async () => {
-      const { project, state } = await fixture()
-      const repository = await openRepository(project, state)
-      const original = JSON.parse(await readFile(repository.statePath, "utf8"))
-      const mutations = {
-        "extra field": { extra: true },
-        cycle: { relations: [relation("one", "two"), relation("two", "one")] },
-        "source mismatch": { relations: [{ ...relation("child", "root"), sourceMessageId: "later-source" }] },
-        noncanonical: { relations: [relation("z", "root"), relation("a", "root")] },
-        v2: { schemaVersion: 2 },
-        "unknown version": { schemaVersion: 99 },
-      }
-      const contents = `${JSON.stringify({ ...original, ...mutations[corruption] })}\n`
-      await writeFile(repository.statePath, contents)
-      const error = await rejected(repository.loadMetadata)
-      expect(error).toBeInstanceOf(PersistenceError)
-      if (corruption === "cycle") expect((error as PersistenceError).message).toContain("cycle")
-      if (corruption === "source mismatch") expect((error as PersistenceError).message).toContain("must end at the source message")
-      if (corruption === "noncanonical") expect((error as PersistenceError).message).toContain("canonically ordered")
-      let transformed = false
-      expect(await rejected(repository.updateMetadata((metadata) => {
-        transformed = true
-        return { ...metadata, relations: [...metadata.relations, relation("new", "root")] }
-      }))).toBeInstanceOf(PersistenceError)
-      expect(transformed).toBeFalse()
-      expect(await readFile(repository.statePath, "utf8")).toBe(contents)
-    })
-  }
-
-  test("accepts the documented zero-prefix replay relation", async () => {
-    const { project, state } = await fixture()
-    const repository = await openRepository(project, state)
-    const zeroPrefix = { ...relation("child", "root"), sharedMessages: [] }
-
-    await saveRelation(repository, zeroPrefix)
-    expect((await run(repository.loadMetadata)).relations).toEqual([zeroPrefix])
-  })
+test("relation conflicts and cycles roll back without modifying valid ancestry", async () => {
+  const repository = await open(await fixture())
+  await run(repository.saveRelation(relation("child")))
+  await expect(run(repository.saveRelation(relation("child", "different")))).rejects.toThrow("different branch metadata")
+  await expect(run(repository.saveRelation(relation("root", "child")))).rejects.toThrow("cycle")
+  expect((await run(repository.loadMetadata)).relations).toEqual([relation("child")])
+  await run(repository.saveRelation({ ...relation("empty"), sharedMessages: [] }))
+  expect((await run(repository.loadMetadata)).relations).toHaveLength(2)
 })
 
-function saveRelationEffect(
-  repository: ProviderStateRepositoryApi,
-  value: BranchRelation,
-) {
-  return repository.updateMetadata((metadata) => ({
-    ...metadata,
-    relations: [...metadata.relations, value],
-  }))
-}
+test("workspace writes do not query ancestry and temporary adoption retains local references", async () => {
+  const options = await fixture(); const first = await open(options); const second = await open({ ...options, instanceId: "two" })
+  await run(first.saveRelation({ ...relation("temporary"), sharedMessages: [] }))
+  await run(first.saveNavigation({ view: "terminal", sessionId: "temporary" }))
+  await run(second.saveNavigation({ view: "roots", selectedSessionId: "temporary" }))
+  await run(second.saveNavigation({ view: "roots", selectedSessionId: "temporary" }))
+  using db = new Database(first.statePath)
+  const before = db.query("SELECT session_ref_id FROM session_refs WHERE provider_session_id = 'temporary'").get()
+  await run(first.replaceIdentity("temporary", "actual", { kind: "temporary-adoption" }))
+  expect(db.query("SELECT session_ref_id FROM session_refs WHERE provider_session_id = 'actual'").get()).toEqual(before)
+  await run(first.saveNavigation({ view: "terminal", sessionId: "temporary" }))
+  expect((await run(first.loadMetadata)).navigation).toEqual({ view: "terminal", sessionId: "actual" })
+  expect((await run(second.loadMetadata)).navigation).toEqual({ view: "roots", selectedSessionId: "actual" })
+  // A malformed ancestry record does not make a single cursor save scan ancestry.
+  db.run("UPDATE branch_relations SET source_message_id = 'missing'")
+  await run(first.saveNavigation({ view: "roots", selectedSessionId: "actual" }))
+})
 
-async function saveRelation(
-  repository: ProviderStateRepositoryApi,
-  value: BranchRelation,
-): Promise<void> {
-  await run(saveRelationEffect(repository, value))
-}
+test("removal variants round-trip and remain idempotent through adoption", async () => {
+  const repository = await open(await fixture())
+  const removal = { kind: "subtree" as const, target: { kind: "message" as const, aliases: [{ sessionId: "temporary", messageId: "a" }] }, createdAt: "2026-01-01T00:00:00.000Z" }
+  await run(repository.commitRemoval(removal, []))
+  await run(repository.replaceIdentity("temporary", "actual", { kind: "temporary-adoption" }))
+  const actual = { ...removal, target: { ...removal.target, aliases: [{ sessionId: "actual", messageId: "a" }] } }
+  await run(repository.commitRemoval(actual, []))
+  expect((await run(repository.loadMetadata)).removals).toEqual([actual])
+})
 
-async function saveNavigationState(
-  repository: ProviderStateRepositoryApi,
-  navigation: NavigationState,
-): Promise<void> {
-  await run(repository.updateMetadata((metadata) => ({ ...metadata, navigation })))
-}
+test("metadata worker serializes writes, preserves workspace isolation, and drains on close", async () => {
+  const options = await fixture()
+  await run(Effect.scoped(Effect.gen(function*() {
+    const first = yield* makeMetadataWorker(options)
+    const second = yield* makeMetadataWorker({ ...options, instanceId: "two" })
+    yield* first.saveNavigation({ view: "roots", selectedSessionId: "first" })
+    yield* second.saveNavigation({ view: "roots", selectedSessionId: "second" })
+    yield* Effect.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? first : second).saveRelation({ ...relation(`child-${i}`), sharedMessages: [] })), { concurrency: "unbounded" })
+    expect((yield* first.loadMetadata).relations).toHaveLength(20)
+    expect((yield* second.loadMetadata).navigation).toEqual({ view: "roots", selectedSessionId: "second" })
+    yield* first.close; yield* second.close
+    expect((yield* Effect.flip(first.saveNavigation({ view: "roots", selectedSessionId: null }))).message).toContain("closing")
+  })))
+})
 
-function relation(childSessionId: string, parentSessionId: string) {
-  return {
-    childSessionId,
-    parentSessionId,
-    sourceMessageId: "source",
-    sharedMessages: [{ parentMessageId: "source", childMessageId: `${childSessionId}-source` }],
-    createdAt: timestamp(0),
-  }
-}
+test("foreign keys prevent cross-scope references", async () => {
+  const options = await fixture(); const first = await open(options); const second = await open({ ...options, providerId: "codex" })
+  await run(first.saveNavigation({ view: "terminal", sessionId: "a" })); await run(second.saveNavigation({ view: "terminal", sessionId: "b" }))
+  using db = new Database(first.statePath)
+  db.run("PRAGMA foreign_keys = ON")
+  const rows = db.query<{ session_ref_id: string; scope_id: string }, []>("SELECT session_ref_id, scope_id FROM session_refs ORDER BY provider_session_id").all()
+  expect(() => db.query("INSERT INTO branch_relations VALUES (?, ?, ?, 'source', '2026-01-01T00:00:00.000Z')").run(rows[0]!.session_ref_id, rows[0]!.scope_id, rows[1]!.session_ref_id)).toThrow()
+})
 
-function timestamp(offset: number): string {
-  return new Date(Date.UTC(2026, 7, 30, 12, offset)).toISOString()
-}
+test("delayed navigation cannot undo a native fork; fresh navigation may select its source", async () => {
+  const options = await fixture()
+  await run(Effect.scoped(Effect.gen(function*() {
+    const worker = yield* makeMetadataWorker(options)
+    yield* worker.saveNavigation({ view: "terminal", sessionId: "root" })
+    const delayed = worker.saveNavigation({ view: "terminal", sessionId: "root" })
+    yield* worker.replaceIdentity("root", "fork", { kind: "native-fork", relation: { ...relation("fork"), sharedMessages: [] } })
+    yield* delayed
+    expect((yield* worker.loadMetadata).navigation).toEqual({ view: "terminal", sessionId: "fork" })
+    yield* worker.saveNavigation({ view: "terminal", sessionId: "root" })
+    expect((yield* worker.loadMetadata).navigation).toEqual({ view: "terminal", sessionId: "root" })
+  })))
+})
 
-async function fixture(): Promise<{ project: string; state: string }> {
-  const root = await mkdtemp(join(tmpdir(), "claude-tree-v3-metadata-"))
-  temporaryDirectories.push(root)
-  const project = join(root, "project")
-  const state = join(root, "state")
-  await mkdir(project)
-  return { project, state }
-}
+test("newer schema and altered migration history are rejected in place", async () => {
+  const options = await fixture(); const first = await open(options); await run(first.close)
+  using db = new Database(first.statePath)
+  db.run("PRAGMA user_version = 99")
+  await expect(open(options)).rejects.toThrow("Unsupported")
+  expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 99 })
+  db.run("PRAGMA user_version = 1"); db.run("UPDATE __drizzle_migrations SET hash = 'invalid'")
+  await expect(open(options)).rejects.toThrow("migration history")
+})
 
-function projectManifestPath(statePath: string): string {
-  return join(dirname(dirname(dirname(statePath))), "project.json")
-}
+test("missing database is not recreated by an attached repository", async () => {
+  const repository = await open(await fixture())
+  await rm(repository.statePath)
+  await expect(run(repository.saveNavigation({ view: "roots", selectedSessionId: null }))).rejects.toThrow()
+  await expect(stat(repository.statePath)).rejects.toThrow()
+})
 
-function testPlatform(overrides: Partial<PersistencePlatformApi>): PersistencePlatformApi {
-  return { ...nativePersistencePlatform, ...overrides }
-}
+test("explicit v3 import preserves navigation and leaves source untouched", async () => {
+  const options = await fixture()
+  const legacyDirectory = join(options.stateHome, "claude-tree/v2/projects", createHash("sha256").update(options.projectDirectory).digest("hex"))
+  const providerDirectory = join(legacyDirectory, "providers/claude"); await mkdir(providerDirectory, { recursive: true })
+  await writeFile(join(legacyDirectory, "project.json"), JSON.stringify({ schemaVersion: 3, projectPath: options.projectDirectory }))
+  const source = JSON.stringify({ schemaVersion: 3, relations: [relation("child")], removals: [], navigations: [{ instanceId: "old", navigation: { view: "terminal", sessionId: "child" } }] })
+  const path = join(providerDirectory, "state.json"); await writeFile(path, source)
+  await expect(open(options)).rejects.toThrow("explicit import")
+  const imported = await open({ ...options, importLegacy: true })
+  expect((await run(imported.load)).navigations[0]?.instanceId).toBe("old")
+  expect(await readFile(path, "utf8")).toBe(source)
+  await run(imported.close)
+  await open({ ...options, importLegacy: true })
+  await writeFile(path, source.replace('"child"', '"changed"'))
+  await expect(open({ ...options, importLegacy: true })).rejects.toThrow("changed after import")
+})
 
-function deferred(): {
-  readonly promise: Promise<void>
-  readonly resolve: () => void
-} {
-  let resolve!: () => void
-  const promise = new Promise<void>((complete) => {
-    resolve = complete
-  })
-  return { promise, resolve }
-}
-
-async function boundedBarrier(promise: Promise<void>, label: string): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined
+test("backup contains committed WAL data and exports private metadata", async () => {
+  const options = await fixture(); const repository = await open(options)
+  await run(repository.saveRelation(relation("child")))
+  const destination = join(options.stateHome, "backup.sqlite")
+  const previous = process.env.XDG_STATE_HOME; process.env.XDG_STATE_HOME = options.stateHome
   try {
-    await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 2_000)
-    })])
-  } finally {
-    clearTimeout(timer)
+    await run(runStateCommand({ command: "state", action: "backup", provider: "claude", project: ".", destination }))
+    using backup = new Database(destination, { readonly: true })
+    expect(backup.query("SELECT count(*) AS count FROM branch_relations").get()).toEqual({ count: 1 })
+    expect((await stat(destination)).mode & 0o777).toBe(0o600)
+    expect(await run(runStateCommand({ command: "state", action: "check", provider: "claude", project: "." }))).toContain("passed")
+  } finally { if (previous === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previous }
+})
+
+async function upgradePolicy(options: Awaited<ReturnType<typeof fixture>>, fail = false): Promise<DatabaseSchemaPolicy> {
+  const folder = join(options.stateHome, "upgrade-migrations")
+  await cp("src/infrastructure/metadata/migrations", folder, { recursive: true })
+  const journalPath = join(folder, "meta/_journal.json")
+  const journal = JSON.parse(await readFile(journalPath, "utf8"))
+  journal.entries.push({ idx: 1, version: "6", when: journal.entries[0].when + 1, tag: "0001_upgrade", breakpoints: true })
+  await writeFile(journalPath, JSON.stringify(journal))
+  await writeFile(join(folder, "0001_upgrade.sql"), `CREATE TABLE upgrade_marker (value TEXT NOT NULL) STRICT;\n--> statement-breakpoint\n${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('upgraded');"}\n--> statement-breakpoint\nPRAGMA user_version = 2;`)
+  return { version: 2, folder, migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
+}
+
+test("forward migration requires exclusive access, backs up, and rejects downgrade", async () => {
+  const options = await fixture(); const repository = await open(options)
+  const policy = await upgradePolicy(options)
+  await expect(run(openStateDatabase(options.stateHome, true, policy))).rejects.toThrow("Exit other")
+  await run(repository.close)
+  const upgraded = await run(openStateDatabase(options.stateHome, true, policy))
+  expect(upgraded.db.query("SELECT value FROM upgrade_marker").get()).toEqual({ value: "upgraded" })
+  await upgraded.close()
+  const backups = (await readdir(join(options.stateHome, "claude-tree"))).filter((name) => name.includes("before-v2"))
+  expect(backups).toHaveLength(1)
+  expect((await stat(join(options.stateHome, "claude-tree", backups[0]!))).mode & 0o777).toBe(0o600)
+  await expect(open(options)).rejects.toThrow("Unsupported")
+})
+
+test("failed forward migration rolls back DDL, ledger, and compatibility version", async () => {
+  const options = await fixture(); const repository = await open(options); await run(repository.close)
+  const policy = await upgradePolicy(options, true)
+  await expect(run(openStateDatabase(options.stateHome, true, policy))).rejects.toThrow()
+  const reopened = await open(options)
+  using db = new Database(reopened.statePath, { readonly: true })
+  expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
+  expect(db.query("SELECT name FROM sqlite_master WHERE name = 'upgrade_marker'").all()).toEqual([])
+})
+
+test("independent processes serialize metadata writes without losing relationships", async () => {
+  const options = await fixture()
+  const children = Array.from({ length: 4 }, (_, index) => Bun.spawn([process.execPath, "test/next/helpers/sqlite-process.ts", options.projectDirectory, options.stateHome, `process-${index}`], { stdout: "pipe", stderr: "pipe" }))
+  for (const child of children) {
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect(stderr).toBe(""); expect(code).toBe(0)
   }
-}
+  const repository = await open(options)
+  expect((await run(repository.loadMetadata)).relations).toHaveLength(80)
+})
 
-function openRepositoryEffect(
-  project: string,
-  state: string,
-  platform: PersistencePlatformApi = nativePersistencePlatform,
-) {
-  return makeProviderStateRepository({
-    projectDirectory: project,
-    providerId: "test-provider",
-    stateHome: state,
-    instanceId: platform.instanceId,
-  }).pipe(Effect.provideService(PersistencePlatform, platform))
-}
-
-function openRepository(
-  project: string,
-  state: string,
-  platform?: PersistencePlatformApi,
-): Promise<ProviderStateRepositoryApi> {
-  return run(openRepositoryEffect(project, state, platform))
-}
-
-async function exists(path: string): Promise<boolean> {
+test("process death rolls back an uncommitted write and releases database and schema locks", async () => {
+  const options = await fixture(); const repository = await open(options)
+  await run(repository.saveRelation(relation("child")))
+  const child = Bun.spawn([process.execPath, "test/next/helpers/sqlite-process.ts", options.projectDirectory, options.stateHome, "crash-holder", "crash"], { stdout: "pipe", stderr: "pipe" })
   try {
-    await stat(path)
-    return true
-  } catch (error) {
-    if ((error as { readonly code?: string }).code === "ENOENT") return false
-    throw error
-  }
-}
-
-function run<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
-  return Effect.runPromise(effect)
-}
-
-async function rejected(effect: Effect.Effect<unknown, unknown> | Promise<unknown>): Promise<unknown> {
-  try {
-    if (effect instanceof Promise) await effect
-    else await Effect.runPromise(effect)
-    throw new Error("Expected operation to fail")
-  } catch (error) {
-    return error
-  }
-}
+    const reader = child.stdout.getReader()
+    const chunk = await reader.read()
+    expect(new TextDecoder().decode(chunk.value)).toContain("transaction-held")
+    reader.releaseLock()
+  } finally { child.kill("SIGKILL"); await child.exited }
+  expect((await run(repository.loadMetadata)).relations).toEqual([relation("child")])
+  await run(repository.saveRelation({ ...relation("after-crash"), sharedMessages: [] }))
+  await run(repository.close)
+  const upgraded = await run(openStateDatabase(options.stateHome, true, await upgradePolicy(options)))
+  await upgraded.close()
+})
