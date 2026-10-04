@@ -756,6 +756,10 @@ class OpenTuiPresentationController {
       return
     }
     if (modal._tag === "About" || modal._tag === "Error") {
+      if (modal._tag === "About" && isUnmodifiedKey(key, "c") && !key.repeated) {
+        this.copyModalText()
+        return
+      }
       if (modal._tag === "Error") {
         if (["tab", "left", "right", "h", "l"].some((name) => isUnmodifiedKey(key, name))) {
           this.errorChoice = this.errorChoice === "copy" ? "close" : "copy"
@@ -763,10 +767,12 @@ class OpenTuiPresentationController {
           return
         }
         if (isEnterKey(key) && this.errorChoice === "copy") {
-          if (!key.repeated) this.copyError()
+          if (!key.repeated) this.copyModalText()
           return
         }
-        if (isUnmodifiedKey(key, "c") && !key.repeated) { this.copyError(); return }
+        if (isUnmodifiedKey(key, "c") && !key.repeated) { this.copyModalText(); return }
+      }
+      if (modal._tag === "Error") {
         const delta = listNavigationDelta(key)
         if (delta !== undefined) { this.errorScroll.scrollBy(delta); this.render(); return }
         if (isUnmodifiedKey(key, "pageup") || isUnmodifiedKey(key, "pagedown")) {
@@ -798,10 +804,11 @@ class OpenTuiPresentationController {
     if (isEnterKey(key) && !key.repeated) this.completeConfirmation(this.modalChoice)
   }
 
-  private copyError(): void {
+  private copyModalText(): void {
     const modal = this.viewModel?.modal
-    if (modal?._tag !== "Error") return
-    try { this.errorCopyState = this.renderer.copyToClipboardOSC52(modal.message) ? "copied" : "failed" }
+    const text = modal?._tag === "Error" ? modal.message : modal?._tag === "About" ? this.options.resumeCommand : undefined
+    if (!text) return
+    try { this.errorCopyState = this.renderer.copyToClipboardOSC52(text) ? "copied" : "failed" }
     catch { this.errorCopyState = "failed" }
     this.render()
   }
@@ -1500,7 +1507,10 @@ class OpenTuiPresentationController {
   }
 
   private modalActions(modal: ApplicationModal) {
-    if (modal._tag === "About") return styledText([chunk("close", theme.selectedText, TextAttributes.BOLD, theme.primary)])
+    if (modal._tag === "About") return styledText([
+      chunk("close", theme.selectedText, TextAttributes.BOLD, theme.primary),
+      ...(this.errorCopyState === "idle" ? [] : [chunk(`  ${this.errorCopyLabel()}`, theme.textMuted, TextAttributes.NONE, theme.element)]),
+    ])
     if (modal._tag === "Error") return styledText([
       ...(["copy", "close"] as const).flatMap((choice) => [
         chunk(choice === "copy" ? "Copy" : "Close",
@@ -1839,7 +1849,7 @@ class OpenTuiPresentationController {
     if (choice !== pending.choice) return
     event.preventDefault()
     event.stopPropagation()
-    if (choice === "copy") this.copyError()
+    if (choice === "copy") this.copyModalText()
     else if (choice === "close") this.enqueue(this.appRuntime.closeModal)
     else this.completeConfirmation(choice)
   }
@@ -2047,7 +2057,10 @@ function modalContent(modal: ApplicationModal, resumeCommand?: string): {
       body: styledText([
         chunk(PROGRAM_NAME, theme.text, TextAttributes.BOLD, theme.element),
         chunk(`\nVersion ${PROGRAM_VERSION}`, theme.textMuted, TextAttributes.NONE, theme.element),
-        ...(resumeCommand ? [chunk(`\n\nResume this workspace:\n${resumeCommand}`, theme.text, TextAttributes.NONE, theme.element)] : []),
+        ...(resumeCommand ? [
+          chunk("\n\nResume this workspace: (c to copy)\n", theme.text, TextAttributes.NONE, theme.element),
+          chunk(resumeCommand, theme.textMuted, TextAttributes.NONE, theme.element),
+        ] : []),
         chunk(
           "\n\nNote: Branches are not isolated. All conversations share this working directory and can modify the same files.",
           theme.warning,
