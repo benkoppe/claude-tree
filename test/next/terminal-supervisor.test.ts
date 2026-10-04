@@ -381,6 +381,28 @@ test("concurrent opens of one session acquire exactly one launch", async () => {
   })))
 })
 
+test("a superseded acquisition registers its owner without activating its surface", async () => {
+  const fixture = makeFixture()
+  await withSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let current = true
+    const slow = yield* Effect.forkChild(supervisor.show({ session: session("slow"),
+      acquireLaunch: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(acquiredLaunch("slow", fixture))),
+    }, () => current))
+    yield* Deferred.await(entered)
+    current = false
+    yield* supervisor.show(prepared("other", fixture))
+    yield* Deferred.succeed(release, undefined)
+    const owner = yield* Fiber.join(slow)
+    expect(yield* supervisor.activeSessionId).toBe("other")
+    expect(yield* supervisor.runningSessionIds).toEqual(new Set(["slow", "other"]))
+    expect(fixture.log).not.toContain(`focus:${owner}`)
+    yield* supervisor.show(prepared("slow", fixture))
+    expect(yield* supervisor.activeSessionId).toBe("slow")
+  })))
+})
+
 test("shutdown interrupts provider acquisition and waits for its rollback", async () => {
   const fixture = makeFixture()
   await withSupervisor(fixture.dependencies, (supervisor) => Effect.scoped(Effect.gen(function*() {

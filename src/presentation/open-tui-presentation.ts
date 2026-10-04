@@ -302,8 +302,7 @@ class OpenTuiPresentationController {
   private errorMessage: string | undefined
   private errorCopyState: "idle" | "copied" | "failed" = "idle"
   private errorChoice: "copy" | "close" = "close"
-  private actionPending = false
-  private terminalOpening = false
+  private readonly pendingActions = new Set<string>()
   private started = false
   private stopping = false
   private spinnerFrame = 0
@@ -624,7 +623,7 @@ class OpenTuiPresentationController {
       if (!isHostEscape(key)) return
       key.stopPropagation()
       this.rememberConsumedKeyRelease(key)
-      if (!key.repeated) this.runAction(this.appRuntime.returnFromTerminal)
+      if (!key.repeated) this.runAction(this.appRuntime.returnFromTerminal, "terminal-return")
       return
     }
     if (!surface || this.stopping) return
@@ -685,7 +684,7 @@ class OpenTuiPresentationController {
     } else if (isUnmodifiedKey(key, "x") && !key.repeated) {
       this.showStopConfirmation()
     } else if (isUnmodifiedKey(key, "n") && !key.repeated) {
-      this.runTerminalAction(this.appRuntime.newSession)
+      this.runAction(this.appRuntime.newSession, "terminal:new")
     }
   }
 
@@ -725,7 +724,7 @@ class OpenTuiPresentationController {
     } else if (isUnmodifiedKey(key, "x") && !key.repeated) {
       this.showStopConfirmation()
     } else if (isUnmodifiedKey(key, "n") && !key.repeated) {
-      this.runTerminalAction(this.appRuntime.newSession)
+      this.runAction(this.appRuntime.newSession, "terminal:new")
     }
   }
 
@@ -958,7 +957,8 @@ class OpenTuiPresentationController {
       this.showError(`No ${this.provider.displayName} session is reachable from this node`)
     } else if (options.length === 1) {
       this.preferredOpenSession = null
-      this.runTerminalAction(this.appRuntime.openEndpoint(options[0]!.session.id))
+      const sessionId = options[0]!.session.id
+      this.runAction(this.appRuntime.openEndpoint(sessionId), `terminal:${sessionId}`)
     } else {
       const preferred = this.preferredOpenSession
       const preferredIndex = preferred && preferred.familySessionId === this.graphSurface()?.familySessionId &&
@@ -1010,7 +1010,7 @@ class OpenTuiPresentationController {
     const target = selected.target.kind === "message"
       ? selected.target.preferred
       : selected.aliases.at(-1)
-    if (target) this.runAction(this.appRuntime.branchFrom(target))
+    if (target) this.runAction(this.appRuntime.branchFrom(target), `fork:${target.sessionId}:${target.messageId}`)
   }
 
   private showStopConfirmation(): void {
@@ -1143,7 +1143,8 @@ class OpenTuiPresentationController {
       } else {
         yield* self.appRuntime.remove(modal.removal, modal.affectedSessionIds, modal.requestId)
       }
-    }))
+    }), modal._tag === "ConfirmRemoval" ? `remove:${modal.requestId}`
+      : modal._tag === "ConfirmStopTree" ? `stop-tree:${modal.rootSessionId}` : `stop:${modal.sessionId}`)
   }
 
   private showError(message: string): void {
@@ -1176,27 +1177,21 @@ class OpenTuiPresentationController {
       return
     }
     this.preferredOpenSession = null
-    this.runTerminalAction(this.appRuntime.openEndpoint(option.session.id))
+    this.runAction(this.appRuntime.openEndpoint(option.session.id), `terminal:${option.session.id}`)
   }
 
-  private runTerminalAction(action: Effect.Effect<unknown, unknown>): void {
-    this.runAction(action, true)
-  }
-
-  private runAction(action: Effect.Effect<unknown, unknown>, opensTerminal = false): void {
-    if (this.actionPending || this.stopping) return
-    this.actionPending = true
-    this.terminalOpening = opensTerminal
+  private runAction(action: Effect.Effect<unknown, unknown>, key: string): void {
+    if (this.pendingActions.has(key) || this.stopping) return
+    this.pendingActions.add(key)
     this.renderSafely("Render pending action")
     this.enqueue(action.pipe(Effect.ensuring(Effect.sync(() => {
-      this.actionPending = false
-      this.terminalOpening = false
+      this.pendingActions.delete(key)
       this.renderSafely("Render action result")
-    }))))
+    }))), true, "navigation")
   }
 
   private interactionBlocked(): boolean {
-    return this.actionPending || Boolean(this.viewModel?.initialLoadPending || this.viewModel?.shuttingDown)
+    return Boolean(this.viewModel?.initialLoadPending || this.viewModel?.shuttingDown)
   }
 
   private refresh(): void {
@@ -1267,7 +1262,7 @@ class OpenTuiPresentationController {
     if (!this.started || this.renderer.isDestroyed || !this.viewModel) return
     this.updateTitle()
     const surface = this.viewModel.surface
-    const terminal = surface._tag === "Terminal" || this.terminalOpening
+    const terminal = surface._tag === "Terminal"
     this.navigator.visible = !terminal
     this.dialogOverlay.visible = false
     if (terminal) {
@@ -1730,7 +1725,7 @@ class OpenTuiPresentationController {
   private runFooterAction(action: FooterAction): void {
     if (action !== "quit" && action !== "about" && this.interactionBlocked()) return
     if (action === "enter-root") this.enterSelectedRoot()
-    else if (action === "new") this.runTerminalAction(this.appRuntime.newSession)
+    else if (action === "new") this.runAction(this.appRuntime.newSession, "terminal:new")
     else if (action === "refresh") this.refresh()
     else if (action === "details") this.showIssueDetails()
     else if (action === "quit") this.enqueue(this.stop, true, "background")

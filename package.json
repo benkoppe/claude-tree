@@ -25,6 +25,7 @@
   "scripts": {
     "start": "bun run src/cli.ts",
     "test": "bun test",
+    "benchmark:responsiveness": "bun run scripts/benchmark-responsiveness.ts",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun test"
   },

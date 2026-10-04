@@ -126,7 +126,7 @@ export function makeApplicationOperations(options: {
     prepareNew: Effect.suspend(() => options.provider.prepareNewSession),
     prepareResume: (session) => Effect.suspend(() => options.provider.prepareResume(session)),
     branch,
-    show: (prepared) => Effect.suspend(() => options.terminals.show(prepared)),
+    show: (prepared, shouldActivate) => Effect.suspend(() => options.terminals.show(prepared, shouldActivate)),
     hideActive: Effect.suspend(() => Effect.all({
       sessionId: options.terminals.hideActive,
       drafts: options.terminals.draftPreviews,
