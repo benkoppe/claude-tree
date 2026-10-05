@@ -64,7 +64,8 @@ export function selectHistoryDetails(state: ApplicationState, sessionIds: Iterab
       ? "History gap: showing the last accepted snapshot (SDK context order until history is verified). Open the session to continue; forking awaits verified history."
       : status._tag === "Unavailable" ? status.reason
       : status._tag === "Missing" ? "Session history was not found" : undefined
-    return reason ? [`${describeSession(state, id)}\n${reason}`] : []
+    const verification = state.branchVerifications.get(id)
+    return reason || verification ? [`${describeSession(state, id)}\n${[reason, verification?.reason].filter(Boolean).join("\n")}`] : []
   })
 }
 

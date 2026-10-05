@@ -123,7 +123,14 @@ export interface LocalOverlayState {
   readonly temporarySessionIds: ReadonlySet<string>
 }
 
+export interface BranchVerificationState {
+  readonly status: "verifying" | "paused" | "unavailable" | "contradicted" | "persistence-failed" | "independent"
+  readonly reason: string
+  readonly retryable: boolean
+}
+
 export interface ApplicationState {
+  readonly branchVerifications: ReadonlyMap<string, BranchVerificationState>
   /** Invocation-local recency; metadata-only writes do not count as conversation activity. */
   readonly conversationActivity: ReadonlyMap<string, number>
   /** Latest read outcome, independent of retained accepted history. */
@@ -165,6 +172,7 @@ export function makeInitialApplicationState(
   initial: InitialApplicationState = {},
 ): ApplicationState {
   return {
+    branchVerifications: new Map(),
     conversationActivity: new Map(),
     historyStatus: new Map(),
     selectionId: null,

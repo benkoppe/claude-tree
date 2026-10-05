@@ -34,6 +34,7 @@ import type {
   ActiveRefresh,
   ApplicationModal,
   ApplicationState,
+  BranchVerificationState,
   ApplicationSurface,
   NavigatorSurface,
   PendingCompletion,
@@ -42,6 +43,7 @@ import type {
 export const MAX_COMPLETION_REFRESH_ATTEMPTS = HISTORY_RETRY_DELAYS_MS.length
 
 export type StateEvent =
+  | { readonly _tag: "BranchVerificationChanged"; readonly sessionId: string; readonly verification?: BranchVerificationState }
   | { readonly _tag: "PreparedRefreshPublished"; readonly base: ApplicationState; readonly candidate: ApplicationState }
   | { readonly _tag: "RefreshProgress"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
   | { readonly _tag: "RefreshStarted"; readonly refresh: ActiveRefresh; readonly replaceAll?: boolean }
@@ -76,6 +78,12 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
   if (state.shutdown === "shutting-down" && !isShutdownEvent(event)) return state
 
   switch (event._tag) {
+    case "BranchVerificationChanged": {
+      const branchVerifications = new Map(state.branchVerifications)
+      if (event.verification) branchVerifications.set(event.sessionId, event.verification)
+      else branchVerifications.delete(event.sessionId)
+      return { ...state, branchVerifications }
+    }
     case "PreparedRefreshPublished": {
       const next: ApplicationState = { ...event.candidate, surface: state.surface, selectionId: state.selectionId,
         modal: event.candidate.modal === event.base.modal ? state.modal : event.candidate.modal }
@@ -313,6 +321,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       return {
         ...state,
         shutdown: "shutting-down",
+        branchVerifications: new Map(),
         terminals: new Map([...state.terminals].map(([id, terminal]) => [id, { ...terminal, pendingSubmission: undefined }])),
         modal: null,
         pendingCompletions: new Map(),
@@ -477,7 +486,8 @@ function refreshSucceeded(
     localTranscripts.delete(sessionId)
     const session = sessions.get(sessionId)
     if (session && !session.transient) {
-      localSessions.delete(sessionId)
+      if (state.branchVerifications.has(sessionId)) localSessions.set(sessionId, session)
+      else localSessions.delete(sessionId)
       temporarySessionIds.delete(sessionId)
     }
   }
