@@ -110,6 +110,7 @@ export type SurfaceViewModel =
     }
 
 export interface ApplicationViewModel {
+  readonly branchVerifications?: ApplicationState["branchVerifications"]
   readonly selectionId: string | null
   readonly surface: SurfaceViewModel
   readonly modal: ApplicationModal | null
@@ -144,6 +145,7 @@ export function cacheGraphLayout(graph: ConversationGraph, visible: ReadonlySet<
   return geometry
 }
 const graphViewCache = new WeakMap<ConversationGraph, {
+  branchVerifications: ApplicationState["branchVerifications"]
   historyStatus: ApplicationState["historyStatus"]
   layout: ReturnType<typeof layoutConversationGraph>
   terminals: ApplicationState["terminals"]
@@ -155,6 +157,7 @@ const graphViewCache = new WeakMap<ConversationGraph, {
 const rootSummaryCache = new WeakMap<ConversationGraph, Omit<RootViewModel, "status" | "history" | "activation" | "lastModified">>()
 const rootRowCache = new WeakMap<object, RootViewModel>()
 const rootViewCache = new WeakMap<ReturnType<typeof selectVisibleConversationForest>, {
+  branchVerifications: ApplicationState["branchVerifications"]
   refresh: ApplicationState["refresh"]["active"]
   provider: ApplicationState["provider"]
   conversationActivity: ApplicationState["conversationActivity"]
@@ -212,7 +215,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   const data = selectProjectedData(state)
   const forest = selectVisibleConversationForest(state)
   const cached = rootViewCache.get(forest)
-  if (cached && cached.refresh === state.refresh.active && cached.provider === state.provider && cached.terminals === state.terminals && cached.historyStatus === state.historyStatus &&
+  if (cached && cached.branchVerifications === state.branchVerifications && cached.refresh === state.refresh.active && cached.provider === state.provider && cached.terminals === state.terminals && cached.historyStatus === state.historyStatus &&
     cached.completions === state.pendingCompletions && cached.unviewed === state.unviewedSessionIds &&
     cached.conversationActivity === state.conversationActivity) return cached.roots
   const roots = forest.graphs.map((graph): RootViewModel => {
@@ -261,7 +264,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   const rows = [...roots.filter((root) => !pendingIds.has(root.sessionId)), ...pendingRoots].sort(
     (left, right) => right.lastModified - left.lastModified || left.sessionId.localeCompare(right.sessionId),
   )
-  rootViewCache.set(forest, { refresh: state.refresh.active, provider: state.provider, conversationActivity: state.conversationActivity, terminals: state.terminals, historyStatus: state.historyStatus,
+  rootViewCache.set(forest, { branchVerifications: state.branchVerifications, refresh: state.refresh.active, provider: state.provider, conversationActivity: state.conversationActivity, terminals: state.terminals, historyStatus: state.historyStatus,
     completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, roots: rows })
   return rows
 }
@@ -295,7 +298,7 @@ export function projectGraphViewModel(
     initialVisibleGraphNodeId(graph, visibleEndpointSessionIds) ??
     null
   const cached = graphViewCache.get(graph)
-  if (cached && cached.layout === layout && sameFamilyValues(cached.terminals, state.terminals, graph.sessionIds) && sameFamilyValues(cached.drafts, state.drafts, graph.sessionIds) &&
+  if (cached && sameFamilyValues(cached.branchVerifications, state.branchVerifications, graph.sessionIds) && cached.layout === layout && sameFamilyValues(cached.terminals, state.terminals, graph.sessionIds) && sameFamilyValues(cached.drafts, state.drafts, graph.sessionIds) &&
     sameFamilyValues(cached.completions, state.pendingCompletions, graph.sessionIds) &&
     (cached.unviewed === state.unviewedSessionIds || [...graph.sessionIds].every((id) => cached.unviewed.has(id) === state.unviewedSessionIds.has(id))) &&
     sameFamilyValues(cached.historyStatus, state.historyStatus, graph.sessionIds)) {
@@ -338,7 +341,7 @@ export function projectGraphViewModel(
     worldWidth: layout.worldWidth,
     worldHeight: layout.worldHeight,
   }
-  graphViewCache.set(graph, { historyStatus: state.historyStatus, layout, terminals: state.terminals, drafts: state.drafts,
+  graphViewCache.set(graph, { branchVerifications: state.branchVerifications, historyStatus: state.historyStatus, layout, terminals: state.terminals, drafts: state.drafts,
     completions: state.pendingCompletions, unviewed: state.unviewedSessionIds, view })
   return withGraphSelection(view, selectedNodeId)
 }

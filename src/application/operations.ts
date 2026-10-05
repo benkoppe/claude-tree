@@ -16,7 +16,10 @@ import type {
   BranchOutcome,
   PreparedTerminal,
   ValidatedBranch,
+  BranchCreated,
+  BranchVerificationReceipt,
 } from "../services/provider"
+import { awaitBranchVerification } from "../services/branch-verification"
 import type { TerminalCleanupError, TerminalSupervisorApi } from "../services/terminal-supervisor"
 export type ApplicationMetadataFacet = Pick<
   ProviderStateRepositoryApi,
@@ -45,10 +48,11 @@ export interface ApplicationOperations {
   readonly reconcileActivity: TerminalSupervisorApi["reconcileActivity"]
   readonly prepareNew: Effect.Effect<PreparedTerminal, unknown>
   readonly prepareResume: AgentProviderApi["prepareResume"]
-  readonly branch: (target: Parameters<AgentProviderApi["branchFrom"]>[0]) => Effect.Effect<
+  readonly branch: (target: Parameters<AgentProviderApi["branchFrom"]>[0], created?: BranchCreated) => Effect.Effect<
     PersistedBranch | IndependentBranch,
     unknown
   >
+  readonly verifyBranch: (receipt: BranchVerificationReceipt) => Effect.Effect<PersistedBranch | IndependentBranch, unknown>
   readonly show: TerminalSupervisorApi["show"]
   readonly hideActive: Effect.Effect<{
     readonly sessionId: string | null
@@ -90,8 +94,7 @@ export function makeApplicationOperations(options: {
         relation,
       ))
 
-  const branch: ApplicationOperations["branch"] = (target) => Effect.suspend(() => Effect.gen(function*() {
-    const outcome = yield* Effect.suspend(() => options.provider.branchFrom(target))
+  const persistBranch = (outcome: BranchOutcome): Effect.Effect<PersistedBranch | IndependentBranch, unknown> => Effect.gen(function*() {
     if (outcome._tag === "AmbiguousBranchMutation") return { outcome }
     if (outcome._tag === "CreatedIndependentSession") return { outcome }
 
@@ -111,10 +114,20 @@ export function makeApplicationOperations(options: {
           ? snapshot.value.transcripts.get(outcome.session.id) ?? { _tag: "Missing" }
           : { _tag: "Unavailable", reason: errorMessage(Cause.squash(snapshot.cause)) },
         reason: `Branch was created but ancestry could not be saved: ${errorMessage(Cause.squash(persisted.cause))}`,
+        verification: { status: "persistence-failed", reasonCode: "metadata-failed",
+          receipt: { session: outcome.session, verify: Effect.succeed(outcome) } },
         acquireLaunch: outcome.acquireLaunch,
       },
     }
-  }))
+  })
+
+  const branch: ApplicationOperations["branch"] = (target, created) => Effect.gen(function*() {
+    let outcome = yield* options.provider.branchFrom(target, created)
+    if (outcome._tag === "CreatedIndependentSession" && outcome.verification?.status === "pending" && outcome.verification.receipt) {
+      outcome = yield* awaitBranchVerification(outcome.verification.receipt, outcome)
+    }
+    return yield* persistBranch(outcome)
+  })
 
   return {
     loadSnapshot,
@@ -122,6 +135,7 @@ export function makeApplicationOperations(options: {
     prepareNew: Effect.suspend(() => options.provider.prepareNewSession),
     prepareResume: (session) => Effect.suspend(() => options.provider.prepareResume(session)),
     branch,
+    verifyBranch: (receipt) => awaitBranchVerification(receipt).pipe(Effect.flatMap(persistBranch)),
     show: (prepared, shouldActivate) => Effect.suspend(() => options.terminals.show(prepared, shouldActivate)),
     hideActive: Effect.suspend(() => Effect.all({
       sessionId: options.terminals.hideActive,

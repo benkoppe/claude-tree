@@ -51,6 +51,7 @@ import {
   type AgentProviderApi,
   type BranchOutcome,
   type PreparedTerminal,
+  type BranchVerificationReceipt,
 } from "../../src/services/provider"
 import {
   TerminalCleanupError,
@@ -3441,7 +3442,106 @@ describe("application actor", () => {
     expect(takes).toBeGreaterThan(2)
   })
 
-  test("opens a provider-created independent child when ancestry persistence fails", async () => {
+  test("a slow fork remains independently visible and supports cancellation and read-only retry without focus theft", async () => {
+    const fixture = makeFixture()
+    const child = prepared("slow-child", "Slow child")
+    let visible = false
+    let mutations = 0
+    let reads = 0
+    const verified: BranchOutcome = { _tag: "ValidatedBranch", ...child,
+      transcript: { _tag: "Available", messages: [] },
+      derivation: { childSessionId: child.session.id, parentSessionId: ROOT, sourceMessageId: "q", sharedMessages: [] } }
+    const receipt: BranchVerificationReceipt = { session: child.session, verify: Effect.suspend(() => {
+      reads++
+      return Effect.succeed(visible ? verified : { _tag: "CreatedIndependentSession" as const, session: child.session,
+        transcript: { _tag: "Missing" as const }, reason: "Not yet visible",
+        verification: { status: "pending" as const, reasonCode: "missing" as const, receipt } })
+    }) }
+    const provider: AgentProviderApi = { ...fixture.options.provider, branchFrom: (_target, created) => Effect.gen(function*() {
+      mutations++
+      if (created) yield* created(receipt)
+      return yield* receipt.verify
+    }) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      const branch = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
+      yield* waitForState(runtime, (state) => state.branchVerifications.get(child.session.id)?.status === "verifying")
+      yield* TestClock.adjust(30_000)
+      expect(branch.pollUnsafe()).toBeUndefined()
+      expect(reads).toBeGreaterThan(20)
+      yield* runtime.selectRoot(CHILD)
+      yield* runtime.refresh()
+      expect((yield* runtime.getState).local.sessions.has(child.session.id)).toBeTrue()
+      expect(fixture.calls.some((call) => call === `show:${child.session.id}`)).toBeFalse()
+      yield* runtime.manageBranchVerification(child.session.id, "cancel")
+      expect(Exit.isFailure(yield* Fiber.join(branch))).toBeTrue()
+      expect((yield* runtime.getState).branchVerifications.get(child.session.id)?.status).toBe("paused")
+      const retry = yield* Effect.forkChild(runtime.manageBranchVerification(child.session.id, "retry"))
+      yield* waitForState(runtime, (state) => state.branchVerifications.get(child.session.id)?.status === "verifying")
+      expect(Exit.isFailure(yield* Effect.exit(runtime.manageBranchVerification(child.session.id, "retry")))).toBeTrue()
+      visible = true
+      yield* TestClock.adjust(1_000)
+      yield* Fiber.join(retry)
+      const state = yield* runtime.getState
+      expect(state.relations.some((relation) => relation.childSessionId === child.session.id)).toBeTrue()
+      expect(state.branchVerifications.has(child.session.id)).toBeFalse()
+      expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      expect(fixture.calls.some((call) => call === `show:${child.session.id}`)).toBeFalse()
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(mutations).toBe(1)
+  })
+
+  test("explicitly opening an unverified child cancels verification and retires captured evidence", async () => {
+    const fixture = makeFixture()
+    const child = prepared("independent-child", "Independent child")
+    const receipt: BranchVerificationReceipt = { session: child.session, verify: Effect.never }
+    const provider: AgentProviderApi = { ...fixture.options.provider,
+      branchFrom: (_target, created) => (created ? created(receipt) : Effect.void).pipe(Effect.andThen(Effect.never)) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      const branch = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
+      yield* waitForState(runtime, (state) => state.branchVerifications.has(child.session.id))
+      yield* runtime.resumeSession(child.session.id)
+      expect(Exit.isFailure(yield* Fiber.join(branch))).toBeTrue()
+      expect((yield* runtime.getState).branchVerifications.get(child.session.id)?.retryable).toBeFalse()
+      expect(Exit.isFailure(yield* Effect.exit(runtime.manageBranchVerification(child.session.id, "retry")))).toBeTrue()
+      expect(fixture.calls).toContain(`show:${child.session.id}`)
+    })))
+  })
+
+  test("shutdown cancels verification but waits for admitted native settlement without saving late ancestry", async () => {
+    const fixture = makeFixture()
+    const child = prepared("late-child", "Late child")
+    const started = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    let persistenceClosed = false
+    const receipt: BranchVerificationReceipt = { session: child.session, verify: Effect.uninterruptible(
+      Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as({
+        _tag: "ValidatedBranch" as const, ...child,
+        derivation: { childSessionId: child.session.id, parentSessionId: ROOT, sourceMessageId: "q", sharedMessages: [] },
+      }))) }
+    const provider: AgentProviderApi = { ...fixture.options.provider,
+      branchFrom: (_target, created) => (created ? created(receipt) : Effect.void).pipe(Effect.andThen(receipt.verify)) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider,
+        closeNavigationPersistence: Effect.sync(() => { persistenceClosed = true }) })
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+      const branch = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
+      yield* Deferred.await(started)
+      const shutdown = yield* Effect.forkChild(runtime.shutdown)
+      yield* TestClock.adjust(120_000)
+      expect(shutdown.pollUnsafe()).toBeUndefined()
+      expect(persistenceClosed).toBeFalse()
+      expect(Exit.isFailure(yield* Fiber.join(branch))).toBeTrue()
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(shutdown)
+      expect(persistenceClosed).toBeTrue()
+      expect((yield* fixture.options.metadata.loadMetadata).relations).toEqual([])
+      expect(fixture.calls.some((call) => call === `show:${child.session.id}`)).toBeFalse()
+    }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("retains a verified child and retries metadata without creation or automatic launch after persistence fails", async () => {
     const fixture = makeFixture()
     const child = prepared("zero-prefix-child", "Zero prefix child")
     fixture.branchOutcome = {
@@ -3470,15 +3570,16 @@ describe("application actor", () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
       const exit = yield* Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" }))
+      expect((yield* runtime.getState).branchVerifications.get(child.session.id)?.status).toBe("persistence-failed")
+      yield* runtime.manageBranchVerification(child.session.id, "retry")
       return { exit, state: yield* runtime.getState }
     })))
 
     expect(Exit.isSuccess(result.exit)).toBeTrue()
-    expect(fixture.calls).toContain("show:zero-prefix-child")
+    expect(fixture.calls).not.toContain("show:zero-prefix-child")
     expect(result.state.local.sessions.has("zero-prefix-child")).toBeTrue()
-    expect(result.state.modal?._tag === "Error" ? result.state.modal.message : "").toContain(
-      "ancestry could not be saved",
-    )
+    expect(result.state.relations.some((relation) => relation.childSessionId === child.session.id)).toBeTrue()
+    expect(result.state.branchVerifications.has(child.session.id)).toBeFalse()
   })
 })
 

@@ -48,6 +48,26 @@ test("duplicate-session dialog defaults to Cancel and requires an explicit Open 
   } finally { await running.stop() }
 })
 
+test("verification progress has a cancel action and paused verification has a distinct retry action", async () => {
+  const setup = await createTestRenderer({ width: 140, height: 24 })
+  const verifying: ApplicationViewModel = { ...rootsView(), branchVerifications: new Map([["root-1", {
+    status: "verifying", reason: "Fork created; verifying history", retryable: true,
+  }]]) }
+  const running = await startPresentation(setup.renderer, verifying)
+  try {
+    await frame(setup, (value) => value.includes("verifying fork · cancel"))
+    setup.mockInput.pressKey("v")
+    await waitFor(() => running.harness.calls.includes("verification:cancel:root-1"))
+    await Effect.runPromise(running.harness.update({ ...verifying, branchVerifications: new Map([["root-1", {
+      status: "paused", reason: "Child preserved independently", retryable: true,
+    }]]) }))
+    await frame(setup, (value) => value.includes("retry verification"))
+    setup.mockInput.pressKey("v")
+    await waitFor(() => running.harness.calls.includes("verification:retry:root-1"))
+    expect(running.harness.calls.some((call) => call.startsWith("branch:"))).toBeFalse()
+  } finally { await running.stop() }
+})
+
 test("renders roots and preserves directional graph navigation intent", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const roots = rootsView()
@@ -1760,6 +1780,9 @@ function makeHarness(
       branchFrom: (target: { sessionId: string; messageId: string }) => Effect.sync(() => {
         calls.push(`branch:${target.sessionId}:${target.messageId}`)
         return true
+      }),
+      manageBranchVerification: (sessionId: string, action: string) => Effect.sync(() => {
+        calls.push(`verification:${action}:${sessionId}`)
       }),
       returnFromTerminal: Effect.gen(function*() {
         calls.push("return-terminal")
