@@ -17,21 +17,28 @@ test("nested provider environment removes Herdr pane ownership without changing 
   expect(parent.HERDR_PANE_ID).toBe("pane")
 })
 
-test.each(["metadata", "sidecar", "terminal"] as const)("the default provider %s spawn explicitly supplies an isolated environment", async (mode) => {
+test.each(["metadata", "sidecar", "terminal-codex", "terminal-claude"] as const)("the default provider %s spawn explicitly supplies an isolated environment", async (mode) => {
   let spawned = false
   let environment: NodeJS.ProcessEnv | undefined
+  let argv: string[] | undefined
   const spawn = spyOn(Bun, "spawn").mockImplementation((command: string[] | { env?: NodeJS.ProcessEnv }, options?: { env?: NodeJS.ProcessEnv }) => {
     spawned = true
+    if (Array.isArray(command)) argv = command
     environment = (Array.isArray(command) ? options : command)?.env
     throw new Error("Controlled spawn failure")
   })
   try {
-    if (mode === "terminal") {
-      expect(() => new BunPtyProcessFactory().spawn({ sessionId: "test", observer: new NullTerminalObserver(), command: ["codex"], cwd: "/project",
-        env: { HERDR_ENV: "1", HERDR_PANE_ID: "must-not-leak", CLAUDE_TREE_CODEX_TOKEN: "capability" },
+    if (mode === "terminal-codex" || mode === "terminal-claude") {
+      const token = mode === "terminal-claude" ? "CLAUDE_TREE_HOOK_TOKEN" : "CLAUDE_TREE_CODEX_TOKEN"
+      const command: [string, ...string[]] = mode === "terminal-claude"
+        ? ["claude", "--resume", "test", "--settings", JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "http", url: "http://127.0.0.1/lifecycle" }] }] } })]
+        : ["codex"]
+      expect(() => new BunPtyProcessFactory().spawn({ sessionId: "test", observer: new NullTerminalObserver(), command, cwd: "/project",
+        env: { HERDR_ENV: "1", HERDR_PANE_ID: "must-not-leak", [token]: "capability", CUSTOM_HOOK_SETTING: "enabled" },
       }, { columns: 80, rows: 24 }, { onOutput() {}, onPtyClosed() {} })).toThrow("Controlled spawn failure")
       expect(environment).toEqual(providerEnvironment({ ...process.env,
-        CLAUDE_TREE_CODEX_TOKEN: "capability", TERM: "xterm-256color", COLORTERM: "truecolor" }))
+        [token]: "capability", CUSTOM_HOOK_SETTING: "enabled", TERM: "xterm-256color", COLORTERM: "truecolor" }))
+      expect(argv).toEqual(command)
       return
     }
     const operation: Effect.Effect<void, unknown, Scope.Scope> = mode === "metadata" ? makeCodexAppServerClient("codex").pipe(Effect.asVoid) : makeCodexSidecar("codex", {
