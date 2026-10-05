@@ -495,6 +495,7 @@ function refreshSucceeded(
   const cleansUndiscoveredTemporarySessions = active.mode === "full" || active.reason === "stop"
   if (cleansUndiscoveredTemporarySessions) {
     for (const sessionId of temporarySessionIds) {
+      if (state.branchVerifications.get(sessionId)?.status === "prepared") continue
       if (staleSessionIds.has(sessionId)) continue
       if (state.terminals.has(sessionId)) continue
       const discovered = incomingSessions.get(sessionId)

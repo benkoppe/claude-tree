@@ -335,7 +335,7 @@ export class CodexProvider implements AgentProviderApi {
       const receipt: BranchVerificationReceipt = {
         session: provisionalSession,
         verify: Effect.suspend(() => this.withServer((reader) => this.verifyCreatedFork(reader, receipt,
-          target.sessionId, selected.id, copiedParent), "validateFork")),
+          target.sessionId, selected.id, copiedParent), "validateFork", true)),
       }
       yield* Effect.uninterruptible(Effect.sync(() => { knownChild = receipt }).pipe(
         Effect.andThen(created ? created(receipt) : Effect.void)))

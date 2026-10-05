@@ -389,13 +389,15 @@ export function makeAppRuntime(
       yield* commandExecutor.start(key, token, command, effect)
     })
 
-    const retireVerification = (sessionId: string): Effect.Effect<void> => Effect.gen(function*() {
+    const retireVerification = (sessionId: string, reason = "Opening the child independently ended ancestry verification"): Effect.Effect<void> => Effect.gen(function*() {
       const retained = verificationReceipts.get(sessionId)
-      if (!retained) return
-      yield* supersede(retained.key, "Opening the child independently ended ancestry verification")
+      const prepared = state.branchVerifications.get(sessionId)?.status === "prepared"
+      if (!retained && !prepared) return
+      if (retained) yield* supersede(retained.key, reason)
+      if (prepared) preparedTerminals.delete(sessionId)
       verificationReceipts.delete(sessionId)
       yield* publish({ _tag: "BranchVerificationChanged", sessionId, verification: {
-        status: "independent", retryable: false, reason: "Opened independently; captured ancestry verification was discarded",
+        status: "independent", retryable: false, reason,
       } })
     })
 
@@ -1111,6 +1113,12 @@ export function makeAppRuntime(
             ...(outcome.transcript === undefined ? {} : { transcript: outcome.transcript }),
           })
           if (command.verificationSessionId) {
+            if (outcome.prepared.session.transient) {
+              preparedTerminals.set(outcome.prepared.session.id, outcome.prepared)
+              yield* publish({ _tag: "BranchVerificationChanged", sessionId: outcome.prepared.session.id, verification: {
+                status: "prepared", retryable: false, reason: "Ancestry saved; open this prepared replay to start its provider session",
+              } })
+            }
             yield* Deferred.succeed(command.reply, undefined)
             return
           }
@@ -1514,6 +1522,10 @@ export function makeAppRuntime(
             return
           }
           case "ResumeSession": {
+            if (state.local.sessions.get(intent.sessionId)?.transient && !state.terminals.has(intent.sessionId)) {
+              yield* reject(envelope.reply, intent._tag, "invalid", "This replay has not started; use Open after ancestry verification succeeds")
+              return
+            }
             yield* retireVerification(intent.sessionId)
             if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
               yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
@@ -1536,6 +1548,15 @@ export function makeAppRuntime(
             return
           }
           case "OpenEndpoint": {
+            if (state.local.sessions.get(intent.sessionId)?.transient && !state.terminals.has(intent.sessionId)) {
+              const prepared = preparedTerminals.get(intent.sessionId)
+              if (state.branchVerifications.get(intent.sessionId)?.status === "prepared" && prepared) {
+                yield* publish({ _tag: "BranchVerificationChanged", sessionId: intent.sessionId })
+                yield* startShow(prepared, navigatorSurface(intent.sessionId), envelope.reply, true, navigatorRequestGeneration,
+                  state.relations.find((relation) => relation.childSessionId === intent.sessionId))
+              } else yield* reject(envelope.reply, intent._tag, "invalid", "Retry ancestry verification before opening this unstarted replay")
+              return
+            }
             yield* retireVerification(intent.sessionId)
             const running = state.terminals.get(intent.sessionId)
             if (running?.phase === "running") {
@@ -1659,6 +1680,8 @@ export function makeAppRuntime(
               intent.affectedSessionIds,
               operationGeneration,
             )
+            for (const sessionId of canonical.affectedSessionIds) yield* retireVerification(sessionId,
+              "Navigator removal discarded captured fork verification")
             pendingRemovals.set(key, {
               removal: canonical.removal,
               affectedSessionIds: canonical.affectedSessionIds,
@@ -1714,7 +1737,7 @@ export function makeAppRuntime(
         if (state.terminals.has(sessionId) || state.branchVerifications.get(sessionId)?.status === "independent") return
         verificationReceipts.set(sessionId, { receipt: message.receipt, key: message.key })
         yield* publish({ _tag: "LocalSessionProjected", session: message.receipt.session,
-          transcript: { _tag: "Unavailable", reason: "Fork created; verifying copied history" } })
+          transcript: { _tag: "Unavailable", reason: "Created fork history has not been verified" } })
         const active = activeCommands.has(message.key)
         yield* publish({ _tag: "BranchVerificationChanged", sessionId, verification: {
           status: active ? "verifying" : "paused", retryable: true,

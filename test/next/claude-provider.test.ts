@@ -687,15 +687,11 @@ describe("Effect Claude provider", () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     const forkStarted = Deferred.makeUnsafe<void>()
     let forkCalls = 0
-    let childReads = 0
     let resolveFork: ((result: { readonly sessionId: string }) => void) | undefined
     const provider = providerWith({
       messages: {
         [ROOT]: parent,
-        [CHILD]: () => {
-          childReads += 1
-          return []
-        },
+        [CHILD]: [],
       },
       physical: { [ROOT]: parent },
       forkSession: () => new Promise((resolve) => {
@@ -718,6 +714,7 @@ describe("Effect Claude provider", () => {
         yield* TestClock.adjust(10)
         expect(fiber.pollUnsafe()).toBeUndefined()
         resolveFork?.({ sessionId: CHILD })
+        yield* TestClock.adjust(100)
         return yield* Fiber.join(fiber)
       }),
       TestClock.layer(),
@@ -729,7 +726,7 @@ describe("Effect Claude provider", () => {
     expect(outcome.verification?.receipt).toBeDefined()
     await new Promise<void>((resolve) => setImmediate(resolve))
     expect(forkCalls).toBe(1)
-    expect(childReads).toBeGreaterThan(0)
+    expect(outcome.verification?.status).toBe("unavailable")
   })
 
   test("queues reconciliation and preserves interruption after forkSession invocation", async () => {
@@ -812,6 +809,22 @@ describe("Effect Claude provider", () => {
     expect(receipt?.session.id).toBe(CHILD)
   })
 
+  test("an explicit validation budget stops pending observation without losing the confirmed child", async () => {
+    const parent = [message(ROOT, "p1", "assistant", "Answer")]
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [] },
+      physical: { [ROOT]: parent, [CHILD]: [] }, retryDelays: [], forkValidationTimeoutMs: 10 })
+    await Effect.runPromise(Effect.gen(function*() {
+      const waiting = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p1" }))
+      yield* TestClock.adjust(20)
+      const result = yield* Fiber.join(waiting)
+      if (result._tag !== "CreatedIndependentSession") throw new Error("expected known child")
+      expect(result.session.id).toBe(CHILD)
+      expect(result.verification?.status).toBe("unavailable")
+      expect(result.verification?.reasonCode).toBe("deadline")
+      expect(result.verification?.receipt).toBeDefined()
+    }).pipe(Effect.provide(TestClock.layer())))
+  })
+
   test("a short copied prefix containing contradictory provenance is not classified as pending", async () => {
     const parent = [message(ROOT, "p1", "user", "Question"), message(ROOT, "p2", "assistant", "Answer")]
     const copied = copyMessage(parent[0]!, CHILD, "c1")
@@ -822,6 +835,17 @@ describe("Effect Claude provider", () => {
     if (result._tag !== "CreatedIndependentSession") throw new Error("expected independent")
     expect(result.verification?.status).toBe("contradicted")
     expect(result.verification?.reasonCode).toBe("copy-mismatch")
+  })
+
+  test("an incomplete physical snapshot cannot mask a contradictory already-observed active record", async () => {
+    const parent = [message(ROOT, "p1", "user", "Question"), message(ROOT, "p2", "assistant", "Answer")]
+    const copied = copyMessage(parent[0]!, CHILD, "c1")
+    const changed = { ...copied, message: { role: "user", content: "Changed question" } }
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [changed] },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copied, ROOT, "p1")] }, retryDelays: [] })
+    const result = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "p2" }))
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected independent child")
+    expect(result.verification?.status).toBe("contradicted")
   })
 
   test("a late native success during interruption publishes the confirmed child before finalization ends", async () => {

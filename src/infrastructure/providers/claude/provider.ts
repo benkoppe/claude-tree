@@ -636,7 +636,8 @@ export class ClaudeProvider implements AgentProviderApi {
       let status: "pending" | "unavailable" | "contradicted" = "pending"
       let reasonCode: "missing" | "incomplete" | "read-failed" | "unsupported" | "copy-mismatch" | "deadline" = "incomplete"
 
-      for (let attempt = 0; attempt <= this.retryDelays.length; attempt += 1) {
+      for (let attempt = 0; attempt <= this.retryDelays.length ||
+        (deadline.expiresAt !== undefined && status === "pending"); attempt += 1) {
         if (attempt > 0) {
           const remaining = yield* this.remainingMillis(deadline)
           if (remaining <= 0) {
@@ -645,7 +646,8 @@ export class ClaudeProvider implements AgentProviderApi {
             reasonCode = "deadline"
             break
           }
-          yield* Effect.sleep(Math.min(this.retryDelays[attempt - 1] ?? 0, remaining))
+          const delay = this.retryDelays[Math.min(attempt - 1, this.retryDelays.length - 1)] ?? DEFAULT_FORK_VALIDATION_RETRY_DELAYS_MS[0]!
+          yield* Effect.sleep(Math.min(Math.max(deadline.expiresAt === undefined ? 0 : 1, delay), remaining))
         }
 
         const activeRead = yield* this.readActiveContext(
@@ -661,9 +663,10 @@ export class ClaudeProvider implements AgentProviderApi {
         if (activeRead._tag === "Failure") {
           transcript = { _tag: "Unavailable", reason: activeRead.error.message }
           lastReason = `its transcript could not be read: ${activeRead.error.message}`
-          const missing = this.failureCode(activeRead.error, childSessionId) === "source-not-found"
+          const failure = this.failureCode(activeRead.error, childSessionId)
+          const missing = failure === "source-not-found"
           status = missing ? "pending" : "unavailable"
-          reasonCode = missing ? "missing" : activeRead.error._tag === "ProviderProtocolError" ? "unsupported" : "read-failed"
+          reasonCode = missing ? "missing" : failure === "timeout" ? "deadline" : activeRead.error._tag === "ProviderProtocolError" ? "unsupported" : "read-failed"
           if (activeRead.error._tag === "ProviderProtocolError" && !missing) break
           continue
         }
@@ -688,9 +691,10 @@ export class ClaudeProvider implements AgentProviderApi {
         )
         if (physicalRead._tag === "Failure") {
           lastReason = `its copied-prefix provenance could not be read: ${physicalRead.error.message}`
-          const missing = this.failureCode(physicalRead.error, childSessionId) === "source-not-found"
+          const failure = this.failureCode(physicalRead.error, childSessionId)
+          const missing = failure === "source-not-found"
           status = missing ? "pending" : "unavailable"
-          reasonCode = missing ? "missing" : physicalRead.error._tag === "ProviderProtocolError" ? "unsupported" : "read-failed"
+          reasonCode = missing ? "missing" : failure === "timeout" ? "deadline" : physicalRead.error._tag === "ProviderProtocolError" ? "unsupported" : "read-failed"
           if (physicalRead.error._tag === "ProviderProtocolError" && !missing) break
           continue
         }
@@ -727,7 +731,8 @@ export class ClaudeProvider implements AgentProviderApi {
       transcript: { _tag: "Unavailable" as const, reason: error.message },
       reason: `Fork ${childSessionId} was created, but its history could not be validated: ${error.message}`,
       status: "unavailable" as const,
-      reasonCode: error._tag === "ProviderProtocolError" ? "unsupported" as const : "read-failed" as const,
+      reasonCode: this.failureCode(error, childSessionId) === "timeout" ? "deadline" as const
+        : error._tag === "ProviderProtocolError" ? "unsupported" as const : "read-failed" as const,
     })))
   }
 
@@ -1350,14 +1355,14 @@ function validateFork(
     parentByChildId.set(child.id, parent.id)
   }
 
-  if (physicalChild.length < sourcePrefix.records.length) return {
-    _tag: "Short",
-    reason: `its physical copied prefix is incomplete (expected ${sourcePrefix.records.length} records; found ${physicalChild.length})`,
-  }
+  const incomplete = physicalChild.length < sourcePrefix.records.length
 
   // Physical copy order proves integrity; SDK reconstruction defines graph order.
   let orders = [sourcePrefix.activeMessageIds, sourcePrefix.historyMessageIds].map((ids) => ({
-    indexes: new Map(ids.map((id, index) => [childByParentId.get(id)!.id, index])),
+    indexes: new Map(ids.flatMap((id, index) => {
+      const copied = childByParentId.get(id)
+      return copied ? [[copied.id, index] as const] : []
+    })),
     length: ids.length,
     previous: -1,
   }))
@@ -1365,6 +1370,7 @@ function validateFork(
 
   for (const child of activeChild) {
     const physical = physicalByChildId.get(child.id)
+    if (physical === undefined && incomplete) continue
     if (
       physical === undefined ||
       sourceRole(physical.type) !== child.role ||
@@ -1384,6 +1390,10 @@ function validateFork(
       return true
     })
     if (orders.length === 0) return { _tag: "Invalid", reason: "its active transcript is not an ordered subsequence of the source conversation" }
+  }
+  if (incomplete) return {
+    _tag: "Short",
+    reason: `its physical copied prefix is incomplete (expected ${sourcePrefix.records.length} records; found ${physicalChild.length})`,
   }
   if (!orders.some((order) => order.previous === order.length - 1)) {
     return {
