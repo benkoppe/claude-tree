@@ -168,6 +168,7 @@ export interface CodexAppServerClient {
     threadId: string,
     lastTurnId: string,
     cwd: string,
+    dispatched?: () => void,
   ) => Effect.Effect<CodexThread, CodexAppServerError>
   readonly close: () => Effect.Effect<void, CodexCleanupError>
 }
@@ -176,6 +177,7 @@ interface PendingRequest {
   readonly method: string
   readonly deferred: Deferred.Deferred<unknown, CodexAppServerError>
   readonly mutation: boolean
+  readonly dispatched?: () => void
   assigned: boolean
   sent: boolean
 }
@@ -337,12 +339,13 @@ class ClientImpl implements CodexAppServerClient {
     threadId: string,
     lastTurnId: string,
     cwd: string,
+    dispatched?: () => void,
   ): Effect.Effect<CodexThread, CodexAppServerError> =>
     Effect.all([
       validateIdentifier(threadId, "thread/fork", "source thread id"),
       validateIdentifier(lastTurnId, "thread/fork", "last turn id"),
     ]).pipe(
-      Effect.andThen(this.request("thread/fork", { threadId, lastTurnId, cwd, ephemeral: false }, true)),
+      Effect.andThen(this.request("thread/fork", { threadId, lastTurnId, cwd, ephemeral: false }, true, dispatched)),
       Effect.flatMap((result) => decodeThreadEnvelope(result, "thread/fork").pipe(
         Effect.flatMap((thread) => thread.id !== threadId
           ? Effect.succeed(thread)
@@ -361,6 +364,7 @@ class ClientImpl implements CodexAppServerClient {
     method: string,
     params: unknown,
     mutation: boolean,
+    dispatched?: () => void,
   ): Effect.Effect<unknown, CodexAppServerError> {
     const self = this
     return Effect.gen(function*() {
@@ -380,7 +384,7 @@ class ClientImpl implements CodexAppServerClient {
 
       const id = self.nextRequestId++
       const deferred = yield* Deferred.make<unknown, CodexAppServerError>()
-      const pending: PendingRequest = { method, deferred, mutation, assigned: false, sent: false }
+      const pending: PendingRequest = { method, deferred, mutation, assigned: false, sent: false, ...(dispatched ? { dispatched } : {}) }
       const execute = Effect.gen(function*() {
         self.pending.set(id, pending)
         return yield* Effect.raceFirst(
@@ -505,9 +509,10 @@ class ClientImpl implements CodexAppServerClient {
           const assigned = queued.requestId === undefined ? undefined : this.pending.get(queued.requestId)
           if (queued.requestId !== undefined && (!assigned || !assigned.assigned)) continue
           if (this.failure) throw this.failure
-          if (assigned) assigned.sent = true
           const write = yield* Effect.exit(Effect.tryPromise({
             try: () => {
+              if (assigned) assigned.sent = true
+              assigned?.dispatched?.()
               const operation = (async () => {
                 await this.transport.stdin.write(queued.text)
                 await this.transport.stdin.flush()

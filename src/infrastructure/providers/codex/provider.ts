@@ -21,6 +21,10 @@ import {
   type AgentProviderApi,
   type AmbiguousBranchMutation,
   type BranchOutcome,
+  type BranchCreated,
+  type BranchVerificationReceipt,
+  type CreatedIndependentSession,
+  type ValidatedBranch,
   makeBranchMutationReconciliationSignal,
   type PreparedTerminal,
   type TerminalLaunch,
@@ -268,9 +272,11 @@ export class CodexProvider implements AgentProviderApi {
 
   branchFrom(
     target: MessageRef,
+    created?: BranchCreated,
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
     let mutationMayHaveDispatched = false
     let deadlineExpired = false
+    let knownChild: BranchVerificationReceipt | undefined
     const operation = this.withServer((server) => Effect.gen({ self: this }, function*() {
       yield* this.validateSessionId(target.sessionId, "branchFrom")
       const parentThread = yield* this.requireThread(server, target.sessionId, "branchFrom")
@@ -292,11 +298,11 @@ export class CodexProvider implements AgentProviderApi {
       yield* this.validateForkTarget(selected, parentThread)
 
       const copiedParent = parentTranscript.slice(0, selectedIndex + 1)
-      mutationMayHaveDispatched = true
       const mutation = yield* server.forkThread(
         target.sessionId,
         selected.turnId,
         this.projectPath,
+        () => { mutationMayHaveDispatched = true },
       ).pipe(
         Effect.map((thread) => ({ _tag: "Success" as const, thread })),
         Effect.catch((error) => Effect.succeed({ _tag: "Failure" as const, error })),
@@ -326,58 +332,14 @@ export class CodexProvider implements AgentProviderApi {
       }
       const now = yield* Clock.currentTimeMillis
       const provisionalSession = provisionalSessionFromThread(childThread, now)
-      let transcript: TranscriptRead = {
-        _tag: "Unavailable",
-        reason: `The created Codex transcript ${childThread.id} has not been read`,
+      const receipt: BranchVerificationReceipt = {
+        session: provisionalSession,
+        verify: Effect.suspend(() => this.withServer((reader) => this.verifyCreatedFork(reader, receipt,
+          target.sessionId, selected.id, copiedParent), "validateFork")),
       }
-
-      return yield* Effect.gen({ self: this }, function*() {
-        yield* this.validateSessionId(childThread.id, "branchFrom")
-        const childRead = yield* this.readThreadWithOverloadRetry(server, childThread.id).pipe(
-          Effect.mapError((error) => this.mapTransportError("validateFork", error)),
-        )
-        if (!(yield* this.threadBelongsToProject(childRead))) {
-          return ambiguity(
-            `Codex fork child ${childThread.id} resolved outside the canonical project after dispatch`,
-          )
-        }
-        const childTranscript = yield* this.normalizeThread(childRead, "validateFork")
-        transcript = { _tag: "Available", messages: childTranscript }
-        yield* this.validateCopiedPrefix(childThread.id, copiedParent, childTranscript)
-        const session = yield* this.sessionFromThread(childRead, "validateFork")
-        return {
-          _tag: "ValidatedBranch" as const,
-          session,
-          transcript,
-          acquireLaunch: this.acquireObservedLaunch("resume", session.id),
-          derivation: {
-            childSessionId: session.id,
-            parentSessionId: target.sessionId,
-            sourceMessageId: selected.id,
-            sharedMessages: copiedParent.map((message, index) => ({
-              parentMessageId: message.id,
-              childMessageId: childTranscript[index]!.id,
-            })),
-          },
-        }
-      }).pipe(
-        Effect.catch((error) => {
-          if (isMissingCodexThreadErrorCause(error.cause)) transcript = { _tag: "Missing" }
-          else if (transcript._tag !== "Available") {
-            transcript = { _tag: "Unavailable", reason: error.message }
-          }
-          const launchable = isValidSessionId(provisionalSession.id)
-          return Effect.succeed({
-            _tag: "CreatedIndependentSession" as const,
-            session: provisionalSession,
-            transcript,
-            reason: `Fork ${provisionalSession.id || "(unknown)"} was created, but ${error.message}`,
-            ...(launchable
-              ? { acquireLaunch: this.acquireObservedLaunch("resume", provisionalSession.id) }
-              : {}),
-          })
-        }),
-      )
+      yield* Effect.uninterruptible(Effect.sync(() => { knownChild = receipt }).pipe(
+        Effect.andThen(created ? created(receipt) : Effect.void)))
+      return yield* this.verifyCreatedFork(server, receipt, target.sessionId, selected.id, copiedParent)
     }), "branchFrom")
     const ambiguity = (reason: string): AmbiguousBranchMutation => ({
       _tag: "AmbiguousBranchMutation",
@@ -391,7 +353,12 @@ export class CodexProvider implements AgentProviderApi {
       Effect.tap(() => Effect.sync(() => {
         deadlineExpired = true
       })),
-      Effect.flatMap(() => mutationMayHaveDispatched
+      Effect.flatMap((): Effect.Effect<BranchOutcome, ProviderError> => knownChild
+        ? Effect.succeed({ _tag: "CreatedIndependentSession" as const, session: knownChild.session,
+          transcript: { _tag: "Unavailable" as const, reason: "Verification observation deadline expired" },
+          reason: "Fork was created; verification observation deadline expired",
+          verification: { status: "unavailable" as const, reasonCode: "deadline" as const, receipt: knownChild } })
+        : mutationMayHaveDispatched
         ? Effect.succeed(ambiguity(
             `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline after thread/fork dispatch`,
           ))
@@ -400,12 +367,66 @@ export class CodexProvider implements AgentProviderApi {
             `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline`,
           ))),
     )
-    const interruptibleOperation = operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !deadlineExpired
+    const interruptibleOperation = operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !knownChild && !deadlineExpired
         ? Effect.sync(() => this.branchMutationReconciliations.offer(ambiguity(
             "Codex thread/fork was interrupted after dispatch and may have created a child thread",
           )))
         : Effect.void))
     return this.metadataDeadlineMs === undefined ? interruptibleOperation : Effect.raceFirst(interruptibleOperation, deadline)
+  }
+
+  private verifyCreatedFork(
+    server: CodexAppServerClient,
+    receipt: BranchVerificationReceipt,
+    parentSessionId: string,
+    sourceMessageId: string,
+    copiedParent: readonly CodexMessage[],
+  ): Effect.Effect<ValidatedBranch | CreatedIndependentSession, ProviderError | ProviderProtocolError> {
+    let transcript: TranscriptRead = { _tag: "Missing" }
+    let contradiction = false
+    const read = Effect.gen({ self: this }, function*() {
+      const childRead = yield* this.readThreadWithOverloadRetry(server, receipt.session.id).pipe(
+        Effect.mapError((error) => this.mapTransportError("validateFork", error)),
+      )
+      if (!(yield* this.threadBelongsToProject(childRead))) {
+        contradiction = true
+        return yield* Effect.fail(this.protocolError("validateFork", "The confirmed fork child resolved outside the canonical project"))
+      }
+      const childTranscript = yield* this.normalizeThread(childRead, "validateFork")
+      transcript = { _tag: "Available", messages: childTranscript }
+      contradiction = true
+      yield* this.validateCopiedPrefix(receipt.session.id, copiedParent.slice(0, childTranscript.length), childTranscript)
+      contradiction = false
+      if (childTranscript.length < copiedParent.length) return {
+        _tag: "CreatedIndependentSession" as const, session: receipt.session, transcript,
+        reason: "The created Codex copied prefix is not complete yet",
+        verification: { status: "pending" as const, reasonCode: "incomplete" as const, receipt },
+      }
+      const session = yield* this.sessionFromThread(childRead, "validateFork")
+      return {
+        _tag: "ValidatedBranch" as const, session, transcript,
+        acquireLaunch: this.acquireObservedLaunch("resume", session.id),
+        derivation: {
+          childSessionId: session.id, parentSessionId, sourceMessageId,
+          sharedMessages: copiedParent.map((message, index) => ({ parentMessageId: message.id, childMessageId: childTranscript[index]!.id })),
+        },
+      }
+    })
+    return read.pipe(Effect.catch((error) => {
+      const missing = isMissingCodexThreadErrorCause(error.cause)
+      if (missing) transcript = { _tag: "Missing" }
+      else if (transcript._tag !== "Available") transcript = { _tag: "Unavailable", reason: error.message }
+      return Effect.succeed({
+        _tag: "CreatedIndependentSession" as const, session: receipt.session, transcript,
+        reason: `Fork ${receipt.session.id} was created, but ${error.message}`,
+        verification: {
+          status: missing ? "pending" as const : contradiction ? "contradicted" as const : "unavailable" as const,
+          reasonCode: missing ? "missing" as const : contradiction ? "copy-mismatch" as const
+            : error._tag === "ProviderProtocolError" ? "unsupported" as const : "read-failed" as const,
+          receipt,
+        },
+      })
+    }))
   }
 
   private withServer<A>(
