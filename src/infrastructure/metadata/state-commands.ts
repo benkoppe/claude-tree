@@ -10,13 +10,13 @@ import * as s from "./schema"
 import { backupDatabase } from "./backup"
 
 export function runStateCommand(options: Extract<CliOptions, { command: "state" }>): Effect.Effect<string, unknown> {
-  if (options.action === "export" || options.action === "import-json") return Effect.acquireUseRelease(
+  if (options.action === "export" || options.action === "import-json") return Effect.scoped(Effect.acquireUseRelease(
     makeProviderStateRepository({ projectDirectory: options.project, providerId: options.provider, requireExisting: options.action === "export", importLegacy: options.action === "import-json" })
       .pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform)),
     (repository) => repository.load.pipe(Effect.map((state) => options.action === "export" ? JSON.stringify({ projectId: repository.projectId, projectPath: repository.projectPath, providerId: options.provider, ...state }, null, 2)
       : `Imported application metadata for ${repository.projectPath}. Legacy files were left untouched.`)),
-    (repository) => repository.close)
-  return Effect.acquireUseRelease(openStateDatabase(nativePersistencePlatform.stateHome(), true),
+    (repository) => repository.close))
+  return Effect.scoped(Effect.acquireUseRelease(Effect.interruptible(openStateDatabase(nativePersistencePlatform.stateHome(), true)),
     ({ db }) => Effect.gen(function*() {
       if (options.action === "check") {
         yield* Effect.try({ try: () => {
@@ -39,5 +39,5 @@ export function runStateCommand(options: Extract<CliOptions, { command: "state" 
       const destination = resolve(options.destination!)
       yield* Effect.tryPromise({ try: () => backupDatabase(db, destination), catch: (e) => e })
       return `State backup written to ${destination}.`
-    }), ({ close }) => Effect.promise(close))
+    }), ({ close }) => Effect.promise(close)))
 }

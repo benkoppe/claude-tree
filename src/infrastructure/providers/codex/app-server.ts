@@ -1,5 +1,8 @@
-import { Cause, Data, Deferred, Effect, Exit, FiberSet, Schema, Scope } from "effect"
+import { Cause, Data, Deferred, Effect, Exit, Fiber, FiberSet, Queue, Schema, Scope } from "effect"
 import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
+import { makeCloseOperation } from "../../../services/close-operation"
+import { makeCleanupBudget } from "../../../services/cleanup-budget"
+import { PROCESS_TERMINATION_GRACE_PERIOD_MS } from "../../../services/lifecycle-policy"
 
 import { CodexProtocolError, CodexRpcError, decodeCodexMessage } from "./protocol"
 import { CodexTurnStatusSchema } from "./protocol-schema"
@@ -7,11 +10,10 @@ import { CodexTurnStatusSchema } from "./protocol-schema"
 export { CodexProtocolError, CodexRpcError } from "./protocol"
 
 import {
-  cleanupProcessGroup,
+  cleanupProcessGroup, isProcessGroupAlive, waitForProcessGroupExit,
   type ProcessGroupHandle,
 } from "../../process-group"
 
-const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1_000
 const DEFAULT_JSONL_RECORD_LIMIT_BYTES = 1_024 * 1_024
 const STDERR_LIMIT_BYTES = 8_192
 const DEFAULT_PENDING_REQUEST_LIMIT = 1_024
@@ -150,6 +152,7 @@ export interface CodexSidecarOptions {
   readonly shutdownTimeoutMs?: number
   readonly maxJsonlRecordBytes?: number
   readonly maxPendingRequests?: number
+  readonly createWebSocket?: (url: string, options: { readonly headers: Record<string, string> }) => WebSocket
 }
 
 export interface CodexAppServerClient {
@@ -187,7 +190,7 @@ interface QueuedWrite {
   cancelled: boolean
 }
 
-type ScopedRunPromise = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
+type RunTask = (effect: Effect.Effect<void>) => Fiber.Fiber<void>
 
 interface CodexTransport {
   readonly stdin: CodexAppServerProcess["stdin"]
@@ -229,32 +232,43 @@ const LoadedThreadListSchema = Schema.Struct({ data: Schema.Array(Schema.String)
 class ClientImpl implements CodexAppServerClient {
   private nextRequestId = 1
   private readonly pending = new Map<number, PendingRequest>()
-  private readonly stdoutTask: Promise<void>
-  private readonly stderrTask: Promise<void>
+  private readonly stdoutTask: Fiber.Fiber<void>
+  private readonly stderrTask: Fiber.Fiber<void>
   private stderrBytes = new Uint8Array()
   private readonly writeQueue: QueuedWrite[] = []
   private activeWrite: QueuedWrite | undefined
-  private writerTask: Promise<void> | undefined
-  private closeTask: Promise<void> | undefined
+  private readonly writerTask: Fiber.Fiber<void>
+  private readonly closeTask: Effect.Effect<void, CodexCleanupError>
   private failure: CodexAppServerError | undefined
   private closing = false
   private closed = false
   private stdinEnded = false
+  private nativeWrite: Promise<void> | undefined
   private stdoutReader: { cancel(reason?: unknown): Promise<void> } | undefined
   private stderrReader: { cancel(reason?: unknown): Promise<void> } | undefined
+  private readonly cancelStdout = makeCloseOperation(Effect.tryPromise({
+    try: () => cancelReader(this.stdoutReader, this.transport.stdout), catch: (cause) => cause,
+  }), true)
+  private readonly cancelStderr = makeCloseOperation(Effect.tryPromise({
+    try: () => cancelReader(this.stderrReader, this.transport.stderr), catch: (cause) => cause,
+  }), true)
 
   constructor(
     private readonly transport: CodexTransport,
-    private readonly runPromise: ScopedRunPromise,
+    runTask: RunTask,
+    private readonly writeSignal: Queue.Queue<void>,
     private readonly requestTimeoutMs: number | undefined,
     private readonly shutdownTimeoutMs: number,
     private readonly maxJsonlRecordBytes: number,
     private readonly maxPendingRequests: number,
+    private readonly cleanupTimeoutMs: number | undefined,
   ) {
-    this.stdoutTask = this.readStdout()
-    this.stderrTask = this.readStderr()
-    const exitObservation = transport.exited.then(
-      (exitCode) => {
+    this.stdoutTask = runTask(Effect.interruptible(this.readStdout()))
+    this.stderrTask = runTask(Effect.interruptible(this.readStderr()))
+    this.writerTask = runTask(Effect.interruptible(Effect.forever(Queue.take(writeSignal).pipe(Effect.andThen(this.drainWrites())))))
+    this.closeTask = makeCloseOperation(this.closeResources(), true)
+    runTask(Effect.interruptible(Effect.tryPromise({ try: () => transport.exited, catch: (cause) => cause })).pipe(Effect.match({
+      onSuccess: (exitCode) => {
         if (!this.closing) {
           this.failAll(new CodexProcessError({
             operation: "run",
@@ -264,19 +278,12 @@ class ClientImpl implements CodexAppServerClient {
           }))
         }
       },
-      (cause) => this.failAll(new CodexProcessError({
+      onFailure: (cause) => this.failAll(new CodexProcessError({
         operation: "run",
         message: "Unable to observe Codex app-server exit",
         cause,
       })),
-    )
-    void exitObservation.catch((cause) => {
-      this.failAll(new CodexProcessError({
-        operation: "run",
-        message: "Unable to process Codex app-server exit",
-        cause,
-      }))
-    })
+    }), Effect.asVoid))
   }
 
   initialize(): Effect.Effect<void, CodexAppServerError> {
@@ -348,15 +355,7 @@ class ClientImpl implements CodexAppServerClient {
       )),
     )
 
-  close = (): Effect.Effect<void, CodexCleanupError> => Effect.tryPromise({
-    try: () => {
-      this.closeTask ??= this.closePromise()
-      return this.closeTask
-    },
-    catch: (cause) => cause instanceof CodexCleanupError
-      ? cause
-      : new CodexCleanupError({ message: "Failed to close Codex app-server", cause }),
-  })
+  close = (): Effect.Effect<void, CodexCleanupError> => this.closeTask
 
   private request(
     method: string,
@@ -463,7 +462,7 @@ class ClientImpl implements CodexAppServerClient {
         cancelled: false,
       }
       self.writeQueue.push(queued)
-      self.startWriter()
+      Queue.offerUnsafe(self.writeSignal, undefined)
       yield* restore(Deferred.await(assignmentReady)).pipe(
         Effect.onInterrupt(() => Effect.sync(() => self.cancelQueuedWrite(queued))),
       )
@@ -490,57 +489,52 @@ class ClientImpl implements CodexAppServerClient {
     }))
   }
 
-  private startWriter(): void {
-    if (this.writerTask) return
-    this.writerTask = this.drainWrites()
-      .catch((cause) => {
-        this.failAll(new CodexProcessError({
-          operation: "write",
-          message: "Codex app-server writer stopped unexpectedly",
-          cause,
-        }))
-      })
-      .finally(() => {
-        this.writerTask = undefined
-        if (this.writeQueue.length > 0 && !this.closed) this.startWriter()
-      })
-  }
-
-  private async drainWrites(): Promise<void> {
-    while (this.writeQueue.length > 0) {
-      const queued = this.writeQueue.shift()!
-      this.activeWrite = queued
-      const pending = queued.requestId === undefined ? undefined : this.pending.get(queued.requestId)
-      try {
-        if (queued.cancelled || (queued.requestId !== undefined && pending === undefined)) continue
-        if (this.failure) throw this.failure
-        queued.phase = "offered"
-        Deferred.doneUnsafe(queued.assignmentReady, Effect.void)
-        const dispatch = await this.runPromise(Deferred.await(queued.dispatchAllowed))
-        if (!dispatch || queued.cancelled) continue
-        const assigned = queued.requestId === undefined ? undefined : this.pending.get(queued.requestId)
-        if (queued.requestId !== undefined && (!assigned || !assigned.assigned)) continue
-        if (this.failure) throw this.failure
-        if (assigned) assigned.sent = true
-        await this.transport.stdin.write(queued.text)
-        await this.transport.stdin.flush()
-        queued.phase = "completed"
-        Deferred.doneUnsafe(queued.deferred, Effect.void)
-      } catch (cause) {
-        const error = isCodexAppServerError(cause)
-          ? cause
-          : new CodexProcessError({
-              operation: "write",
-              message: "Unable to write to Codex app-server",
-              cause,
-            })
-        queued.phase = "completed"
-        Deferred.doneUnsafe(queued.deferred, Effect.fail(error))
-        this.failAll(error)
-      } finally {
-        if (this.activeWrite === queued) this.activeWrite = undefined
+  private drainWrites(): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function*() {
+      while (this.writeQueue.length > 0) {
+        const queued = this.writeQueue.shift()!
+        this.activeWrite = queued
+        const pending = queued.requestId === undefined ? undefined : this.pending.get(queued.requestId)
+        try {
+          if (queued.cancelled || (queued.requestId !== undefined && pending === undefined)) continue
+          if (this.failure) throw this.failure
+          queued.phase = "offered"
+          Deferred.doneUnsafe(queued.assignmentReady, Effect.void)
+          const dispatch = yield* Deferred.await(queued.dispatchAllowed)
+          if (!dispatch || queued.cancelled) continue
+          const assigned = queued.requestId === undefined ? undefined : this.pending.get(queued.requestId)
+          if (queued.requestId !== undefined && (!assigned || !assigned.assigned)) continue
+          if (this.failure) throw this.failure
+          if (assigned) assigned.sent = true
+          const write = yield* Effect.exit(Effect.tryPromise({
+            try: () => {
+              const operation = (async () => {
+                await this.transport.stdin.write(queued.text)
+                await this.transport.stdin.flush()
+              })()
+              this.nativeWrite = operation
+              return operation
+            },
+            catch: (cause) => cause,
+          }))
+          if (Exit.isFailure(write)) throw Cause.squash(write.cause)
+          this.nativeWrite = undefined
+          queued.phase = "completed"
+          Deferred.doneUnsafe(queued.deferred, Effect.void)
+        } catch (cause) {
+          const error = isCodexAppServerError(cause) ? cause : new CodexProcessError({
+            operation: "write", message: "Unable to write to Codex app-server", cause,
+          })
+          queued.phase = "completed"
+          Deferred.doneUnsafe(queued.deferred, Effect.fail(error))
+          this.failAll(error)
+        } finally {
+          if (this.activeWrite === queued) this.activeWrite = undefined
+        }
       }
-    }
+    }).pipe(Effect.catch((cause) => Effect.sync(() => this.failAll(isCodexAppServerError(cause) ? cause : new CodexProcessError({
+      operation: "write", message: "Unable to write to Codex app-server", cause,
+    })))))
   }
 
   private cancelQueuedWrite(queued: QueuedWrite): void {
@@ -586,14 +580,14 @@ class ClientImpl implements CodexAppServerClient {
     })
   }
 
-  private async readStdout(): Promise<void> {
-    try {
+  private readStdout(): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function*() {
       const reader = this.transport.stdout.getReader()
       this.stdoutReader = reader
       const decoder = new TextDecoder("utf-8", { fatal: true })
       let buffer: Uint8Array = new Uint8Array()
       while (true) {
-        const { done, value } = await reader.read()
+        const { done, value } = yield* Effect.tryPromise({ try: () => reader.read(), catch: (cause) => cause })
         if (done) break
         let start = 0
         for (let index = 0; index < value.byteLength; index += 1) {
@@ -626,7 +620,7 @@ class ClientImpl implements CodexAppServerClient {
         this.failProtocol("read", "Codex app-server closed with an unterminated JSONL record")
       } else if (!this.closing) {
         // Give the process observer one microtask to report its more useful exit code first.
-        await Promise.resolve()
+        yield* Effect.promise(() => Promise.resolve())
         if (!this.failure && !this.closing) {
           this.failAll(new CodexProcessError({
             operation: "read",
@@ -635,17 +629,14 @@ class ClientImpl implements CodexAppServerClient {
           }))
         }
       }
-    } catch (cause) {
-      if (!this.closing) {
-        this.failAll(cause instanceof CodexProtocolError
-          ? cause
-          : new CodexProtocolError({
-            operation: "read",
-            message: "Codex app-server emitted invalid UTF-8",
-            cause,
-          }))
+    }).pipe(Effect.catchCause((cause) => Effect.sync(() => {
+      if (!this.closing && !Cause.hasInterruptsOnly(cause)) {
+        const error = Cause.squash(cause)
+        this.failAll(error instanceof CodexProtocolError ? error : new CodexProtocolError({
+          operation: "read", message: "Codex app-server stream failed", cause,
+        }))
       }
-    }
+    })))
   }
 
   private handleLine(line: string): void {
@@ -676,18 +667,16 @@ class ClientImpl implements CodexAppServerClient {
       : Effect.succeed(message.result))
   }
 
-  private async readStderr(): Promise<void> {
-    try {
+  private readStderr(): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function*() {
       const reader = this.transport.stderr.getReader()
       this.stderrReader = reader
       while (true) {
-        const { done, value } = await reader.read()
+        const { done, value } = yield* Effect.promise(() => reader.read())
         if (done) break
         this.appendStderr(value)
       }
-    } catch {
-      // Stderr is bounded diagnostic context; stdout and process exit remain authoritative.
-    }
+    }).pipe(Effect.catchCause(() => Effect.void))
   }
 
   private appendStderr(chunk: Uint8Array): void {
@@ -725,86 +714,72 @@ class ClientImpl implements CodexAppServerClient {
     this.pending.clear()
   }
 
-  private async closePromise(): Promise<void> {
-    if (this.closed) return
-    this.closing = true
-    const closingError = new CodexProcessError({
-      operation: "close",
-      message: "Codex app-server is closing",
-    })
-    this.failAll(closingError)
-    const failures: unknown[] = []
-    this.cancelQueuedWrites(closingError)
-    if (!this.stdinEnded) {
-      try {
-        this.transport.stdin.end()
-        this.stdinEnded = true
-      } catch (cause) {
-        failures.push(cause)
-      }
-    }
-
-    if (this.transport.processGroup) {
-      const result = await this.runPromise(cleanupProcessGroup(this.transport.processGroup, {
-        gracePeriodMs: this.shutdownTimeoutMs,
-        killPeriodMs: this.shutdownTimeoutMs,
-      }))
-      for (const issue of result.issues) failures.push(issue.cause ?? new Error(issue.message))
-      if (result.status !== "absent" && result.issues.length === 0) {
-        failures.push(new Error("Codex app-server process group did not exit after SIGKILL"))
-      }
-    } else {
-      let exit = await settlementWithin(this.transport.exited, this.shutdownTimeoutMs)
-      if (exit._tag !== "Fulfilled") {
-        try {
-          this.transport.terminate("SIGTERM")
-        } catch (cause) {
-          failures.push(cause)
-        }
-        exit = await settlementWithin(this.transport.exited, this.shutdownTimeoutMs)
-      }
-      if (exit._tag !== "Fulfilled") {
-        try {
-          this.transport.terminate("SIGKILL")
-        } catch (cause) {
-          failures.push(cause)
-        }
-        exit = await settlementWithin(this.transport.exited, this.shutdownTimeoutMs)
-      }
-      if (exit._tag === "Rejected") {
-        failures.push(exit.cause)
-      } else if (exit._tag === "TimedOut") {
-        failures.push(new Error("Codex app-server did not exit after SIGKILL"))
-      }
-    }
-
-    const cancellations = [
-      cancelReader(this.stdoutReader, this.transport.stdout),
-      cancelReader(this.stderrReader, this.transport.stderr),
-    ]
-    const cleanupSettlements = await Promise.all([
-      ...cancellations.map((promise) => settlementWithin(promise, this.shutdownTimeoutMs)),
-      settlementWithin(this.stdoutTask, this.shutdownTimeoutMs),
-      settlementWithin(this.stderrTask, this.shutdownTimeoutMs),
-      ...(this.writerTask ? [settlementWithin(this.writerTask, this.shutdownTimeoutMs)] : []),
-    ])
-    for (const settlement of cleanupSettlements) {
-      if (settlement._tag === "Rejected" && settlement.cause !== this.failure) failures.push(settlement.cause)
-      else if (settlement._tag === "TimedOut") failures.push(new Error("Codex app-server stream cleanup timed out"))
-    }
-    try {
-      this.transport.unref()
-    } catch (cause) {
-      failures.push(cause)
-    }
-    if (failures.length > 0) {
-      this.closeTask = undefined
-      throw new CodexCleanupError({
-        message: "Failed to clean up Codex app-server",
-        cause: failures.length === 1 ? failures[0] : new AggregateError(failures),
+  private closeResources(): Effect.Effect<void, CodexCleanupError> {
+    return Effect.gen({ self: this }, function*() {
+      if (this.closed) return
+      this.closing = true
+      const closingError = new CodexProcessError({
+        operation: "close", message: "Codex app-server is closing",
       })
-    }
-    this.closed = true
+      this.failAll(closingError)
+      const failures: unknown[] = []
+      if (!this.stdinEnded) {
+        try {
+          this.transport.stdin.end()
+          this.stdinEnded = true
+        } catch (cause) {
+          failures.push(cause)
+        }
+      }
+
+      if (this.transport.processGroup) {
+        const result = yield* cleanupProcessGroup(this.transport.processGroup, {
+          gracePeriodMs: this.shutdownTimeoutMs,
+          killPeriodMs: this.shutdownTimeoutMs,
+        })
+        for (const issue of result.issues) failures.push(issue.cause ?? new Error(issue.message))
+        if (result.status !== "absent" && result.issues.length === 0) {
+          failures.push(new Error("Codex app-server process group did not exit after SIGKILL"))
+        }
+      } else {
+        const observeExit = Effect.interruptible(Effect.tryPromise({
+          try: () => this.transport.exited, catch: (cause) => cause,
+        })).pipe(Effect.asVoid, Effect.timeoutOrElse({
+          duration: this.shutdownTimeoutMs,
+          orElse: () => Effect.fail(new Error("Codex app-server did not exit")),
+        }))
+        let exit = yield* Effect.exit(observeExit)
+        for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+          if (Exit.isSuccess(exit)) break
+          try { this.transport.terminate(signal) }
+          catch (cause) { failures.push(cause) }
+          exit = yield* Effect.exit(observeExit)
+        }
+        if (Exit.isFailure(exit)) failures.push(exit.cause)
+      }
+
+      const budget = yield* makeCleanupBudget(this.cleanupTimeoutMs)
+      this.writerTask.interruptUnsafe()
+      const cleanupSettlements = yield* Effect.all([
+        this.cancelStdout, this.cancelStderr,
+        Fiber.join(this.stdoutTask), Fiber.join(this.stderrTask),
+        Fiber.await(this.writerTask).pipe(Effect.asVoid),
+        Effect.promise(() => this.nativeWrite?.then(() => undefined, () => undefined) ?? Promise.resolve()),
+      ].map((effect) => Effect.exit(budget.observe(effect,
+        () => new Error("Codex app-server stream cleanup timed out")))), { concurrency: "unbounded" })
+      for (const settlement of cleanupSettlements) {
+        if (Exit.isFailure(settlement) && Cause.squash(settlement.cause) !== this.failure) failures.push(settlement.cause)
+      }
+      try { this.transport.unref() }
+      catch (cause) { failures.push(cause) }
+      if (failures.length > 0) {
+        return yield* Effect.fail(new CodexCleanupError({
+          message: "Failed to clean up Codex app-server",
+          cause: failures.length === 1 ? failures[0] : new AggregateError(failures),
+        }))
+      }
+      this.closed = true
+    })
   }
 
   private cancelQueuedWrites(error: CodexAppServerError): void {
@@ -841,58 +816,62 @@ export function makeCodexAppServerClient(
   executable: string,
   options: CodexAppServerOptions = {},
 ): Effect.Effect<CodexAppServerClient, CodexAppServerError, Scope.Scope> {
-  const transport = Effect.try({
+  return acquireClient((own) => Effect.try({
     try: () => {
       const process = (options.spawn ?? spawnCodex)([executable, "app-server", "--stdio"])
-      return processTransport(process)
+      const transport = processTransport(process)
+      own(transport)
+      return transport
     },
     catch: (cause) => new CodexProcessError({
       operation: "spawn",
       message: "Unable to spawn Codex app-server",
       cause,
     }),
-  })
-
-  return acquireClient(transport, options)
+  }), options)
 }
 
 export function connectCodexAppServerSidecar(
   url: string,
   options: CodexSidecarOptions,
 ): Effect.Effect<CodexAppServerClient, CodexAppServerError, Scope.Scope> {
-  const transport = Effect.tryPromise({
+  return acquireClient((own) => withOperationTimeout(Effect.tryPromise({
     try: (signal) => connectWebSocketTransport(
       url,
       options.bearerToken,
-      optionalOperationTimeout(options.connectTimeoutMs),
       signal,
+      own,
+      options.createWebSocket,
     ),
     catch: (cause) => cause instanceof CodexConnectionError || cause instanceof CodexProtocolError
       ? cause
       : new CodexConnectionError({ url, message: "Unable to connect to Codex sidecar", cause }),
-  })
-
-  return acquireClient(transport, options)
+  }), optionalOperationTimeout(options.connectTimeoutMs),
+    () => Effect.fail(new CodexConnectionError({ url, message: "Timed out connecting to Codex sidecar", retryable: true }))), options)
 }
 
 function acquireClient(
-  acquireTransport: Effect.Effect<CodexTransport, CodexAppServerError>,
+  acquireTransport: (own: (transport: CodexTransport) => void) => Effect.Effect<CodexTransport, CodexAppServerError>,
   options: CodexAppServerOptions | CodexSidecarOptions,
 ): Effect.Effect<CodexAppServerClient, CodexAppServerError, Scope.Scope> {
   const requestTimeoutMs = optionalOperationTimeout(options.requestTimeoutMs)
   return Effect.gen(function*() {
-    const runPromise = yield* FiberSet.makeRuntimePromise<never>()
+    const runTask = yield* FiberSet.makeRuntime<never, void, never>()
+    const writeSignal = yield* Queue.unbounded<void>()
     return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
-      const transport = yield* restore(acquireTransport)
-      const client = new ClientImpl(
-        transport,
-        runPromise,
-        requestTimeoutMs,
-        positiveDuration(options.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS),
-        positiveInteger(options.maxJsonlRecordBytes, DEFAULT_JSONL_RECORD_LIMIT_BYTES),
-        positiveInteger(options.maxPendingRequests, DEFAULT_PENDING_REQUEST_LIMIT),
-      )
+      let client: ClientImpl | undefined
+      const own = (transport: CodexTransport) => {
+        client = new ClientImpl(transport, runTask, writeSignal, requestTimeoutMs,
+          positiveDuration(options.shutdownTimeoutMs, PROCESS_TERMINATION_GRACE_PERIOD_MS),
+          positiveInteger(options.maxJsonlRecordBytes, DEFAULT_JSONL_RECORD_LIMIT_BYTES),
+          positiveInteger(options.maxPendingRequests, DEFAULT_PENDING_REQUEST_LIMIT),
+          optionalOperationTimeout(options.shutdownTimeoutMs))
+      }
+      yield* Effect.addFinalizer(() => client ? client.close().pipe(Effect.orDie) : Effect.void)
       const initialized = yield* Effect.exit(restore(Effect.gen(function*() {
+        const transport = yield* acquireTransport(own)
+        const owned = client
+        if (!owned) return yield* Effect.die(new Error("Codex transport acquisition did not register ownership"))
         yield* Effect.try({
           try: () => transport.unref(),
           catch: (cause) => new CodexProcessError({
@@ -901,10 +880,11 @@ function acquireClient(
             cause,
           }),
         })
-        yield* client.initialize()
+        yield* owned.initialize()
+        return owned
       })))
       if (Exit.isFailure(initialized)) {
-        const cleanup = yield* Effect.exit(client.close())
+        const cleanup = yield* Effect.exit(client?.close() ?? Effect.void)
         if (Exit.isFailure(cleanup)) {
           return yield* Effect.fail(new CodexCleanupError({
             message: "Codex app-server acquisition failed and rollback was incomplete",
@@ -916,8 +896,7 @@ function acquireClient(
         }
         return yield* Effect.failCause(initialized.cause)
       }
-      yield* Effect.addFinalizer(() => client.close().pipe(Effect.orDie))
-      return client
+      return initialized.value
     }))
   })
 }
@@ -946,8 +925,9 @@ function spawnCodex(command: readonly string[]): CodexAppServerProcess {
 async function connectWebSocketTransport(
   url: string,
   bearerToken: string,
-  connectTimeoutMs: number | undefined,
   signal: AbortSignal,
+  own: (transport: CodexTransport) => void,
+  createWebSocket: NonNullable<CodexSidecarOptions["createWebSocket"]> = (url, options) => new WebSocket(url, options),
 ): Promise<CodexTransport> {
   assertLoopbackWebSocketUrl(url)
   const encoder = new TextEncoder()
@@ -969,9 +949,15 @@ async function connectWebSocketTransport(
     exitSettled = true
     resolveExited(code)
   }
-  const socket = new WebSocket(url, {
+  const socket = createWebSocket(url, {
     headers: { Authorization: `Bearer ${bearerToken}` },
   })
+  const confirmClosed = () => {
+    if (socket.readyState !== WebSocket.CLOSED) return
+    if (!stdoutSettled) { stdoutSettled = true; stdoutController.close() }
+    settleExit(1)
+  }
+  const terminate = () => { socket.terminate(); confirmClosed() }
 
   socket.addEventListener("message", (event) => {
     if (stdoutSettled) return
@@ -981,8 +967,7 @@ async function connectWebSocketTransport(
         operation: "read",
         message: "Codex sidecar sent a non-text WebSocket message",
       }))
-      socket.terminate()
-      settleExit(1)
+      terminate()
       return
     }
     stdoutController.enqueue(encoder.encode(`${event.data}\n`))
@@ -995,35 +980,47 @@ async function connectWebSocketTransport(
     settleExit(event.code === 1000 ? 0 : 1)
   }, { once: true })
 
+  const transport: CodexTransport = {
+    stdin: {
+      write(data) {
+        socket.send(data.endsWith("\n") ? data.slice(0, -1) : data)
+        return data.length
+      },
+      flush: () => 0,
+      end: () => {
+        if (socket.readyState === WebSocket.CONNECTING) terminate()
+        else { socket.close(1000); confirmClosed() }
+      },
+    },
+    stdout,
+    stderr,
+    exited,
+    terminate(signal) {
+      if (signal === "SIGKILL" || socket.readyState === WebSocket.CONNECTING) terminate()
+      else { socket.close(1000); confirmClosed() }
+    },
+    unref() {},
+  }
+  own(transport)
+
   await new Promise<void>((resolve, reject) => {
     let settled = false
     const finish = (effect: () => void) => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
       signal.removeEventListener("abort", onAbort)
       socket.removeEventListener("open", onOpen)
       socket.removeEventListener("error", onError)
       socket.removeEventListener("close", onClose)
       effect()
     }
-    const timer = connectTimeoutMs === undefined ? undefined : setTimeout(() => {
-      socket.terminate()
-      settleExit(1)
-      finish(() => reject(new CodexConnectionError({
-        url,
-        message: `Timed out connecting to Codex sidecar after ${connectTimeoutMs}ms`,
-        retryable: true,
-      })))
-    }, connectTimeoutMs)
     const onOpen = () => finish(resolve)
     const onClose = () => finish(() => reject(new CodexConnectionError({
       url,
       message: "Codex sidecar closed before the connection was established",
     })))
     const onError = (event: Event) => {
-      socket.terminate()
-      settleExit(1)
+      terminate()
       finish(() => reject(new CodexConnectionError({
         url,
         message: "Unable to connect to Codex sidecar",
@@ -1033,8 +1030,7 @@ async function connectWebSocketTransport(
       })))
     }
     const onAbort = () => {
-      socket.terminate()
-      settleExit(1)
+      terminate()
       finish(() => reject(new CodexConnectionError({
         url,
         message: "Codex sidecar connection was interrupted",
@@ -1051,28 +1047,7 @@ async function connectWebSocketTransport(
     socket.addEventListener("close", onClose, { once: true })
   })
 
-  return {
-    stdin: {
-      write(data) {
-        socket.send(data.endsWith("\n") ? data.slice(0, -1) : data)
-        return data.length
-      },
-      flush: () => 0,
-      end: () => socket.close(1000),
-    },
-    stdout,
-    stderr,
-    exited,
-    terminate(signal) {
-      if (signal === "SIGKILL") {
-        socket.terminate()
-        settleExit(1)
-      } else {
-        socket.close(1000)
-      }
-    },
-    unref() {},
-  }
+  return transport
 }
 
 function decodeThreadEnvelope(
@@ -1274,27 +1249,10 @@ function processGroupHandle(process: CodexAppServerProcess): ProcessGroupHandle 
     processGroupId,
     signalGroup: (signal) => signalProcessGroup(process, signal),
     isGroupAlive: () => isProcessGroupAlive(processGroupId),
-    waitForGroupExit: (timeoutMs) => Effect.promise(() => waitForProcessGroupExit(
-      processGroupId,
+    waitForGroupExit: (timeoutMs) => waitForProcessGroupExit(
+      () => isProcessGroupAlive(processGroupId),
       timeoutMs,
-    )),
-  }
-}
-
-async function waitForProcessGroupExit(processGroupId: number, timeoutMs: number): Promise<boolean> {
-  const deadline = performance.now() + timeoutMs
-  while (isProcessGroupAlive(processGroupId) && performance.now() < deadline) {
-    await Bun.sleep(Math.min(10, Math.max(0, deadline - performance.now())))
-  }
-  return !isProcessGroupAlive(processGroupId)
-}
-
-function isProcessGroupAlive(processGroupId: number): boolean {
-  try {
-    globalThis.process.kill(-processGroupId, 0)
-    return true
-  } catch (cause) {
-    return !isNoSuchProcessError(cause)
+    ),
   }
 }
 
@@ -1344,25 +1302,4 @@ function assertLoopbackWebSocketUrl(value: string): void {
       message: "Codex sidecar must use an authenticated loopback WebSocket",
     })
   }
-}
-
-type PromiseSettlement =
-  | { readonly _tag: "Fulfilled" }
-  | { readonly _tag: "Rejected"; readonly cause: unknown }
-  | { readonly _tag: "TimedOut" }
-
-async function settlementWithin(promise: Promise<unknown>, timeoutMs: number): Promise<PromiseSettlement> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<PromiseSettlement>((resolve) => {
-    timer = setTimeout(() => resolve({ _tag: "TimedOut" }), timeoutMs)
-  })
-  const settled = await Promise.race([
-    promise.then<PromiseSettlement, PromiseSettlement>(
-      () => ({ _tag: "Fulfilled" }),
-      (cause) => ({ _tag: "Rejected", cause }),
-    ),
-    timeout,
-  ])
-  if (timer !== undefined) clearTimeout(timer)
-  return settled
 }

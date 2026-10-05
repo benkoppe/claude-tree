@@ -47,6 +47,8 @@ import { replaceSessionIdInProjectState } from "../services/provider-state-repos
 import { HISTORY_RETRY_DELAYS_MS, HISTORY_CONFIRMATION_DELAY_MS } from "../services/lifecycle-policy"
 import { causeFailures, errorDetails, errorSummary as errorMessage } from "../error-format"
 import { makeNavigationWriter } from "./navigation-writer"
+import { makeScopeClose } from "../services/close-operation"
+import { makeCleanupBudget } from "../services/cleanup-budget"
 import { makeCommandExecutor, type CommandCompleted } from "./command-executor"
 import { describeSession, selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
@@ -90,9 +92,6 @@ import {
 } from "./view-model"
 
 const DEFAULT_COMPLETION_DELAYS_MS = HISTORY_RETRY_DELAYS_MS
-const DEFAULT_SHUTDOWN_NAVIGATION_TIMEOUT_MS = 500
-const DEFAULT_SHUTDOWN_TRANSITION_TIMEOUT_MS = 500
-const COMMAND_SCOPE_CLOSE_TIMEOUT_MS = 100
 const RECONCILIATION_FAILURE_BACKOFF_MS = 100
 const TRANSCRIPT_CONFIRMATION_DELAY_MS = HISTORY_CONFIRMATION_DELAY_MS
 
@@ -102,7 +101,6 @@ export interface AppRuntimeOptions {
   readonly terminals: TerminalSupervisorApi
   readonly completionDelaysMs?: readonly number[]
   readonly shutdownNavigationTimeoutMs?: number
-  readonly shutdownTransitionTimeoutMs?: number
   readonly navigationSaveIntervalMs?: number
   readonly closeNavigationPersistence?: Effect.Effect<void, unknown>
   readonly closeProviderReads?: Effect.Effect<void, unknown>
@@ -232,14 +230,11 @@ export function makeAppRuntime(
     const controlInbox = yield* Queue.unbounded<ActorControlMessage>()
     const actorStopped = yield* Deferred.make<void>()
     const commandScope = yield* Scope.make("parallel")
-    const closeCommandScope = Effect.suspend(() =>
-      Scope.closeUnsafe(commandScope, Exit.void) ?? Effect.void)
-    yield* Effect.addFinalizer(() => Effect.interruptible(closeCommandScope).pipe(
-      Effect.timeoutOrElse({
-        duration: COMMAND_SCOPE_CLOSE_TIMEOUT_MS,
-        orElse: () => Effect.void,
-      }),
-    ))
+    const closeCommandScope = makeScopeClose(commandScope)
+    yield* Effect.addFinalizer(() => Effect.gen(function*() {
+      const budget = yield* makeCleanupBudget(options.shutdownNavigationTimeoutMs)
+      yield* budget.observe(closeCommandScope, () => new Error("Application commands did not finish finalizing")).pipe(Effect.orDie)
+    }))
     const operations = makeApplicationOperations(options)
     const navigation = yield* makeNavigationWriter(options.metadata, (cause) =>
       Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }), options.navigationSaveIntervalMs)
@@ -253,10 +248,7 @@ export function makeAppRuntime(
     const pendingRemovals = new Map<string, PendingRemoval>()
     const pendingTransitionAcknowledgments = new Map<string, DeferredType.Deferred<void, unknown>>()
     const completionDelays = options.completionDelaysMs ?? DEFAULT_COMPLETION_DELAYS_MS
-    const shutdownNavigationTimeoutMs = options.shutdownNavigationTimeoutMs ??
-      DEFAULT_SHUTDOWN_NAVIGATION_TIMEOUT_MS
-    const shutdownTransitionTimeoutMs = options.shutdownTransitionTimeoutMs ??
-      DEFAULT_SHUTDOWN_TRANSITION_TIMEOUT_MS
+    const shutdownNavigationTimeoutMs = options.shutdownNavigationTimeoutMs
     let nextCorrelationId = 1
     let nextCommandToken = 1
     let nextRemovalRequestId = 1
@@ -1753,6 +1745,8 @@ export function makeAppRuntime(
             yield* supersede(key, message.reason)
           }
           for (const ownerId of ownerIds) yield* drainOwner(ownerId)
+          for (const acknowledgment of pendingTransitionAcknowledgments.values()) yield* Deferred.fail(acknowledgment, transitionRejected(message.reason))
+          pendingTransitionAcknowledgments.clear()
           yield* Deferred.succeed(message.reply, undefined)
         })
       }
@@ -2119,64 +2113,29 @@ export function makeAppRuntime(
     const performShutdown = (
       result: DeferredType.Deferred<void, ApplicationShutdownError>,
       beginReply: DeferredType.Deferred<void>,
-      transitionAcknowledgments: readonly DeferredType.Deferred<void, unknown>[],
     ): Effect.Effect<void> => Effect.gen(function*() {
-      const transitionExit = yield* Effect.exit(
-        Effect.all(
-          transitionAcknowledgments.map((acknowledgment) => Deferred.await(acknowledgment)),
-          { discard: true },
-        ).pipe(Effect.timeoutOrElse({
-          duration: shutdownTransitionTimeoutMs,
-          orElse: () => Effect.fail(new Error(
-            `Timed out after ${shutdownTransitionTimeoutMs}ms while acknowledging session identity`,
-          )),
-        })),
-      )
-      let transitionAbortError: Error | undefined
-      if (Exit.isFailure(transitionExit)) {
-        const reason = errorMessage(Cause.squash(transitionExit.cause))
-        const aborted = yield* sendControl((reply) => ({
-          _tag: "AbortTransitionAcknowledgments",
-          reason,
-          reply,
-        }))
-        if (!aborted) {
-          transitionAbortError = new Error(
-            `${reason}; application actor could not abort pending identity acknowledgments`,
-          )
-        }
-      }
-
       const lifecycleShutdown = Effect.gen(function*() {
         const began = yield* Effect.raceFirst(
           Deferred.await(beginReply).pipe(Effect.as(true)),
           Deferred.await(actorStopped).pipe(Effect.as(false)),
         )
         if (!began) return yield* Effect.fail(new Error("Application actor could not begin shutdown"))
-        const navigationExit = yield* Effect.exit(Effect.interruptible(navigation.flush).pipe(
-          Effect.timeoutOrElse({
-            duration: shutdownNavigationTimeoutMs,
-            orElse: () => Effect.fail(new Error(
-              `Timed out after ${shutdownNavigationTimeoutMs}ms while saving navigation`,
-            )),
-          }),
-        ))
-        yield* Effect.interruptible(Effect.suspend(() => navigation.close)).pipe(Effect.timeoutOrElse({
-          duration: shutdownNavigationTimeoutMs,
-          orElse: () => Effect.void,
+        const aborted = yield* sendControl((reply) => ({
+          _tag: "AbortTransitionAcknowledgments", reason: "Application shutdown cancelled pending identity acknowledgment", reply,
         }))
-        yield* Effect.interruptible(closeCommandScope).pipe(
-          Effect.timeoutOrElse({
-            duration: COMMAND_SCOPE_CLOSE_TIMEOUT_MS,
-            orElse: () => Effect.void,
-          }),
-        )
+        if (!aborted) return yield* Effect.fail(new Error("Application actor could not settle pending identity acknowledgments"))
+        const budget = yield* makeCleanupBudget(shutdownNavigationTimeoutMs)
+        const navigationExit = yield* Effect.exit(budget.observe(navigation.flush,
+          () => new Error(`Timed out after ${shutdownNavigationTimeoutMs}ms while saving navigation`)))
+        const drainExit = yield* Effect.exit(budget.observe(navigation.close,
+          () => new Error("Navigation writer did not finish closing")))
+        const commandExit = yield* Effect.exit(budget.observe(closeCommandScope,
+          () => new Error("Application commands did not finish finalizing")))
         const closeExit = yield* Effect.exit(options.closeNavigationPersistence ?? Effect.void)
-        if (Exit.isFailure(navigationExit) && Exit.isFailure(closeExit)) return yield* Effect.fail(new AggregateError([
-          ...causeFailures(navigationExit.cause), ...causeFailures(closeExit.cause),
-        ], "Navigation persistence could not be flushed and closed"))
-        if (Exit.isFailure(navigationExit)) yield* Effect.failCause(navigationExit.cause)
-        if (Exit.isFailure(closeExit)) yield* Effect.failCause(closeExit.cause)
+        const failures = [...new Set([navigationExit, drainExit, commandExit, closeExit].flatMap((exit) =>
+          Exit.isFailure(exit) ? causeFailures(exit.cause) : []))]
+        if (failures.length > 1) return yield* Effect.fail(new AggregateError(failures, "Navigation persistence could not be flushed and closed"))
+        if (failures.length === 1) return yield* Effect.fail(failures[0])
       })
       const [lifecycleExit, terminalExit, readsExit, projectionExit] = yield* Effect.all([
         Effect.exit(lifecycleShutdown),
@@ -2186,8 +2145,6 @@ export function makeAppRuntime(
       ], { concurrency: "unbounded" })
       const failures = [lifecycleExit, terminalExit, readsExit, projectionExit].flatMap((exit) =>
         Exit.isFailure(exit) ? causeFailures(exit.cause) : [])
-      if (Exit.isFailure(transitionExit)) failures.unshift(...causeFailures(transitionExit.cause))
-      if (transitionAbortError) failures.unshift(transitionAbortError)
       const error = failures.length === 0
         ? undefined
         : shutdownFailure(failures)
@@ -2215,7 +2172,6 @@ export function makeAppRuntime(
       accepting = false
       const result = Deferred.makeUnsafe<void, ApplicationShutdownError>()
       const beginReply = Deferred.makeUnsafe<void>()
-      const transitionAcknowledgments = [...pendingTransitionAcknowledgments.values()]
       shutdownResult = result
       if (!Queue.offerUnsafe(controlInbox, { _tag: "BeginShutdown", reply: beginReply })) {
         const error = new ApplicationShutdownError({
@@ -2224,7 +2180,7 @@ export function makeAppRuntime(
         Deferred.doneUnsafe(result, Effect.fail(error))
         return Deferred.await(result)
       }
-      return Effect.forkDetach(performShutdown(result, beginReply, transitionAcknowledgments), {
+      return Effect.forkDetach(performShutdown(result, beginReply), {
         startImmediately: true,
         uninterruptible: false,
       }).pipe(Effect.andThen(Deferred.await(result)))

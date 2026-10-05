@@ -1355,14 +1355,16 @@ describe("Codex sidecar", () => {
     })
   })
 
-  test("requests file-handle closure when token fsync exceeds its acquisition timeout", async () => {
+  test("retains a native fsync and closes its handle only after late completion", async () => {
     const opened: string[] = []
     const closed: string[] = []
     let syncStarted = false
+    let releaseSync!: () => void
+    const directoryRemoved = Deferred.makeUnsafe<void>()
     const handle = (path: string): CodexSidecarFileHandle => ({
       sync: () => {
         syncStarted = true
-        return new Promise<void>(() => undefined)
+        return new Promise<void>((resolve) => { releaseSync = resolve })
       },
       close: async () => { closed.push(path) },
     })
@@ -1376,21 +1378,27 @@ describe("Codex sidecar", () => {
           opened.push(path)
           return handle(path)
         },
-        removeDirectory: async () => {},
+        removeDirectory: async () => { Deferred.doneUnsafe(directoryRemoved, Effect.void) },
       }, { acquisitionTimeoutMs: 10, cleanupTimeoutMs: 10 })))
       yield* Effect.promise(() => waitUntil(() => syncStarted))
       yield* TestClock.adjust(10)
-      return yield* Fiber.join(fiber).pipe(Effect.flip)
+      yield* TestClock.adjust(10)
+      const failure = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(closed).toEqual([])
+      releaseSync()
+      yield* Deferred.await(directoryRemoved)
+      return failure
     }), TestClock.layer()))
 
-    expect(error).toMatchObject({ operation: "token" })
+    expect(error).toMatchObject({ operation: "acquire-rollback" })
     expect(opened).toEqual(["/tmp/injected-codex-fsync/token"])
     expect(closed).toEqual(["/tmp/injected-codex-fsync/token"])
   })
 
-  test("times out an interruptible token write and rolls back its directory without sleeps", async () => {
+  test("reports a timed-out native write as incomplete and removes its directory after it settles", async () => {
     const removed: string[] = []
     let releaseWrite!: () => void
+    const directoryRemoved = Deferred.makeUnsafe<void>()
 
     const error = await Effect.runPromise(Effect.provide(Effect.gen(function*() {
       const writeStarted = yield* Deferred.make<void>()
@@ -1402,17 +1410,20 @@ describe("Codex sidecar", () => {
             releaseWrite = resolve
           })
         },
-        removeDirectory: async (path) => { removed.push(path) },
+        removeDirectory: async (path) => { removed.push(path); Deferred.doneUnsafe(directoryRemoved, Effect.void) },
       }, { acquisitionTimeoutMs: 10, cleanupTimeoutMs: 10 })))
       yield* Deferred.await(writeStarted)
       yield* TestClock.adjust(10)
+      yield* TestClock.adjust(10)
       const failure = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(removed).toEqual([])
       releaseWrite()
+      yield* Deferred.await(directoryRemoved)
       return failure
     }), TestClock.layer()))
 
     expect(error).toBeInstanceOf(CodexSidecarError)
-    expect(error).toMatchObject({ operation: "token" })
+    expect(error).toMatchObject({ operation: "acquire-rollback" })
     expect(removed).toEqual(["/tmp/injected-codex-timeout"])
   })
 
@@ -1433,10 +1444,12 @@ describe("Codex sidecar", () => {
         removeDirectory: async (path) => { removed.push(path) },
       }, { acquisitionTimeoutMs: 1_000, cleanupTimeoutMs: 10 })))
       yield* Deferred.await(writeStarted)
-      yield* Fiber.interrupt(fiber)
-      const exit = yield* Fiber.await(fiber)
+      fiber.interruptUnsafe()
+      yield* Effect.yieldNow
+      expect(removed).toEqual([])
+      expect(fiber.pollUnsafe()).toBeUndefined()
       releaseWrite()
-      return exit
+      return yield* Fiber.await(fiber)
     }))
 
     expect(result._tag).toBe("Failure")

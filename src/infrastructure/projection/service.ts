@@ -2,6 +2,8 @@ import { Worker } from "node:worker_threads"
 
 import { Deferred, Effect, Scope } from "effect"
 import { workerEntry } from "../worker-entry"
+import { makeCloseOperation } from "../../services/close-operation"
+import { withOperationTimeout } from "../../services/operation-deadline"
 
 import { prepareForest } from "../../application/forest-projection"
 import { selectProjectedData, selectProjectedRelations, selectVisibleEndpointSessionIds } from "../../application/selectors"
@@ -9,7 +11,6 @@ import type { ApplicationState } from "../../application/state"
 import { cacheGraphLayout } from "../../application/view-model"
 import type { ProjectionRequest, ProjectionResponse } from "./protocol"
 
-const PROJECTION_WORKER_CLOSE_TIMEOUT_MS = 1_000
 
 export interface ProjectionService {
   readonly prepare: (state: ApplicationState) => Effect.Effect<void, unknown>
@@ -18,6 +19,7 @@ export interface ProjectionService {
 
 export function makeProjectionService(
   createWorker: () => Worker = () => new Worker(workerEntry(new URL("./worker.ts", import.meta.url), "src/infrastructure/projection/worker.ts")),
+  closeTimeoutMs?: number,
 ): Effect.Effect<ProjectionService, unknown, Scope.Scope> {
   return Effect.uninterruptible(Effect.gen(function*() {
     const pending = new Map<number, Deferred.Deferred<Extract<ProjectionResponse, { _tag: "Projected" }>, Error>>()
@@ -38,13 +40,12 @@ export function makeProjectionService(
       pending.delete(response.id)
       Deferred.doneUnsafe(reply, response._tag === "Projected" ? Effect.succeed(response) : Effect.fail(new Error(response.message)))
     })
-    const close = Effect.tryPromise({ try: () => {
+    const close = withOperationTimeout(makeCloseOperation(Effect.tryPromise({ try: () => {
       // Pure computation: no provider mutation, persistence lock, or terminal resource.
       if (!closing) { fail(new Error("Projection worker is closing")); closing = worker.terminate() }
       return closing.then(() => {})
-    }, catch: (cause) => cause }).pipe(Effect.timeoutOrElse({ duration: PROJECTION_WORKER_CLOSE_TIMEOUT_MS,
-      orElse: () => Effect.fail(new Error("Projection worker did not finish closing")),
-    }), Effect.onError(() => Effect.sync(() => worker.unref())))
+    }, catch: (cause) => cause })), closeTimeoutMs, () => Effect.fail(new Error("Projection worker did not finish closing"))).pipe(
+      Effect.onError(() => Effect.sync(() => worker.unref())))
     yield* Effect.addFinalizer(() => close.pipe(Effect.catch((cause) => Effect.logError(cause))))
     return {
       close,

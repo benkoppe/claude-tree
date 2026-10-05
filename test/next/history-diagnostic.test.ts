@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { EventEmitter } from "node:events"
-import type { ChildProcess } from "node:child_process"
+import { fork, type ChildProcess } from "node:child_process"
 
 import { getSessionMessages, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
 import { Deferred, Effect, Exit, Fiber } from "effect"
@@ -13,6 +13,8 @@ import { UNKNOWN_BUILD } from "../../src/build-info"
 import { makeCliProgram } from "../../src/cli"
 import { HistoryDiagnosticReportSchema, HistoryTrace, MAX_TRACE_EVENTS } from "../../src/diagnostics/history-trace"
 import { runHistoryWorker } from "../../src/diagnostics/run-history"
+import { HistoryProcessRequestSchema, type HistoryDiagnosticJob, type HistoryProcessRequest } from "../../src/diagnostics/history-protocol"
+import { runHistoryProcess } from "../../src/diagnostics/history-runtime"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
 import { runSubprocess } from "../subprocess"
 
@@ -133,73 +135,234 @@ test("diagnostic CLI bypasses TTY and interactive composition and sanitizes unex
   for (const value of [SECRET, PRIVATE_PATH, "private-session"]) expect(output[0]).not.toContain(value)
 })
 
-test("an explicitly requested worker timeout remains bounded and closes the read-only worker", async () => {
-  let terminations = 0
-  const ready = Deferred.makeUnsafe<void>()
-  const worker = Object.assign(new EventEmitter(), {
-    exitCode: null, signalCode: null,
-    send() { Deferred.doneUnsafe(ready, Effect.void) },
-    kill() { terminations++; queueMicrotask(() => worker.emit("exit", 0)); return true }, unref() {},
-  }) as unknown as ChildProcess
+class ControlledDiagnosticProcess extends EventEmitter {
+  readonly pid = 12345
+  exitCode: number | null = null
+  signalCode: NodeJS.Signals | null = null
+  readonly ready = Deferred.makeUnsafe<void>()
+  readonly cancelling = Deferred.makeUnsafe<void>()
+  readonly signalled = Deferred.makeUnsafe<void>()
+  readonly requests: HistoryProcessRequest[] = []
+  readonly signals: NodeJS.Signals[] = []
+  autoCancel = false
+  autoKill = false
+  detached = false
+  send(request: HistoryProcessRequest, callback: (error: Error | null) => void) {
+    this.requests.push(request)
+    if (request._tag === "Execute") Deferred.doneUnsafe(this.ready, Effect.void)
+    else {
+      Deferred.doneUnsafe(this.cancelling, Effect.void)
+      if (this.autoCancel) queueMicrotask(() => this.finish())
+    }
+    callback(null)
+  }
+  kill(signal: NodeJS.Signals) {
+    this.signals.push(signal)
+    Deferred.doneUnsafe(this.signalled, Effect.void)
+    if (this.autoKill) queueMicrotask(() => this.finish())
+    return true
+  }
+  finish() { this.exitCode = 0; this.emit("exit", 0) }
+  unref() { this.detached = true }
+  create = () => this as unknown as ChildProcess
+}
+
+test("an explicitly requested execution timeout cooperatively closes the read-only worker", async () => {
+  const worker = new ControlledDiagnosticProcess()
+  worker.autoCancel = true
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, () => worker, 30_000))
-    yield* Deferred.await(ready)
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create, 30_000))
+    yield* Deferred.await(worker.ready)
     yield* TestClock.adjust(30_000)
     const report = yield* Fiber.join(task)
     expect(report.failure?.code).toBe("diagnostic-timeout")
-    expect(terminations).toBe(1)
+    expect(worker.signals).toEqual([])
+    expect(worker.requests.map((request) => request._tag)).toEqual(["Execute", "Cancel"])
     expect(JSON.stringify(report)).not.toContain(SECRET)
   }).pipe(Effect.provide(TestClock.layer()))))
 })
 
 test.each([false, true])("default diagnostic waits beyond its former budget and remains cancellable (cancel: %s)", async (cancel) => {
-  const ready = Deferred.makeUnsafe<void>()
-  let terminations = 0
-  const worker = Object.assign(new EventEmitter(), {
-    exitCode: null, signalCode: null,
-    send() { Deferred.doneUnsafe(ready, Effect.void) },
-    kill() { terminations++; queueMicrotask(() => worker.emit("exit", 0)); return true }, unref() {},
-  }) as unknown as ChildProcess
+  const worker = new ControlledDiagnosticProcess()
+  worker.autoCancel = true
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, () => worker))
-    yield* Deferred.await(ready)
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create))
+    yield* Deferred.await(worker.ready)
     yield* TestClock.adjust(120_000)
     expect(task.pollUnsafe()).toBeUndefined()
-    expect(terminations).toBe(0)
+    expect(worker.signals).toEqual([])
     if (cancel) {
       yield* Fiber.interrupt(task)
       expect(Exit.isFailure(yield* Fiber.await(task))).toBeTrue()
     }
     else {
       worker.emit("message", new HistoryTrace("read-only").finish(UNKNOWN_BUILD, "Missing"))
+      yield* Effect.yieldNow
+      expect(task.pollUnsafe()).toBeUndefined()
+      worker.finish()
       expect((yield* Fiber.join(task)).outcome).toBe("Missing")
     }
-    expect(terminations).toBe(1)
+    expect(worker.signals).toEqual([])
+    expect(worker.eventNames()).toEqual([])
   }).pipe(Effect.provide(TestClock.layer()))))
 })
 
-test("cancelling an unlimited diagnostic still bounds cleanup of a child that never exits", async () => {
-  const ready = Deferred.makeUnsafe<void>()
-  const killing = Deferred.makeUnsafe<void>()
-  let detached = false
-  const worker = Object.assign(new EventEmitter(), {
-    exitCode: null, signalCode: null,
-    send() { Deferred.doneUnsafe(ready, Effect.void) },
-    kill() { Deferred.doneUnsafe(killing, Effect.void); return true },
-    unref() { detached = true },
-  }) as unknown as ChildProcess
+test("diagnostic cancellation escalates but waits for actual late exit without a default deadline", async () => {
+  const worker = new ControlledDiagnosticProcess()
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, () => worker))
-    yield* Deferred.await(ready)
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create))
+    yield* Deferred.await(worker.ready)
     yield* TestClock.adjust(120_000)
     expect(task.pollUnsafe()).toBeUndefined()
     const cancellation = yield* Effect.forkChild(Fiber.interrupt(task))
-    yield* Deferred.await(killing)
+    yield* Deferred.await(worker.cancelling)
     yield* TestClock.adjust(1_000)
+    expect(worker.signals).toEqual(["SIGTERM"])
+    yield* TestClock.adjust(1_000)
+    expect(worker.signals).toEqual(["SIGTERM", "SIGKILL"])
+    yield* TestClock.adjust(120_000)
+    expect(cancellation.pollUnsafe()).toBeUndefined()
+    expect(worker.detached).toBeFalse()
+    worker.finish()
     yield* Fiber.join(cancellation)
     expect(Exit.isFailure(yield* Fiber.await(task))).toBeTrue()
-    expect(detached).toBeTrue()
+    expect(worker.eventNames()).toEqual([])
   }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("an explicit diagnostic cleanup deadline retains late exit observation without repeating escalation", async () => {
+  const worker = new ControlledDiagnosticProcess()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create, undefined, 100))
+    yield* Deferred.await(worker.ready)
+    worker.emit("message", new HistoryTrace("read-only").finish(UNKNOWN_BUILD, "Missing"))
+    yield* TestClock.adjust(100)
+    expect((yield* Fiber.join(task)).failure?.code).toBe("cleanup-failed")
+    expect(worker.detached).toBeTrue()
+    expect(worker.listenerCount("exit")).toBe(1)
+    yield* TestClock.adjust(900)
+    expect(worker.signals).toEqual(["SIGTERM"])
+    yield* TestClock.adjust(1_000)
+    expect(worker.signals).toEqual(["SIGTERM", "SIGKILL"])
+    worker.finish()
+    yield* Effect.yieldNow
+    expect(worker.eventNames()).toEqual([])
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("child exit does not discard a report still buffered in IPC", async () => {
+  const worker = new ControlledDiagnosticProcess()
+  await Effect.runPromise(Effect.gen(function*() {
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create))
+    yield* Deferred.await(worker.ready)
+    worker.finish()
+    yield* Effect.yieldNow
+    expect(task.pollUnsafe()).toBeUndefined()
+    worker.emit("message", new HistoryTrace("read-only").finish(UNKNOWN_BUILD, "Missing"))
+    expect((yield* Fiber.join(task)).outcome).toBe("Missing")
+    expect(worker.signals).toEqual([])
+  }))
+})
+
+test("diagnostic IPC disconnect without a report cancels and verifies the remaining child", async () => {
+  const worker = new ControlledDiagnosticProcess()
+  worker.autoKill = true
+  await Effect.runPromise(Effect.gen(function*() {
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create))
+    yield* Deferred.await(worker.ready)
+    worker.emit("disconnect")
+    yield* Deferred.await(worker.cancelling)
+    yield* TestClock.adjust(1_000)
+    expect((yield* Fiber.join(task)).failure?.code).toBe("worker-failed")
+    expect(worker.signals).toEqual(["SIGTERM"])
+    expect(worker.eventNames()).toEqual([])
+  }).pipe(Effect.provide(TestClock.layer())))
+})
+
+test.each([false, true])("diagnostic child finalizes owned reads before report or cancellation completion (cancel: %s)", async (cancel) => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const job = yield* Deferred.make<HistoryDiagnosticJob>()
+    const cancelled = yield* Deferred.make<void>()
+    const reading = yield* Deferred.make<void>()
+    const finishRead = yield* Deferred.make<void>()
+    const finalizing = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const reports: unknown[] = []
+    const child = yield* Effect.forkChild(runHistoryProcess(job, cancelled, (report) => Effect.sync(() => { reports.push(report) }),
+      () => Effect.addFinalizer(() => Deferred.succeed(finalizing, undefined).pipe(Effect.andThen(Deferred.await(release)))).pipe(
+        Effect.andThen(Deferred.succeed(reading, undefined)),
+        Effect.andThen(Deferred.await(finishRead)),
+        Effect.as(new HistoryTrace("read-only").finish(UNKNOWN_BUILD, "Missing")),
+      )))
+    yield* Deferred.succeed(job, { projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD })
+    yield* Deferred.await(reading)
+    if (cancel) yield* Deferred.succeed(cancelled, undefined)
+    else yield* Deferred.succeed(finishRead, undefined)
+    yield* Deferred.await(finalizing)
+    yield* TestClock.adjust(120_000)
+    expect(child.pollUnsafe()).toBeUndefined()
+    expect(reports).toEqual([])
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(child)
+    expect(reports).toHaveLength(cancel ? 0 : 1)
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("diagnostic cancellation before Execute admits no read", async () => {
+  await Effect.runPromise(Effect.gen(function*() {
+    const job = yield* Deferred.make<HistoryDiagnosticJob>()
+    const cancelled = yield* Deferred.make<void>()
+    yield* Deferred.succeed(cancelled, undefined)
+    let reads = 0
+    yield* runHistoryProcess(job, cancelled, () => Effect.die("unexpected report"), () => {
+      reads++
+      return Effect.never
+    })
+    expect(reads).toBe(0)
+  }))
+})
+
+test("diagnostic child validates its private lifecycle protocol without accepting arbitrary fields", () => {
+  expect(HistoryProcessRequestSchema.safeParse({ _tag: "Cancel" }).success).toBeTrue()
+  expect(HistoryProcessRequestSchema.safeParse({ _tag: "Execute", job: { projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD } }).success).toBeTrue()
+  for (const value of [null, {}, { _tag: "Cancel", payload: SECRET }, { _tag: "Execute", job: { projectPath: PRIVATE_PATH } }]) {
+    expect(HistoryProcessRequestSchema.safeParse(value).success).toBeFalse()
+  }
+})
+
+test("failed diagnostic signal dispatch remains a cleanup failure even after verified exit", async () => {
+  const worker = new ControlledDiagnosticProcess()
+  worker.kill = () => { throw new Error(SECRET) }
+  await Effect.runPromise(Effect.gen(function*() {
+    const task = yield* Effect.forkChild(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD }, worker.create))
+    yield* Deferred.await(worker.ready)
+    worker.emit("message", new HistoryTrace("read-only").finish(UNKNOWN_BUILD, "Missing"))
+    yield* TestClock.adjust(2_000)
+    expect(task.pollUnsafe()).toBeUndefined()
+    worker.finish()
+    const report = yield* Fiber.join(task)
+    expect(report.failure?.code).toBe("cleanup-failed")
+    expect(JSON.stringify(report)).not.toContain(SECRET)
+  }).pipe(Effect.provide(TestClock.layer())))
+})
+
+test("a failed diagnostic spawn settles without awaiting a nonexistent child exit", async () => {
+  const report = await Effect.runPromise(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD },
+    () => fork("unused.ts", [], { execPath: `/tmp/opencode/nonexistent-diagnostic-${crypto.randomUUID()}`, stdio: ["ignore", "ignore", "ignore", "ipc"] })))
+  expect(report.failure?.code).toBe("worker-failed")
+  expect(JSON.stringify(report)).not.toContain(PRIVATE_PATH)
+})
+
+test.each(["cancel", "disconnect"])("real diagnostic child exits cleanly when %s arrives before Execute", async (mode) => {
+  const script = `import { fork } from "node:child_process";
+    const child = fork("./src/diagnostics/history-process.ts", [], {execPath: process.execPath, stdio: ["ignore", "ignore", "ignore", "ipc"]});
+    const exit = new Promise((resolve) => child.once("exit", (code, signal) => resolve({code, signal})));
+    ${mode === "cancel" ? 'child.send({_tag: "Cancel"});' : 'child.disconnect();'}
+    console.log(JSON.stringify(await exit));`
+  const [code, stdout, stderr] = await runSubprocess([process.execPath, "-e", script], { cwd: join(import.meta.dir, "../..") })
+  expect(code).toBe(0)
+  expect(stderr).toBe("")
+  expect(JSON.parse(stdout)).toEqual({ code: 0, signal: null })
 })
 
 test.each(["valid", "invalid", "crash"])("worker output and exceptions cannot leak into CLI streams (%s)", async (mode) => {

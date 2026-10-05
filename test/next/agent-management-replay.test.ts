@@ -301,7 +301,7 @@ class ReplayPty implements TerminalProcess {
   readonly pid = 42001
   readonly processGroupId = this.pid
   readonly exited: Promise<number>
-  readonly ptyDrained: Promise<void>
+  readonly ptyOutput: TerminalProcess["ptyOutput"]
   exitCode: number | null = null
   ptyOpen = true
   detached = false
@@ -309,10 +309,10 @@ class ReplayPty implements TerminalProcess {
   readonly signals: NodeJS.Signals[] = []
   verification?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> }
   private resolveExit!: (code: number) => void
-  private resolveDrain!: () => void
+  private resolveOutput!: (settlement: Awaited<TerminalProcess["ptyOutput"]>) => void
   constructor() {
     this.exited = new Promise((resolve) => { this.resolveExit = resolve })
-    this.ptyDrained = new Promise((resolve) => { this.resolveDrain = resolve })
+    this.ptyOutput = new Promise((resolve) => { this.resolveOutput = resolve })
   }
   write() {}
   resize() {}
@@ -320,6 +320,7 @@ class ReplayPty implements TerminalProcess {
     this.signals.push(signal)
     this.exitCode = 0
     this.resolveExit(0)
+    this.resolveOutput({ _tag: "Ended", status: "eof" })
   }
   isGroupAlive() { return this.exitCode === null }
   waitForGroupExit() {
@@ -331,6 +332,6 @@ class ReplayPty implements TerminalProcess {
       return !this.isGroupAlive()
     })
   }
-  closePty() { this.ptyOpen = false; this.resolveDrain(); this.callbacks.onPtyClosed() }
+  closePty() { this.ptyOpen = false; this.resolveOutput({ _tag: "Closed" }); this.callbacks.onPtyClosed() }
   unref() { this.detached = true }
 }

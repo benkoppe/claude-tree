@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import { cp, mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { Database } from "bun:sqlite"
-import { Deferred, Effect, Fiber } from "effect"
+import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { TestClock } from "effect/testing"
 
 import type { BranchRelation } from "../../src/domain/persistence"
@@ -16,11 +16,14 @@ import { readMigrationFiles } from "drizzle-orm/migrator"
 
 const directories: string[] = []
 const repositories: ProviderStateRepositoryApi[] = []
+let testScope = Scope.makeUnsafe()
 afterEach(async () => {
   for (const repository of repositories.splice(0)) await run(repository.close)
+  await Effect.runPromise(Scope.close(testScope, Exit.void))
+  testScope = Scope.makeUnsafe()
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true })
 })
-const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
+const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope>) => Effect.runPromise(Scope.provide(effect, testScope))
 async function fixture() {
   await mkdir("/tmp/opencode", { recursive: true })
   const directory = await realpath(await mkdtemp("/tmp/opencode/sqlite-test-"))
@@ -98,9 +101,25 @@ test("metadata worker serializes writes, preserves workspace isolation, and drai
     yield* Effect.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? first : second).saveRelation({ ...relation(`child-${i}`), sharedMessages: [] })), { concurrency: "unbounded" })
     expect((yield* first.loadMetadata).relations).toHaveLength(20)
     expect((yield* second.loadMetadata).navigation).toEqual({ view: "roots", selectedSessionId: "second" })
+    yield* first.saveNavigation({ view: "roots", selectedSessionId: "latest" })
+    expect((yield* first.loadMetadata).relations).toHaveLength(20)
+    expect((yield* second.loadMetadata).navigation).toEqual({ view: "roots", selectedSessionId: "second" })
     yield* first.close; yield* second.close
     expect((yield* Effect.flip(first.saveNavigation({ view: "roots", selectedSessionId: null }))).message).toContain("closing")
   })))
+})
+
+test.each(["incompatible", "missing"])("metadata worker rejects %s initialized state without replacing it", async (kind) => {
+  const options = await fixture()
+  const repository = await open(options)
+  await run(repository.close)
+  const invalid = "{\"version\":1}"
+  if (kind === "incompatible") await writeFile(repository.statePath, invalid)
+  else await rm(repository.statePath)
+  const failure = await run(Effect.scoped(Effect.flip(makeMetadataWorker({ ...options, requireExisting: true }))))
+  expect(failure._tag).toBe("PersistenceError")
+  if (kind === "incompatible") expect(await readFile(repository.statePath, "utf8")).toBe(invalid)
+  else expect(await Bun.file(repository.statePath).exists()).toBeFalse()
 })
 
 test("foreign keys prevent cross-scope references", async () => {

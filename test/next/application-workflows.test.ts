@@ -2630,7 +2630,7 @@ describe("application actor", () => {
     expect(reasons.every((reason) => reason === "shutting-down" || reason === "superseded")).toBeTrue()
   })
 
-  test("shutdown does not wait for an uninterruptible command fiber", async () => {
+  test("graceful shutdown waits for late command finalization without a default deadline", async () => {
     const fixture = makeFixture()
     const commandStarted = Deferred.makeUnsafe<void, never>()
     const releaseCommand = Deferred.makeUnsafe<void, never>()
@@ -2647,21 +2647,22 @@ describe("application actor", () => {
         }))
       }),
     }
-    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const result = await Effect.runPromiseExit(Effect.scoped(Effect.gen(function*() {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
       yield* Effect.addFinalizer(() => Deferred.succeed(releaseCommand, undefined).pipe(Effect.asVoid))
       const refresh = yield* Effect.forkScoped(runtime.refresh())
       yield* Deferred.await(commandStarted)
       const shutdown = yield* Effect.forkScoped(runtime.shutdown)
       yield* Effect.yieldNow
-      yield* TestClock.adjust(100)
-      yield* Fiber.join(shutdown)
+      yield* TestClock.adjust(120_000)
+      expect(shutdown.pollUnsafe()).toBeUndefined()
       const refreshExit = yield* Fiber.await(refresh)
+      expect(Exit.isFailure(refreshExit)).toBeTrue()
       yield* Deferred.succeed(releaseCommand, undefined)
-      return { refreshExit, state: yield* runtime.getState }
+      yield* Fiber.join(shutdown)
+      expect((yield* runtime.getState).shutdown).toBe("stopped")
     }).pipe(Effect.provide(TestClock.layer()))))
-    expect(Exit.isFailure(result.refreshExit)).toBeTrue()
-    expect(result.state.shutdown).toBe("stopped")
+    expect(Exit.isSuccess(result)).toBeTrue()
     expect(fixture.shutdowns).toBe(1)
   })
 
@@ -3068,7 +3069,7 @@ describe("application actor", () => {
     }
   })
 
-  test("starts terminal cleanup while navigation is blocked and bounds shutdown", async () => {
+  test("starts terminal cleanup promptly and waits for slow navigation without a default deadline", async () => {
     const fixture = makeFixture()
     const navigationStarted = Deferred.makeUnsafe<void, never>()
     const releaseNavigation = Deferred.makeUnsafe<void, never>()
@@ -3098,22 +3099,22 @@ describe("application actor", () => {
         ...fixture.options,
         metadata,
         terminals,
-        shutdownNavigationTimeoutMs: 100,
       })
       const navigation = yield* Effect.forkScoped(runtime.selectRoot(ROOT))
       yield* Deferred.await(navigationStarted)
       const shutdown = yield* Effect.forkScoped(runtime.shutdown)
       yield* Deferred.await(terminalStarted)
       expect(shutdown.pollUnsafe()).toBeUndefined()
-      yield* TestClock.adjust(100)
-      shutdownExit = yield* Fiber.await(shutdown)
-      shutdownState = yield* runtime.getState
+      yield* TestClock.adjust(120_000)
+      expect(shutdown.pollUnsafe()).toBeUndefined()
       yield* Deferred.succeed(releaseNavigation, undefined)
       yield* Fiber.await(navigation)
+      shutdownExit = yield* Fiber.await(shutdown)
+      shutdownState = yield* runtime.getState
     }).pipe(Effect.provide(TestClock.layer()))))
-    expect(Exit.isFailure(scopedExit)).toBeTrue()
-    expect(shutdownExit && Exit.isFailure(shutdownExit)).toBeTrue()
-    expect(shutdownState?.shutdown).toBe("cleanup-incomplete")
+    expect(Exit.isSuccess(scopedExit)).toBeTrue()
+    expect(shutdownExit && Exit.isSuccess(shutdownExit)).toBeTrue()
+    expect(shutdownState?.shutdown).toBe("stopped")
     expect(fixture.shutdowns).toBe(1)
   })
 

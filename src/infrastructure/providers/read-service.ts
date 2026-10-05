@@ -2,13 +2,14 @@ import { Worker } from "node:worker_threads"
 
 import { Deferred, Effect, Exit, Queue, Scope } from "effect"
 import { workerEntry } from "../worker-entry"
+import { makeCloseOperation } from "../../services/close-operation"
+import { withOperationTimeout } from "../../services/operation-deadline"
 
 import { ProviderError } from "../../domain/errors"
 import type { AgentSession, AgentSessionSnapshot, TranscriptRead } from "../../domain/model"
 import type { AgentProviderApi } from "../../services/provider"
 import type { ProviderReadRequest, ProviderReadResponse, ProviderReadWorkerOptions } from "./read-worker-protocol"
 
-const READ_WORKER_CLOSE_TIMEOUT_MS = 15_000
 type ReadDelivery = Extract<ProviderReadResponse, { readonly _tag: "Progress" | "Completed" }>
 
 /** Read-only jobs never acquire terminal ownership or perform provider mutations. */
@@ -21,6 +22,7 @@ export interface ProviderReads {
 export function makeProviderReads(
   options: ProviderReadWorkerOptions,
   createWorker: () => Worker = () => new Worker(workerEntry(new URL("./read-worker.ts", import.meta.url), "src/infrastructure/providers/read-worker.ts"), { workerData: options }),
+  closeTimeoutMs?: number,
 ): Effect.Effect<ProviderReads, ProviderError, Scope.Scope> {
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const ready = yield* Deferred.make<void, ProviderError>()
@@ -32,9 +34,9 @@ export function makeProviderReads(
     let failed: ProviderError | undefined
     const error = (message: string) => new ProviderError({ providerId: options.providerId, operation: "provider read worker", message })
     const fail = (failure: ProviderError) => {
-      failed = failure
-      Deferred.doneUnsafe(ready, Effect.fail(failure))
-      for (const job of pending.values()) Deferred.doneUnsafe(job.failure, Effect.fail(failure))
+      failed ??= failure
+      Deferred.doneUnsafe(ready, Effect.fail(failed))
+      for (const job of pending.values()) Deferred.doneUnsafe(job.failure, Effect.fail(failed))
     }
     const worker = yield* Effect.try({ try: createWorker, catch: (cause) => error(String(cause)) })
     worker.on("message", (message: ProviderReadResponse) => {
@@ -62,14 +64,13 @@ export function makeProviderReads(
     const post = (message: ProviderReadRequest) => Effect.try({
       try: () => worker.postMessage(message), catch: (cause) => error(String(cause)),
     })
-    const close = Effect.suspend(() => {
+    const close = withOperationTimeout(makeCloseOperation(Effect.suspend(() => {
       if (closing) return Deferred.await(exited)
       closing = true
       for (const job of pending.values()) Deferred.doneUnsafe(job.failure, Effect.fail(error("Provider read worker is closing")))
-      return post({ _tag: "Close" }).pipe(Effect.andThen(Deferred.await(exited)))
-    }).pipe(Effect.timeoutOrElse({ duration: READ_WORKER_CLOSE_TIMEOUT_MS,
-      orElse: () => Effect.fail(error("Provider read worker did not finish closing")),
-    }), Effect.onError(() => Effect.sync(() => worker.unref())))
+      return post({ _tag: "Close" }).pipe(Effect.tapError((failure) => Effect.sync(() => fail(failure))), Effect.andThen(Deferred.await(exited)))
+    })), closeTimeoutMs, () => Effect.fail(error("Provider read worker did not finish closing"))).pipe(
+      Effect.onError(() => Effect.sync(() => worker.unref())))
     yield* Effect.addFinalizer(() => close.pipe(Effect.catch((failure) => Effect.logError(failure))))
     yield* restore(Deferred.await(ready))
     const requestSnapshot = (sessionIds?: readonly string[], publish?: (snapshot: AgentSessionSnapshot) => Effect.Effect<void>, transcriptsOnly = false) => Effect.gen(function*() {

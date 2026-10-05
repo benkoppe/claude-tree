@@ -1,31 +1,34 @@
-import { Effect } from "effect"
+import { Deferred, Effect } from "effect"
 
-import type { BuildInfo } from "../build-info"
-import { ClaudeProvider } from "../infrastructure/providers/claude/provider"
-import { HistoryTrace } from "./history-trace"
+import { HistoryProcessRequestSchema, type HistoryDiagnosticJob } from "./history-protocol"
+import { runHistoryProcess } from "./history-runtime"
 
-export interface HistoryDiagnosticJob {
-  readonly projectPath: string
-  readonly sessionId: string
-  readonly build: BuildInfo
+const job = Deferred.makeUnsafe<HistoryDiagnosticJob>()
+const cancelled = Deferred.makeUnsafe<void>()
+const cancel = () => { Deferred.doneUnsafe(cancelled, Effect.void) }
+const receive = (value: unknown) => {
+  const parsed = HistoryProcessRequestSchema.safeParse(value)
+  if (!parsed.success) { cancel(); return }
+  if (parsed.data._tag === "Cancel") cancel()
+  else if (Deferred.isDoneUnsafe(job)) cancel()
+  else Deferred.doneUnsafe(job, Effect.succeed(parsed.data.job))
 }
 
-process.once("message", (value) => {
-  const job = value as HistoryDiagnosticJob
-  const trace = new HistoryTrace(job.sessionId)
-  const provider = new ClaudeProvider(job.projectPath)
-  const send = (report: ReturnType<HistoryTrace["finish"]>) => {
-    process.send?.(report, () => { if (process.connected) process.disconnect?.() })
-  }
-  // The same public read operation used by refresh. No application runtime,
-  // repository, terminal supervisor, or provider mutation is acquired here.
-  Effect.runPromise(provider.readTranscripts([job.sessionId], trace)).then((reads) => {
-    const read = reads.get(job.sessionId)
-    if (!read) trace.fail("worker", "unexpected-failure")
-    send(trace.finish(job.build, read?._tag === "Available" && read.coverage ? "Limited" : read?._tag ?? "Unavailable", read?._tag === "Available"
-      ? { messages: read.messages.length, visible: read.messages.filter((message) => message.visible).length } : undefined))
-  }, () => {
-    trace.fail("worker", "unexpected-failure")
-    send(trace.finish(job.build, "Unavailable"))
-  })
+process.on("message", receive)
+process.on("disconnect", cancel)
+process.on("SIGTERM", cancel)
+process.on("SIGINT", cancel)
+if (!process.connected) cancel()
+
+void Effect.runPromise(runHistoryProcess(job, cancelled, (report) => Effect.tryPromise({
+  try: () => new Promise<void>((resolve, reject) => {
+    if (!process.connected || !process.send) { reject(); return }
+    process.send(report, (error) => error ? reject(error) : resolve())
+  }), catch: () => undefined,
+}))).finally(() => {
+  process.off("message", receive)
+  process.off("disconnect", cancel)
+  process.off("SIGTERM", cancel)
+  process.off("SIGINT", cancel)
+  if (process.connected) process.disconnect?.()
 })
