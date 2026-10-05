@@ -13,9 +13,8 @@ import { makeKeyedSerialExecutor, type KeyedSerialExecutor } from "./keyed-seria
 import { optionalOperationTimeout, withOperationTimeout } from "./operation-deadline"
 import { makeCloseOperation, makeScopeClose } from "./close-operation"
 import { CleanupDeadline, makeCleanupBudget, type CleanupBudget } from "./cleanup-budget"
+import { PROCESS_TERMINATION_GRACE_PERIOD_MS } from "./lifecycle-policy"
 
-const GRACE_PERIOD_MS = 200
-const KILL_PERIOD_MS = 200
 const ACTIVITY_PROBE_INTERVAL_MS = 2_000
 const ACTIVITY_CONFIRMATION_DELAY_MS = 100
 
@@ -195,8 +194,8 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
 
   constructor(private readonly dependencies: TerminalSupervisorDependencies, private readonly executor: KeyedSerialExecutor<string>) {
     this.events = dependencies.events ?? {}
-    this.graceMs = dependencies.gracePeriodMs ?? GRACE_PERIOD_MS
-    this.killMs = dependencies.killPeriodMs ?? KILL_PERIOD_MS
+    this.graceMs = dependencies.gracePeriodMs ?? PROCESS_TERMINATION_GRACE_PERIOD_MS
+    this.killMs = dependencies.killPeriodMs ?? PROCESS_TERMINATION_GRACE_PERIOD_MS
     this.closeMs = optionalOperationTimeout(dependencies.providerCleanupTimeoutMs)
     optionalOperationTimeout(dependencies.acquisitionTimeoutMs)
     optionalOperationTimeout(dependencies.transitionDerivationTimeoutMs)

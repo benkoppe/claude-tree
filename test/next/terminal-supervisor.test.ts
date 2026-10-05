@@ -6,8 +6,10 @@ import { PersistenceError, ProviderCleanupError, SessionOwnedError, TerminalErro
 import type { TerminalProcess, TerminalProcessCallbacks, TerminalRenderer, TerminalSurface } from "../../src/infrastructure/terminal"
 import type { PreparedTerminal, TerminalLaunch, TerminalTransitionRequest } from "../../src/services/provider"
 import { makeTerminalSupervisor, type TerminalActivityEvent, type TerminalExitEvent, type TerminalSupervisorApi, type TerminalSupervisorDependencies } from "../../src/services/terminal-supervisor"
+import { PROCESS_TERMINATION_GRACE_PERIOD_MS } from "../../src/services/lifecycle-policy"
+import { waitForProcessGroupExit } from "../../src/infrastructure/process-group"
 
-function fixture() {
+function fixture(defaultTerminationPolicy = false) {
   const log: string[] = []
   const children: FakeProcess[] = []
   const surfaces: TerminalSurface[] = []
@@ -26,7 +28,7 @@ function fixture() {
     },
   }
   const dependencies: TerminalSupervisorDependencies = {
-    renderer, gracePeriodMs: 10, killPeriodMs: 10,
+    renderer, ...(defaultTerminationPolicy ? {} : { gracePeriodMs: 10, killPeriodMs: 10 }),
     guard: { acquire: (id, allowDuplicate) => Effect.sync(() => {
       log.push(`claim:${id}:${!!allowDuplicate}`)
       return { release: Effect.sync(() => { log.push(`release:${id}`) }) }
@@ -264,6 +266,98 @@ test("cleanup keeps the PTY open through TERM/KILL and releases the guard last",
     expect(f.log.indexOf("provider:one")).toBeLessThan(f.log.indexOf("release:one"))
   }))
 })
+
+test("default terminal grace permits a late graceful provider exit without SIGKILL", async () => {
+  const f = fixture(true)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor(f.dependencies)
+    yield* supervisor.show(f.prepare("one"))
+    const child = f.children[0]!
+    child.ignoreTerm = true
+    child.waitForGroupExit = (timeoutMs: number) => waitForProcessGroupExit(() => child.alive, timeoutMs)
+    const stop = yield* Effect.forkChild(supervisor.stopSession("one"))
+    yield* eventually(() => f.log.includes("term:one"))
+    yield* TestClock.adjust(PROCESS_TERMINATION_GRACE_PERIOD_MS - 10)
+    expect(stop.pollUnsafe()).toBeUndefined()
+    expect(f.log).not.toContain("kill:one")
+    child.finish(0)
+    yield* TestClock.adjust(10)
+    yield* Fiber.join(stop)
+    expect(f.log).not.toContain("kill:one")
+    expect(f.log).toContain("release:one")
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("default terminal cleanup escalates a surviving provider only after the shared grace", async () => {
+  const f = fixture(true)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor(f.dependencies)
+    yield* supervisor.show(f.prepare("one"))
+    const child = f.children[0]!
+    child.ignoreTerm = true
+    child.waitForGroupExit = (timeoutMs: number) => waitForProcessGroupExit(() => child.alive, timeoutMs)
+    const stop = yield* Effect.forkChild(supervisor.stopSession("one"))
+    yield* eventually(() => f.log.includes("term:one"))
+    yield* TestClock.adjust(PROCESS_TERMINATION_GRACE_PERIOD_MS - 10)
+    expect(f.log).not.toContain("kill:one")
+    yield* TestClock.adjust(10)
+    yield* Fiber.join(stop)
+    expect(f.log.filter((entry) => entry === "kill:one")).toHaveLength(1)
+    expect(f.log).toContain("release:one")
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("failed post-KILL verification retains terminal ownership and the guard until verified retry", async () => {
+  const f = fixture(true)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor(f.dependencies)
+    yield* supervisor.show(f.prepare("one"))
+    const child = f.children[0]!
+    let uncertain = false
+    const signal = child.signalGroup.bind(child)
+    child.signalGroup = (name) => { signal(name); if (name === "SIGKILL") uncertain = true }
+    child.ignoreTerm = true
+    child.isGroupAlive = () => { if (uncertain) throw new Error("Exit verification unavailable"); return child.alive }
+    child.waitForGroupExit = (timeoutMs: number) => waitForProcessGroupExit(() => child.isGroupAlive(), timeoutMs)
+    const stop = yield* Effect.forkChild(Effect.exit(supervisor.stopSession("one")))
+    yield* eventually(() => f.log.includes("term:one"))
+    yield* TestClock.adjust(PROCESS_TERMINATION_GRACE_PERIOD_MS)
+    expect(Exit.isFailure(yield* Fiber.join(stop))).toBeTrue()
+    expect(f.log).toContain("kill:one")
+    expect(f.log).not.toContain("release:one")
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set(["one"]))
+    expect((yield* supervisor.ownershipSnapshot)[0]?.state).toBe("cleanup-incomplete")
+    uncertain = false
+    yield* Effect.exit(supervisor.stopSession("one"))
+    expect(f.log).toContain("release:one")
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("a group surviving SIGKILL receives the shared verification window without releasing ownership", async () => {
+  const f = fixture(true)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor(f.dependencies)
+    yield* supervisor.show(f.prepare("one"))
+    const child = f.children[0]!
+    child.ignoreTerm = true
+    child.ignoreKill = true
+    child.waitForGroupExit = (timeoutMs: number) => waitForProcessGroupExit(() => child.alive, timeoutMs)
+    const stop = yield* Effect.forkChild(Effect.exit(supervisor.stopSession("one")))
+    yield* eventually(() => f.log.includes("term:one"))
+    yield* TestClock.adjust(PROCESS_TERMINATION_GRACE_PERIOD_MS)
+    expect(f.log).toContain("kill:one")
+    yield* TestClock.adjust(PROCESS_TERMINATION_GRACE_PERIOD_MS - 10)
+    expect(stop.pollUnsafe()).toBeUndefined()
+    expect(f.log).not.toContain("release:one")
+    yield* TestClock.adjust(10)
+    expect(Exit.isFailure(yield* Fiber.join(stop))).toBeTrue()
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set(["one"]))
+    child.finish(0)
+    yield* supervisor.stopSession("one")
+    expect(f.log).toContain("release:one")
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
 test("in-process incomplete cleanup can be retried, without writing recovery metadata", async () => {
   const f = fixture()
   await use(f, (supervisor) => Effect.gen(function*() {
@@ -382,6 +476,7 @@ test("fallback activity probes use a controlled clock", async () => {
 class FakeProcess implements TerminalProcess {
   alive = true
   ignoreTerm = false
+  ignoreKill = false
   exitCode: number | null = null
   ptyOpen = true
   outputTail = ""
@@ -398,10 +493,10 @@ class FakeProcess implements TerminalProcess {
   signalGroup(signal: NodeJS.Signals) {
     this.log.push(`${signal === "SIGTERM" ? "term" : "kill"}:${this.id}`)
     expect(this.ptyOpen).toBeTrue()
-    if (signal === "SIGKILL" || !this.ignoreTerm) this.finish(0)
+    if (signal === "SIGKILL" ? !this.ignoreKill : !this.ignoreTerm) this.finish(0)
   }
   isGroupAlive() { return this.alive }
-  waitForGroupExit() { return Effect.sync(() => !this.alive) }
+  waitForGroupExit(_timeoutMs: number) { return Effect.sync(() => !this.alive) }
   closePty() { this.ptyOpen = false; this.log.push(`pty:${this.id}`) }
   unref() { this.log.push(`unref:${this.id}`) }
   finish(code: number) {
