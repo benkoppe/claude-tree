@@ -124,7 +124,7 @@ export interface LocalOverlayState {
 }
 
 export interface BranchVerificationState {
-  readonly status: "verifying" | "paused" | "unavailable" | "contradicted" | "persistence-failed" | "independent"
+  readonly status: "verifying" | "paused" | "unavailable" | "contradicted" | "persistence-failed" | "independent" | "prepared"
   readonly reason: string
   readonly retryable: boolean
 }

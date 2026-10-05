@@ -530,6 +530,26 @@ describe("Effect Codex provider", () => {
     expect(outcome.reason).toContain("overall deadline after thread/fork dispatch")
   })
 
+  test("an explicit Codex deadline during child verification preserves the confirmed child instead of mutation ambiguity", async () => {
+    const started = Deferred.makeUnsafe<void>()
+    const parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
+    const client = fakeClient({ readThread: (id) => id === ROOT ? Effect.succeed(parent)
+      : Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)) })
+    const provider = providerWith(client, { metadataDeadlineMs: 10 })
+    await Effect.runPromise(Effect.gen(function*() {
+      const waiting = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+      yield* Deferred.await(started)
+      yield* TestClock.adjust(10)
+      const result = yield* Fiber.join(waiting)
+      if (result._tag !== "CreatedIndependentSession") throw new Error("expected known child")
+      expect(result.session.id).toBe(CHILD)
+      expect(result.verification?.status).toBe("unavailable")
+      expect(result.verification?.reasonCode).toBe("deadline")
+      expect(result.verification?.receipt).toBeDefined()
+      expect(client.forkCalls).toHaveLength(1)
+    }).pipe(Effect.provide(TestClock.layer())))
+  })
+
   test("read-only verification retries a missing child against captured source evidence after the parent changes", async () => {
     let parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
     const child = thread(CHILD, [turn("c-turn", "completed", [{ id: "c-agent", type: "agentMessage", text: "Answer" }])])

@@ -3491,7 +3491,7 @@ describe("application actor", () => {
     expect(mutations).toBe(1)
   })
 
-  test("explicitly opening an unverified child cancels verification and retires captured evidence", async () => {
+  test.each(["open", "remove"] as const)("explicit %s of an unverified child cancels verification and retires captured evidence", async (action) => {
     const fixture = makeFixture()
     const child = prepared("independent-child", "Independent child")
     const receipt: BranchVerificationReceipt = { session: child.session, verify: Effect.never }
@@ -3501,11 +3501,13 @@ describe("application actor", () => {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
       const branch = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
       yield* waitForState(runtime, (state) => state.branchVerifications.has(child.session.id))
-      yield* runtime.resumeSession(child.session.id)
+      if (action === "open") yield* runtime.resumeSession(child.session.id)
+      else yield* runtime.remove({ kind: "tree", rootSessionId: child.session.id,
+        memberSessionIds: [child.session.id], createdAt: "2026-10-04T00:00:00.000Z" }, [child.session.id])
       expect(Exit.isFailure(yield* Fiber.join(branch))).toBeTrue()
       expect((yield* runtime.getState).branchVerifications.get(child.session.id)?.retryable).toBeFalse()
       expect(Exit.isFailure(yield* Effect.exit(runtime.manageBranchVerification(child.session.id, "retry")))).toBeTrue()
-      expect(fixture.calls).toContain(`show:${child.session.id}`)
+      expect(fixture.calls.includes(`show:${child.session.id}`)).toBe(action === "open")
     })))
   })
 
@@ -3539,6 +3541,31 @@ describe("application actor", () => {
       expect((yield* fixture.options.metadata.loadMetadata).relations).toEqual([])
       expect(fixture.calls.some((call) => call === `show:${child.session.id}`)).toBeFalse()
     }).pipe(Effect.provide(TestClock.layer()))))
+  })
+
+  test("metadata-only retry preserves an unstarted zero-prefix replay for explicit opening", async () => {
+    const fixture = makeFixture()
+    const launch = prepared("replay-child", "Replay child")
+    const child = { ...launch, session: { ...launch.session, transient: true } }
+    fixture.branchOutcome = { _tag: "ValidatedBranch", ...child,
+      derivation: { childSessionId: child.session.id, parentSessionId: ROOT, sourceMessageId: "q", sharedMessages: [] } }
+    const update = fixture.options.metadata.updateMetadata
+    let failOnce = true
+    const metadata: ApplicationMetadataFacet = { ...fixture.options.metadata, updateMetadata: (transform) => {
+      if (failOnce) { failOnce = false; return Effect.fail(persistenceFailure("ancestry write failed")) }
+      return update(transform)
+    } }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
+      yield* runtime.branchFrom({ sessionId: ROOT, messageId: "q" })
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openEndpoint(child.session.id)))).toBeTrue()
+      yield* runtime.manageBranchVerification(child.session.id, "retry")
+      expect(fixture.calls).not.toContain(`show:${child.session.id}`)
+      yield* runtime.refresh()
+      expect((yield* runtime.getState).local.sessions.has(child.session.id)).toBeTrue()
+      yield* runtime.openEndpoint(child.session.id)
+      expect(fixture.calls).toContain(`show:${child.session.id}`)
+    })))
   })
 
   test("retains a verified child and retries metadata without creation or automatic launch after persistence fails", async () => {
