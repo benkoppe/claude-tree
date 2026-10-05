@@ -114,13 +114,13 @@ test("hidden emulators keep processing output from independent Bun PTYs", async 
 
     firstProcess.process.write(new TextEncoder().encode("x"))
     expect(await within(Promise.all([
-      firstProcess.process.exited, firstProcess.process.ptyDrained,
-    ]), "first PTY exit and drain")).toEqual([0, undefined])
+      firstProcess.process.exited, firstProcess.process.ptyOutput,
+    ]), "first PTY exit and drain")).toMatchObject([0, { _tag: "Ended" }])
     expect(secondProcess.process.exitCode).toBeNull()
     secondProcess.process.write(new TextEncoder().encode("x"))
     expect(await within(Promise.all([
-      secondProcess.process.exited, secondProcess.process.ptyDrained,
-    ]), "second PTY exit and drain")).toEqual([0, undefined])
+      secondProcess.process.exited, secondProcess.process.ptyOutput,
+    ]), "second PTY exit and drain")).toMatchObject([0, { _tag: "Ended" }])
     first.setActive(true)
     await setup.renderOnce()
     expect(first.screen().lines.join("\n")).toContain("first-ready\nfirst-finished")
@@ -155,7 +155,7 @@ test("failed Bun PTYs retain a bounded plain-text error after exit and output dr
     observer: new NullTerminalObserver(),
   }, { columns: 80, rows: 24 }, { onOutput() {}, onPtyClosed() {} })
   try {
-    await within(Promise.all([child.exited, child.ptyDrained]), "failed PTY exit and drain")
+    await within(Promise.all([child.exited, child.ptyOutput]), "failed PTY exit and drain")
     expect(child.exitCode).toBe(1)
     expect(child.outputTail).toEndWith("ERROR: saved session unavailable — détails")
     expect(Buffer.byteLength(child.outputTail!)).toBeLessThanOrEqual(8 * 1_024)
@@ -163,6 +163,44 @@ test("failed Bun PTYs retain a bounded plain-text error after exit and output dr
     expect(child.outputTail).not.toContain("�")
   } finally {
     try { child.closePty() } finally { child.unref() }
+  }
+})
+
+test("Bun PTY explicit close is not natural output settlement", async () => {
+  let ready!: () => void
+  const started = new Promise<void>((resolve) => { ready = resolve })
+  const child = new BunPtyProcessFactory().spawn({
+    sessionId: "forced-close", command: [process.execPath, "-e", "process.stdin.resume(); process.stdout.write('ready')"],
+    cwd: process.cwd(), observer: new NullTerminalObserver(),
+  }, { columns: 80, rows: 24 }, { onOutput() { ready() }, onPtyClosed() {} })
+  try {
+    await within(started, "PTY ready")
+    child.closePty()
+    expect(await within(child.ptyOutput, "forced PTY closure")).toEqual({ _tag: "Closed" })
+  } finally {
+    await Effect.runPromise(cleanupProcessGroup(child, { gracePeriodMs: 100, killPeriodMs: 100 }))
+    child.closePty()
+    child.unref()
+  }
+})
+
+test("native PTY settlement follows delivery of the complete output burst", async () => {
+  const count = 256 * 1024
+  let received = 0
+  const child = new BunPtyProcessFactory().spawn({
+    sessionId: "output-burst", command: [process.execPath, "-e", `process.stdout.write('x'.repeat(${count}), () => process.exit(0))`],
+    cwd: process.cwd(), observer: new NullTerminalObserver(),
+  }, { columns: 80, rows: 24 }, { onOutput(data) { received += data.length }, onPtyClosed() {} })
+  try {
+    expect((await within(child.ptyOutput, "output burst settlement"))._tag).toBe("Ended")
+    expect(received).toBe(count)
+    await within(child.exited, "output burst exit")
+    child.closePty()
+    expect((await child.ptyOutput)._tag).toBe("Ended")
+  } finally {
+    await Effect.runPromise(cleanupProcessGroup(child, { gracePeriodMs: 100, killPeriodMs: 100 }))
+    child.closePty()
+    child.unref()
   }
 })
 

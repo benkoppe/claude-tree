@@ -1,6 +1,6 @@
 import { parentPort, workerData } from "node:worker_threads"
 
-import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, FiberSet } from "effect"
 
 import type { AgentMessage, AgentSessionSnapshot, TranscriptRead } from "../../domain/model"
 import { errorSummary } from "../../error-format"
@@ -12,6 +12,7 @@ const options = workerData as ProviderReadWorkerOptions
 const jobs = new Map<number, Fiber.Fiber<void, never>>()
 const acknowledgments = new Map<string, Deferred.Deferred<void>>()
 let closing = false
+const drained = Deferred.makeUnsafe<void>()
 const PROGRESS_CHARACTER_BUDGET = 1_000_000
 
 // Provider-specific payloads remain inside this read boundary. Forks independently
@@ -56,8 +57,7 @@ function send(message: ProviderReadResponse): void {
 
 function finishClose(): void {
   if (!closing || jobs.size > 0) return
-  send({ _tag: "Closed" })
-  port.close()
+  Deferred.doneUnsafe(drained, Effect.void)
 }
 
 const makeProvider = Effect.gen(function*(): Effect.gen.Return<AgentProviderApi, unknown> {
@@ -69,7 +69,9 @@ const makeProvider = Effect.gen(function*(): Effect.gen.Return<AgentProviderApi,
   return new ClaudeProvider(options.projectPath)
 })
 
-Effect.runPromise(makeProvider).then((provider) => {
+const run = Effect.scoped(Effect.gen(function*() {
+  const provider = yield* makeProvider
+  const runJob = yield* FiberSet.makeRuntime<never, void, never>()
   port.on("message", (request: ProviderReadRequest) => {
     if (request._tag === "Acknowledged") {
       const key = `${request.id}:${request.sequence}`
@@ -127,7 +129,7 @@ Effect.runPromise(makeProvider).then((provider) => {
           return remaining.size ? publish({ sessions: [], transcripts: remaining }) : Effect.void
         }))
       : provider.loadSessionSnapshotFor(request.sessionIds).pipe(Effect.flatMap(publish))
-    const fiber = Effect.runFork(Effect.yieldNow.pipe(Effect.andThen(operation), Effect.onExit((exit) => Effect.sync(() => {
+    const fiber = runJob(Effect.yieldNow.pipe(Effect.andThen(operation), Effect.onExit((exit) => Effect.sync(() => {
       jobs.delete(request.id)
       if (Exit.isSuccess(exit)) send({ _tag: "Completed", id: request.id })
       else send({ _tag: "Failed", id: request.id, message: errorSummary(Cause.squash(exit.cause)) })
@@ -136,4 +138,6 @@ Effect.runPromise(makeProvider).then((provider) => {
     jobs.set(request.id, fiber)
   })
   send({ _tag: "Ready" })
-}, (cause) => { throw cause })
+  yield* Deferred.await(drained)
+}))
+Effect.runPromise(run).then(() => { send({ _tag: "Closed" }); port.close() }, (cause) => { throw cause })

@@ -1,10 +1,50 @@
 import { expect, test } from "bun:test"
-import { Deferred, Effect, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
 import { makeNavigationWriter, NAVIGATION_SAVE_INTERVAL_MS } from "../../src/application/navigation-writer"
 import { PersistenceError } from "../../src/domain/errors"
 import type { ProjectState } from "../../src/domain/persistence"
+
+test("navigation close has no default deadline and shares late admitted-write completion", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const saved: string[] = []
+    const writer = yield* makeNavigationWriter({ saveNavigation: (navigation) => Effect.gen(function*() {
+      yield* Deferred.succeed(entered, undefined)
+      yield* Deferred.await(release)
+      if (navigation.view === "roots") saved.push(navigation.selectedSessionId!)
+    }) }, undefined, 0)
+    yield* writer.schedule({ view: "roots", selectedSessionId: "first" })
+    yield* Deferred.await(entered)
+    yield* writer.schedule({ view: "roots", selectedSessionId: "latest" })
+    const first = yield* Effect.forkChild(writer.close)
+    yield* Effect.yieldNow
+    yield* TestClock.adjust(120_000)
+    expect(first.pollUnsafe()).toBeUndefined()
+    const second = yield* Effect.forkChild(writer.close, { startImmediately: true })
+    expect(second.pollUnsafe()).toBeUndefined()
+    expect(saved).toEqual([])
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(first)
+    yield* Fiber.join(second)
+    yield* writer.close
+    expect(saved).toEqual(["first", "latest"])
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("navigation waiter and flush preserve a save defect rather than asserting PersistenceError", async () => {
+  const failure = new Error("save defect")
+  const exit = await Effect.runPromiseExit(Effect.scoped(Effect.gen(function*() {
+    const writer = yield* makeNavigationWriter({ saveNavigation: () => Effect.die(failure) })
+    for (const operation of [writer.write({ view: "roots", selectedSessionId: null }), writer.flush]) {
+      const result = yield* Effect.exit(operation)
+      expect(Exit.isFailure(result) && Cause.squash(result.cause)).toBe(failure)
+    }
+  })))
+  expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBe(failure)
+})
 
 test("navigation writes fail promptly after explicit close", async () => {
   let writes = 0

@@ -3,13 +3,12 @@ import { randomBytes } from "node:crypto"
 import { Effect, PubSub, Semaphore, type Scope } from "effect"
 
 import { ProviderCleanupError } from "../../../domain/errors"
+import { makeCloseOperation } from "../../../services/close-operation"
 
 const TOKEN_ENV = "CLAUDE_TREE_HOOK_TOKEN"
 const HOOK_PATH = "/lifecycle"
 const MAX_BODY_BYTES = 64 * 1024
 const REQUEST_TIMEOUT_MS = 750
-// Leave margin inside the supervisor's explicit-close and scope deadlines.
-const CLEANUP_TIMEOUT_MS = 200
 const MAX_REQUESTS = 4
 
 export interface ClaudeLifecycleHooks {
@@ -92,7 +91,7 @@ export function makeClaudeLifecycleHooks(
       message: "Unable to close Claude lifecycle hooks",
     })
     const cleanupLock = Semaphore.makeUnsafe(1)
-    const close = Effect.uninterruptible(cleanupLock.withPermit(Effect.gen(function*() {
+    const close = makeCloseOperation(cleanupLock.withPermit(Effect.gen(function*() {
       closing = true
       yield* PubSub.shutdown(activityHints)
       if (stopped) return
@@ -100,12 +99,9 @@ export function makeClaudeLifecycleHooks(
       yield* Effect.tryPromise({
         try: () => server.stop(true),
         catch: cleanupError,
-      }).pipe(Effect.timeoutOrElse({
-        duration: CLEANUP_TIMEOUT_MS,
-        orElse: () => Effect.fail(cleanupError()),
-      }))
+      })
       stopped = true
-    })))
+    })), true)
     yield* Effect.addFinalizer(() => close.pipe(Effect.orDie))
     const hook = {
       type: "http",

@@ -29,7 +29,8 @@ import {
   type TerminalTransitionRequest,
   type ProviderTerminalEvent,
 } from "../../../services/provider"
-import { PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { makeCloseOperation, makeScopeClose } from "../../../services/close-operation"
+import { CleanupDeadline, makeCleanupBudget } from "../../../services/cleanup-budget"
 import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 import {
   CodexMutationAmbiguousError,
@@ -63,10 +64,8 @@ import {
 
 const TRANSCRIPT_READ_CONCURRENCY = 16
 const OVERLOAD_RETRY_DELAYS_MS = [25, 50, 100, 200]
-const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS
 const SIDECAR_RETRY_DELAY_MS = 10
 const TOKEN_ENVIRONMENT_VARIABLE = "CLAUDE_TREE_CODEX_TOKEN"
-const METADATA_CLEANUP_TIMEOUT_MS = 10_000
 const THREAD_LIST_PAGE_LIMIT = 100
 const SNAPSHOT_SESSION_LIMIT = 10_000
 
@@ -166,7 +165,7 @@ export class CodexProvider implements AgentProviderApi {
   private readonly readConcurrency: number
   private readonly overloadRetryDelays: readonly number[]
   private readonly metadataDeadlineMs: number | undefined
-  private readonly metadataCleanupTimeoutMs: number
+  private readonly metadataCleanupTimeoutMs: number | undefined
   private readonly maxThreadListPages: number
   private readonly maxSnapshotSessions: number
   private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
@@ -195,7 +194,7 @@ export class CodexProvider implements AgentProviderApi {
     )
     this.overloadRetryDelays = options.overloadRetryDelaysMs ?? OVERLOAD_RETRY_DELAYS_MS
     this.metadataDeadlineMs = optionalOperationTimeout(options.metadataDeadlineMs)
-    this.metadataCleanupTimeoutMs = optionalOperationTimeout(options.metadataCleanupTimeoutMs) ?? METADATA_CLEANUP_TIMEOUT_MS
+    this.metadataCleanupTimeoutMs = optionalOperationTimeout(options.metadataCleanupTimeoutMs)
     this.maxThreadListPages = positiveInteger(options.maxThreadListPages, THREAD_LIST_PAGE_LIMIT)
     this.maxSnapshotSessions = positiveInteger(options.maxSnapshotSessions, SNAPSHOT_SESSION_LIMIT)
     this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
@@ -426,7 +425,7 @@ export class CodexProvider implements AgentProviderApi {
       )))
       if (Exit.isFailure(acquisition)) {
         const scopeCleanup = yield* Effect.exit(this.boundedServerCleanup(
-          Scope.close(scope, acquisition),
+          makeScopeClose(scope, acquisition),
           operation,
         ))
         if (Exit.isFailure(scopeCleanup)) {
@@ -439,14 +438,10 @@ export class CodexProvider implements AgentProviderApi {
       }
 
       const outcome = yield* Effect.exit(restore(use(acquisition.value)))
-      const explicitCleanup = yield* Effect.exit(this.boundedServerCleanup(
-        acquisition.value.close(),
-        operation,
-      ))
-      const scopeCleanup = yield* Effect.exit(this.boundedServerCleanup(
-        Scope.close(scope, outcome),
-        operation,
-      ))
+      const budget = yield* makeCleanupBudget(this.metadataCleanupTimeoutMs)
+      const expired = () => this.providerError(operation, `Codex ${operation} app-server cleanup exceeded ${this.metadataCleanupTimeoutMs}ms`)
+      const explicitCleanup = yield* Effect.exit(budget.observe(acquisition.value.close(), expired).pipe(Effect.provideService(CleanupDeadline, budget)))
+      const scopeCleanup = yield* Effect.exit(budget.observe(makeScopeClose(scope, outcome), expired).pipe(Effect.provideService(CleanupDeadline, budget)))
       const cleanupFailures = [explicitCleanup, scopeCleanup].flatMap((exit) =>
         Exit.isFailure(exit) ? [Cause.squash(exit.cause)] : [])
       if (cleanupFailures.length > 0) {
@@ -485,13 +480,11 @@ export class CodexProvider implements AgentProviderApi {
     effect: Effect.Effect<A, E, R>,
     operation: string,
   ): Effect.Effect<A, E | ProviderError, R> {
-    return effect.pipe(Effect.timeoutOrElse({
-      duration: this.metadataCleanupTimeoutMs,
-      orElse: () => Effect.fail(this.providerError(
+    return withOperationTimeout(Effect.interruptible(effect), this.metadataCleanupTimeoutMs,
+      () => Effect.fail(this.providerError(
         operation,
         `Codex ${operation} app-server cleanup exceeded ${this.metadataCleanupTimeoutMs}ms`,
-      )),
-    }))
+      )))
   }
 
   private listSessionsFrom(
@@ -1172,7 +1165,7 @@ export function makeObservedServices(
       )),
     )
     if (Exit.isFailure(readiness)) {
-      const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
+      const rollback = yield* Effect.exit(sidecar.close())
       if (Exit.isFailure(rollback)) {
         return yield* Effect.fail(new CodexSidecarError({
           operation: "acquire-rollback",
@@ -1193,7 +1186,7 @@ export function makeObservedServices(
       initialThreadIsTemporary,
     })))
     if (Exit.isFailure(proxyAcquisition)) {
-      const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
+      const rollback = yield* Effect.exit(sidecar.close())
       if (Exit.isFailure(rollback)) {
         return yield* Effect.fail(new CodexSidecarError({
           operation: "acquire-rollback",
@@ -1207,14 +1200,15 @@ export function makeObservedServices(
       return yield* Effect.failCause(proxyAcquisition.cause)
     }
     const proxy = proxyAcquisition.value
-    const close = () => Effect.gen(function*() {
+    const cleanup = makeCloseOperation(Effect.gen(function*() {
+      const budget = yield* makeCleanupBudget()
       const failures: unknown[] = []
-      yield* boundedObservedCleanup(proxy.close()).pipe(
-        Effect.catch((error) => Effect.sync(() => failures.push(error))),
-      )
-      yield* boundedObservedCleanup(sidecar.close()).pipe(
-        Effect.catch((error) => Effect.sync(() => failures.push(error))),
-      )
+      for (const resource of [proxy, sidecar]) {
+        const result = yield* Effect.exit(budget.observe(resource.close() as Effect.Effect<void, CodexObservedServicesError>, () => new CodexSidecarError({
+          operation: "cleanup", message: "Codex observed-services cleanup deadline expired",
+        })).pipe(Effect.provideService(CleanupDeadline, budget)))
+        if (Exit.isFailure(result)) failures.push(result.cause)
+      }
       if (failures.length > 0) {
         return yield* Effect.fail(new CodexSidecarError({
           operation: "cleanup",
@@ -1222,7 +1216,9 @@ export function makeObservedServices(
           cause: failures.length === 1 ? failures[0] : new AggregateError(failures),
         }))
       }
-    })
+    }), true)
+    const close = () => cleanup
+    yield* Effect.addFinalizer(() => close().pipe(Effect.orDie))
     return {
       remoteUrl: proxy.remoteUrl,
       bearerToken: sidecar.bearerToken,
@@ -1243,16 +1239,6 @@ export function makeObservedServices(
   }))
 }
 
-function boundedObservedCleanup<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E | CodexSidecarError> {
-  return effect.pipe(Effect.timeoutOrElse({
-    duration: OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS,
-    orElse: () => Effect.fail(new CodexSidecarError({
-      operation: "cleanup",
-      message: `Codex observed-services cleanup timed out after ${OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS}ms`,
-    })),
-  }))
-}
-
 function waitForSidecar(
   sidecar: CodexSidecar,
   connectSidecar: typeof connectCodexAppServerSidecar = connectCodexAppServerSidecar,
@@ -1269,7 +1255,6 @@ function waitForSidecar(
       const result = yield* Effect.matchEffect(
         Effect.scoped(connectSidecar(sidecar.remoteUrl, {
           bearerToken: sidecar.bearerToken,
-          shutdownTimeoutMs: 100,
         })),
         {
           onFailure: (error) => Effect.succeed({ _tag: "Failure" as const, error }),

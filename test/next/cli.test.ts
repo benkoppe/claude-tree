@@ -120,6 +120,30 @@ test("all shutdown signals interrupt the scoped application and remove listeners
   }
 })
 
+test("a second shutdown signal requests forced exit while graceful finalization is still pending", async () => {
+  const emitter = new EventEmitter()
+  const ready = Deferred.makeUnsafe<void>()
+  const closing = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  const forced: string[] = []
+  const application = Effect.addFinalizer(() => Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(release)))).pipe(
+    Effect.andThen(Deferred.succeed(ready, undefined)), Effect.andThen(Effect.never),
+  )
+  const running = Effect.runPromiseExit(runScopedApplication(application,
+    makeShutdownSignals(emitter as ShutdownSignalTarget, (signal) => { forced.push(signal) })))
+  await Effect.runPromise(Deferred.await(ready))
+  emitter.emit("SIGINT")
+  await Effect.runPromise(Deferred.await(closing))
+  expect(forced).toEqual([])
+  emitter.emit("SIGINT")
+  emitter.emit("SIGTERM")
+  expect(forced).toEqual(["SIGINT"])
+  await Effect.runPromise(Deferred.succeed(release, undefined))
+  const exit = await running
+  expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+  expect(emitter.eventNames()).toEqual([])
+})
+
 test("presentation interruption invokes direct runtime shutdown before teardown", async () => {
   const started = Deferred.makeUnsafe<void, never>()
   const shutdownStarted = Deferred.makeUnsafe<void, never>()

@@ -1,8 +1,5 @@
-// Child resource stages fit inside resource and supervisor cleanup deadlines.
-export const PROVIDER_RESOURCE_STAGE_TIMEOUT_MS = 1_000
-export const PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS = 5 * PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
-export const PROVIDER_LAUNCH_CLEANUP_TIMEOUT_MS = 2 * PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS + 100
-export const PROVIDER_SUPERVISOR_CLEANUP_TIMEOUT_MS = PROVIDER_LAUNCH_CLEANUP_TIMEOUT_MS + 150
+// Time determines signal escalation, not whether resource finalization succeeded.
+export const PROCESS_TERMINATION_GRACE_PERIOD_MS = 1_000
 
 export const HISTORY_RETRY_DELAYS_MS = [100, 250, 500, 1_000] as const
 export const HISTORY_CONFIRMATION_DELAY_MS = 100

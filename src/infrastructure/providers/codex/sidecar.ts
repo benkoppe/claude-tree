@@ -4,13 +4,14 @@ import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { Cause, Data, Effect, Exit, FiberSet, Scope } from "effect"
-import { PROVIDER_RESOURCE_STAGE_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { Cause, Data, Effect, Exit, Fiber, FiberSet, Scope } from "effect"
+import { PROCESS_TERMINATION_GRACE_PERIOD_MS } from "../../../services/lifecycle-policy"
 import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
+import { makeCloseOperation } from "../../../services/close-operation"
+import { makeCleanupBudget } from "../../../services/cleanup-budget"
 
-import { cleanupProcessGroup, type ProcessGroupHandle } from "../../process-group"
+import { cleanupProcessGroup, isProcessGroupAlive, waitForProcessGroupExit, type ProcessGroupHandle } from "../../process-group"
 
-const DEFAULT_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_STAGE_TIMEOUT_MS
 const STDERR_LIMIT_BYTES = 8_192
 
 export class CodexSidecarError extends Data.TaggedError("CodexSidecarError")<{
@@ -69,7 +70,7 @@ export function makeCodexSidecar(
   dependencies: CodexSidecarDependencies = {},
   options: CodexSidecarLaunchOptions = {},
 ): Effect.Effect<CodexSidecar, CodexSidecarError, Scope.Scope> {
-  const cleanupTimeoutMs = positiveDuration(options.cleanupTimeoutMs, DEFAULT_CLEANUP_TIMEOUT_MS)
+  const cleanupTimeoutMs = optionalOperationTimeout(options.cleanupTimeoutMs)
   const removeDirectory = dependencies.removeDirectory ??
     ((path: string) => rm(path, { recursive: true, force: true }))
   const signal = dependencies.signalProcessGroup ?? signalProcessGroup
@@ -81,7 +82,13 @@ export function makeCodexSidecar(
       try: () => optionalOperationTimeout(options.acquisitionTimeoutMs),
       catch: (cause) => sidecarError("acquire", "Acquisition timeout must be a finite positive duration", cause),
     })
-    const runPromise = yield* FiberSet.makeRuntimePromise<never>()
+    const runTask = yield* FiberSet.makeRuntime<never, void, never>()
+    const nativeTasks = new Set<Promise<unknown>>()
+    const track = <A>(task: Promise<A>): Promise<A> => {
+      nativeTasks.add(task)
+      void task.then(() => nativeTasks.delete(task), () => nativeTasks.delete(task))
+      return task
+    }
     let directoryRemoved = false
     let directory: string | undefined
     let process: CodexSidecarProcess | undefined
@@ -89,6 +96,7 @@ export function makeCodexSidecar(
     let bearerToken = ""
     let remoteUrl = ""
     let rollbackStarted = false
+    let rollbackFinished = false
     let lateDirectoryTask: Promise<void> | undefined
     let lateDirectoryFailure: CodexSidecarError | undefined
     const reportCleanupFailure = dependencies.reportCleanupFailure ?? ((error) => {
@@ -127,23 +135,23 @@ export function makeCodexSidecar(
         catch: (cause) => sidecarError("token", "Unable to create Codex capability token", cause),
       })
       yield* boundedAcquisitionPhase(Effect.tryPromise({
-        try: (signal) => (dependencies.writeToken ?? writeTokenFile)(tokenPath, bearerToken, {
+        try: (signal) => track((dependencies.writeToken ?? writeTokenFile)(tokenPath, bearerToken, {
           mode: 0o600,
           flush: true,
           signal,
-        }),
+        })),
         catch: (cause) => sidecarError("token", "Unable to write Codex capability token", cause),
       }), acquisitionTimeoutMs, "token", "write Codex capability token")
       yield* boundedAcquisitionPhase(Effect.tryPromise({
-        try: () => (dependencies.setTokenMode ?? chmod)(tokenPath, 0o600),
+        try: () => track((dependencies.setTokenMode ?? chmod)(tokenPath, 0o600)),
         catch: (cause) => sidecarError("token", "Unable to restrict Codex capability token", cause),
       }), acquisitionTimeoutMs, "token", "restrict Codex capability token")
       yield* boundedAcquisitionPhase(Effect.tryPromise({
-        try: (signal) => syncToken(tokenPath, directory!, signal),
+        try: (signal) => track(syncToken(tokenPath, directory!, signal)),
         catch: (cause) => sidecarError("token", "Unable to durably store Codex capability token", cause),
       }), acquisitionTimeoutMs, "token", "durably store Codex capability token")
       const port = yield* boundedAcquisitionPhase(Effect.tryPromise({
-        try: (signal) => (dependencies.allocatePort ?? availableLoopbackPort)(signal),
+        try: (signal) => track((dependencies.allocatePort ?? availableLoopbackPort)(signal)),
         catch: (cause) => sidecarError("listen", "Unable to allocate a Codex loopback port", cause),
       }), acquisitionTimeoutMs, "listen", "allocate Codex loopback port")
       remoteUrl = `ws://127.0.0.1:${port}`
@@ -165,11 +173,19 @@ export function makeCodexSidecar(
         catch: (cause) => sidecarError("spawn", "Unable to detach Codex app-server sidecar", cause),
       })
       stderr = yield* Effect.try({
-        try: () => makeBoundedStderr(process!.stderr, STDERR_LIMIT_BYTES, cleanupTimeoutMs),
+        try: () => makeBoundedStderr(process!.stderr, STDERR_LIMIT_BYTES, runTask),
         catch: (cause) => sidecarError("stderr", "Unable to observe Codex sidecar stderr", cause),
       })
     })))
 
+    const removeToken = makeCloseOperation(Effect.tryPromise({ try: async () => {
+      if (directoryRemoved || !directory) return
+      await Promise.allSettled([...nativeTasks])
+      await removeDirectory(directory)
+      directoryRemoved = true
+    }, catch: (cause) => sidecarError("cleanup", "Unable to remove Codex token directory", cause) }).pipe(
+      Effect.tapError((error) => Effect.sync(() => { if (rollbackFinished) reportCleanupFailure(error) })),
+    ), true)
     const cleanup = () => cleanupSidecarResources({
       process,
       stderr,
@@ -177,18 +193,15 @@ export function makeCodexSidecar(
       signal,
       cleanupTimeoutMs,
       inspectProcessGroup: dependencies.signalProcessGroup === undefined,
-      removeDirectory,
+      removeToken,
       lateDirectoryTask,
       lateDirectoryFailure: () => lateDirectoryFailure,
-      directoryRemoved: () => directoryRemoved,
-      markDirectoryRemoved: () => {
-        directoryRemoved = true
-      },
     })
 
     if (Exit.isFailure(acquisition)) {
       rollbackStarted = true
       const rollback = yield* Effect.exit(cleanup())
+      rollbackFinished = true
       if (Exit.isFailure(rollback)) {
         return yield* Effect.fail(sidecarError(
           "acquire-rollback",
@@ -202,19 +215,8 @@ export function makeCodexSidecar(
       return yield* Effect.failCause(acquisition.cause)
     }
 
-    let cleanupTask: Promise<void> | undefined
-    const close = (): Effect.Effect<void, CodexSidecarError> => Effect.tryPromise({
-      try: () => {
-        cleanupTask ??= runPromise(cleanup()).catch((cause) => {
-          cleanupTask = undefined
-          throw cause
-        })
-        return cleanupTask
-      },
-      catch: (cause) => cause instanceof CodexSidecarError
-        ? cause
-        : sidecarError("cleanup", "Unable to clean up Codex app-server sidecar", cause),
-    })
+    const cleanupTask = makeCloseOperation(Effect.suspend(cleanup), true)
+    const close = () => cleanupTask
     yield* Effect.addFinalizer(() => close().pipe(Effect.orDie))
     return {
       remoteUrl,
@@ -231,13 +233,11 @@ interface SidecarCleanupResources {
   readonly stderr: BoundedStderr | undefined
   readonly directory: string | undefined
   readonly signal: (process: CodexSidecarProcess, signal: NodeJS.Signals) => void
-  readonly cleanupTimeoutMs: number
+  readonly cleanupTimeoutMs: number | undefined
   readonly inspectProcessGroup: boolean
-  readonly removeDirectory: (path: string) => Promise<void>
+  readonly removeToken: Effect.Effect<void, CodexSidecarError>
   readonly lateDirectoryTask: Promise<void> | undefined
   readonly lateDirectoryFailure: () => CodexSidecarError | undefined
-  readonly directoryRemoved: () => boolean
-  readonly markDirectoryRemoved: () => void
 }
 
 function cleanupSidecarResources(
@@ -249,44 +249,28 @@ function cleanupSidecarResources(
       yield* cleanupProcess(
         resources.process,
         resources.signal,
-        resources.cleanupTimeoutMs,
+        resources.cleanupTimeoutMs ?? PROCESS_TERMINATION_GRACE_PERIOD_MS,
         resources.inspectProcessGroup,
       ).pipe(Effect.catch((error) => Effect.sync(() => failures.push(error))))
     }
+    const budget = yield* makeCleanupBudget(resources.cleanupTimeoutMs)
     if (resources.stderr) {
-      yield* resources.stderr.close().pipe(
-        Effect.timeoutOrElse({
-          duration: resources.cleanupTimeoutMs,
-          orElse: () => Effect.fail(sidecarError(
-            "cleanup",
-            "Timed out stopping Codex sidecar stderr reader",
-          )),
-        }),
+      yield* budget.observe(resources.stderr.close(), () => sidecarError("cleanup", "Timed out stopping Codex sidecar stderr reader")).pipe(
         Effect.catch((error) => Effect.sync(() => failures.push(error))),
       )
     }
     if (!resources.directory && resources.lateDirectoryTask) {
-      yield* Effect.promise(() => resources.lateDirectoryTask!).pipe(
-        Effect.timeoutOrElse({
-          duration: resources.cleanupTimeoutMs,
-          orElse: () => Effect.fail(sidecarError(
-            "cleanup",
-            `Timed out waiting for Codex token directory creation after ${resources.cleanupTimeoutMs}ms`,
-          )),
-        }),
+      yield* budget.observe(Effect.promise(() => resources.lateDirectoryTask!), () => sidecarError(
+        "cleanup", `Timed out waiting for Codex token directory creation after ${resources.cleanupTimeoutMs}ms`,
+      )).pipe(
         Effect.catch((error) => Effect.sync(() => failures.push(error))),
       )
       const lateFailure = resources.lateDirectoryFailure()
       if (lateFailure !== undefined) failures.push(lateFailure)
     }
     if (resources.directory) {
-      yield* removeTokenDirectory(
-        resources.directory,
-        resources.removeDirectory,
-        resources.directoryRemoved,
-        resources.markDirectoryRemoved,
-        resources.cleanupTimeoutMs,
-      ).pipe(Effect.catch((error) => Effect.sync(() => failures.push(error))))
+      yield* budget.observe(resources.removeToken, () => sidecarError("cleanup", "Timed out removing Codex token directory")).pipe(
+        Effect.catch((error) => Effect.sync(() => failures.push(error))))
     }
     if (failures.length > 0) {
       return yield* Effect.fail(sidecarError(
@@ -343,8 +327,9 @@ function sidecarProcessGroup(
       ? isProcessGroupAlive(process.pid)
       : process.exitCode === null,
     waitForGroupExit: (timeoutMs) => inspectProcessGroup
-      ? Effect.promise(() => waitForProcessGroupExit(process.pid, timeoutMs))
-      : Effect.promise(() => settlesWithin(process.exited, timeoutMs)),
+      ? waitForProcessGroupExit(() => isProcessGroupAlive(process.pid), timeoutMs)
+      : Effect.tryPromise({ try: () => process.exited, catch: (cause) => cause }).pipe(
+        Effect.as(true), Effect.timeoutOrElse({ duration: timeoutMs, orElse: () => Effect.succeed(false) }), Effect.orDie),
   }
 }
 
@@ -429,24 +414,11 @@ async function syncFile(
   const handle = await openFile(path)
   try {
     if (signal.aborted) throw signal.reason ?? new Error("Codex token fsync was interrupted")
-    await rejectOnAbort(handle.sync(), signal)
+    await handle.sync()
+    if (signal.aborted) throw signal.reason ?? new Error("Codex token fsync was interrupted")
   } finally {
     await handle.close()
   }
-}
-
-function rejectOnAbort<A>(promise: Promise<A>, signal: AbortSignal): Promise<A> {
-  if (signal.aborted) {
-    void promise.catch(() => undefined)
-    return Promise.reject(signal.reason ?? new Error("Codex filesystem operation was interrupted"))
-  }
-  return new Promise<A>((resolve, reject) => {
-    const onAbort = () => reject(
-      signal.reason ?? new Error("Codex filesystem operation was interrupted"),
-    )
-    signal.addEventListener("abort", onAbort, { once: true })
-    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort))
-  })
 }
 
 interface BoundedStderr {
@@ -457,40 +429,23 @@ interface BoundedStderr {
 function makeBoundedStderr(
   stream: ReadableStream<Uint8Array>,
   limit: number,
-  cleanupTimeoutMs: number,
+  runTask: (effect: Effect.Effect<void>) => Fiber.Fiber<void>,
 ): BoundedStderr {
   const reader = stream.getReader()
   let bytes = new Uint8Array()
-  let closed = false
-  const task = (async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) return
-        bytes = appendBounded(bytes, value, limit)
-      }
-    } catch {
-      // Stderr is diagnostic only; the process lifecycle remains authoritative.
+  const task = runTask(Effect.interruptible(Effect.gen(function*() {
+    while (true) {
+      const { done, value } = yield* Effect.promise(() => reader.read())
+      if (done) return
+      bytes = appendBounded(bytes, value, limit)
     }
-  })()
+  }).pipe(Effect.catchCause(() => Effect.void))))
+  const close = makeCloseOperation(Effect.tryPromise({ try: () => reader.cancel(),
+    catch: (cause) => sidecarError("cleanup", "Unable to stop Codex sidecar stderr reader", cause),
+  }).pipe(Effect.andThen(Fiber.join(task))), true)
   return {
     snapshot: () => new TextDecoder().decode(bytes).trim(),
-    close: () => Effect.tryPromise({
-      try: async () => {
-        if (closed) return
-        const cancellation = await settlementWithin(
-          Promise.resolve().then(() => reader.cancel()),
-          cleanupTimeoutMs,
-        )
-        if (cancellation._tag === "Rejected") throw cancellation.cause
-        if (cancellation._tag === "TimedOut") throw new Error("Codex sidecar stderr cancellation timed out")
-        const settled = await settlementWithin(task, cleanupTimeoutMs)
-        if (settled._tag === "Rejected") throw settled.cause
-        if (settled._tag === "TimedOut") throw new Error("Codex sidecar stderr reader did not stop")
-        closed = true
-      },
-      catch: (cause) => sidecarError("cleanup", "Unable to stop Codex sidecar stderr reader", cause),
-    }),
+    close: () => close,
   }
 }
 
@@ -509,29 +464,6 @@ function appendBounded(
   next.set(current.slice(current.byteLength - retained))
   next.set(chunk, retained)
   return next
-}
-
-function removeTokenDirectory(
-  path: string,
-  remove: (path: string) => Promise<void>,
-  removed: () => boolean,
-  markRemoved: () => void,
-  timeoutMs: number,
-): Effect.Effect<void, CodexSidecarError> {
-  if (removed()) return Effect.void
-  return Effect.tryPromise({
-    try: async () => {
-      await remove(path)
-      markRemoved()
-    },
-    catch: (cause) => sidecarError("cleanup", "Unable to remove Codex token directory", cause),
-  }).pipe(Effect.timeoutOrElse({
-    duration: timeoutMs,
-    orElse: () => Effect.fail(sidecarError(
-      "cleanup",
-      `Timed out removing Codex token directory after ${timeoutMs}ms`,
-    )),
-  }))
 }
 
 function boundedAcquisitionPhase<A>(
@@ -554,58 +486,6 @@ function sidecarError(operation: string, message: string, cause?: unknown): Code
   })
 }
 
-function positiveDuration(value: number | undefined, fallback: number): number {
-  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback
-}
-
-async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<false>((resolve) => {
-    timer = setTimeout(() => resolve(false), timeoutMs)
-  })
-  const settled = await Promise.race([promise.then(() => true, () => true), timeout])
-  if (timer !== undefined) clearTimeout(timer)
-  return settled
-}
-
-type PromiseSettlement =
-  | { readonly _tag: "Fulfilled" }
-  | { readonly _tag: "Rejected"; readonly cause: unknown }
-  | { readonly _tag: "TimedOut" }
-
-async function settlementWithin(promise: Promise<unknown>, timeoutMs: number): Promise<PromiseSettlement> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<PromiseSettlement>((resolve) => {
-    timer = setTimeout(() => resolve({ _tag: "TimedOut" }), timeoutMs)
-  })
-  const settled = await Promise.race([
-    promise.then<PromiseSettlement, PromiseSettlement>(
-      () => ({ _tag: "Fulfilled" }),
-      (cause) => ({ _tag: "Rejected", cause }),
-    ),
-    timeout,
-  ])
-  if (timer !== undefined) clearTimeout(timer)
-  return settled
-}
-
 function isNoSuchProcessError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH"
-}
-
-async function waitForProcessGroupExit(processGroupId: number, timeoutMs: number): Promise<boolean> {
-  const deadline = performance.now() + timeoutMs
-  while (isProcessGroupAlive(processGroupId) && performance.now() < deadline) {
-    await Bun.sleep(Math.min(10, Math.max(0, deadline - performance.now())))
-  }
-  return !isProcessGroupAlive(processGroupId)
-}
-
-function isProcessGroupAlive(processGroupId: number): boolean {
-  try {
-    globalThis.process.kill(-processGroupId, 0)
-    return true
-  } catch (cause) {
-    return !isNoSuchProcessError(cause)
-  }
 }

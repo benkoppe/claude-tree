@@ -141,7 +141,7 @@ export function reconcileMutation<A>(
 ): Effect.Effect<A, PersistenceError> {
   return Effect.matchCauseEffect(mutation, {
     onFailure: (cause) => Effect.flatMap(Effect.suspend(() => metadata.loadMetadata), (state) =>
-      committed(state) ? Effect.succeed(recovered) : Effect.fail(Cause.squash(cause) as PersistenceError)),
+      committed(state) ? Effect.succeed(recovered) : Effect.failCause(cause)),
     onSuccess: Effect.succeed,
   })
 }

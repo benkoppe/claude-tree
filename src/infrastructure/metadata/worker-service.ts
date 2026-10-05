@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto"
 import { Worker } from "node:worker_threads"
 import { Deferred, Effect, Scope } from "effect"
 import { workerEntry } from "../worker-entry"
+import { makeCloseOperation } from "../../services/close-operation"
+import { withOperationTimeout } from "../../services/operation-deadline"
 
 import { PersistenceError, SessionRemovedError } from "../../domain/errors"
 import type { ProviderState, ProjectState } from "../../domain/persistence"
@@ -12,6 +14,7 @@ type Result = Extract<MetadataResponse, { _tag: "Completed" }>["value"]
 
 export function makeMetadataWorker(options: ProviderStateRepositoryOptions,
   createWorker: (options: ProviderStateRepositoryOptions & { instanceId: string }) => Worker = (data) => new Worker(workerEntry(new URL("./worker.ts", import.meta.url), "src/infrastructure/metadata/worker.ts"), { workerData: data }),
+  closeTimeoutMs?: number,
 ): Effect.Effect<ProviderStateRepositoryApi, PersistenceError, Scope.Scope> {
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const instanceId = options.instanceId ?? randomUUID()
@@ -26,8 +29,8 @@ export function makeMetadataWorker(options: ProviderStateRepositoryOptions,
     let failed: PersistenceError | undefined
     const error = (message: string) => new PersistenceError({ operation: "metadata worker", path: options.projectDirectory, message })
     const fail = (failure: PersistenceError) => {
-      failed = failure; Deferred.doneUnsafe(ready, Effect.fail(failure))
-      for (const reply of pending.values()) Deferred.doneUnsafe(reply, Effect.fail(failure))
+      failed ??= failure; Deferred.doneUnsafe(ready, Effect.fail(failed))
+      for (const reply of pending.values()) Deferred.doneUnsafe(reply, Effect.fail(failed))
       pending.clear()
     }
     const worker = yield* Effect.try({ try: () => createWorker({ ...options, instanceId }), catch: (e) => error(String(e)) })
@@ -52,11 +55,11 @@ export function makeMetadataWorker(options: ProviderStateRepositoryOptions,
       Deferred.doneUnsafe(exited, failed ? Effect.fail(failed) : Effect.void)
     })
     const post = (request: MetadataRequest) => Effect.try({ try: () => worker.postMessage(request), catch: (e) => error(String(e)) })
-    const close = Effect.suspend(() => {
-      if (closing) return Deferred.await(exited)
+    const close = withOperationTimeout(makeCloseOperation(Effect.suspend(() => {
+      if (closing || Deferred.isDoneUnsafe(exited)) return Deferred.await(exited)
       closing = true
-      return post({ _tag: "Close" }).pipe(Effect.andThen(Deferred.await(exited)))
-    }).pipe(Effect.timeoutOrElse({ duration: 2_000, orElse: () => Effect.fail(error("Metadata worker did not finish closing")) }),
+      return post({ _tag: "Close" }).pipe(Effect.tapError((e) => Effect.sync(() => fail(e))), Effect.andThen(Deferred.await(exited)))
+    })), closeTimeoutMs, () => Effect.fail(error("Metadata worker did not finish closing; admitted commands may still commit"))).pipe(
       Effect.tapError(() => Effect.sync(() => worker.unref())))
     yield* Effect.addFinalizer(() => close.pipe(Effect.catch((e) => Effect.logError(e))))
     const location = yield* restore(Deferred.await(ready))

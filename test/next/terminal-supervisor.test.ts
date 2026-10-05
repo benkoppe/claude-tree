@@ -58,6 +58,70 @@ function eventually(condition: () => boolean): Effect.Effect<void> {
   return Effect.gen(function*() { for (let i = 0; i < 1_000; i++) { if (condition()) return; yield* Effect.yieldNow }; return yield* Effect.die("Condition not reached") })
 }
 
+test("failed pre-owner provider cleanup retains the guard and blocks replacement until a stop retry", async () => {
+  const f = fixture()
+  f.failSpawn()
+  f.failClose()
+  await use(f, (supervisor) => Effect.gen(function*() {
+    expect(Exit.isFailure(yield* Effect.exit(supervisor.show(f.prepare("one"))))).toBeTrue()
+    expect(f.log).not.toContain("release:one")
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set(["one"]))
+    expect(Exit.isFailure(yield* Effect.exit(supervisor.show(f.prepare("one"))))).toBeTrue()
+    expect(f.log.filter((entry) => entry.startsWith("claim:one:"))).toHaveLength(1)
+    f.recoverClose()
+    expect(yield* supervisor.stopSession("one")).toBeTrue()
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
+    expect(f.log.filter((entry) => entry === "release:one")).toHaveLength(1)
+  }))
+})
+
+test("shutdown retries a retained pre-owner rollback", async () => {
+  const f = fixture()
+  f.failSpawn()
+  f.failClose()
+  await use(f, (supervisor) => Effect.gen(function*() {
+    yield* Effect.exit(supervisor.show(f.prepare("one")))
+    expect(Exit.isFailure(yield* Effect.exit(supervisor.shutdown()))).toBeTrue()
+    expect(f.log).not.toContain("release:one")
+    f.recoverClose()
+    yield* supervisor.shutdown()
+    expect(f.log).toContain("release:one")
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set())
+  }))
+})
+
+test("pre-owner rollback keeps its original scope completion through timeout and a stop retry", async () => {
+  const f = fixture()
+  f.failSpawn()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let finalizers = 0
+    const supervisor = yield* makeTerminalSupervisor({ ...f.dependencies, providerCleanupTimeoutMs: 20 })
+    const prepared = f.prepare("one")
+    const show = yield* Effect.forkChild(Effect.exit(supervisor.show({ ...prepared, acquireLaunch: Effect.gen(function*() {
+      yield* Effect.addFinalizer(() => Effect.gen(function*() {
+        finalizers++
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+      }))
+      return yield* prepared.acquireLaunch
+    }) })))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(20)
+    expect(Exit.isFailure(yield* Fiber.join(show))).toBeTrue()
+    expect(f.log).not.toContain("release:one")
+    expect(yield* supervisor.ownedSessionIds).toEqual(new Set(["one"]))
+    const stop = yield* Effect.forkChild(supervisor.stopSession("one"))
+    yield* Effect.yieldNow
+    expect(stop.pollUnsafe()).toBeUndefined()
+    yield* Deferred.succeed(release, undefined)
+    expect(yield* Fiber.join(stop)).toBeTrue()
+    expect(f.log).toContain("release:one")
+    expect(finalizers).toBe(1)
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
 test("opening the same session reuses its terminal and hidden sessions stay running", async () => {
   const f = fixture()
   await use(f, (supervisor) => Effect.gen(function*() {
@@ -70,6 +134,59 @@ test("opening the same session reuses its terminal and hidden sessions stay runn
     expect(yield* supervisor.activeSessionId).toBeNull()
     expect(yield* supervisor.runningSessionIds).toEqual(new Set(["one", "two"]))
   }))
+})
+
+test("a timed-out provider scope cannot release its guard until the original finalizer finishes", async () => {
+  const f = fixture()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let finalizers = 0
+    const supervisor = yield* makeTerminalSupervisor({ ...f.dependencies, providerCleanupTimeoutMs: 20 })
+    const prepared = f.prepare("one")
+    yield* supervisor.show({ ...prepared, acquireLaunch: Effect.gen(function*() {
+      yield* Effect.addFinalizer(() => Effect.gen(function*() {
+        finalizers++
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+      }))
+      return yield* prepared.acquireLaunch
+    }) })
+    const first = yield* Effect.forkChild(Effect.exit(supervisor.stopSession("one")))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(20)
+    expect(Exit.isFailure(yield* Fiber.join(first))).toBeTrue()
+    expect(f.log).not.toContain("release:one")
+    const second = yield* Effect.forkChild(Effect.exit(supervisor.stopSession("one")))
+    yield* Effect.yieldNow
+    expect(second.pollUnsafe()).toBeUndefined()
+    expect(f.log).not.toContain("release:one")
+    yield* Deferred.succeed(release, undefined)
+    expect(Exit.isSuccess(yield* Fiber.join(second))).toBeTrue()
+    expect(f.log).toContain("release:one")
+    expect(finalizers).toBe(1)
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("graceful terminal shutdown awaits slow provider cleanup without a default observation deadline", async () => {
+  const f = fixture()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const supervisor = yield* makeTerminalSupervisor(f.dependencies)
+    const prepared = f.prepare("one")
+    yield* supervisor.show({ ...prepared, acquireLaunch: prepared.acquireLaunch.pipe(Effect.map((acquired) => ({
+      ...acquired, close: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+    }))) })
+    const close = yield* Effect.forkChild(supervisor.shutdown())
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(120_000)
+    expect(close.pollUnsafe()).toBeUndefined()
+    expect(f.log).not.toContain("release:one")
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(close)
+    expect(f.log).toContain("release:one")
+  }).pipe(Effect.provide(TestClock.layer()))))
 })
 test("a superseded acquisition registers its owner without activating its surface", async () => {
   const f = fixture()
@@ -267,9 +384,10 @@ class FakeProcess implements TerminalProcess {
   ignoreTerm = false
   exitCode: number | null = null
   ptyOpen = true
+  outputTail = ""
   readonly processGroupId: number
   readonly exited: Promise<number>
-  readonly ptyDrained = Promise.resolve()
+  ptyOutput: TerminalProcess["ptyOutput"] = Promise.resolve({ _tag: "Ended", status: "eof" })
   private resolve!: (code: number) => void
   constructor(readonly id: string, readonly pid: number, readonly callbacks: TerminalProcessCallbacks, private readonly log: string[]) {
     this.processGroupId = pid
@@ -286,5 +404,69 @@ class FakeProcess implements TerminalProcess {
   waitForGroupExit() { return Effect.sync(() => !this.alive) }
   closePty() { this.ptyOpen = false; this.log.push(`pty:${this.id}`) }
   unref() { this.log.push(`unref:${this.id}`) }
-  finish(code: number) { this.alive = false; this.exitCode = code; this.resolve(code) }
+  finish(code: number) {
+    this.alive = false
+    if (this.exitCode === null) { this.exitCode = code; this.resolve(code) }
+  }
 }
+
+test("natural exit cleans descendants before awaiting slow final output and shares cleanup with stop", async () => {
+  const f = fixture()
+  const exits: TerminalExitEvent[] = []
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor({ ...f.dependencies, events: { onProcessExited: (event) => { exits.push(event) } } })
+    yield* supervisor.show(f.prepare("one", { failureDetails: () => "provider snapshot" }))
+    const child = f.children[0]!
+    let settle!: (value: Awaited<TerminalProcess["ptyOutput"]>) => void
+    child.ptyOutput = new Promise((resolve) => { settle = resolve })
+    child.finish(1)
+    child.alive = true // A descendant still owns the slave end of the PTY.
+    child.ignoreTerm = true
+    yield* eventually(() => f.log.includes("kill:one"))
+    const stop = yield* Effect.forkChild(supervisor.stopSession("one"))
+    yield* TestClock.adjust(120_000)
+    expect(stop.pollUnsafe()).toBeUndefined()
+    expect(f.log).not.toContain("pty:one")
+    expect(f.log).not.toContain("release:one")
+    expect(exits).toEqual([])
+    child.outputTail = "late final error"
+    child.callbacks.onOutput(new TextEncoder().encode(child.outputTail))
+    settle({ _tag: "Ended", status: "error-or-hangup" })
+    yield* Fiber.join(stop)
+    yield* eventually(() => exits.length === 1)
+    expect(exits[0]?.outputTail).toBe("late final error\n\nprovider snapshot")
+    expect(exits[0]?.ownershipReleased).toBeTrue()
+    expect(f.log.filter((entry) => entry === "provider:one")).toHaveLength(1)
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("an explicit PTY observation deadline retains ownership and permits late-settlement retry", async () => {
+  const f = fixture()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const supervisor = yield* makeTerminalSupervisor({ ...f.dependencies, providerCleanupTimeoutMs: 20 })
+    yield* supervisor.show(f.prepare("one"))
+    const child = f.children[0]!
+    let settle!: (value: Awaited<TerminalProcess["ptyOutput"]>) => void
+    child.ptyOutput = new Promise((resolve) => { settle = resolve })
+    const stop = yield* Effect.forkChild(Effect.exit(supervisor.stopSession("one")))
+    yield* eventually(() => f.log.includes("provider:one"))
+    yield* TestClock.adjust(20)
+    expect(Exit.isFailure(yield* Fiber.join(stop))).toBeTrue()
+    expect(child.ptyOpen).toBeTrue()
+    expect(f.log).not.toContain("release:one")
+    settle({ _tag: "Ended", status: "eof" })
+    yield* supervisor.stopSession("one")
+    expect(f.log).toContain("release:one")
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
+
+test("forced PTY closure reports unconfirmed output rather than a natural drain", async () => {
+  const f = fixture()
+  await use(f, (supervisor) => Effect.gen(function*() {
+    yield* supervisor.show(f.prepare("one"))
+    f.children[0]!.ptyOutput = Promise.resolve({ _tag: "Closed" })
+    const result = yield* Effect.flip(supervisor.stopSession("one"))
+    expect(result.issues.some((issue) => issue.message.includes("final output is unconfirmed"))).toBeTrue()
+    expect(result.ownershipReleased).toBeTrue()
+  }))
+})

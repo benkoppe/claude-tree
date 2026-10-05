@@ -2,15 +2,20 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect } from "effect"
+import { Effect, Exit, Scope } from "effect"
 import { PersistenceError } from "../../src/domain/errors"
 import type { NavigationState } from "../../src/domain/model"
 import { nativePersistencePlatform, PersistencePlatform } from "../../src/infrastructure/metadata/platform"
 import { makeProviderStateRepository, type ProviderStateRepositoryOptions } from "../../src/services/provider-state-repository"
 
 const directories: string[] = []
-afterEach(async () => { await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))) })
-const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
+let testScope = Scope.makeUnsafe()
+afterEach(async () => {
+  await Effect.runPromise(Scope.close(testScope, Exit.void))
+  testScope = Scope.makeUnsafe()
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
+})
+const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope>) => Effect.runPromise(Scope.provide(effect, testScope))
 const open = (options: ProviderStateRepositoryOptions) => run(makeProviderStateRepository(options).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform)))
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), "workspace-test-"))

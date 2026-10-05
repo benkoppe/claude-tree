@@ -10,14 +10,14 @@ import type { TerminalProcess, TerminalProcessFactory, TerminalRenderer, Termina
 import type { AcquiredTerminalLaunch, PreparedTerminal, TerminalLaunch, TerminalTransitionRequest, ProviderTerminalEvent } from "./provider"
 import type { ProviderStateRepositoryApi } from "./provider-state-repository"
 import { makeKeyedSerialExecutor, type KeyedSerialExecutor } from "./keyed-serial-executor"
-import { PROVIDER_SUPERVISOR_CLEANUP_TIMEOUT_MS } from "./lifecycle-policy"
 import { optionalOperationTimeout, withOperationTimeout } from "./operation-deadline"
+import { makeCloseOperation, makeScopeClose } from "./close-operation"
+import { CleanupDeadline, makeCleanupBudget, type CleanupBudget } from "./cleanup-budget"
 
 const GRACE_PERIOD_MS = 200
 const KILL_PERIOD_MS = 200
 const ACTIVITY_PROBE_INTERVAL_MS = 2_000
 const ACTIVITY_CONFIRMATION_DELAY_MS = 100
-const PTY_DRAIN_PERIOD_MS = 250
 
 export type TerminalOwnerState = "running" | "stopping" | "cleanup-incomplete"
 export interface TerminalCleanupIssue {
@@ -128,11 +128,17 @@ type SemanticEvent =
   | { readonly _tag: "Transition"; readonly request: TerminalTransitionRequest; readonly sequenceId: number }
 type UnsequencedEvent = SemanticEvent extends infer Event ? Event extends SemanticEvent ? Omit<Event, "sequenceId"> : never : never
 interface PendingLaunch { readonly ownerId: string; readonly done: Deferred.Deferred<void>; readonly cancelled: Deferred.Deferred<void> }
+interface LaunchRollback {
+  readonly ownerId: string
+  readonly sessionId: string
+  readonly close: Effect.Effect<void, TerminalCleanupError>
+}
 interface TerminalOwner {
   readonly ownerId: string
   sessionId: string
   state: TerminalOwnerState
   readonly scope: Scope.Closeable
+  readonly closeScope: Effect.Effect<void>
   readonly close: AcquiredTerminalLaunch["close"]
   claim: SessionClaim
   readonly claims: Set<SessionClaim>
@@ -161,6 +167,8 @@ interface TerminalOwner {
   uiReleased: boolean
   providerClosed: boolean
   scopeClosed: boolean
+  outputSettled: boolean
+  failureSnapshot?: string | undefined
   ptyClosed: boolean
   detached: boolean
   claimReleased: boolean
@@ -170,8 +178,10 @@ interface TerminalOwner {
 class TerminalSupervisorImpl implements TerminalSupervisorApi {
   private readonly owners = new Map<string, TerminalOwner>()
   private readonly launches = new Map<string, PendingLaunch>()
+  private readonly rollbacks = new Map<string, LaunchRollback>()
   private readonly gate = Semaphore.makeUnsafe(1)
   private readonly scope = Scope.makeUnsafe("parallel")
+  private readonly closeScope = makeScopeClose(this.scope)
   private readonly stopping = Deferred.makeUnsafe<void>()
   private readonly events: TerminalSupervisorEvents
   private readonly unsubscribe: () => void
@@ -181,13 +191,13 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
   private shutdownResult: Deferred.Deferred<void, TerminalCleanupError> | undefined
   private readonly graceMs: number
   private readonly killMs: number
-  private readonly closeMs: number
+  private readonly closeMs: number | undefined
 
   constructor(private readonly dependencies: TerminalSupervisorDependencies, private readonly executor: KeyedSerialExecutor<string>) {
     this.events = dependencies.events ?? {}
     this.graceMs = dependencies.gracePeriodMs ?? GRACE_PERIOD_MS
     this.killMs = dependencies.killPeriodMs ?? KILL_PERIOD_MS
-    this.closeMs = dependencies.providerCleanupTimeoutMs ?? PROVIDER_SUPERVISOR_CLEANUP_TIMEOUT_MS
+    this.closeMs = optionalOperationTimeout(dependencies.providerCleanupTimeoutMs)
     optionalOperationTimeout(dependencies.acquisitionTimeoutMs)
     optionalOperationTimeout(dependencies.transitionDerivationTimeoutMs)
     optionalOperationTimeout(dependencies.applicationAcknowledgmentTimeoutMs)
@@ -203,6 +213,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       return launch
     }), (pending) => Effect.uninterruptibleMask((restore) => Effect.gen({ self: this }, function*() {
       if (this.shuttingDown) return yield* Effect.fail(this.error("show", prepared.session.id, "Cannot open a session during shutdown"))
+      if (this.rollbacks.has(prepared.session.id)) return yield* Effect.fail(this.error("show", prepared.session.id, "Previous launch cleanup is incomplete"))
       const existing = this.owners.get(prepared.session.id)
       if (existing) {
         if (existing.state !== "running" || existing.transitioning) return yield* Effect.fail(this.error("show", existing.sessionId, "Session is stopping or switching identity"))
@@ -211,6 +222,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       }
       const claim = yield* restore(this.untilCancelled(this.dependencies.guard.acquire(prepared.session.id, prepared.allowDuplicate), pending.cancelled))
       const scope = yield* Scope.make("sequential")
+      const closeScope = makeScopeClose(scope)
       let acquired: AcquiredTerminalLaunch | undefined
       let owner: TerminalOwner | undefined
       const opened = yield* Effect.exit(Effect.gen({ self: this }, function*() {
@@ -246,17 +258,14 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       }))
       if (Exit.isSuccess(opened)) return opened.value
       if (owner) {
-        const failureOutput = this.failureOutput(owner)
         yield* this.cleanup(owner, "acquire-rollback", this.graceMs)
+        const failureOutput = this.failureOutput(owner)
         const cause = Cause.squash(opened.cause)
         if (failureOutput && owner.process.exitCode !== null && owner.process.exitCode !== 0) return yield* Effect.fail(this.error("acquire", owner.sessionId, `Agent exited with code ${owner.process.exitCode}\n\n${failureOutput}`, cause))
       } else {
-        const issues: TerminalCleanupIssue[] = []
-        for (const [stage, effect] of [["provider", acquired?.close ?? Effect.void], ["provider", Scope.close(scope, Exit.void)], ["guard", claim.release]] as const) {
-          const exit = yield* Effect.exit(this.bounded(effect as Effect.Effect<void, unknown>))
-          if (Exit.isFailure(exit)) issues.push({ ownerId: pending.ownerId, sessionId: prepared.session.id, stage, message: "Launch rollback failed", cause: Cause.squash(exit.cause) })
-        }
-        if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation: "acquire-rollback", issues }))
+        const rollback = this.makeLaunchRollback(pending.ownerId, prepared.session.id, acquired?.close ?? Effect.void, closeScope, claim)
+        this.rollbacks.set(prepared.session.id, rollback)
+        yield* rollback.close
       }
       return yield* Effect.failCause(opened.cause)
     })), (pending) => Effect.sync(() => {
@@ -278,7 +287,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
   readonly activeSessionId = Effect.sync(() => this.active?.sessionId ?? null)
   readonly ownsInput = Effect.sync(() => this.active !== undefined)
   readonly runningSessionIds = this.sessionIds((owner) => owner.state === "running" && owner.exitCode === null)
-  readonly ownedSessionIds = Effect.sync(() => new Set([...this.owners.keys(), ...this.launches.keys()]))
+  readonly ownedSessionIds = Effect.sync(() => new Set([...this.owners.keys(), ...this.launches.keys(), ...this.rollbacks.keys()]))
   readonly nonIdleSessionIds = this.sessionIds((owner) => owner.state === "running" && owner.exitCode === null && owner.activity !== "idle")
   readonly activitySessionIds = (activity: AgentActivity) => this.sessionIds((owner) => owner.state === "running" && owner.exitCode === null && owner.activity === activity)
   readonly draftPreviews = Effect.sync(() => new Map([...new Set(this.owners.values())].flatMap((owner) =>
@@ -293,7 +302,8 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
   readonly stopSession: TerminalSupervisorApi["stopSession"] = (sessionId, graceMs = this.graceMs, expectedOwnerId) => Effect.uninterruptible(Effect.suspend(() => {
     const owner = this.owners.get(sessionId)
     const pending = this.launches.get(sessionId)
-    const ownerId = expectedOwnerId ?? owner?.ownerId ?? pending?.ownerId
+    const rollback = this.rollbacks.get(sessionId)
+    const ownerId = expectedOwnerId ?? owner?.ownerId ?? rollback?.ownerId ?? pending?.ownerId
     if (!ownerId) return Effect.succeed(false)
     if (owner?.ownerId === ownerId) Deferred.doneUnsafe(owner.cancelled, Effect.void)
     if (pending?.ownerId === ownerId) Deferred.doneUnsafe(pending.cancelled, Effect.void)
@@ -301,7 +311,9 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       if (pending?.ownerId === ownerId) yield* this.bounded(Deferred.await(pending.done)).pipe(Effect.mapError((cause) => this.cleanupFailure("stop", sessionId, cause)))
       const current = [...this.owners.values()].find((candidate) => candidate.ownerId === ownerId)
       if (current) yield* this.cleanup(current, "stop", graceMs)
-      return current !== undefined || pending?.ownerId === ownerId
+      const incomplete = this.rollbacks.get(sessionId)
+      if (incomplete?.ownerId === ownerId) yield* incomplete.close
+      return current !== undefined || pending?.ownerId === ownerId || incomplete?.ownerId === ownerId
     })
   }))
 
@@ -318,8 +330,9 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         const first = yield* Effect.forEach([...new Set(this.owners.values())], (owner) => Effect.exit(this.cleanup(owner, "shutdown", graceMs)), { concurrency: "unbounded" })
         const launches = yield* Effect.exit(this.bounded(Effect.all([...this.launches.values()].map((pending) => Deferred.await(pending.done)), { concurrency: "unbounded", discard: true })))
         const late = yield* Effect.forEach([...new Set(this.owners.values())], (owner) => Effect.exit(this.cleanup(owner, "shutdown", graceMs)), { concurrency: "unbounded" })
-        const closed = yield* Effect.exit(this.bounded(Scope.close(this.scope, Exit.void)))
-        const issues = [...first, ...late].flatMap((exit) => Exit.isFailure(exit) ? this.cleanupFailure("shutdown", "", Cause.squash(exit.cause)).issues : [])
+        const rollbacks = yield* Effect.forEach([...this.rollbacks.values()], (rollback) => Effect.exit(rollback.close), { concurrency: "unbounded" })
+        const closed = yield* Effect.exit(this.bounded(this.closeScope))
+        const issues = [...first, ...late, ...rollbacks].flatMap((exit) => Exit.isFailure(exit) ? this.cleanupFailure("shutdown", "", Cause.squash(exit.cause)).issues : [])
         for (const exit of [launches, closed]) if (Exit.isFailure(exit)) issues.push(...this.cleanupFailure("shutdown", "", Cause.squash(exit.cause)).issues)
         if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation: "shutdown", issues }))
       }))
@@ -327,6 +340,30 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       if (Exit.isFailure(exit)) { this.shutdownResult = undefined; return yield* Effect.failCause(exit.cause) }
     })
   }))
+
+  private makeLaunchRollback(ownerId: string, sessionId: string, providerClose: AcquiredTerminalLaunch["close"], scopeClose: Effect.Effect<void>, claim: SessionClaim): LaunchRollback {
+    const closeProvider = makeCloseOperation(providerClose, true)
+    const releaseClaim = makeCloseOperation(claim.release, true)
+    let providerClosed = false
+    let scopeClosed = false
+    const close = makeCloseOperation(Effect.gen({ self: this }, function*() {
+      const budget = yield* makeCleanupBudget(this.closeMs)
+      const issues: TerminalCleanupIssue[] = []
+      const observe = (effect: Effect.Effect<void, unknown>, stage: "provider" | "guard") => Effect.gen(function*() {
+        const result = yield* Effect.exit(budget.observe(effect, () => new Error("Launch rollback deadline expired")).pipe(
+          Effect.provideService(CleanupDeadline, budget),
+        ))
+        if (Exit.isSuccess(result)) return true
+        issues.push({ ownerId, sessionId, stage, message: "Launch rollback failed", cause: result.cause })
+        return false
+      })
+      if (!providerClosed) providerClosed = yield* observe(closeProvider, "provider")
+      if (!scopeClosed) scopeClosed = yield* observe(scopeClose, "provider")
+      if (providerClosed && scopeClosed && (yield* observe(releaseClaim, "guard"))) this.rollbacks.delete(sessionId)
+      if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation: "acquire-rollback", issues }))
+    }), true)
+    return { ownerId, sessionId, close }
+  }
 
   private createOwner(ownerId: string, acquired: AcquiredTerminalLaunch, scope: Scope.Closeable, claim: SessionClaim, transient: boolean): Effect.Effect<TerminalOwner, TerminalError> {
     return Effect.gen({ self: this }, function*() {
@@ -387,12 +424,12 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       if (Exit.isFailure(spawned)) { this.ignore(() => surface.release()); return yield* Effect.failCause(spawned.cause) }
       child = spawned.value
       owner = {
-        ownerId, sessionId: launch.sessionId, state: "running", scope, close: acquired.close, claim, claims: new Set([claim]), process: child, surface,
+        ownerId, sessionId: launch.sessionId, state: "running", scope, closeScope: makeScopeClose(scope), close: makeCloseOperation(acquired.close, true), claim, claims: new Set([claim]), process: child, surface,
         observer: launch.observer, ...(launch.failureDetails ? { failureDetails: launch.failureDetails } : {}), queue,
         ready: Deferred.makeUnsafe<void>(), cancelled: Deferred.makeUnsafe<void>(), gate: Semaphore.makeUnsafe(1), probeGate: Semaphore.makeUnsafe(1),
         pendingTransitions: new Set(), fibers: [], sequence, activity: "idle", lastQueuedActivity: lastActivity,
         ...(launch.initialDraft ? { draft: launch.initialDraft } : {}), inputObserved: false, transient, transitioning: false, exitCode: null,
-        uiReleased: false, providerClosed: false, scopeClosed: false, ptyClosed: false, detached: false, claimReleased: false, exitNotified: false,
+        uiReleased: false, providerClosed: false, scopeClosed: false, outputSettled: false, ptyClosed: false, detached: false, claimReleased: false, exitNotified: false,
       }
       return owner
     })
@@ -421,11 +458,10 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
     }
     if (event._tag === "Transition") return this.transition(owner, event)
     if (event._tag === "Exited") return Effect.uninterruptible(Effect.gen({ self: this }, function*() {
-      yield* Effect.promise(() => Promise.race([owner.process.ptyDrained, Bun.sleep(PTY_DRAIN_PERIOD_MS)]))
       owner.exitCode = event.exitCode
       const wasActive = this.active === owner
-      const outputTail = event.exitCode !== 0 ? this.failureOutput(owner) : undefined
       const cleaned = yield* Effect.exit(this.cleanup(owner, "natural-exit", this.graceMs))
+      const outputTail = event.exitCode !== 0 ? this.failureOutput(owner) : undefined
       this.notifyExit(owner, event.sequenceId, wasActive, Exit.isFailure(cleaned) ? Cause.squash(cleaned.cause) as TerminalCleanupError : undefined, outputTail)
     }))
     if (event._tag === "Provider") {
@@ -465,7 +501,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
         const expectedKind = owner.transient ? "temporary-adoption" : "native-fork"
         if (transition.kind !== expectedKind) return yield* Effect.fail(this.error("transition", previousSessionId, `Expected ${expectedKind}, received ${transition.kind}`))
         const destination = transition.session.id
-        if (this.owners.has(destination) || this.launches.has(destination)) return yield* Effect.fail(this.error("transition", destination, "Session already has a terminal in this invocation"))
+        if (this.owners.has(destination) || this.launches.has(destination) || this.rollbacks.has(destination)) return yield* Effect.fail(this.error("transition", destination, "Session already has a terminal in this invocation"))
         owner.transitioning = true
         this.owners.set(destination, owner)
         const derived = transition.derivation ? yield* this.untilCancelled(withOperationTimeout(transition.derivation, this.dependencies.transitionDerivationTimeoutMs,
@@ -518,12 +554,24 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       return Effect.gen({ self: this }, function*() {
         const exit = yield* Effect.exit(owner.gate.withPermit(Effect.gen({ self: this }, function*() {
           const issues = [...this.releaseUi(owner)]
+          if (owner.process.exitCode !== null && owner.process.exitCode !== 0 && owner.failureSnapshot === undefined) {
+            this.ignore(() => { owner.failureSnapshot = owner.failureDetails?.()?.slice(-8 * 1_024) })
+          }
           const stopped = yield* cleanupProcessGroup(owner.process, { gracePeriodMs: graceMs, killPeriodMs: this.killMs })
           if (stopped.status !== "absent") issues.push(...stopped.issues.map((issue) => ({ ...issue, ownerId: owner.ownerId, sessionId: owner.sessionId })))
-          const close = asyncEffectStage.bind(this, owner, issues)
+          const budget = yield* makeCleanupBudget(this.closeMs)
+          const close = asyncEffectStage.bind(this, owner, issues, budget)
           if (!owner.providerClosed) owner.providerClosed = yield* close("provider", "Unable to close provider resources", owner.close)
-          if (!owner.scopeClosed) owner.scopeClosed = yield* close("provider", "Unable to close provider scope", Scope.close(owner.scope, Exit.void))
-          if (!owner.ptyClosed) owner.ptyClosed = yield* close("pty", "Unable to close PTY", Effect.sync(() => owner.process.closePty()))
+          if (!owner.scopeClosed) owner.scopeClosed = yield* close("provider", "Unable to close provider scope", owner.closeScope)
+          if (stopped.status === "absent" && !owner.outputSettled) {
+            owner.outputSettled = yield* close("pty", "Unable to observe terminal output settlement", Effect.promise(() => owner.process.ptyOutput).pipe(
+              Effect.tap((settlement) => Effect.sync(() => {
+                if (settlement._tag === "Closed") issues.push({ ownerId: owner.ownerId, sessionId: owner.sessionId,
+                  stage: "pty", message: "PTY was closed before natural output settlement; final output is unconfirmed" })
+              })), Effect.asVoid,
+            ))
+          }
+          if (!owner.ptyClosed && (owner.outputSettled || stopped.status !== "absent")) owner.ptyClosed = yield* close("pty", "Unable to close PTY", Effect.sync(() => owner.process.closePty()))
           if (!owner.detached) owner.detached = yield* close("pty", "Unable to detach process", Effect.sync(() => owner.process.unref()))
           if (stopped.status === "absent" && owner.providerClosed && owner.scopeClosed && owner.ptyClosed && owner.detached && owner.uiReleased) {
             for (const claim of owner.claims) {
@@ -540,7 +588,7 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
           if (issues.length) return yield* Effect.fail(new TerminalCleanupError({ operation, issues, ...(owner.claimReleased ? { ownershipReleased: true as const } : {}) }))
         })))
         Deferred.doneUnsafe(result, exit)
-        if (notify) this.notifyExit(owner, owner.sequence++, wasActive, Exit.isFailure(exit) ? Cause.squash(exit.cause) as TerminalCleanupError : undefined)
+        if (notify) this.notifyExit(owner, owner.sequence++, wasActive, Exit.isFailure(exit) ? this.cleanupFailure(operation, owner.sessionId, Cause.squash(exit.cause)) : undefined)
         if (Exit.isFailure(exit)) {
           delete owner.cleanup
           const error = this.cleanupFailure(operation, owner.sessionId, Cause.squash(exit.cause))
@@ -550,8 +598,10 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       })
     }))
 
-    function asyncEffectStage(this: TerminalSupervisorImpl, owner: TerminalOwner, issues: TerminalCleanupIssue[], stage: TerminalCleanupIssue["stage"], message: string, effect: Effect.Effect<void, unknown>): Effect.Effect<boolean> {
-      return Effect.exit(this.bounded(effect)).pipe(Effect.map((exit) => {
+    function asyncEffectStage(this: TerminalSupervisorImpl, owner: TerminalOwner, issues: TerminalCleanupIssue[], budget: CleanupBudget, stage: TerminalCleanupIssue["stage"], message: string, effect: Effect.Effect<void, unknown>): Effect.Effect<boolean> {
+      return Effect.exit(budget.observe(effect, () => new Error(message + "; cleanup deadline expired")).pipe(
+        Effect.provideService(CleanupDeadline, budget),
+      )).pipe(Effect.map((exit) => {
         if (Exit.isSuccess(exit)) return true
         issues.push({ ownerId: owner.ownerId, sessionId: owner.sessionId, stage, message, cause: Cause.squash(exit.cause) })
         return false
@@ -649,12 +699,10 @@ class TerminalSupervisorImpl implements TerminalSupervisorApi {
       Effect.andThen(Effect.fail(this.error("acquire", "", "Terminal operation cancelled by stop or shutdown")))))
   }
   private bounded<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E | Error> {
-    return Effect.interruptible(effect).pipe(Effect.timeoutOrElse({ duration: this.closeMs, orElse: () => Effect.fail(new Error("Resource cleanup timed out")) }))
+    return withOperationTimeout(Effect.interruptible(effect), this.closeMs, () => Effect.fail(new Error("Resource cleanup timed out")))
   }
   private failureOutput(owner: TerminalOwner): string {
-    let details: string | undefined
-    this.ignore(() => { details = owner.failureDetails?.()?.slice(-8 * 1_024) })
-    return [owner.process.outputTail, details].filter(Boolean).join("\n\n")
+    return [owner.process.outputTail, owner.failureSnapshot].filter(Boolean).join("\n\n")
   }
   private attempt<A>(operation: string, sessionId: string, run: () => A): Effect.Effect<A, TerminalError> {
     return Effect.try({ try: run, catch: (cause) => this.error(operation, sessionId, cause instanceof Error ? cause.message : String(cause), cause) })

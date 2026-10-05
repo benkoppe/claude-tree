@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { Worker } from "node:worker_threads"
 
 import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
+import { TestClock } from "effect/testing"
 
 import { makeProviderReads } from "../../src/infrastructure/providers/read-service"
 import type { ProviderReadRequest, ProviderReadResponse } from "../../src/infrastructure/providers/read-worker-protocol"
@@ -35,6 +36,22 @@ class ControlledReadWorker extends EventEmitter {
     return this as unknown as Worker
   }
 }
+
+test("graceful read-worker close waits for provider drain without a default deadline", async () => {
+  const worker = new ControlledReadWorker()
+  worker.autoClose = false
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const reads = yield* makeProviderReads({ providerId: "claude", projectPath: "/project" }, worker.create)
+    const close = yield* Effect.forkChild(reads.close)
+    yield* worker.waitFor({ _tag: "Close" })
+    yield* TestClock.adjust(120_000)
+    expect(close.pollUnsafe()).toBeUndefined()
+    expect(worker.terminated).toBe(0)
+    worker.send({ _tag: "Closed" })
+    yield* Fiber.join(close)
+    expect(worker.terminated).toBe(1)
+  }).pipe(Effect.provide(TestClock.layer()))))
+})
 
 test("read progress has backpressure and the final result reuses delivered histories", async () => {
   const worker = new ControlledReadWorker()
