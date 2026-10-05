@@ -11,6 +11,7 @@ import { makeCloseOperation } from "../../../services/close-operation"
 import { makeCleanupBudget } from "../../../services/cleanup-budget"
 
 import { cleanupProcessGroup, isProcessGroupAlive, waitForProcessGroupExit, type ProcessGroupHandle } from "../../process-group"
+import { providerEnvironment } from "../../provider-environment"
 
 const STDERR_LIMIT_BYTES = 8_192
 
@@ -335,6 +336,7 @@ function sidecarProcessGroup(
 
 function spawnSidecar(command: readonly string[]): CodexSidecarProcess {
   return Bun.spawn([...command], {
+    env: providerEnvironment(),
     detached: true,
     stdin: "ignore",
     stdout: "ignore",

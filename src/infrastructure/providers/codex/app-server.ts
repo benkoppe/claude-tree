@@ -13,6 +13,7 @@ import {
   cleanupProcessGroup, isProcessGroupAlive, waitForProcessGroupExit,
   type ProcessGroupHandle,
 } from "../../process-group"
+import { providerEnvironment } from "../../provider-environment"
 
 const DEFAULT_JSONL_RECORD_LIMIT_BYTES = 1_024 * 1_024
 const STDERR_LIMIT_BYTES = 8_192
@@ -920,6 +921,7 @@ function processTransport(process: CodexAppServerProcess): CodexTransport {
 
 function spawnCodex(command: readonly string[]): CodexAppServerProcess {
   return Bun.spawn([...command], {
+    env: providerEnvironment(),
     detached: true,
     stdin: "pipe",
     stdout: "pipe",
