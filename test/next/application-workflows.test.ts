@@ -1635,6 +1635,31 @@ describe("application actor", () => {
     expect(fixture.shutdowns).toBe(1)
   })
 
+  test("shutdown settles a queued identity barrier before awaiting terminal cleanup", async () => {
+    const fixture = makeFixture()
+    const acknowledgment = Deferred.makeUnsafe<void, unknown>()
+    let barrier: Exit.Exit<void, unknown> | undefined
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options,
+        terminals: { ...fixture.options.terminals, shutdown: () => Effect.gen(function*() {
+          barrier = yield* Effect.exit(Deferred.await(acknowledgment))
+        }) },
+      })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.resumeSession(ROOT)
+      runtime.terminalEvents.onSessionChanged?.({
+        ownerId: "owner-1", sequenceId: 1, previousSessionId: ROOT,
+        session: session("adopted", "Adopted"), kind: "native-fork",
+        adoptionToken: "queued-projection", wasActive: true, acknowledgment,
+      })
+      expect(Deferred.isDoneUnsafe(acknowledgment)).toBeFalse()
+      yield* runtime.shutdown
+      expect(barrier).toBeDefined()
+      expect(Deferred.isDoneUnsafe(acknowledgment)).toBeTrue()
+      expect((yield* runtime.getState).shutdown).toBe("stopped")
+    })))
+  })
+
   test("supersedes an in-flight manual refresh and resolves both replies", async () => {
     const fixture = makeFixture()
     const first = Deferred.makeUnsafe<AgentSessionSnapshot>()
@@ -2664,6 +2689,44 @@ describe("application actor", () => {
     }).pipe(Effect.provide(TestClock.layer()))))
     expect(Exit.isSuccess(result)).toBeTrue()
     expect(fixture.shutdowns).toBe(1)
+  })
+
+  test("shutdown keeps the actor and second-signal path live while an admitted navigation write drains", async () => {
+    const fixture = makeFixture()
+    const emitter = new EventEmitter()
+    const started = Deferred.makeUnsafe<void>()
+    const release = Deferred.makeUnsafe<void>()
+    const forced: string[] = []
+    let stall = false
+    let persistenceClosed = false
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      yield* makeShutdownSignals(emitter as ShutdownSignalTarget, (signal) => { forced.push(signal) })
+      const runtime = yield* makeAppRuntime({ ...fixture.options,
+        metadata: { ...fixture.options.metadata, saveNavigation: (navigation) => stall
+          ? Effect.uninterruptible(Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)),
+            Effect.andThen(fixture.options.metadata.saveNavigation(navigation))))
+          : fixture.options.metadata.saveNavigation(navigation) },
+        closeNavigationPersistence: Effect.sync(() => { persistenceClosed = true }),
+      })
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      stall = true
+      yield* runtime.selectRoot(CHILD)
+      const shutdown = yield* Effect.forkChild(runtime.shutdown)
+      yield* Deferred.await(started)
+      yield* waitForState(runtime, (state) => state.shutdown === "shutting-down")
+      yield* TestClock.adjust(120_000)
+      expect(shutdown.pollUnsafe()).toBeUndefined()
+      expect(persistenceClosed).toBeFalse()
+      emitter.emit("SIGINT")
+      emitter.emit("SIGTERM")
+      expect(forced).toEqual(["SIGTERM"])
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(shutdown)
+      expect(persistenceClosed).toBeTrue()
+      expect((yield* runtime.getState).shutdown).toBe("stopped")
+    }).pipe(Effect.provide(TestClock.layer()))))
+    expect(emitter.eventNames()).toEqual([])
   })
 
   test("scope finalization shuts the actor down exactly once", async () => {
