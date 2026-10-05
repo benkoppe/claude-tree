@@ -2,6 +2,7 @@ import { stripVTControlCharacters } from "node:util"
 
 import { Effect } from "effect"
 import { isProcessGroupAlive, waitForProcessGroupExit } from "../process-group"
+import { providerEnvironment } from "../provider-environment"
 
 import type { TerminalLaunch } from "../../services/provider"
 import type {
@@ -11,15 +12,6 @@ import type {
   TerminalOutputSettlement,
 } from "./types"
 import { TerminalSpawnCleanupError } from "./types"
-
-const NESTED_HERDR_ENVIRONMENT_KEYS = [
-  "HERDR_ENV",
-  "HERDR_BIN_PATH",
-  "HERDR_SOCKET_PATH",
-  "HERDR_PANE_ID",
-  "HERDR_TAB_ID",
-  "HERDR_WORKSPACE_ID",
-] as const
 
 const OUTPUT_TAIL_BYTES = 8 * 1_024
 
@@ -41,13 +33,12 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
       outputSettled = true
       resolveOutput(settlement)
     }
-    const environment: NodeJS.ProcessEnv = {
+    const environment = providerEnvironment({
       ...globalThis.process.env,
       ...launch.env,
       TERM: "xterm-256color",
       COLORTERM: "truecolor",
-    }
-    for (const key of NESTED_HERDR_ENVIRONMENT_KEYS) delete environment[key]
+    })
 
     const subprocess = Bun.spawn([...launch.command], {
       cwd: launch.cwd,
