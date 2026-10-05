@@ -507,7 +507,8 @@ describe("Effect Codex provider", () => {
           yield* Deferred.await(releaseRead)
           return parent
         }),
-        forkThread: () => Effect.gen(function*() {
+        forkThread: (_id, _turn, _cwd, dispatched) => Effect.gen(function*() {
+          dispatched?.()
           yield* Deferred.succeed(forkStarted, undefined)
           return yield* Effect.never
         }),
@@ -527,6 +528,59 @@ describe("Effect Codex provider", () => {
     expect(outcome._tag).toBe("AmbiguousBranchMutation")
     if (outcome._tag !== "AmbiguousBranchMutation") throw new Error("expected ambiguity")
     expect(outcome.reason).toContain("overall deadline after thread/fork dispatch")
+  })
+
+  test("read-only verification retries a missing child against captured source evidence after the parent changes", async () => {
+    let parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
+    const child = thread(CHILD, [turn("c-turn", "completed", [{ id: "c-agent", type: "agentMessage", text: "Answer" }])])
+    let visible = false
+    const client = fakeClient({
+      readThread: (id) => id === ROOT ? Effect.succeed(parent) : visible ? Effect.succeed(child)
+        : Effect.fail(new CodexRpcError({ method: "thread/read", code: -32600, message: "missing rollout", data: { appErrorCode: "rollout_not_found" } })),
+      forkThread: () => Effect.succeed(child),
+    })
+    const result = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected pending child")
+    expect(result.verification?.status).toBe("pending")
+    parent = thread(ROOT, [])
+    visible = true
+    const receipt = result.verification?.receipt
+    if (!receipt) throw new Error("expected verification receipt")
+    expect((await Effect.runPromise(receipt.verify))._tag).toBe("ValidatedBranch")
+    expect(client.forkCalls).toHaveLength(1)
+    expect(client.readCalls.filter((id) => id === ROOT)).toHaveLength(1)
+  })
+
+  test("a cancellation before transport dispatch does not report a mutation ambiguity", async () => {
+    const started = Deferred.makeUnsafe<void>()
+    const parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
+    const client = fakeClient({ readThread: () => Effect.succeed(parent),
+      forkThread: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)) })
+    const provider = providerWith(client)
+    await Effect.runPromise(Effect.gen(function*() {
+      const running = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(running)
+      const reconciliation = yield* Effect.forkChild(provider.takeBranchMutationReconciliation)
+      yield* Effect.yieldNow
+      expect(reconciliation.pollUnsafe()).toBeUndefined()
+      yield* Fiber.interrupt(reconciliation)
+    }))
+  })
+
+  test("a short Codex prefix still rejects contradictory copied payloads", async () => {
+    const parent = thread(ROOT, [turn("p-turn", "completed", [
+      { id: "p-user", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+      { id: "p-agent", type: "agentMessage", text: "Answer" },
+    ])])
+    const child = thread(CHILD, [turn("c-turn", "completed", [
+      { id: "c-user", type: "userMessage", content: [{ type: "text", text: "Wrong question" }] },
+    ])])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : child), forkThread: () => Effect.succeed(child) })
+    const result = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected independent child")
+    expect(result.verification?.status).toBe("contradicted")
+    expect(client.forkCalls).toHaveLength(1)
   })
 
   test("returns an independent child for every post-create read or prefix failure", async () => {
@@ -568,7 +622,8 @@ describe("Effect Codex provider", () => {
       if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected independent")
       expect(outcome.session.id).toBe(CHILD)
       expect(outcome.transcript._tag).toBe(expectedTranscript)
-      expect(outcome.acquireLaunch).toBeDefined()
+      expect(outcome.acquireLaunch).toBeUndefined()
+      expect(outcome.verification?.receipt).toBeDefined()
       expect(client.forkCalls).toHaveLength(1)
     }
   })
@@ -1685,9 +1740,9 @@ function fakeClient(overrides: Partial<CodexAppServerClient> = {}): FakeClient {
       readCalls.push(id)
       return overrides.readThread?.(id, includeTurns) ?? Effect.succeed(thread(id))
     },
-    forkThread(threadId, turnId, cwd) {
+    forkThread(threadId, turnId, cwd, dispatched) {
       forkCalls.push({ threadId, turnId, cwd })
-      return overrides.forkThread?.(threadId, turnId, cwd) ?? Effect.succeed(thread(CHILD))
+      return overrides.forkThread?.(threadId, turnId, cwd, dispatched) ?? Effect.succeed(thread(CHILD))
     },
     close: overrides.close ?? (() => Effect.void),
   }

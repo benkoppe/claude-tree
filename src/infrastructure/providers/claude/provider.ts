@@ -29,6 +29,10 @@ import {
   type AgentProviderApi,
   type AmbiguousBranchMutation,
   type BranchOutcome,
+  type BranchCreated,
+  type BranchVerificationReceipt,
+  type CreatedIndependentSession,
+  type ValidatedBranch,
   makeBranchMutationReconciliationSignal,
   type PreparedTerminal,
   type TerminalLaunch,
@@ -147,7 +151,9 @@ type ForkReadResult =
         readonly childMessageId: string
       }[]
     }
-  | { readonly _tag: "Invalid"; readonly transcript: TranscriptRead; readonly reason: string }
+  | { readonly _tag: "NotValidated"; readonly transcript: TranscriptRead; readonly reason: string;
+      readonly status: "pending" | "unavailable" | "contradicted";
+      readonly reasonCode: "missing" | "incomplete" | "read-failed" | "unsupported" | "copy-mismatch" | "deadline" }
 
 export class ClaudeProvider implements AgentProviderApi {
   readonly id = "claude"
@@ -332,9 +338,11 @@ export class ClaudeProvider implements AgentProviderApi {
 
   branchFrom(
     target: MessageRef,
+    created?: BranchCreated,
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
     let mutationMayHaveDispatched = false
     let mutationSourceMessageId = target.messageId
+    let knownChild: BranchVerificationReceipt | undefined
     const operation = Effect.gen({ self: this }, function*() {
       const deadline = yield* this.makeDeadline(
         "branchFrom",
@@ -420,29 +428,35 @@ export class ClaudeProvider implements AgentProviderApi {
       )
       const parentTitle = this.sessionTitles.get(target.sessionId) ?? "Conversation"
       mutationSourceMessageId = forkMessage.id
-      mutationMayHaveDispatched = true
-      const forkResult = yield* this.forkSessionOnce(
+      const forkResult = yield* Effect.uninterruptible(this.forkSessionOnce(
         target.sessionId,
         forkMessage.id,
         deadline,
-      )
-      if (forkResult._tag === "AmbiguousBranchMutation") return forkResult
+        () => { mutationMayHaveDispatched = true },
+      ).pipe(Effect.flatMap((forkResult) => Effect.gen({ self: this }, function*() {
+        if (forkResult._tag === "AmbiguousBranchMutation") return forkResult
 
-      const childId = forkResult.sessionId
-      const now = yield* Clock.currentTimeMillis
-      const childSession: AgentSession = {
-        id: childId,
-        title: `${parentTitle} (fork)`,
-        lastModified: now,
-      }
-      const postCreate = this.prepareCreatedFork(
-        childSession,
-        target.sessionId,
-        forkMessage.id,
-        sourcePrefix,
-        deadline,
-        replayText,
-      )
+        const childId = forkResult.sessionId
+        const now = yield* Clock.currentTimeMillis
+        const childSession: AgentSession = {
+          id: childId,
+          title: `${parentTitle} (fork)`,
+          lastModified: now,
+        }
+        const receipt: BranchVerificationReceipt = {
+          session: childSession,
+          verify: Effect.suspend(() => this.makeDeadline("validateFork", this.forkValidationTimeoutMs).pipe(
+            Effect.flatMap((validationDeadline) => this.prepareCreatedFork(childSession, target.sessionId,
+              forkMessage.id, sourcePrefix, validationDeadline, replayText, receipt)))),
+        }
+        knownChild = receipt
+        if (created) yield* created(receipt)
+        return { _tag: "Created" as const, receipt }
+      }))))
+      if (forkResult._tag === "AmbiguousBranchMutation") return forkResult
+      const childSession = forkResult.receipt.session
+      const postCreate = this.prepareCreatedFork(childSession, target.sessionId, forkMessage.id,
+        sourcePrefix, deadline, replayText, forkResult.receipt)
       return yield* postCreate.pipe(
         Effect.matchEffect({
           onFailure: (error) => Effect.succeed({
@@ -450,15 +464,13 @@ export class ClaudeProvider implements AgentProviderApi {
             session: childSession,
             transcript: { _tag: "Unavailable" as const, reason: error.message },
             reason: error.message,
-            ...(isValidSessionId(childSession.id)
-              ? { acquireLaunch: this.acquireLaunch("resume", childSession.id, replayText) }
-              : {}),
+            verification: { status: "unavailable" as const, reasonCode: "read-failed" as const, receipt: forkResult.receipt },
           }),
           onSuccess: Effect.succeed,
         }),
       )
     })
-    return operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched
+    return operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !knownChild
       ? Effect.sync(() => this.branchMutationReconciliations.offer(
           this.ambiguousBranchMutation(
             target.sessionId,
@@ -473,6 +485,7 @@ export class ClaudeProvider implements AgentProviderApi {
     parentSessionId: string,
     sourceMessageId: string,
     deadline: OperationDeadline,
+    dispatched: () => void,
   ): Effect.Effect<
     | { readonly _tag: "Created"; readonly sessionId: string }
     | AmbiguousBranchMutation,
@@ -484,46 +497,38 @@ export class ClaudeProvider implements AgentProviderApi {
         this.forkSessionTimeoutMs,
         deadline,
       )
-      const request = Effect.tryPromise({
-        try: () => handledPromise(() => this.sdk.forkSession(parentSessionId, {
-          dir: this.projectPath,
-          upToMessageId: sourceMessageId,
-        })),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.match({
-          onFailure: (cause) => this.ambiguousBranchMutation(
-            parentSessionId,
-            sourceMessageId,
-            `Claude forkSession failed after invocation: ${errorMessage(cause)}; Claude may have created a child session`,
-          ),
-          onSuccess: (value) => {
-            if (
-              !isRecord(value) ||
-              typeof value.sessionId !== "string" ||
-              !isValidSessionId(value.sessionId) ||
-              value.sessionId === parentSessionId
-            ) {
-              const ambiguity = this.ambiguousBranchMutation(
-                parentSessionId,
-                sourceMessageId,
-                "Claude returned an invalid or non-distinct child session ID after creating a fork",
-              )
-              this.branchMutationReconciliations.offer(ambiguity)
-              return ambiguity
-            }
-            return { _tag: "Created" as const, sessionId: value.sessionId }
-          },
-        }),
-      )
-      const result = yield* withOperationTimeout(request, budget.durationMs,
-          () => Effect.succeed(this.ambiguousBranchMutation(
+      let settled: { readonly _tag: "Created"; readonly sessionId: string } | AmbiguousBranchMutation | undefined
+      const decode = (value: unknown) => {
+        if (!isRecord(value) || typeof value.sessionId !== "string" ||
+          !isValidSessionId(value.sessionId) || value.sessionId === parentSessionId) {
+          const ambiguity = this.ambiguousBranchMutation(parentSessionId, sourceMessageId,
+            "Claude returned an invalid or non-distinct child session ID after creating a fork")
+          this.branchMutationReconciliations.offer(ambiguity)
+          return ambiguity
+        }
+        return { _tag: "Created" as const, sessionId: value.sessionId }
+      }
+      const request = Effect.promise(() => handledPromise(() => {
+        dispatched()
+        return this.sdk.forkSession(parentSessionId, { dir: this.projectPath, upToMessageId: sourceMessageId })
+      }).then((value) => {
+        settled = decode(value)
+        return settled
+      }, (cause) => {
+        settled = this.ambiguousBranchMutation(parentSessionId, sourceMessageId,
+          `Claude forkSession failed after invocation: ${errorMessage(cause)}; Claude may have created a child session`)
+        return settled
+      }))
+      const result = yield* withOperationTimeout(Effect.uninterruptible(request), budget.durationMs,
+          () => Effect.succeed(settled ?? this.ambiguousBranchMutation(
             parentSessionId,
             sourceMessageId,
             `${budget.error().message}; Claude may have created a child session`,
           )),
       )
-      return result
+      // Timeout fallback can be chosen before native settlement finishes. Prefer
+      // the actual response retained while the interrupted child was finalizing.
+      return settled ?? result
     })
   }
 
@@ -577,7 +582,8 @@ export class ClaudeProvider implements AgentProviderApi {
     sourcePrefix: SourcePrefix,
     deadline: OperationDeadline,
     replayText?: string,
-  ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
+    receipt?: BranchVerificationReceipt,
+  ): Effect.Effect<ValidatedBranch | CreatedIndependentSession, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       yield* this.validateLaunchInput(session.id, replayText)
       const validationDeadline = yield* this.makeDeadline("validateFork", this.forkValidationTimeoutMs)
@@ -591,13 +597,13 @@ export class ClaudeProvider implements AgentProviderApi {
         effectiveDeadline,
       )
       const acquireLaunch = this.acquireLaunch("resume", session.id, replayText)
-      if (validation._tag === "Invalid") {
+      if (validation._tag === "NotValidated") {
         return {
           _tag: "CreatedIndependentSession",
           session,
           transcript: validation.transcript,
           reason: validation.reason,
-          acquireLaunch,
+          verification: { status: validation.status, reasonCode: validation.reasonCode, ...(receipt ? { receipt } : {}) },
         }
       }
       return {
@@ -627,12 +633,16 @@ export class ClaudeProvider implements AgentProviderApi {
         reason: "The created Claude transcript has not been read",
       }
       let lastReason = "its copied prefix was not yet complete"
+      let status: "pending" | "unavailable" | "contradicted" = "pending"
+      let reasonCode: "missing" | "incomplete" | "read-failed" | "unsupported" | "copy-mismatch" | "deadline" = "incomplete"
 
       for (let attempt = 0; attempt <= this.retryDelays.length; attempt += 1) {
         if (attempt > 0) {
           const remaining = yield* this.remainingMillis(deadline)
           if (remaining <= 0) {
             lastReason = this.deadlineError(deadline).message
+            status = "unavailable"
+            reasonCode = "deadline"
             break
           }
           yield* Effect.sleep(Math.min(this.retryDelays[attempt - 1] ?? 0, remaining))
@@ -651,12 +661,17 @@ export class ClaudeProvider implements AgentProviderApi {
         if (activeRead._tag === "Failure") {
           transcript = { _tag: "Unavailable", reason: activeRead.error.message }
           lastReason = `its transcript could not be read: ${activeRead.error.message}`
-          if (activeRead.error._tag === "ProviderProtocolError") break
+          const missing = this.failureCode(activeRead.error, childSessionId) === "source-not-found"
+          status = missing ? "pending" : "unavailable"
+          reasonCode = missing ? "missing" : activeRead.error._tag === "ProviderProtocolError" ? "unsupported" : "read-failed"
+          if (activeRead.error._tag === "ProviderProtocolError" && !missing) break
           continue
         }
         if (activeRead.context === undefined) {
           transcript = { _tag: "Missing" }
           lastReason = "its transcript is not available yet"
+          status = "pending"
+          reasonCode = "missing"
           continue
         }
         transcript = { _tag: "Available", messages: activeRead.context.messages }
@@ -673,7 +688,10 @@ export class ClaudeProvider implements AgentProviderApi {
         )
         if (physicalRead._tag === "Failure") {
           lastReason = `its copied-prefix provenance could not be read: ${physicalRead.error.message}`
-          if (physicalRead.error._tag === "ProviderProtocolError") break
+          const missing = this.failureCode(physicalRead.error, childSessionId) === "source-not-found"
+          status = missing ? "pending" : "unavailable"
+          reasonCode = missing ? "missing" : physicalRead.error._tag === "ProviderProtocolError" ? "unsupported" : "read-failed"
+          if (physicalRead.error._tag === "ProviderProtocolError" && !missing) break
           continue
         }
 
@@ -693,18 +711,23 @@ export class ClaudeProvider implements AgentProviderApi {
           }
         }
         lastReason = validation.reason
+        status = validation._tag === "Invalid" ? "contradicted" : "pending"
+        reasonCode = validation._tag === "Invalid" ? "copy-mismatch" : "incomplete"
         if (validation._tag === "Invalid") break
       }
 
       return {
-        _tag: "Invalid" as const,
+        _tag: "NotValidated" as const,
         transcript,
         reason: `Fork ${childSessionId} was created, but ${lastReason}`,
+        status, reasonCode,
       }
     }).pipe(Effect.catch((error) => Effect.succeed({
-      _tag: "Invalid" as const,
+      _tag: "NotValidated" as const,
       transcript: { _tag: "Unavailable" as const, reason: error.message },
       reason: `Fork ${childSessionId} was created, but its history could not be validated: ${error.message}`,
+      status: "unavailable" as const,
+      reasonCode: error._tag === "ProviderProtocolError" ? "unsupported" as const : "read-failed" as const,
     })))
   }
 
@@ -1292,12 +1315,6 @@ function validateFork(
   activeChild: readonly ClaudeMessage[],
   physicalChild: readonly ConversationRecord[],
 ): ForkValidation {
-  if (physicalChild.length < sourcePrefix.records.length) {
-    return {
-      _tag: "Short",
-      reason: `its physical copied prefix is incomplete (expected ${sourcePrefix.records.length} records; found ${physicalChild.length})`,
-    }
-  }
   if (physicalChild.length > sourcePrefix.records.length) {
     return {
       _tag: "Invalid",
@@ -1307,7 +1324,7 @@ function validateFork(
 
   const childByParentId = new Map<string, ConversationRecord>()
   const parentByChildId = new Map<string, string>()
-  for (const [index, parent] of sourcePrefix.records.entries()) {
+  for (const [index, parent] of sourcePrefix.records.slice(0, physicalChild.length).entries()) {
     const child = physicalChild[index]
     if (child === undefined) {
       return { _tag: "Short", reason: "its physical copied prefix is incomplete" }
@@ -1331,6 +1348,11 @@ function validateFork(
     }
     childByParentId.set(parent.id, child)
     parentByChildId.set(child.id, parent.id)
+  }
+
+  if (physicalChild.length < sourcePrefix.records.length) return {
+    _tag: "Short",
+    reason: `its physical copied prefix is incomplete (expected ${sourcePrefix.records.length} records; found ${physicalChild.length})`,
   }
 
   // Physical copy order proves integrity; SDK reconstruction defines graph order.

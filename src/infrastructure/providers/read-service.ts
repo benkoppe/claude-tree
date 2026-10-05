@@ -113,6 +113,6 @@ export function withProviderReads(provider: AgentProviderApi, reads: ProviderRea
     readTranscripts: reads.readTranscripts,
     prepareNewSession: provider.prepareNewSession,
     prepareResume: (session) => provider.prepareResume(session),
-    branchFrom: (target) => provider.branchFrom(target),
+    branchFrom: (target, created) => provider.branchFrom(target, created),
   }
 }
