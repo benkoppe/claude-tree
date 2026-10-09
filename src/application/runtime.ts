@@ -82,6 +82,7 @@ import {
   makeInitialApplicationState,
   type ActiveRefresh,
   type ApplicationModal,
+  type ApplicationOperationKind,
   type ApplicationState,
   type NavigatorSurface,
 } from "./state"
@@ -279,6 +280,27 @@ export function makeAppRuntime(
       yield* SubscriptionRef.set(publication, viewModel)
       if (!isDeepStrictEqual(next.surface, state.surface)) navigationGeneration += 1
       state = next
+    })
+
+    let nextOperationId = 1
+    const operationReplies = new Map<number, { readonly reply: IntentEnvelope["reply"]; readonly intent: ApplicationIntent["_tag"] }>()
+    const startOperation = (kind: ApplicationOperationKind, reply: IntentEnvelope["reply"], intent: ApplicationIntent["_tag"]) =>
+      Effect.gen(function*() {
+        const id = nextOperationId++
+        operationReplies.set(id, { reply, intent })
+        yield* publish({ _tag: "OperationStarted", id, kind })
+      })
+    // The same reply spans preparation, launch, and durable removal stages. Caller
+    // interruption does not settle it; only the actor's workflow completion does.
+    const settleOperations = Effect.suspend(() => {
+      const ids: number[] = []
+      for (const [id, { reply }] of operationReplies) {
+        if (Deferred.isDoneUnsafe(reply) || state.shutdown !== "running") {
+          operationReplies.delete(id)
+          ids.push(id)
+        }
+      }
+      return ids.length ? publish({ _tag: "OperationsFinished", ids }) : Effect.void
     })
 
     const reject = (
@@ -706,6 +728,7 @@ export function makeAppRuntime(
         return
       }
       const reply = yield* Deferred.make<void, ApplicationIntentError>()
+      yield* startOperation("open", reply, "ResumeSession")
       yield* launch(`prepare:startup:${navigationState.sessionId}`, {
         _tag: "PrepareResume",
         requestGeneration: navigatorRequestGeneration,
@@ -1512,6 +1535,7 @@ export function makeAppRuntime(
             return
           }
           case "NewSession": {
+            yield* startOperation("new", envelope.reply, intent._tag)
             const restoreTo = navigatorSurface()
             yield* launch(`prepare:new:${envelope.correlationId}`, {
               _tag: "PrepareNew",
@@ -1536,6 +1560,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not resumable`)
               return
             }
+            yield* startOperation("open", envelope.reply, intent._tag)
             yield* launch(`prepare:resume:${envelope.correlationId}`, {
               _tag: "PrepareResume",
               requestGeneration: navigatorRequestGeneration,
@@ -1551,6 +1576,7 @@ export function makeAppRuntime(
             if (state.local.sessions.get(intent.sessionId)?.transient && !state.terminals.has(intent.sessionId)) {
               const prepared = preparedTerminals.get(intent.sessionId)
               if (state.branchVerifications.get(intent.sessionId)?.status === "prepared" && prepared) {
+                yield* startOperation("open", envelope.reply, intent._tag)
                 yield* publish({ _tag: "BranchVerificationChanged", sessionId: intent.sessionId })
                 yield* startShow(prepared, navigatorSurface(intent.sessionId), envelope.reply, true, navigatorRequestGeneration,
                   state.relations.find((relation) => relation.childSessionId === intent.sessionId))
@@ -1565,6 +1591,7 @@ export function makeAppRuntime(
                 yield* reject(envelope.reply, intent._tag, "invalid", `No prepared terminal is available for ${intent.sessionId}`)
                 return
               }
+              yield* startOperation("open", envelope.reply, intent._tag)
               yield* startShow(prepared, navigatorSurface(intent.sessionId), envelope.reply, true, navigatorRequestGeneration)
               return
             }
@@ -1581,6 +1608,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not resumable`)
               return
             }
+            yield* startOperation("open", envelope.reply, intent._tag)
             yield* launch(`prepare:resume:${envelope.correlationId}`, {
               _tag: "PrepareResume",
               requestGeneration: navigatorRequestGeneration,
@@ -1609,6 +1637,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "busy", "This child's ancestry verification is already running")
               return
             }
+            yield* startOperation("verification", envelope.reply, intent._tag)
             const key = `verify:${envelope.correlationId}`
             verificationReceipts.set(intent.sessionId, { receipt: retained.receipt, key })
             yield* publish({ _tag: "BranchVerificationChanged", sessionId: intent.sessionId, verification: {
@@ -1624,6 +1653,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "invalid", "Historical coverage is incomplete; refresh to establish a verified fork prefix")
               return
             }
+            yield* startOperation("fork", envelope.reply, intent._tag)
             const key = `branch:${envelope.correlationId}`
             yield* launch(key, {
               _tag: "Branch",
@@ -1636,6 +1666,7 @@ export function makeAppRuntime(
             return
           }
           case "ReturnFromTerminal":
+            yield* startOperation("return", envelope.reply, intent._tag)
             yield* launch(`hide:${envelope.correlationId}`, { _tag: "Hide", reply: envelope.reply }, operations.hideActive, false)
             return
           case "StopSession": {
@@ -1653,6 +1684,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "busy", `Session ${sessionId} is already stopping`)
               return
             }
+            yield* startOperation("stop", envelope.reply, intent._tag)
             yield* publish({ _tag: "TerminalStopping", sessionId })
             yield* launch(`stop:${sessionId}`, {
               _tag: "Stop",
@@ -1674,6 +1706,7 @@ export function makeAppRuntime(
               )
               return
             }
+            yield* startOperation("remove", envelope.reply, intent._tag)
             const operationGeneration = identityGeneration
             const canonical = currentRemoval(
               intent.removal,
@@ -2023,7 +2056,7 @@ export function makeAppRuntime(
     processMessageWithBoundary = (message) => Effect.catchCause(
       Effect.suspend(() => processMessage(message)).pipe(Effect.andThen(reconcileSubmissionDiscovery)),
       (cause) => containMessageDefect(message, cause),
-    )
+    ).pipe(Effect.ensuring(settleOperations))
 
     const settleActorAbandonment = Effect.gen(function*() {
       accepting = false
@@ -2051,6 +2084,12 @@ export function makeAppRuntime(
         }
       }
       pendingRemovals.clear()
+      for (const { reply, intent } of operationReplies.values()) {
+        yield* Deferred.fail(reply, new IntentRejectedError({
+          intent, reason: "shutting-down", message: "Application actor is unavailable",
+        }))
+      }
+      yield* settleOperations
       for (const cursor of owners.values()) {
         for (const buffered of cursor.buffered.splice(0)) {
           yield* failTerminalBarrier(buffered, unavailable)
@@ -2403,7 +2442,7 @@ function refreshPublicationEvent(message: RefreshPublicationMessage): Extract<St
 
 function sameOperationalState(left: ApplicationState, right: ApplicationState): boolean {
   return (Object.keys(left) as Array<keyof ApplicationState>).every((key) =>
-    key === "surface" || key === "modal" || key === "selectionId" || left[key] === right[key])
+    key === "surface" || key === "modal" || key === "selectionId" || key === "pendingOperations" || left[key] === right[key])
 }
 
 function messageFailureContext(message: ActorMessage): {

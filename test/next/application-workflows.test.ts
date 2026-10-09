@@ -62,6 +62,179 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  test.each(["new", "open"] as const)("%s progress spans preparation and acquisition despite caller interruption", async (kind) => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const preparing = yield* Deferred.make<void>()
+      const releasePreparation = yield* Deferred.make<void>()
+      const acquiring = yield* Deferred.make<void>()
+      const releaseAcquisition = yield* Deferred.make<void>()
+      const provider: AgentProviderApi = { ...fixture.options.provider,
+        prepareNewSession: Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(releasePreparation)),
+          Effect.andThen(fixture.options.provider.prepareNewSession)),
+        prepareResume: (session) => Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(releasePreparation)),
+          Effect.andThen(fixture.options.provider.prepareResume(session))),
+      }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider, terminals: { ...fixture.options.terminals,
+        show: (terminal, shouldActivate) => Deferred.succeed(acquiring, undefined).pipe(Effect.andThen(Deferred.await(releaseAcquisition)),
+          Effect.andThen(fixture.options.terminals.show(terminal, shouldActivate))),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      const caller = yield* Effect.forkChild(kind === "new" ? runtime.newSession : runtime.openEndpoint(ROOT))
+      yield* Deferred.await(preparing)
+      const before = yield* runtime.getState
+      expect([...before.pendingOperations.values()]).toEqual([kind])
+      const id = [...before.pendingOperations.keys()][0]!
+      yield* Fiber.interrupt(caller)
+      expect((yield* runtime.getState).pendingOperations.get(id)).toBe(kind)
+      yield* Deferred.succeed(releasePreparation, undefined)
+      yield* Deferred.await(acquiring)
+      expect((yield* runtime.getState).pendingOperations.get(id)).toBe(kind)
+      yield* Deferred.succeed(releaseAcquisition, undefined)
+      const finished = yield* waitForState(runtime, (state) => state.pendingOperations.size === 0)
+      expect(finished.surface._tag).toBe("Terminal")
+    })))
+  })
+
+  test("workspace resume reports progress before terminal acquisition without a presentation caller", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const preparing = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options,
+        metadata: { ...fixture.options.metadata, loadMetadata: Effect.succeed({ relations: [], removals: [],
+          navigation: { view: "terminal", sessionId: ROOT },
+        }) },
+        provider: { ...fixture.options.provider,
+          prepareResume: (session) => Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(release)),
+            Effect.andThen(fixture.options.provider.prepareResume(session))),
+        },
+      })
+      yield* Deferred.await(preparing)
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["open"])
+      yield* Deferred.succeed(release, undefined)
+      const finished = yield* waitForState(runtime, (state) => state.surface._tag === "Terminal" && state.pendingOperations.size === 0)
+      expect(finished.surface).toMatchObject({ _tag: "Terminal", sessionId: ROOT })
+    })))
+  })
+
+  test("concurrent opens settle independently and rejected or failed operations do not strand progress", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const entered = new Map([[ROOT, Deferred.makeUnsafe<void>()], [CHILD, Deferred.makeUnsafe<void>()]])
+      const release = new Map([[ROOT, Deferred.makeUnsafe<void>()], [CHILD, Deferred.makeUnsafe<void>()]])
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider: { ...fixture.options.provider,
+        prepareResume: (session) => Deferred.succeed(entered.get(session.id)!, undefined).pipe(
+          Effect.andThen(Deferred.await(release.get(session.id)!)), Effect.andThen(Effect.fail(new ProviderError({
+            providerId: "test", operation: "resume", message: "preparation failed",
+          })))),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      const first = yield* Effect.forkChild(runtime.openEndpoint(ROOT).pipe(Effect.exit))
+      yield* Deferred.await(entered.get(ROOT)!)
+      const second = yield* Effect.forkChild(runtime.openEndpoint(CHILD).pipe(Effect.exit))
+      yield* Deferred.await(entered.get(CHILD)!)
+      const both = yield* runtime.getState
+      expect([...both.pendingOperations.values()]).toEqual(["open", "open"])
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openEndpoint("missing")))).toBeTrue()
+      expect((yield* runtime.getState).pendingOperations.size).toBe(2)
+      yield* Deferred.succeed(release.get(ROOT)!, undefined)
+      expect(Exit.isFailure(yield* Fiber.join(first))).toBeTrue()
+      expect((yield* runtime.getState).pendingOperations.size).toBe(1)
+      yield* Deferred.succeed(release.get(CHILD)!, undefined)
+      expect(Exit.isFailure(yield* Fiber.join(second))).toBeTrue()
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
+    })))
+  })
+
+  test("removal progress spans affected-terminal cleanup and metadata commit", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const stopping = yield* Deferred.make<void>()
+      const releaseStop = yield* Deferred.make<void>()
+      const committing = yield* Deferred.make<void>()
+      const releaseCommit = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options,
+        terminals: { ...fixture.options.terminals,
+          stopSession: (id, grace, owner) => Deferred.succeed(stopping, undefined).pipe(Effect.andThen(Deferred.await(releaseStop)),
+            Effect.andThen(fixture.options.terminals.stopSession(id, grace, owner))),
+        },
+        metadata: { ...fixture.options.metadata,
+          commitRemoval: (removal, ids, token) => Deferred.succeed(committing, undefined).pipe(Effect.andThen(Deferred.await(releaseCommit)),
+            Effect.andThen(fixture.options.metadata.commitRemoval(removal, ids, token))),
+        },
+      })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.openEndpoint(ROOT)
+      yield* runtime.returnFromTerminal
+      const removing = yield* Effect.forkChild(runtime.remove({ kind: "tree", rootSessionId: ROOT, memberSessionIds: [ROOT],
+        createdAt: "2026-10-08T00:00:00.000Z",
+      }, [ROOT]))
+      yield* Deferred.await(stopping)
+      const pending = (yield* runtime.getState).pendingOperations
+      expect([...pending.values()]).toEqual(["remove"])
+      yield* Deferred.succeed(releaseStop, undefined)
+      yield* Deferred.await(committing)
+      expect((yield* runtime.getState).pendingOperations).toBe(pending)
+      yield* Deferred.succeed(releaseCommit, undefined)
+      yield* Fiber.join(removing)
+      const finished = yield* runtime.getState
+      expect(finished.pendingOperations.size).toBe(0)
+      expect(finished.removals).toHaveLength(1)
+    })))
+  })
+
+  test("stop and terminal-return progress end at their actor acknowledgments", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const hiding = yield* Deferred.make<void>()
+      const releaseHide = yield* Deferred.make<void>()
+      const stopping = yield* Deferred.make<void>()
+      const releaseStop = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: { ...fixture.options.terminals,
+        hideActive: Deferred.succeed(hiding, undefined).pipe(Effect.andThen(Deferred.await(releaseHide)),
+          Effect.andThen(fixture.options.terminals.hideActive)),
+        stopSession: (id, grace, owner) => Deferred.succeed(stopping, undefined).pipe(Effect.andThen(Deferred.await(releaseStop)),
+          Effect.andThen(fixture.options.terminals.stopSession(id, grace, owner))),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* runtime.openEndpoint(ROOT)
+      const returning = yield* Effect.forkChild(runtime.returnFromTerminal)
+      yield* Deferred.await(hiding)
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["return"])
+      yield* Deferred.succeed(releaseHide, undefined)
+      yield* Fiber.join(returning)
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
+      const stop = yield* Effect.forkChild(runtime.stopSession(ROOT))
+      yield* Deferred.await(stopping)
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["stop"])
+      expect(Exit.isFailure(yield* Effect.exit(runtime.stopSession(ROOT)))).toBeTrue()
+      expect((yield* runtime.getState).pendingOperations.size).toBe(1)
+      yield* Deferred.succeed(releaseStop, undefined)
+      yield* Fiber.join(stop)
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
+    })))
+  })
+
+  test("shutdown clears stalled operation progress without waiting for preparation", async () => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider: { ...fixture.options.provider,
+        prepareNewSession: Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      const creating = yield* Effect.forkChild(runtime.newSession.pipe(Effect.exit))
+      yield* Deferred.await(started)
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["new"])
+      yield* runtime.shutdown
+      expect(Exit.isFailure(yield* Fiber.join(creating))).toBeTrue()
+      const state = yield* runtime.getState
+      expect(state.shutdown).toBe("stopped")
+      expect(state.pendingOperations.size).toBe(0)
+    })))
+  })
+
   test("duplicate-session warning can be cancelled or explicitly bypassed", async () => {
     const fixture = makeFixture()
     const terminals: TerminalSupervisorApi = {
@@ -261,9 +434,14 @@ describe("application actor", () => {
     const started = Deferred.makeUnsafe<void>()
     const release = Deferred.makeUnsafe<void>()
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const branchStarted = yield* Deferred.make<void>()
+      const releaseBranch = yield* Deferred.make<void>()
       const showStarted = yield* Deferred.make<void>()
       const releaseShow = yield* Deferred.make<void>()
-      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: { ...fixture.options.terminals,
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider: { ...fixture.options.provider,
+        branchFrom: (target) => Deferred.succeed(branchStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseBranch)),
+          Effect.andThen(fixture.options.provider.branchFrom(target))),
+      }, terminals: { ...fixture.options.terminals,
         show: (terminal) => Deferred.succeed(showStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseShow)),
           Effect.andThen(fixture.options.terminals.show(terminal))),
       } })
@@ -276,8 +454,13 @@ describe("application actor", () => {
       const refresh = yield* Effect.forkScoped(runtime.refresh())
       yield* Deferred.await(started)
       const branching = yield* Effect.forkChild(runtime.branchFrom({ sessionId: ROOT, messageId: "answer" }))
+      yield* Deferred.await(branchStarted)
+      const pending = (yield* runtime.getState).pendingOperations
+      expect([...pending.values()]).toEqual(["fork"])
+      yield* Deferred.succeed(releaseBranch, undefined)
       yield* Deferred.await(showStarted)
       const during = yield* runtime.getState
+      expect(during.pendingOperations).toBe(pending)
       expect(selectProjectedTranscript(during, child.session.id)).toEqual(copies)
       expect(during.surface._tag).not.toBe("Terminal")
       yield* Deferred.succeed(releaseShow, undefined)
@@ -290,6 +473,7 @@ describe("application actor", () => {
     })))
     expect(result.during.refresh.active.size).toBe(1)
     expect(result.after.terminals.has(child.session.id)).toBeTrue()
+    expect(result.after.pendingOperations.size).toBe(0)
     expect(result.after.relations).toHaveLength(1)
     expect(selectProjectedTranscript(result.after, ROOT)).toEqual(messages)
     expect(selectProjectedTranscript(result.after, child.session.id)).toEqual(copies)
@@ -325,6 +509,8 @@ describe("application actor", () => {
       yield* runtime.returnFromTerminal
       const opening = yield* Effect.forkChild(runtime.resumeSession(ROOT))
       yield* Deferred.await(entered)
+      const pendingOperations = (yield* runtime.getState).pendingOperations
+      expect([...pendingOperations.values()]).toEqual(["open"])
       fixture.adoptOwner(ROOT, "adopted")
       const acknowledgment = yield* Deferred.make<void, unknown>()
       expect(yield* runtime.handleTerminalSessionChanged({
@@ -333,10 +519,12 @@ describe("application actor", () => {
         adoptionToken: "delayed-show", wasActive: true, acknowledgment,
       })).toBeTrue()
       yield* Deferred.await(acknowledgment)
+      expect((yield* runtime.getState).pendingOperations).toBe(pendingOperations)
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(opening)
       const state = yield* runtime.getState
       expect([...state.terminals.keys()]).toEqual(["adopted"])
+      expect(state.pendingOperations.size).toBe(0)
       expect(state.terminals.get("adopted")).toMatchObject({ ownerId: "owner-1", phase: "running" })
       expect(state.surface).toMatchObject({ _tag: "Terminal", sessionId: "adopted",
         returnTo: { _tag: "Graph", familySessionId: "adopted", target: { kind: "endpoint", sessionId: "adopted" } } })
@@ -508,11 +696,13 @@ describe("application actor", () => {
       const fork = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
       yield* Deferred.await(started)
       yield* runtime.selectRoot(CHILD)
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["fork"])
       yield* Deferred.succeed(release, fixture.branchOutcome)
       const result = yield* Fiber.join(fork)
       expect(Exit.isFailure(result)).toBeTrue()
       const state = yield* runtime.getState
       expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
+      expect(state.pendingOperations.size).toBe(0)
       if (fixture.branchOutcome._tag !== "ValidatedBranch") throw new Error("Expected validated branch")
       expect(state.relations).toHaveLength(1)
       expect(state.relations[0]).toMatchObject(derivation)
@@ -547,6 +737,45 @@ describe("application actor", () => {
       const state = yield* runtime.getState
       expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
       expect(state.modal).toEqual({ _tag: "About" })
+    })))
+  })
+
+  test.each([false, true])("operation status does not restart refresh preparation (finished during preparation: %s)", async (finishDuringPreparation) => {
+    const fixture = makeFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const projectionStarted = yield* Deferred.make<void>()
+      const releaseProjection = yield* Deferred.make<void>()
+      const operationStarted = yield* Deferred.make<void>()
+      const releaseOperation = yield* Deferred.make<void>()
+      let stall = false
+      let preparations = 0
+      const runtime = yield* makeAppRuntime({ ...fixture.options,
+        prepareProjection: () => stall ? Effect.sync(() => { preparations += 1 }).pipe(
+          Effect.andThen(Deferred.succeed(projectionStarted, undefined)), Effect.andThen(Deferred.await(releaseProjection))) : Effect.void,
+        provider: { ...fixture.options.provider,
+          prepareResume: () => Deferred.succeed(operationStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseOperation)),
+            Effect.andThen(Effect.fail(new ProviderError({ providerId: "test", operation: "resume", message: "failed" })))),
+        },
+      })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      stall = true
+      const refreshing = yield* Effect.forkChild(runtime.refresh())
+      yield* Deferred.await(projectionStarted)
+      const opening = yield* Effect.forkChild(runtime.openEndpoint(ROOT).pipe(Effect.exit))
+      yield* Deferred.await(operationStarted)
+      if (finishDuringPreparation) {
+        yield* Deferred.succeed(releaseOperation, undefined)
+        yield* Fiber.join(opening)
+      }
+      const latest = (yield* runtime.getState).pendingOperations
+      yield* Deferred.succeed(releaseProjection, undefined)
+      yield* Fiber.join(refreshing)
+      expect(preparations).toBe(1)
+      expect((yield* runtime.getState).pendingOperations).toBe(latest)
+      expect(latest.size).toBe(finishDuringPreparation ? 0 : 1)
+      yield* Deferred.succeed(releaseOperation, undefined)
+      yield* Fiber.join(opening)
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
     })))
   })
 
@@ -711,6 +940,7 @@ describe("application actor", () => {
       return { fork, state: yield* runtime.getState }
     })))
     expect(Exit.isFailure(result.fork)).toBeTrue()
+    expect(result.state.pendingOperations.size).toBe(0)
     expect(result.state.modal).toEqual({ _tag: "About" })
   })
 
@@ -3319,6 +3549,7 @@ describe("application actor", () => {
     })))
     expect(Exit.isFailure(result.exit)).toBeTrue()
     expect(result.state.modal).toEqual({ _tag: "Error", message: "fork response was lost" })
+    expect(result.state.pendingOperations.size).toBe(0)
     expect(fixture.fullLoads).toBe(2)
   })
 
@@ -3466,6 +3697,8 @@ describe("application actor", () => {
       const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
       const branch = yield* Effect.forkChild(Effect.exit(runtime.branchFrom({ sessionId: ROOT, messageId: "q" })))
       yield* waitForState(runtime, (state) => state.branchVerifications.get(child.session.id)?.status === "verifying")
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["fork"])
+      expect((yield* runtime.getViewModel).branchVerifications?.get(child.session.id)?.status).toBe("verifying")
       yield* TestClock.adjust(30_000)
       expect(branch.pollUnsafe()).toBeUndefined()
       expect(reads).toBeGreaterThan(20)
@@ -3476,15 +3709,24 @@ describe("application actor", () => {
       yield* runtime.manageBranchVerification(child.session.id, "cancel")
       expect(Exit.isFailure(yield* Fiber.join(branch))).toBeTrue()
       expect((yield* runtime.getState).branchVerifications.get(child.session.id)?.status).toBe("paused")
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
       const retry = yield* Effect.forkChild(runtime.manageBranchVerification(child.session.id, "retry"))
       yield* waitForState(runtime, (state) => state.branchVerifications.get(child.session.id)?.status === "verifying")
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["verification"])
       expect(Exit.isFailure(yield* Effect.exit(runtime.manageBranchVerification(child.session.id, "retry")))).toBeTrue()
+      expect((yield* runtime.getState).pendingOperations.size).toBe(1)
+      yield* runtime.manageBranchVerification(child.session.id, "cancel")
+      expect(Exit.isFailure(yield* Effect.exit(Fiber.join(retry)))).toBeTrue()
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
+      const resumedRetry = yield* Effect.forkChild(runtime.manageBranchVerification(child.session.id, "retry"))
+      yield* waitForState(runtime, (state) => state.branchVerifications.get(child.session.id)?.status === "verifying")
       visible = true
       yield* TestClock.adjust(1_000)
-      yield* Fiber.join(retry)
+      yield* Fiber.join(resumedRetry)
       const state = yield* runtime.getState
       expect(state.relations.some((relation) => relation.childSessionId === child.session.id)).toBeTrue()
       expect(state.branchVerifications.has(child.session.id)).toBeFalse()
+      expect(state.pendingOperations.size).toBe(0)
       expect(state.surface).toEqual({ _tag: "Roots", selectedSessionId: CHILD })
       expect(fixture.calls.some((call) => call === `show:${child.session.id}`)).toBeFalse()
     }).pipe(Effect.provide(TestClock.layer()))))
@@ -3556,14 +3798,24 @@ describe("application actor", () => {
       return update(transform)
     } }
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata })
+      const acquiring = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const runtime = yield* makeAppRuntime({ ...fixture.options, metadata, terminals: { ...fixture.options.terminals,
+        show: (terminal, shouldActivate) => Deferred.succeed(acquiring, undefined).pipe(Effect.andThen(Deferred.await(release)),
+          Effect.andThen(fixture.options.terminals.show(terminal, shouldActivate))),
+      } })
       yield* runtime.branchFrom({ sessionId: ROOT, messageId: "q" })
       expect(Exit.isFailure(yield* Effect.exit(runtime.openEndpoint(child.session.id)))).toBeTrue()
       yield* runtime.manageBranchVerification(child.session.id, "retry")
       expect(fixture.calls).not.toContain(`show:${child.session.id}`)
       yield* runtime.refresh()
       expect((yield* runtime.getState).local.sessions.has(child.session.id)).toBeTrue()
-      yield* runtime.openEndpoint(child.session.id)
+      const opening = yield* Effect.forkChild(runtime.openEndpoint(child.session.id))
+      yield* Deferred.await(acquiring)
+      expect([...(yield* runtime.getState).pendingOperations.values()]).toEqual(["open"])
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(opening)
+      expect((yield* runtime.getState).pendingOperations.size).toBe(0)
       expect(fixture.calls).toContain(`show:${child.session.id}`)
     })))
   })

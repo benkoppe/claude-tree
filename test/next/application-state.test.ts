@@ -28,6 +28,30 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
+  test("projects captured branch-verification state for production progress and cancellation controls", () => {
+    const state = reduceApplicationState(loadedState(), { _tag: "BranchVerificationChanged", sessionId: ROOT,
+      verification: { status: "verifying", reason: "Verifying captured history", retryable: true },
+    })
+    expect(projectApplicationViewModel(state).branchVerifications).toBe(state.branchVerifications)
+  })
+
+  test("operation status is independent of graph topology and survives prepared refresh publication", () => {
+    const base = loadedState()
+    const forest = selectConversationForest(base)
+    const started = reduceApplicationState(base, { _tag: "OperationStarted", id: 1, kind: "fork" })
+    const concurrent = reduceApplicationState(started, { _tag: "OperationStarted", id: 2, kind: "fork" })
+    expect(selectConversationForest(concurrent)).toBe(forest)
+    expect(projectApplicationViewModel(concurrent).pendingOperations).toBe(concurrent.pendingOperations)
+    const prepared = reduceApplicationState(concurrent, { _tag: "PreparedRefreshPublished", base, candidate: base })
+    expect(prepared.pendingOperations).toBe(concurrent.pendingOperations)
+    const finished = reduceApplicationState(prepared, { _tag: "OperationsFinished", ids: [1] })
+    expect([...finished.pendingOperations]).toEqual([[2, "fork"]])
+    expect(reduceApplicationState(finished, { _tag: "OperationsFinished", ids: [1] })).toBe(finished)
+    const late = reduceApplicationState(finished, { _tag: "PreparedRefreshPublished", base: concurrent, candidate: concurrent })
+    expect([...late.pendingOperations]).toEqual([[2, "fork"]])
+    expect(reduceApplicationState(late, { _tag: "ShutdownStarted" }).pendingOperations.size).toBe(0)
+  })
+
   test("manual refresh identifies multiple failures by current title with an ID fallback", () => {
     let state = loadedState()
     const refresh = activeRefresh("manual", 1, "manual", "full")

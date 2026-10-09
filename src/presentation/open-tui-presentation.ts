@@ -18,6 +18,7 @@ import type {
   AppRuntime,
   ApplicationShutdownError,
   ApplicationModal,
+  ApplicationOperationKind,
   ApplicationViewModel,
   EndpointNodeViewModel,
   GraphNodeViewModel,
@@ -60,9 +61,9 @@ const FOOTER_HEIGHT = 2
 const SEPARATOR_HEIGHT = 1
 const CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
-const REFRESH_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
+const OPERATION_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
 const HISTORY_LOADING_MESSAGE = "This tree is still loading. You can open it when loading finishes."
-const TERMINAL_RETURN_CONTROL = { key: "Ctrl+Space", description: "back" }
+const TERMINAL_RETURN_CONTROL: FooterControl = { key: "Ctrl+Space", description: "back", action: "return" }
 const TERMINAL_RETURN_PREFIX = " c/t · "
 
 export interface OpenTuiProviderIdentity {
@@ -114,11 +115,22 @@ type FooterAction =
   | "about"
   | "details"
   | "verification"
+  | "return"
 
 interface FooterControl {
   readonly key: string
   readonly description: string
   readonly action?: FooterAction
+}
+
+const OPERATION_PRESENTATION: Record<ApplicationOperationKind, { readonly action: FooterAction; readonly label: string }> = {
+  fork: { action: "fork", label: "Forking" },
+  verification: { action: "verification", label: "Verifying fork history" },
+  new: { action: "new", label: "Creating session" },
+  open: { action: "open", label: "Opening session" },
+  stop: { action: "stop", label: "Stopping" },
+  remove: { action: "remove", label: "Deleting" },
+  return: { action: "return", label: "Returning to navigator" },
 }
 
 interface FooterHitRegion {
@@ -276,6 +288,8 @@ class ErrorTextRenderable extends TextRenderable {
 
 class OpenTuiPresentationController {
   private readonly navigator: BoxRenderable
+  private readonly terminalReturnLabel: TextRenderable
+  private terminalReturnHitWidth = 0
   private readonly header: TextRenderable
   private readonly headerSeparator: TextRenderable
   private readonly content: TextRenderable
@@ -418,7 +432,7 @@ class OpenTuiPresentationController {
         }
       }),
     })
-    this.terminalReturnBar.add(new TextRenderable(renderer, {
+    this.terminalReturnLabel = new TextRenderable(renderer, {
       id: "terminal-return-label",
       flexGrow: 1,
       flexShrink: 1,
@@ -432,7 +446,8 @@ class OpenTuiPresentationController {
         chunk(TERMINAL_RETURN_PREFIX, theme.textMuted),
         ...renderControls([TERMINAL_RETURN_CONTROL]).chunks,
       ]),
-    }))
+    })
+    this.terminalReturnBar.add(this.terminalReturnLabel)
     renderer.root.add(this.terminalReturnBar)
 
     this.dialogOverlay = new BoxRenderable(renderer, {
@@ -628,6 +643,8 @@ class OpenTuiPresentationController {
     const unchangedRoots = previous?.surface._tag === "Roots" && viewModel.surface._tag === "Roots" &&
       previous.surface.roots === viewModel.surface.roots && previousRootSelection === this.selectedRootSessionId &&
       previous.modal === viewModel.modal && previous.refreshing === viewModel.refreshing &&
+      previous.pendingOperations === viewModel.pendingOperations &&
+      previous.branchVerifications === viewModel.branchVerifications &&
       previous.initialLoadPending === viewModel.initialLoadPending && previous.shuttingDown === viewModel.shuttingDown
     if (this.started && !unchangedRoots) this.render()
     this.renderFailurePending = false
@@ -1207,7 +1224,8 @@ class OpenTuiPresentationController {
         yield* self.appRuntime.remove(modal.removal, modal.affectedSessionIds, modal.requestId)
       }
     }), modal._tag === "ConfirmRemoval" ? `remove:${modal.requestId}`
-      : modal._tag === "ConfirmStopTree" ? `stop-tree:${modal.rootSessionId}` : `stop:${modal.sessionId}`)
+      : modal._tag === "ConfirmStopTree" ? `stop-tree:${modal.rootSessionId}`
+      : modal._tag === "ConfirmOpenSession" ? `terminal:${modal.sessionId}` : `stop:${modal.sessionId}`)
   }
 
   private showError(message: string): void {
@@ -1350,7 +1368,13 @@ class OpenTuiPresentationController {
     this.terminalReturnBar.visible = surface._tag === "Terminal"
     this.dialogOverlay.visible = false
     if (terminal) {
-      this.stopSpinner()
+      const controls = renderControls([TERMINAL_RETURN_CONTROL], this.busyFooterActions(), this.operationFrame())
+      this.terminalReturnHitWidth = controls.hitRegions[0]!.endX
+      this.terminalReturnLabel.content = styledText([
+        chunk(TERMINAL_RETURN_PREFIX, theme.textMuted),
+        ...controls.chunks,
+      ])
+      this.updateSpinner()
       return
     }
 
@@ -1394,11 +1418,11 @@ class OpenTuiPresentationController {
       const controls = ROOT_CONTROLS.flatMap((control) => control.action !== "enter-root" ? [control]
         : !activation || activation === "loading" ? []
         : [{ ...control, description: activation === "retry" ? "retry" : "open" }])
-      const footer = renderControls(this.controlsWithDetails(controls), this.refreshFrame())
+      const footer = renderControls(this.controlsWithDetails(controls), this.busyFooterActions(), this.operationFrame())
       this.footer.content = styledText([
         ...footer.chunks,
         chunk("\n", theme.text),
-        ...this.rootStatusChunks(),
+        ...(this.operationStatusChunks() ?? this.rootStatusChunks()),
       ])
       this.footerHitRegions = footer.hitRegions
     } else {
@@ -1413,11 +1437,11 @@ class OpenTuiPresentationController {
       )
       this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
       this.content.content = rendered.content
-      const footer = renderControls(this.controlsWithDetails(GRAPH_CONTROLS), this.refreshFrame())
+      const footer = renderControls(this.controlsWithDetails(GRAPH_CONTROLS), this.busyFooterActions(), this.operationFrame())
       this.footer.content = styledText([
         ...footer.chunks,
         chunk("\n", theme.text),
-        chunk(this.selectedDescription(), theme.textMuted),
+        ...(this.operationStatusChunks() ?? [chunk(this.selectedDescription(), theme.textMuted)]),
       ])
       this.footerHitRegions = footer.hitRegions
     }
@@ -1607,13 +1631,31 @@ class OpenTuiPresentationController {
     ])
   }
 
-  private refreshFrame(): string | undefined {
-    return this.viewModel?.refreshing
-      ? REFRESH_SPINNER_FRAMES[this.spinnerFrame % REFRESH_SPINNER_FRAMES.length]
-      : undefined
+  private operationFrame(): string {
+    return OPERATION_SPINNER_FRAMES[this.spinnerFrame % OPERATION_SPINNER_FRAMES.length]!
+  }
+
+  private busyFooterActions(): ReadonlySet<FooterAction> {
+    const actions = new Set<FooterAction>()
+    for (const kind of this.viewModel?.pendingOperations.values() ?? []) actions.add(OPERATION_PRESENTATION[kind].action)
+    if (this.viewModel?.refreshing) actions.add("refresh")
+    return actions
+  }
+
+  private operationStatusChunks(): TextChunk[] | undefined {
+    const counts = new Map<ApplicationOperationKind, number>()
+    for (const kind of this.viewModel?.pendingOperations.values() ?? []) counts.set(kind, (counts.get(kind) ?? 0) + 1)
+    if (!counts.size) return undefined
+    const labels = [...counts].map(([kind, count]) => `${OPERATION_PRESENTATION[kind].label}${count > 1 ? ` (${count})` : ""}`)
+    return [chunk(truncateToWidth(`${this.operationFrame()} ${labels.join(" · ")}`, this.renderer.terminalWidth), theme.textMuted)]
   }
 
   private updateSpinner(): void {
+    if (this.viewModel?.surface._tag === "Terminal") {
+      if (this.busyFooterActions().has("return")) this.startSpinner()
+      else this.stopSpinner()
+      return
+    }
     const graphWorking = this.graphSurface()?.nodes.some((node) =>
       node._tag === "Endpoint" && node.status === "working"
     ) ?? false
@@ -1621,11 +1663,15 @@ class OpenTuiPresentationController {
     const rootsIndex = roots ? indexRootViews(roots.roots) : undefined
     const rootsAnimating = rootsIndex?.working || rootsIndex?.loading
     const pickerWorking = this.leafPicker?.options.some((option) => option.status === "working")
-    const animate = !this.tooSmall() && Boolean(this.viewModel?.initialLoadPending || this.viewModel?.refreshing || graphWorking || rootsAnimating || pickerWorking)
+    const animate = !this.tooSmall() && Boolean(this.viewModel?.pendingOperations.size || this.viewModel?.initialLoadPending || this.viewModel?.refreshing || graphWorking || rootsAnimating || pickerWorking)
     if (!animate) {
       this.stopSpinner()
       return
     }
+    this.startSpinner()
+  }
+
+  private startSpinner(): void {
     if (this.spinnerTimer) return
     const schedule = () => {
       const timer = setTimeout(() => {
@@ -1794,7 +1840,7 @@ class OpenTuiPresentationController {
   private isTerminalReturnHit(event: MouseEvent): boolean {
     const x = event.x - this.terminalReturnBar.screenX - displayWidth(TERMINAL_RETURN_PREFIX)
     return event.y === this.terminalReturnBar.screenY && x >= 0 &&
-      x < displayWidth(`${TERMINAL_RETURN_CONTROL.key} ${TERMINAL_RETURN_CONTROL.description}`)
+      x < this.terminalReturnHitWidth
   }
 
   private readonly onFooterMouseUp = (event: MouseEvent) => {
@@ -2194,7 +2240,8 @@ function modalContent(modal: ApplicationModal, resumeCommand?: string): {
 
 function renderControls(
   controls: readonly FooterControl[],
-  refreshFrame?: string,
+  pendingActions: ReadonlySet<FooterAction> = new Set(),
+  spinnerFrame?: string,
 ): { readonly chunks: TextChunk[]; readonly hitRegions: FooterHitRegion[] } {
   const chunks: TextChunk[] = []
   const hitRegions: FooterHitRegion[] = []
@@ -2204,7 +2251,7 @@ function renderControls(
       chunks.push(chunk(" ", theme.textMuted))
       x += 1
     }
-    const key = control.action === "refresh" && refreshFrame ? refreshFrame : control.key
+    const key = control.action && pendingActions.has(control.action) && spinnerFrame ? spinnerFrame : control.key
     const text = `${key} ${control.description}`
     chunks.push(
       chunk(key, theme.text, TextAttributes.BOLD),
