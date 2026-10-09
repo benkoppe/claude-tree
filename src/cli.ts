@@ -18,6 +18,7 @@ import { nativePersistencePlatform } from "./infrastructure/metadata/platform"
 import { makeProviderReads, withProviderReads } from "./infrastructure/providers/read-service"
 import { makeProjectionService } from "./infrastructure/projection/service"
 import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
+import { makeOpenTuiProgramStatusReporter, reportApplicationToProgramStatus } from "./infrastructure/program-status"
 import { makeSessionGuard } from "./infrastructure/session-guard"
 import { UNKNOWN_BUILD } from "./build-info"
 import { HistoryDiagnosticReportSchema, HistoryTrace, type HistoryDiagnosticReport } from "./diagnostics/history-trace"
@@ -138,6 +139,7 @@ export function composeProductionApplication(
     const provider = withProviderReads(localProvider, reads)
     const projection = yield* makeProjectionService()
     const renderer = yield* makeOpenTuiRenderer()
+    const programStatus = yield* makeOpenTuiProgramStatusReporter(renderer)
     const herdr = yield* makeLiveHerdrReporter()
     const bridge = makeTerminalEventBridge()
     const terminals = yield* makeTerminalSupervisor({
@@ -155,6 +157,7 @@ export function composeProductionApplication(
         bridge.bind(appRuntime.terminalEvents)
         const resumeArgv = [PROGRAM_NAME, ...(options.provider === "codex" ? ["--codex"] : []), "--resume", repository.instanceId, projectPath]
         return reportApplicationToHerdr(herdr, appRuntime.viewModels, { workspaceId: repository.instanceId, argv: resumeArgv }).pipe(
+          Effect.andThen(reportApplicationToProgramStatus(programStatus, appRuntime.viewModels)),
           Effect.andThen(makeOpenTuiPresentation(renderer, appRuntime, provider, { setProcessTitle,
             resumeCommand: resumeArgv.map((argument) => /^[a-zA-Z0-9_./:-]+$/.test(argument) ? argument : `'${argument.replaceAll("'", "'\\''")}'`).join(" ") })),
         )

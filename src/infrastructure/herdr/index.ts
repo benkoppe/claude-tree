@@ -1,5 +1,6 @@
 import { Effect, Layer, Scope, Stream } from "effect"
 import type { ApplicationViewModel } from "../../application/view-model"
+import { projectDisplayedStatus } from "../../application/displayed-status"
 
 import {
   HerdrReporter,
@@ -46,11 +47,10 @@ export function reportApplicationToHerdr(
   workspace?: Omit<HerdrResume, "destination">,
 ): Effect.Effect<void, never, Scope.Scope> {
   return Effect.forkScoped(Stream.runForEach(viewModels, (viewModel) => Effect.sync(() => {
-    const surface = viewModel.surface
     if (viewModel.shuttingDown) return
-    reporter.report(surface._tag === "Roots" ? "idle" : surface.status, workspace ? {
-      ...workspace, destination: surface._tag === "Roots" ? `roots:${surface.selectedSessionId ?? ""}`
-        : surface._tag === "Graph" ? `graph:${surface.familySessionId}` : `terminal:${surface.sessionId}`,
+    const status = projectDisplayedStatus(viewModel)
+    reporter.report(status.activity, workspace ? {
+      ...workspace, destination: status.destination,
     } : undefined)
   }))).pipe(Effect.asVoid)
 }
