@@ -365,7 +365,7 @@ describe("Effect Codex provider", () => {
     ])
 
     for (const [target, reason] of [
-      ["user", "not a user message"],
+      ["user", "first prompts"],
       ["system", "not a system item"],
       ["agent-mid", "final response boundary"],
       ["agent-working", "this turn is inProgress"],
@@ -414,6 +414,162 @@ describe("Effect Codex provider", () => {
     ])]))
     expect(messages.every((message) => message.forkable === false)).toBeTrue()
     expect(messages.map((message) => message.displayGroupId)).toEqual(["answer", undefined, "empty-input"])
+  })
+
+  test.each(["completed", "inProgress", "interrupted", "failed"] as const)(
+    "forking an initial user in a %s turn matches the preceding Agent fork with an empty composer", async (status) => {
+      const firstTurn = turn("first", "completed", [
+        user("first-user", [{ type: "text", text: "Original question" }]),
+        { id: "comment", type: "agentMessage", text: "Checking" },
+        { id: "tool", type: "commandExecution", command: "pwd" },
+        { id: "answer", type: "agentMessage", text: "Answer" },
+        { id: "boundary", type: "reasoning", summary: [] },
+      ])
+      const parent = thread(ROOT, [firstTurn,
+        turn("internal", "completed", [{ id: "internal-item", type: "reasoning", summary: [] }]),
+        turn("selected", status, [
+          user("selected-user", [{ type: "text", text: "Do not submit this\n  prompt" }, { type: "image", url: "https://example.test/image" }]),
+          { id: "later-answer", type: "agentMessage", text: "Excluded answer" },
+        ]),
+      ])
+      const child = thread(CHILD, [{ ...firstTurn, id: "copied-turn",
+        items: firstTurn.items.map((item) => ({ ...item, id: `copy-${item.id}` })),
+      }])
+      const normalized = normalizeCodexThread(parent)
+      expect(normalized.find((message) => message.id === "selected-user")).toMatchObject({ forkable: true, forkBoundaryId: "boundary" })
+      const graph = buildConversationForest([{ id: ROOT, title: "Parent", lastModified: 1 }], new Map([[ROOT, normalized]]), []).graphs[0]!
+      const userNode = [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.messageId === "selected-user"))!
+      const userTarget = resolveForkTarget(graph, userNode.id)!
+      expect(userTarget).toEqual({ sessionId: ROOT, messageId: "selected-user" })
+      const outcomes = []
+      for (const target of [userTarget, { sessionId: ROOT, messageId: "boundary" }]) {
+        const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : child), forkThread: () => Effect.succeed(child) })
+        const provider = providerWith(client)
+        const outcome = await Effect.runPromise(provider.branchFrom(target))
+        expect(outcome._tag).toBe("ValidatedBranch")
+        if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+        expect(client.forkCalls).toEqual([{ threadId: ROOT, turnId: "first", cwd: "/project" }])
+        expect(outcome.derivation.sourceMessageId).toBe("boundary")
+        expect(outcome.derivation.sharedMessages).toEqual(firstTurn.items.map((item) => ({ parentMessageId: item.id, childMessageId: `copy-${item.id}` })))
+        const launch = await Effect.runPromise(Effect.scoped(outcome.acquireLaunch))
+        expect(launch.launch.command).toEqual([
+          "/usr/bin/codex", "resume", "--remote", "ws://127.0.0.1:1", "--remote-auth-token-env", "CLAUDE_TREE_CODEX_TOKEN", CHILD,
+        ])
+        expect(launch.launch.initialDraft).toBeUndefined()
+        expect(provider.capabilities.userMessageReplay).toBeFalse()
+        outcomes.push(outcome)
+      }
+      expect(outcomes[0]!.derivation).toEqual(outcomes[1]!.derivation)
+      expect(outcomes[0]!.transcript).toEqual(outcomes[1]!.transcript)
+      const forked = buildConversationForest([{ id: ROOT, title: "Parent", lastModified: 1 }, outcomes[0]!.session],
+        new Map([[ROOT, normalized], [CHILD, normalizeCodexThread(child)]]), [{ ...outcomes[0]!.derivation, createdAt: "2026-10-08T00:00:00.000Z" }]).graphs[0]!
+      expect(forked.warnings).toEqual([])
+      const branchSource = [...forked.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.messageId === "boundary"))!
+      expect(forked.nodes.get(forked.endpointBySessionId.get(CHILD)!)?.parentId).toBe(branchSource.id)
+    },
+  )
+
+  test.each(["inProgress", "interrupted", "failed"] as const)("does not skip a preceding %s Agent to fork a User from an older turn", async (status) => {
+    const parent = thread(ROOT, [copiedTurn("older", "Old", "older"), turn("unsupported", status, [
+      user("previous-user", [{ type: "text", text: "Previous question" }]),
+      { id: "unsupported-agent", type: "agentMessage", text: "Unfinished response" },
+    ]), turn("selected", "completed", [user("selected-user", [{ type: "text", text: "Selected question" }])])])
+    expect(normalizeCodexThread(parent).find((message) => message.id === "selected-user")?.forkable).toBeFalse()
+    const client = fakeClient({ readThread: () => Effect.succeed(parent) })
+    const error = await Effect.runPromise(Effect.flip(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "selected-user" })))
+    expect(error).toBeInstanceOf(ProviderProtocolError)
+    expect(client.forkCalls).toHaveLength(0)
+  })
+
+  test("rejects steering inputs, including adjacent and hidden earlier users, before creating a child", async () => {
+    for (const precedingItems of [
+      [user("initial", [{ type: "text", text: "Initial prompt" }])],
+      [user("hidden-initial", [])],
+      [{ id: "comment", type: "agentMessage", text: "Working" }],
+    ]) {
+      const parent = thread(ROOT, [copiedTurn("older", "Old", "older"), turn("steered", "completed", [
+        ...precedingItems,
+        user("steer", [{ type: "text", text: "Steering input" }]),
+        { id: "answer", type: "agentMessage", text: "Answer" },
+      ])])
+      expect(normalizeCodexThread(parent).find((message) => message.id === "steer")?.forkable).toBeFalse()
+      const client = fakeClient({ readThread: () => Effect.succeed(parent) })
+      const error = await Effect.runPromise(Effect.flip(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "steer" })))
+      expect(error.message).toContain("mid-turn steering")
+      expect(client.forkCalls).toHaveLength(0)
+    }
+  })
+
+  test("user-fork mutation ambiguity names the resolved Agent boundary rather than the excluded prompt", async () => {
+    const parent = thread(ROOT, [copiedTurn("first", "Old", "first"), turn("selected", "inProgress", [
+      user("selected-user", [{ type: "text", text: "New question" }]),
+    ])])
+    const client = fakeClient({ readThread: () => Effect.succeed(parent), forkThread: () => Effect.fail(new CodexMutationAmbiguousError({
+      method: "thread/fork", message: "fork response was lost",
+      cause: new CodexRequestTimeout({ method: "thread/fork", timeoutMs: 10 }),
+    })) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "selected-user" }))
+    expect(outcome).toMatchObject({ _tag: "AmbiguousBranchMutation", sourceMessageId: "first-agent-Old" })
+    expect(client.forkCalls).toEqual([{ threadId: ROOT, turnId: "first", cwd: "/project" }])
+  })
+
+  test("a dispatched user fork timing out retains the resolved boundary in ambiguity evidence", async () => {
+    const parent = thread(ROOT, [copiedTurn("first", "Old", "first"), turn("selected", "inProgress", [
+      user("selected-user", [{ type: "text", text: "New question" }]),
+    ])])
+    await Effect.runPromise(Effect.gen(function*() {
+      const started = yield* Deferred.make<void>()
+      const client = fakeClient({ readThread: () => Effect.succeed(parent), forkThread: (_id, _turn, _cwd, dispatched) =>
+        Effect.gen(function*() {
+          dispatched?.()
+          yield* Deferred.succeed(started, undefined)
+          return yield* Effect.never
+        }) })
+      const waiting = yield* Effect.forkChild(providerWith(client, { metadataDeadlineMs: 10 }).branchFrom({ sessionId: ROOT, messageId: "selected-user" }))
+      yield* Deferred.await(started)
+      yield* TestClock.adjust(10)
+      expect(yield* Fiber.join(waiting)).toMatchObject({ _tag: "AmbiguousBranchMutation", sourceMessageId: "first-agent-Old" })
+      expect(client.forkCalls).toHaveLength(1)
+    }).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("a user fork's read-only verification keeps its captured Agent prefix after the parent changes", async () => {
+    const firstTurn = copiedTurn("first", "Old", "first")
+    let parent = thread(ROOT, [firstTurn, turn("selected", "inProgress", [
+      user("selected-user", [{ type: "text", text: "New question" }]),
+    ])])
+    const child = thread(CHILD, [{ ...firstTurn, id: "copied-turn", items: firstTurn.items.map((item) => ({ ...item, id: `copy-${item.id}` })) }])
+    let visible = false
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : visible ? child
+      : thread(CHILD, [{ ...child.turns[0]!, items: child.turns[0]!.items.slice(0, 1) }])), forkThread: () => Effect.succeed(child) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "selected-user" }))
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected pending fork evidence")
+    expect(outcome.verification?.status).toBe("pending")
+    const receipt = outcome.verification?.receipt
+    if (!receipt) throw new Error("Expected verification receipt")
+    parent = thread(ROOT, [])
+    visible = true
+    const verified = await Effect.runPromise(receipt.verify)
+    expect(verified._tag).toBe("ValidatedBranch")
+    if (verified._tag !== "ValidatedBranch") throw new Error(verified.reason)
+    expect(verified.derivation.sourceMessageId).toBe("first-agent-Old")
+    expect(verified.derivation.sharedMessages).toHaveLength(firstTurn.items.length)
+    expect(client.forkCalls).toHaveLength(1)
+    expect(client.readCalls.filter((id) => id === ROOT)).toHaveLength(1)
+  })
+
+  test("rejects a user fork whose child copied the excluded prompt", async () => {
+    const firstTurn = copiedTurn("first", "Old", "first")
+    const parent = thread(ROOT, [firstTurn, turn("selected", "completed", [
+      user("selected-user", [{ type: "text", text: "New question" }]),
+    ])])
+    const child = thread(CHILD, [firstTurn, ...parent.turns.slice(1)])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : child), forkThread: () => Effect.succeed(child) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "selected-user" }))
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected contradicted fork evidence")
+    expect(outcome.verification?.status).toBe("contradicted")
+    expect(client.forkCalls).toHaveLength(1)
   })
 
   test.each(["reasoning", "commandExecution", "agentMessage"])("forks the full turn through a hidden %s tail", async (type) => {
