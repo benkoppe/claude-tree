@@ -1,9 +1,10 @@
-import type { AgentMessage, AgentSession, MessageRef } from "../model"
+import type { AgentMessage, AgentSession, MessageRef, ProvisionalBranch } from "../model"
 import type { BranchRelation, ConversationRemoval } from "../persistence"
 
 export type ForkTarget = MessageRef
 
 interface GraphNodeBase {
+  provisional?: true
   id: string
   parentId: string | null
   childIds: string[]
@@ -65,6 +66,8 @@ export interface ReachableSessionEndpoint {
 }
 
 interface SessionGraphContext {
+  /** Visual entry point for this session's shared path, not copied ancestry. */
+  pathParentId: string
   transcript: readonly AgentMessage[]
   rawLogicalNodeIds: Array<string | undefined>
   nodeIdByMessageId: Map<string, string>
@@ -83,12 +86,21 @@ export function buildConversationForest(
   transcripts: ReadonlyMap<string, readonly AgentMessage[]>,
   relations: readonly BranchRelation[],
   removals: readonly ConversationRemoval[] = [],
+  provisionalBranches: readonly ProvisionalBranch[] = [],
 ): ConversationForest {
   const sessionsById = new Map(sessions.map((session) => [session.id, session]))
-  const relationsByParent = groupRelationsByParent(relations)
+  const attachmentsByParent = groupAttachmentsByParent(relations, provisionalBranches)
   const retainedMessagesBySession = collectRetainedMessages(transcripts, relations)
   const exactBranchPointIdsBySession = collectExactBranchPointIds(relations)
   const displayGroupEndIdsBySession = collectDisplayGroupEndIds(relations, removals)
+  for (const branch of provisionalBranches) {
+    for (const boundaries of [exactBranchPointIdsBySession, displayGroupEndIdsBySession]) {
+      const ids = boundaries.get(branch.parentSessionId) ?? new Set<string>()
+      ids.add(branch.sourceMessageId)
+      boundaries.set(branch.parentSessionId, ids)
+    }
+  }
+  propagateSharedMessageIds(exactBranchPointIdsBySession, relations)
   for (const [sessionId, transcript] of transcripts) {
     const lastVisible = transcript.findLast((message) => message.visible)
     if (!lastVisible) continue
@@ -99,7 +111,8 @@ export function buildConversationForest(
     displayGroupEndIdsBySession.set(sessionId, ids)
   }
   propagateSharedMessageIds(displayGroupEndIdsBySession, relations)
-  const recordedChildren = new Set(relations.map((relation) => relation.childSessionId))
+  const recordedChildren = new Set([...attachmentsByParent.values()].flatMap((attachments) =>
+    attachments.map((attachment) => attachment.edge.childSessionId)))
   const processedSessions = new Set<string>()
   const graphBySessionId = new Map<string, ConversationGraph>()
   const graphs: ConversationGraph[] = []
@@ -131,6 +144,7 @@ export function buildConversationForest(
     })
 
     const contexts = new Map<string, SessionGraphContext>()
+    const provisionalSessionIds = new Set<string>()
     const rootContext = appendRootSession(
       graph,
       rootSession,
@@ -143,43 +157,49 @@ export function buildConversationForest(
     graph.sessionIds.add(rootSession.id)
     graphBySessionId.set(rootSession.id, graph)
 
-    interface RelationFrame {
+    interface AttachmentFrame {
       parentSessionId: string
-      relations: readonly BranchRelation[]
+      attachments: readonly SessionAttachment[]
       nextIndex: number
     }
-    const traversal: RelationFrame[] = [{
+    const traversal: AttachmentFrame[] = [{
       parentSessionId: rootSession.id,
-      relations: relationsByParent.get(rootSession.id) ?? [],
+      attachments: attachmentsByParent.get(rootSession.id) ?? [],
       nextIndex: 0,
     }]
     while (traversal.length > 0) {
       const frame = traversal[traversal.length - 1]!
-      const relation = frame.relations[frame.nextIndex]
-      if (!relation) {
+      const attachment = frame.attachments[frame.nextIndex]
+      if (!attachment) {
         traversal.pop()
         continue
       }
       frame.nextIndex += 1
 
       const parentContext = contexts.get(frame.parentSessionId)
-      const child = sessionsById.get(relation.childSessionId)
+      const child = sessionsById.get(attachment.edge.childSessionId)
       if (!parentContext || !child || processedSessions.has(child.id)) continue
 
-      const error = attachChildSession(
-        graph,
-        child,
-        relation,
-        parentContext,
-        transcripts,
-        retainedMessagesBySession,
-        exactBranchPointIdsBySession,
-        displayGroupEndIdsBySession,
-      )
-      if (error) {
-        graph.warnings.push(error)
-        warnings.push(error)
-        continue
+      if (attachment._tag === "Provisional") {
+        if (!attachProvisionalSession(graph, child, attachment.edge, parentContext, transcripts,
+          exactBranchPointIdsBySession, displayGroupEndIdsBySession)) continue
+        provisionalSessionIds.add(child.id)
+      } else {
+        const error = attachChildSession(
+          graph,
+          child,
+          attachment.edge,
+          parentContext,
+          transcripts,
+          retainedMessagesBySession,
+          exactBranchPointIdsBySession,
+          displayGroupEndIdsBySession,
+        )
+        if (error) {
+          graph.warnings.push(error)
+          warnings.push(error)
+          continue
+        }
       }
 
       processedSessions.add(child.id)
@@ -190,9 +210,19 @@ export function buildConversationForest(
       contexts.set(child.id, childContext)
       traversal.push({
         parentSessionId: child.id,
-        relations: relationsByParent.get(child.id) ?? [],
+        attachments: attachmentsByParent.get(child.id) ?? [],
         nextIndex: 0,
       })
+    }
+    // Verified descendants may restore omitted prefix nodes. Mark the resulting
+    // entry edges, rather than a node that was first materialized before recovery.
+    for (const sessionId of provisionalSessionIds) {
+      const context = contexts.get(sessionId)!
+      for (const id of graph.nodes.get(context.pathParentId)?.childIds ?? []) {
+        const node = graph.nodes.get(id)!
+        if ((node.kind === "message" && node.aliases.some((alias) => alias.sessionId === sessionId)) ||
+          (node.kind === "endpoint" && node.session.id === sessionId)) node.provisional = true
+      }
     }
     graphs.push(graph)
   }
@@ -554,7 +584,7 @@ function appendRootSession(
   exactBranchPointIdsBySession: ReadonlyMap<string, ReadonlySet<string>>,
   displayGroupEndIdsBySession: ReadonlyMap<string, ReadonlySet<string>>,
 ): SessionGraphContext {
-  const context = createContext(transcript)
+  const context = createContext(transcript, graph.originNodeId)
   appendSessionMessages(
     graph,
     session.id,
@@ -577,6 +607,30 @@ function appendRootSession(
   return context
 }
 
+/** Materialize only this child's own path; descendants use ordinary attachment rules. */
+function attachProvisionalSession(
+  graph: ConversationGraph,
+  child: AgentSession,
+  branch: ProvisionalBranch,
+  parentContext: SessionGraphContext,
+  transcripts: ReadonlyMap<string, readonly AgentMessage[]>,
+  exactBranchPointIdsBySession: ReadonlyMap<string, ReadonlySet<string>>,
+  displayGroupEndIdsBySession: ReadonlyMap<string, ReadonlySet<string>>,
+): boolean {
+  const sourceNodeId = parentContext.nodeIdByMessageId.get(branch.sourceMessageId)
+  // A removed/rewound source cannot support provisional visual placement.
+  if (!sourceNodeId || !graph.nodes.has(sourceNodeId)) return false
+  const transcript = transcripts.get(child.id) ?? []
+  const context = createContext(transcript, sourceNodeId)
+  appendSessionMessages(graph, child.id, transcript, 0, sourceNodeId,
+    exactBranchPointIdsBySession.get(child.id) ?? new Set(),
+    displayGroupEndIdsBySession.get(child.id) ?? new Set(), context)
+  appendEndpoint(graph, child, lastDefined(context.rawLogicalNodeIds) ?? sourceNodeId,
+    forkTargetForLastMessage(child.id, transcript))
+  contextFor(graph).set(child.id, context)
+  return true
+}
+
 function attachChildSession(
   graph: ConversationGraph,
   child: AgentSession,
@@ -592,7 +646,7 @@ function attachChildSession(
   if (sharedPrefixLength === 0) {
     const sourceNodeId = parentContext.nodeIdByMessageId.get(relation.sourceMessageId) ??
       messageNodeId(relation.parentSessionId, relation.sourceMessageId)
-    const context = createContext(transcript)
+    const context = createContext(transcript, graph.originNodeId)
     appendSessionMessages(
       graph,
       child.id,
@@ -626,7 +680,7 @@ function attachChildSession(
       !retainedParentMessages.has(pair.parentMessageId),
   )
   if (sharedHistoryCompletelyUnavailable) {
-    const context = createContext(transcript)
+    const context = createContext(transcript, graph.originNodeId)
     appendSessionMessages(
       graph,
       child.id,
@@ -766,7 +820,7 @@ function attachChildSession(
     return `Cannot attach ${child.id}: source message ${relation.sourceMessageId} is unavailable`
   }
 
-  const context = createContext(transcript)
+  const context = createContext(transcript, parentContext.pathParentId)
   for (const pair of relation.sharedMessages) {
     const logicalNodeId = parentContext.nodeIdByMessageId.get(pair.parentMessageId)
     if (!logicalNodeId) continue
@@ -868,7 +922,7 @@ function reconcileSharedPath(
   }
 
   let previousExistingIndex = -1
-  let previousExistingNodeId = graph.originNodeId
+  let previousExistingNodeId = parentContext.pathParentId
   for (let index = 0; index < groups.length; index += 1) {
     const nodeId = groups[index]!.existingNodeId
     if (!nodeId) continue
@@ -912,7 +966,7 @@ function reconcileSharedPath(
       validationIndex += 1
     }
     const leftNodeId = runStart === 0
-      ? graph.originNodeId
+      ? parentContext.pathParentId
       : groups[runStart - 1]!.existingNodeId!
     const splitFromNodeIds = new Set(
       groups
@@ -938,7 +992,7 @@ function reconcileSharedPath(
     while (index < groups.length && !groups[index]!.existingNodeId) index += 1
     const runEnd = index
     const leftNodeId = runStart === 0
-      ? graph.originNodeId
+      ? parentContext.pathParentId
       : groups[runStart - 1]!.existingNodeId!
     const rightNodeId = runEnd < groups.length ? groups[runEnd]!.existingNodeId : undefined
     const insertedNodeIds: string[] = []
@@ -1259,8 +1313,9 @@ export function resolveForkTarget(
   return !node || node.kind === "origin" ? undefined : node.forkTarget
 }
 
-function createContext(transcript: readonly AgentMessage[]): SessionGraphContext {
+function createContext(transcript: readonly AgentMessage[], pathParentId: string): SessionGraphContext {
   return {
+    pathParentId,
     transcript,
     rawLogicalNodeIds: new Array<string | undefined>(transcript.length),
     nodeIdByMessageId: new Map(),
@@ -1390,14 +1445,26 @@ function contextFor(graph: ConversationGraph): Map<string, SessionGraphContext> 
   return contexts
 }
 
-function groupRelationsByParent(
+type SessionAttachment =
+  | { readonly _tag: "Verified"; readonly edge: BranchRelation }
+  | { readonly _tag: "Provisional"; readonly edge: ProvisionalBranch }
+
+function groupAttachmentsByParent(
   relations: readonly BranchRelation[],
-): Map<string, BranchRelation[]> {
-  const grouped = new Map<string, BranchRelation[]>()
-  for (const relation of [...relations].sort(compareRelations)) {
-    const children = grouped.get(relation.parentSessionId) ?? []
-    children.push(relation)
-    grouped.set(relation.parentSessionId, children)
+  provisionalBranches: readonly ProvisionalBranch[],
+): Map<string, SessionAttachment[]> {
+  const verifiedChildren = new Set(relations.map((relation) => relation.childSessionId))
+  const attachments: SessionAttachment[] = [
+    ...[...relations].sort(compareRelations).map((edge) => ({ _tag: "Verified" as const, edge })),
+    ...provisionalBranches.filter((edge) => !verifiedChildren.has(edge.childSessionId))
+      .toSorted((left, right) => left.childSessionId.localeCompare(right.childSessionId))
+      .map((edge) => ({ _tag: "Provisional" as const, edge })),
+  ]
+  const grouped = new Map<string, SessionAttachment[]>()
+  for (const attachment of attachments) {
+    const children = grouped.get(attachment.edge.parentSessionId) ?? []
+    children.push(attachment)
+    grouped.set(attachment.edge.parentSessionId, children)
   }
   return grouped
 }

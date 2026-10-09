@@ -312,6 +312,7 @@ export class CodexProvider implements AgentProviderApi {
       mutationSourceMessageId = source.id
 
       const copiedParent = parentTranscript.slice(0, sourceIndex + 1)
+      const excludedParentIds = new Set(parentTranscript.slice(sourceIndex + 1).map((message) => message.id))
       const mutation = yield* server.forkThread(
         target.sessionId,
         source.turnId,
@@ -348,12 +349,14 @@ export class CodexProvider implements AgentProviderApi {
       const provisionalSession = provisionalSessionFromThread(childThread, now)
       const receipt: BranchVerificationReceipt = {
         session: provisionalSession,
+        prepared: { session: provisionalSession, acquireLaunch: this.acquireObservedLaunch("resume", provisionalSession.id) },
+        origin: { childSessionId: provisionalSession.id, parentSessionId: target.sessionId, sourceMessageId: source.id },
         verify: Effect.suspend(() => this.withServer((reader) => this.verifyCreatedFork(reader, receipt,
-          target.sessionId, source.id, copiedParent), "validateFork", true)),
+          target.sessionId, source.id, copiedParent, excludedParentIds, childThread), "validateFork", true)),
       }
       yield* Effect.uninterruptible(Effect.sync(() => { knownChild = receipt }).pipe(
         Effect.andThen(created ? created(receipt) : Effect.void)))
-      return yield* this.verifyCreatedFork(server, receipt, target.sessionId, source.id, copiedParent)
+      return yield* this.verifyCreatedFork(server, receipt, target.sessionId, source.id, copiedParent, excludedParentIds, childThread)
     }), "branchFrom")
     const ambiguity = (reason: string): AmbiguousBranchMutation => ({
       _tag: "AmbiguousBranchMutation",
@@ -395,10 +398,27 @@ export class CodexProvider implements AgentProviderApi {
     parentSessionId: string,
     sourceMessageId: string,
     copiedParent: readonly CodexMessage[],
+    excludedParentIds: ReadonlySet<string>,
+    initialCopy: CodexThread,
   ): Effect.Effect<ValidatedBranch | CreatedIndependentSession, ProviderError | ProviderProtocolError> {
     let transcript: TranscriptRead = { _tag: "Missing" }
     let contradiction = false
     const read = Effect.gen({ self: this }, function*() {
+      // The fork response predates terminal activity. Excess history there is
+      // contradictory even when the provider remapped all copied item identities.
+      const initialTranscript = yield* this.normalizeThread(initialCopy, "validateFork")
+      contradiction = true
+      yield* this.validateCopiedPrefix(receipt.session.id, copiedParent.slice(0, initialTranscript.length), initialTranscript)
+      contradiction = false
+      const validated = (session: AgentSession, messages: readonly CodexMessage[]): ValidatedBranch => ({
+        _tag: "ValidatedBranch", session, transcript: { _tag: "Available", messages },
+        acquireLaunch: this.acquireObservedLaunch("resume", session.id),
+        derivation: { childSessionId: session.id, parentSessionId, sourceMessageId,
+          sharedMessages: copiedParent.map((message, index) => ({ parentMessageId: message.id, childMessageId: messages[index]!.id })) },
+      })
+      if (initialTranscript.length === copiedParent.length) {
+        return validated(yield* this.sessionFromThread(initialCopy, "validateFork"), initialTranscript)
+      }
       const childRead = yield* this.readThreadWithOverloadRetry(server, receipt.session.id).pipe(
         Effect.mapError((error) => this.mapTransportError("validateFork", error)),
       )
@@ -408,8 +428,18 @@ export class CodexProvider implements AgentProviderApi {
       }
       const childTranscript = yield* this.normalizeThread(childRead, "validateFork")
       transcript = { _tag: "Available", messages: childTranscript }
-      contradiction = true
-      yield* this.validateCopiedPrefix(receipt.session.id, copiedParent.slice(0, childTranscript.length), childTranscript)
+      if (childTranscript.slice(copiedParent.length).some((message) => excludedParentIds.has(message.id))) {
+        contradiction = true
+        return yield* Effect.fail(this.protocolError("validateFork", "The child copied parent history beyond the requested boundary"))
+      }
+      // A different current path may be a legitimate rewind after launch. Only
+      // changed payloads of evidenced copied identities prove a contradiction.
+      const evidenced = new Map([...copiedParent, ...initialTranscript].map((message) => [message.id, message]))
+      contradiction = childTranscript.some((message) => {
+        const original = evidenced.get(message.id)
+        return original !== undefined && !sameCopiedCodexMessage(original, message)
+      })
+      yield* this.validateCopiedPrefix(receipt.session.id, copiedParent.slice(0, childTranscript.length), childTranscript.slice(0, copiedParent.length))
       contradiction = false
       if (childTranscript.length < copiedParent.length) return {
         _tag: "CreatedIndependentSession" as const, session: receipt.session, transcript,
@@ -417,14 +447,7 @@ export class CodexProvider implements AgentProviderApi {
         verification: { status: "pending" as const, reasonCode: "incomplete" as const, receipt },
       }
       const session = yield* this.sessionFromThread(childRead, "validateFork")
-      return {
-        _tag: "ValidatedBranch" as const, session, transcript,
-        acquireLaunch: this.acquireObservedLaunch("resume", session.id),
-        derivation: {
-          childSessionId: session.id, parentSessionId, sourceMessageId,
-          sharedMessages: copiedParent.map((message, index) => ({ parentMessageId: message.id, childMessageId: childTranscript[index]!.id })),
-        },
-      }
+      return validated(session, childTranscript)
     })
     return read.pipe(Effect.catch((error) => {
       const missing = isMissingCodexThreadErrorCause(error.cause)

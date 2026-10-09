@@ -321,7 +321,7 @@ function drawNode(
         : node.role === "user"
           ? { icon: ICONS.user, label: "User", color: theme.secondary }
           : { icon: ICONS.system, label: "System", color: theme.warning }
-    drawHeading(canvas, node.x + 2, node.y, kind.icon, kind.label, contentWidth, {
+    drawHeading(canvas, node.x + 2, node.y, kind.icon, node.provisional ? `${kind.label} · unverified fork` : kind.label, contentWidth, {
       ...heading,
       fg: selected ? theme.selectedText : kind.color,
     }, heading)
@@ -335,7 +335,7 @@ function drawNode(
   const agent = node.status === "working" || node.status === "blocked"
   const live = liveSessionIds.has(node.session.id)
   const stoppedFork = !live && node.fork?.empty
-  const label = agent ? "Agent" : stoppedFork
+  const label = node.provisional ? "Unverified fork" : agent ? "Agent" : stoppedFork
     ? node.fork?.number === undefined ? "Fork" : `Fork ${node.fork.number}`
     : live ? "Draft" : "Session"
   drawHeading(canvas, node.x + 2, node.y, agent ? ICONS.agent : stoppedFork ? ICONS.branch : ICONS.session, label, titleWidth, {

@@ -1,13 +1,14 @@
 import { Effect } from "effect"
 
 import { buildConversationForest, type ConversationForest } from "../domain/conversation-graph"
-import type { AgentMessage, AgentSession } from "../domain/model"
+import type { AgentMessage, AgentSession, ProvisionalBranch } from "../domain/model"
 import type { BranchRelation, ConversationRemoval } from "../domain/persistence"
 
 interface FamilyInputs {
   readonly sessions: readonly AgentSession[]
   readonly histories: readonly (readonly AgentMessage[] | undefined)[]
   readonly relations: readonly BranchRelation[]
+  readonly provisionalBranches?: readonly ProvisionalBranch[]
   readonly removals: readonly ConversationRemoval[]
   readonly forest: ConversationForest
 }
@@ -17,9 +18,9 @@ const sameItems = <A>(left: readonly A[], right: readonly A[]) =>
   left.length === right.length && left.every((item, index) => item === right[index])
 
 function cachedFamily(key: AgentSession, sessions: readonly AgentSession[], histories: FamilyInputs["histories"],
-  relations: readonly BranchRelation[], removals: readonly ConversationRemoval[]): FamilyInputs | undefined {
+  relations: readonly BranchRelation[], removals: readonly ConversationRemoval[], provisionalBranches: readonly ProvisionalBranch[] = []): FamilyInputs | undefined {
   return families.get(key)?.find((previous) => sameItems(previous.sessions, sessions) &&
-    sameItems(previous.histories, histories) && sameItems(previous.relations, relations) && sameItems(previous.removals, removals))
+    sameItems(previous.histories, histories) && sameItems(previous.relations, relations) && sameItems(previous.removals, removals) && sameItems(previous.provisionalBranches ?? [], provisionalBranches))
 }
 
 function retainFamily(key: AgentSession, family: FamilyInputs): void {
@@ -29,6 +30,7 @@ function retainFamily(key: AgentSession, family: FamilyInputs): void {
 }
 
 export interface FamilyProjectionInput {
+  readonly provisionalBranches?: readonly ProvisionalBranch[]
   readonly sessions: readonly AgentSession[]
   readonly transcripts: ReadonlyMap<string, readonly AgentMessage[]>
   readonly relations: readonly BranchRelation[]
@@ -40,10 +42,10 @@ export function prepareForest(
   build: (input: FamilyProjectionInput) => Effect.Effect<ConversationForest, unknown>,
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function*() {
-    for (const group of groupSessionFamilies(new Map(input.sessions.map((session) => [session.id, session])), input.relations).values()) {
+    for (const group of groupSessionFamilies(new Map(input.sessions.map((session) => [session.id, session])), input.relations, input.provisionalBranches).values()) {
       const histories = group.sessions.map((session) => input.transcripts.get(session.id))
       const key = group.sessions[0]!
-      if (cachedFamily(key, group.sessions, histories, group.relations, input.removals)) continue
+      if (cachedFamily(key, group.sessions, histories, group.relations, input.removals, group.provisionalBranches)) continue
       const forest = yield* build({ ...group, removals: input.removals, transcripts: new Map(group.sessions.flatMap((session, index) =>
         histories[index] === undefined ? [] : [[session.id, histories[index]!] as const])) })
       retainFamily(key, { ...group, histories, removals: input.removals, forest })
@@ -58,8 +60,9 @@ export function projectForest(
   transcripts: ReadonlyMap<string, readonly AgentMessage[]>,
   relations: readonly BranchRelation[],
   removals: readonly ConversationRemoval[],
+  provisionalBranches: readonly ProvisionalBranch[] = [],
 ): ConversationForest {
-  const groups = groupSessionFamilies(sessions, relations)
+  const groups = groupSessionFamilies(sessions, relations, provisionalBranches)
   const graphs: ConversationForest["graphs"] = []
   const graphBySessionId: ConversationForest["graphBySessionId"] = new Map()
   const graphByRootSessionId: ConversationForest["graphByRootSessionId"] = new Map()
@@ -67,11 +70,11 @@ export function projectForest(
   for (const group of groups.values()) {
     const histories = group.sessions.map((session) => transcripts.get(session.id))
     const key = group.sessions[0]!
-    const previous = cachedFamily(key, group.sessions, histories, group.relations, removals)
+    const previous = cachedFamily(key, group.sessions, histories, group.relations, removals, group.provisionalBranches)
     const forest = previous
       ? previous.forest
       : buildConversationForest(group.sessions, new Map(group.sessions.flatMap((session, index) =>
-        histories[index] === undefined ? [] : [[session.id, histories[index]!] as const])), group.relations, removals)
+        histories[index] === undefined ? [] : [[session.id, histories[index]!] as const])), group.relations, removals, group.provisionalBranches)
     retainFamily(key, previous ?? { ...group, histories, removals, forest })
     graphs.push(...forest.graphs)
     for (const [id, graph] of forest.graphBySessionId) graphBySessionId.set(id, graph)
@@ -83,7 +86,7 @@ export function projectForest(
   return { graphs, graphBySessionId, graphByRootSessionId, warnings }
 }
 
-export function groupSessionFamilies(sessions: ReadonlyMap<string, AgentSession>, relations: readonly BranchRelation[]) {
+export function groupSessionFamilies(sessions: ReadonlyMap<string, AgentSession>, relations: readonly BranchRelation[], provisionalBranches: readonly ProvisionalBranch[] = []) {
   const parents = new Map<string, string>()
   const root = (id: string): string => {
     let current = id
@@ -95,19 +98,20 @@ export function groupSessionFamilies(sessions: ReadonlyMap<string, AgentSession>
     }
     return current
   }
-  for (const relation of relations) {
+  for (const relation of [...relations, ...provisionalBranches]) {
     const parent = root(relation.parentSessionId)
     const child = root(relation.childSessionId)
     if (parent !== child) parents.set(child, parent)
   }
-  const groups = new Map<string, { sessions: AgentSession[]; relations: BranchRelation[] }>()
+  const groups = new Map<string, { sessions: AgentSession[]; relations: BranchRelation[]; provisionalBranches: ProvisionalBranch[] }>()
   for (const session of sessions.values()) {
     const key = root(session.id)
     let group = groups.get(key)
-    if (!group) groups.set(key, group = { sessions: [], relations: [] })
+    if (!group) groups.set(key, group = { sessions: [], relations: [], provisionalBranches: [] })
     group.sessions.push(session)
   }
   for (const relation of relations) groups.get(root(relation.parentSessionId))?.relations.push(relation)
+  for (const branch of provisionalBranches) groups.get(root(branch.parentSessionId))?.provisionalBranches.push(branch)
   for (const group of groups.values()) group.sessions.sort((left, right) => left.id.localeCompare(right.id))
   return groups
 }

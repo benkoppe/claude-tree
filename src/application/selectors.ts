@@ -6,7 +6,8 @@ import type { AgentMessage, AgentSession, MessageRef, TranscriptRead } from "../
 import { SESSION_STATUS_PRIORITY, type SessionStatus } from "../domain/session-status"
 import type { ApplicationState } from "./state"
 import { projectForest } from "./forest-projection"
-import { selectHistoryStatus } from "./catalogue"
+import { selectCatalogueFamilies, selectHistoryStatus, selectProvisionalBranches, type CatalogueFamily } from "./catalogue"
+export { selectProvisionalBranches } from "./catalogue"
 
 export type { SessionStatus } from "../domain/session-status"
 
@@ -15,7 +16,7 @@ export interface ProjectedApplicationData {
   readonly transcripts: ReadonlyMap<string, readonly AgentMessage[]>
 }
 
-type ForestInputs = Pick<ApplicationState, "local" | "terminals" | "rewindAnchors" | "relations" | "removals" | "historyStatus">
+type ForestInputs = Pick<ApplicationState, "local" | "terminals" | "rewindAnchors" | "relations" | "removals" | "historyStatus" | "branchVerifications">
 const forestCache = new WeakMap<ApplicationState["provider"], ForestInputs & { readonly forest: ConversationForest }>()
 const projectedCache = new WeakMap<ApplicationState["provider"], {
   readonly local: ApplicationState["local"]
@@ -109,21 +110,53 @@ export function selectConversationForest(state: ApplicationState): ConversationF
   const cached = forestCache.get(state.provider)
   if (cached && cached.local === state.local && cached.historyStatus === state.historyStatus && sameKeys(cached.terminals, state.terminals) &&
     cached.rewindAnchors === state.rewindAnchors && cached.relations === state.relations &&
-    cached.removals === state.removals) return cached.forest
+     cached.removals === state.removals && cached.branchVerifications === state.branchVerifications) return cached.forest
   const data = selectProjectedData(state)
   const forest = projectForest(
     data.sessions,
     data.transcripts,
     selectProjectedRelations(state),
     state.removals,
+    selectProvisionalBranches(state),
   )
   // Reducer collections are immutable. Navigation, modal, and refresh bookkeeping
   // changes can reuse the graph; never mutate a forest returned by this selector.
   forestCache.set(state.provider, {
     local: state.local, terminals: state.terminals, rewindAnchors: state.rewindAnchors,
-    relations: state.relations, removals: state.removals, historyStatus: state.historyStatus, forest,
+    relations: state.relations, removals: state.removals, historyStatus: state.historyStatus, branchVerifications: state.branchVerifications, forest,
   })
   return forest
+}
+
+const navigationFamilies = new WeakMap<ConversationForest, {
+  readonly catalogue: readonly CatalogueFamily[]
+  readonly historyStatus: ApplicationState["historyStatus"]
+  readonly families: readonly CatalogueFamily[]
+}>()
+
+/** Settled topology belongs to the forest; pending discovery must not hide local/live graphs. */
+export function selectNavigationFamilies(state: ApplicationState) {
+  const forest = selectConversationForest(state)
+  const catalogue = selectCatalogueFamilies(state)
+  const cached = navigationFamilies.get(forest)
+  if (cached?.catalogue === catalogue && cached.historyStatus === state.historyStatus) return cached.families
+  const protectedIds = new Set(forest.graphs.filter((graph) => [...graph.sessionIds].some((id) =>
+    state.local.sessions.has(id) || state.terminals.has(id))).flatMap((graph) => [...graph.sessionIds]))
+  const pendingIds = new Set<string>()
+  const pendingFamilies: CatalogueFamily[] = []
+  for (const family of catalogue) {
+    if (![...family.sessionIds].some((id) => selectHistoryStatus(state, id)._tag === "Pending")) continue
+    const sessionIds = new Set([...family.sessionIds].filter((id) => !protectedIds.has(id)))
+    if (sessionIds.size === 0) continue
+    const root = sessionIds.has(family.root.id) ? family.root
+      : state.local.sessions.get(sessionIds.values().next().value!) ?? state.provider.sessions.get(sessionIds.values().next().value!)!
+    pendingFamilies.push({ root, sessionIds })
+    for (const id of sessionIds) pendingIds.add(id)
+  }
+  const families = [...forest.graphs.filter((graph) => ![...graph.sessionIds].some((id) => pendingIds.has(id)))
+    .map((graph) => ({ root: graph.rootSession, sessionIds: graph.sessionIds })), ...pendingFamilies]
+  navigationFamilies.set(forest, { catalogue, historyStatus: state.historyStatus, families })
+  return families
 }
 
 export function selectProjectedRelations(state: ApplicationState) {

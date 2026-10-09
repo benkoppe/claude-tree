@@ -50,27 +50,31 @@ test("duplicate-session dialog defaults to Cancel and requires an explicit Open 
   } finally { await running.stop() }
 })
 
-test("verification progress has a cancel action and paused verification has a distinct retry action", async () => {
+test("background verification has no dedicated shortcut and leaves Refresh available", async () => {
   const setup = await createTestRenderer({ width: 140, height: 24 })
   const verifying: ApplicationViewModel = { ...rootsView(), branchVerifications: new Map([["root-1", {
     status: "verifying", reason: "Fork created; verifying history", retryable: true,
   }]]) }
   const running = await startPresentation(setup.renderer, verifying)
   try {
-    await frame(setup, (value) => value.includes("verifying fork · cancel"))
+    const initial = await frame(setup, (value) => value.includes("r refresh"))
+    expect(initial).not.toContain("verifying fork · cancel")
+    expect(initial).not.toContain("Verifying fork history")
     setup.mockInput.pressKey("v")
-    await waitFor(() => running.harness.calls.includes("verification:cancel:root-1"))
     await Effect.runPromise(running.harness.update({ ...verifying, branchVerifications: new Map([["root-1", {
       status: "paused", reason: "Child preserved independently", retryable: true,
     }]]) }))
-    await frame(setup, (value) => value.includes("retry verification"))
+    const paused = await frame(setup, (value) => value.includes("r refresh"))
+    expect(paused).not.toContain("retry verification")
     setup.mockInput.pressKey("v")
-    await waitFor(() => running.harness.calls.includes("verification:retry:root-1"))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.includes("refresh"))
+    expect(running.harness.calls.some((call) => call.startsWith("verification:"))).toBeFalse()
     expect(running.harness.calls.some((call) => call.startsWith("branch:"))).toBeFalse()
   } finally { await running.stop() }
 })
 
-test("read-only verification retry animates and cancellation restores its shortcut on unchanged root rows", async () => {
+test("background verification status changes do not add foreground progress", async () => {
   const setup = await createTestRenderer({ width: 140, height: 24 })
   const roots = idleRootsView()
   const clock = controlSpinnerClock()
@@ -78,23 +82,22 @@ test("read-only verification retry animates and cancellation restores its shortc
   try {
     running = await startPresentation(setup.renderer, roots)
     await frame(setup, (value) => value.includes("Conversation roots"))
-    await Effect.runPromise(running.harness.update({ ...roots, pendingOperations: new Map([[1, "verification"]]),
+    await Effect.runPromise(running.harness.update({ ...roots,
       branchVerifications: new Map([["root-1", { status: "verifying", reason: "Reading captured fork history", retryable: true }]]),
     }))
-    await frame(setup, (value) => value.includes("| verifying fork · cancel") && value.includes("| Verifying fork history"))
-    clock.tick!()
-    await frame(setup, (value) => value.includes("/ verifying fork · cancel"))
+    const verifying = await frame(setup, (value) => value.includes("r refresh"))
+    expect(verifying).not.toContain("Verifying fork history")
     setup.mockInput.pressKey("v")
-    await waitFor(() => running!.harness.calls.includes("verification:cancel:root-1"))
     await Effect.runPromise(running.harness.update({ ...roots,
       branchVerifications: new Map([["root-1", { status: "paused", reason: "Child preserved independently", retryable: true }]]),
     }))
-    await frame(setup, (value) => value.includes("v retry verification") && !value.includes("Verifying fork history"))
-    expect(clock.cleared).toBeTrue()
+    const paused = await frame(setup, (value) => value.includes("r refresh"))
+    expect(paused).not.toContain("retry verification")
     // No other root-row or operation change can invalidate this next publication.
     await Effect.runPromise(running.harness.update({ ...roots, branchVerifications: new Map() }))
     await frame(setup, (value) => !value.includes("retry verification"))
     expect(running.harness.calls.some((call) => call.startsWith("branch:"))).toBeFalse()
+    expect(running.harness.calls.some((call) => call.startsWith("verification:"))).toBeFalse()
   } finally {
     try { await running?.stop() }
     finally { clock.restore() }
@@ -2139,9 +2142,6 @@ function makeHarness(
       branchFrom: (target: { sessionId: string; messageId: string }) => Effect.sync(() => {
         calls.push(`branch:${target.sessionId}:${target.messageId}`)
         return true
-      }),
-      manageBranchVerification: (sessionId: string, action: string) => Effect.sync(() => {
-        calls.push(`verification:${action}:${sessionId}`)
       }),
       returnFromTerminal: Effect.gen(function*() {
         calls.push("return-terminal")

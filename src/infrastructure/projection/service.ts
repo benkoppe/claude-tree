@@ -6,7 +6,7 @@ import { makeCloseOperation } from "../../services/close-operation"
 import { withOperationTimeout } from "../../services/operation-deadline"
 
 import { prepareForest } from "../../application/forest-projection"
-import { selectProjectedData, selectProjectedRelations, selectVisibleEndpointSessionIds } from "../../application/selectors"
+import { selectProjectedData, selectProjectedRelations, selectProvisionalBranches, selectVisibleEndpointSessionIds } from "../../application/selectors"
 import type { ApplicationState } from "../../application/state"
 import { cacheGraphLayout } from "../../application/view-model"
 import type { ProjectionRequest, ProjectionResponse } from "./protocol"
@@ -53,7 +53,7 @@ export function makeProjectionService(
         const data = selectProjectedData(state)
         const visible = selectVisibleEndpointSessionIds(state)
         return prepareForest({ sessions: [...data.sessions.values()], transcripts: data.transcripts,
-          relations: selectProjectedRelations(state), removals: state.removals }, (input) => Effect.gen(function*() {
+          relations: selectProjectedRelations(state), removals: state.removals, provisionalBranches: selectProvisionalBranches(state) }, (input) => Effect.gen(function*() {
             if (failure || closing) return yield* Effect.fail(failure ?? new Error("Projection worker is closing"))
             const id = nextId++
             const reply = yield* Deferred.make<Extract<ProjectionResponse, { _tag: "Projected" }>, Error>()

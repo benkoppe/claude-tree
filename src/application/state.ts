@@ -4,6 +4,7 @@ import type {
   AgentSession,
   DraftPreview,
   NavigationTarget,
+  ProvisionalBranch,
   TranscriptRead,
 } from "../domain/model"
 import type { BranchRelation, ConversationRemoval } from "../domain/persistence"
@@ -124,12 +125,13 @@ export interface LocalOverlayState {
 }
 
 export interface BranchVerificationState {
+  readonly origin?: ProvisionalBranch
   readonly status: "verifying" | "paused" | "unavailable" | "contradicted" | "persistence-failed" | "independent" | "prepared"
   readonly reason: string
   readonly retryable: boolean
 }
 
-export type ApplicationOperationKind = "fork" | "verification" | "new" | "open" | "stop" | "remove" | "return"
+export type ApplicationOperationKind = "fork" | "new" | "open" | "stop" | "remove" | "return"
 
 export interface ApplicationState {
   readonly branchVerifications: ReadonlyMap<string, BranchVerificationState>

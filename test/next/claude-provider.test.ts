@@ -488,6 +488,42 @@ describe("Effect Claude provider", () => {
     ])
   })
 
+  test("fork verification accepts native continuation after the exact copied boundary", async () => {
+    const parent = [message(ROOT, "p", "assistant", "original answer")]
+    const copy = copyMessage(parent[0]!, CHILD, "c")
+    const native = message(CHILD, "new", "user", "new prompt")
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [copy, native] },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copy, ROOT, "p"), native] } })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "p" }))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(outcome.derivation.sharedMessages).toEqual([{ parentMessageId: "p", childMessageId: "c" }])
+  })
+
+  test("complete physical copy evidence survives a child-native rewind of the active path", async () => {
+    const parent = [message(ROOT, "p", "assistant", "original answer")]
+    const copy = copyMessage(parent[0]!, CHILD, "c")
+    const native = message(CHILD, "new", "user", "replacement prompt")
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [native] },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copy, ROOT, "p"), native] } })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "p" }))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(outcome.derivation.sharedMessages).toEqual([{ parentMessageId: "p", childMessageId: "c" }])
+  })
+
+  test("continued child history cannot hide a contradictory re-emission of a copied identity", async () => {
+    const parent = [message(ROOT, "p", "assistant", "original answer")]
+    const copy = copyMessage(parent[0]!, CHILD, "c")
+    const replacement = message(CHILD, "c", "assistant", "different answer")
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [replacement] },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copy, ROOT, "p"), replacement] } })
+    const outcome = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "p" }))
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected contradiction")
+    expect(outcome.verification?.status).toBe("contradicted")
+  })
+
   test("distinct copied source identities cannot collapse onto one repeated child UUID", async () => {
     const parent = [message(ROOT, "one", "assistant", "same payload"), message(ROOT, "two", "assistant", "same payload")]
     const copied = parent.map((entry) => copyMessage(entry, CHILD, "collapsed"))

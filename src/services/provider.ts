@@ -7,6 +7,7 @@ import type {
   BranchDerivation,
   DraftPreview,
   MessageRef,
+  ProvisionalBranch,
   TerminalObserver,
   TerminalObservation,
   TranscriptRead,
@@ -127,6 +128,9 @@ export type BranchOutcome = ValidatedBranch | CreatedIndependentSession | Ambigu
 /** The provider retains captured source evidence; verification never mutates a session. */
 export interface BranchVerificationReceipt {
   readonly session: AgentSession
+  /** Launch admission is independent of copied-history verification. */
+  readonly prepared?: PreparedTerminal
+  readonly origin?: ProvisionalBranch
   readonly verify: Effect.Effect<ValidatedBranch | CreatedIndependentSession, ProviderError | ProviderProtocolError>
 }
 
