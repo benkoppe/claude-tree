@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { cp, mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Database } from "bun:sqlite"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
@@ -25,8 +26,7 @@ afterEach(async () => {
 })
 const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope>) => Effect.runPromise(Scope.provide(effect, testScope))
 async function fixture() {
-  await mkdir("/tmp/opencode", { recursive: true })
-  const directory = await realpath(await mkdtemp("/tmp/opencode/sqlite-test-"))
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "sqlite-test-")))
   directories.push(directory)
   const projectDirectory = join(directory, "project"); await mkdir(projectDirectory)
   return { projectDirectory, stateHome: join(directory, "state"), providerId: "claude", instanceId: "one" }

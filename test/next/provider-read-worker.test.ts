@@ -186,7 +186,7 @@ test("production worker reads real SDK transcripts, flushes a partial batch, and
 })
 
 test("production Codex worker transfers response grouping and hidden fork boundaries without raw payloads", async () => {
-  const directory = await realpath(await mkdtemp("/tmp/opencode/claude-tree-codex-read-"))
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-codex-read-")))
   const options = { providerId: "codex" as const, projectPath: directory }
   const thread = { id: "worker-thread", name: "Worker", preview: "Question", updatedAt: 1,
     cwd: directory, gitInfo: null, turns: [{ id: "turn", status: "completed", items: [
