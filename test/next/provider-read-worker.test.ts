@@ -186,7 +186,7 @@ test("production worker reads real SDK transcripts, flushes a partial batch, and
 })
 
 test("production Codex worker transfers response grouping and hidden fork boundaries without raw payloads", async () => {
-  const directory = await realpath(await mkdtemp("/tmp/opencode/claude-tree-codex-read-"))
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-tree-codex read's-")))
   const options = { providerId: "codex" as const, projectPath: directory }
   const thread = { id: "worker-thread", name: "Worker", preview: "Question", updatedAt: 1,
     cwd: directory, gitInfo: null, turns: [{ id: "turn", status: "completed", items: [
@@ -199,8 +199,8 @@ test("production Codex worker transfers response grouping and hidden fork bounda
       { id: "next-user", type: "userMessage", content: [{ type: "text", text: "Next question" }] },
     ] }] }
   try {
-    await writeFile(join(directory, "codex"), `#!${process.execPath}
-import { createInterface } from "node:readline";
+    const script = join(directory, "codex.ts")
+    await writeFile(script, `import { createInterface } from "node:readline";
 const thread = ${JSON.stringify(thread)};
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
@@ -208,6 +208,10 @@ for await (const line of createInterface({ input: process.stdin })) {
   const result = request.method === "initialize" ? {} : request.method === "thread/read" ? { thread } : null;
   process.stdout.write(JSON.stringify({ id: request.id, result }) + "\\n");
 }
+`)
+    const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+    await writeFile(join(directory, "codex"), `#!/bin/sh
+exec ${shellQuote(process.execPath)} ${shellQuote(script)} "$@"
 `, { mode: 0o700 })
     const workerEntry = new URL("../../src/infrastructure/providers/read-worker.ts", import.meta.url).href
     const bootstrap = join(directory, "worker.ts")

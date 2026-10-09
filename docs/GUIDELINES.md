@@ -18,6 +18,7 @@ Follow general code best practices, such as:
 - Keep application-state mutation behind the application actor. Asynchronous commands and callbacks should return typed events carrying stable owner and sequence identities rather than retaining mutable state references.
 - Keep normal resource cleanup completion-driven and idempotent, without default observation deadlines. Explicit caller deadlines may report incomplete cleanup but never prove release; retain time windows for signal escalation. Cleanup state is process-local; do not introduce persisted orphan recovery. OS-held session guards are advisory across invocations, with a user-confirmed override, and release automatically when the application exits.
 - Test timeouts, retries, heartbeats, and escalation with Effect's `TestClock` or controlled deferred values. Do not add real sleeps to deterministic unit tests.
+- Create filesystem test fixtures with `mkdtemp(join(tmpdir(), prefix))`, not hardcoded host or coding-harness directories. Tests must run independently and respect the platform's temporary directory; retain `realpath` where canonical project identity matters and clean up each owned fixture.
 
 ## Responsiveness Benchmark
 
