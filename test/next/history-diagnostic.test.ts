@@ -348,7 +348,7 @@ test("failed diagnostic signal dispatch remains a cleanup failure even after ver
 
 test("a failed diagnostic spawn settles without awaiting a nonexistent child exit", async () => {
   const report = await Effect.runPromise(runHistoryWorker({ projectPath: PRIVATE_PATH, sessionId: SECRET, build: UNKNOWN_BUILD },
-    () => fork("unused.ts", [], { execPath: `/tmp/opencode/nonexistent-diagnostic-${crypto.randomUUID()}`, stdio: ["ignore", "ignore", "ignore", "ipc"] })))
+    () => fork("unused.ts", [], { execPath: join(tmpdir(), `nonexistent-diagnostic-${crypto.randomUUID()}`), stdio: ["ignore", "ignore", "ignore", "ipc"] })))
   expect(report.failure?.code).toBe("worker-failed")
   expect(JSON.stringify(report)).not.toContain(PRIVATE_PATH)
 })
