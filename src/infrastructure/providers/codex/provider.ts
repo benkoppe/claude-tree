@@ -79,6 +79,8 @@ export interface CodexMessage extends AgentMessage {
   readonly turnId: string
   readonly turnStatus: CodexTurnStatus
   readonly itemIndex: number
+  /** User-node convenience target; never included in the copied provider payload. */
+  readonly forkBoundaryId?: string
 }
 
 export type CodexAppServerFactory = () => Effect.Effect<
@@ -277,6 +279,7 @@ export class CodexProvider implements AgentProviderApi {
     let mutationMayHaveDispatched = false
     let deadlineExpired = false
     let knownChild: BranchVerificationReceipt | undefined
+    let mutationSourceMessageId = target.messageId
     const operation = this.withServer((server) => Effect.gen({ self: this }, function*() {
       yield* this.validateSessionId(target.sessionId, "branchFrom")
       const parentThread = yield* this.requireThread(server, target.sessionId, "branchFrom")
@@ -295,12 +298,23 @@ export class CodexProvider implements AgentProviderApi {
           "The selected historical message is no longer available",
         ))
       }
-      yield* this.validateForkTarget(selected, parentThread)
+      const sourceIndex = selected.role === "user"
+        ? parentTranscript.findIndex((message) => message.id === selected.forkBoundaryId)
+        : selectedIndex
+      const source = parentTranscript[sourceIndex]
+      if (source === undefined) {
+        return yield* Effect.fail(this.protocolError(
+          "branchFrom",
+          "Codex user-message forks require a preceding completed Agent response; first prompts and mid-turn steering inputs are unsupported",
+        ))
+      }
+      yield* this.validateForkTarget(source, parentThread)
+      mutationSourceMessageId = source.id
 
-      const copiedParent = parentTranscript.slice(0, selectedIndex + 1)
+      const copiedParent = parentTranscript.slice(0, sourceIndex + 1)
       const mutation = yield* server.forkThread(
         target.sessionId,
-        selected.turnId,
+        source.turnId,
         this.projectPath,
         () => { mutationMayHaveDispatched = true },
       ).pipe(
@@ -313,7 +327,7 @@ export class CodexProvider implements AgentProviderApi {
             _tag: "AmbiguousBranchMutation" as const,
             providerId: this.id,
             parentSessionId: target.sessionId,
-            sourceMessageId: selected.id,
+            sourceMessageId: source.id,
             reason: mutation.error.message,
             reconciliation: "full-snapshot" as const,
           }
@@ -335,17 +349,17 @@ export class CodexProvider implements AgentProviderApi {
       const receipt: BranchVerificationReceipt = {
         session: provisionalSession,
         verify: Effect.suspend(() => this.withServer((reader) => this.verifyCreatedFork(reader, receipt,
-          target.sessionId, selected.id, copiedParent), "validateFork", true)),
+          target.sessionId, source.id, copiedParent), "validateFork", true)),
       }
       yield* Effect.uninterruptible(Effect.sync(() => { knownChild = receipt }).pipe(
         Effect.andThen(created ? created(receipt) : Effect.void)))
-      return yield* this.verifyCreatedFork(server, receipt, target.sessionId, selected.id, copiedParent)
+      return yield* this.verifyCreatedFork(server, receipt, target.sessionId, source.id, copiedParent)
     }), "branchFrom")
     const ambiguity = (reason: string): AmbiguousBranchMutation => ({
       _tag: "AmbiguousBranchMutation",
       providerId: this.id,
       parentSessionId: target.sessionId,
-      sourceMessageId: target.messageId,
+      sourceMessageId: mutationSourceMessageId,
       reason,
       reconciliation: "full-snapshot",
     })
@@ -1087,6 +1101,7 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
   const messages: CodexMessage[] = []
   const turnIds = new Set<string>()
   const itemIds = new Set<string>()
+  let precedingAgentBoundaryId: string | undefined
   for (const sourceTurn of thread.turns) {
     const candidateTurn: unknown = sourceTurn
     if (!isRecord(candidateTurn) || typeof candidateTurn.id !== "string" ||
@@ -1100,6 +1115,8 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
     turnIds.add(turn.id)
     const turnStart = messages.length
     let displayGroupId = turn.items[0]?.id
+    let userSeen = false
+    let agentSeen = false
     for (const [itemIndex, sourceItem] of turn.items.entries()) {
       const candidateItem: unknown = sourceItem
       if (!isRecord(candidateItem) || typeof candidateItem.id !== "string" ||
@@ -1110,7 +1127,13 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
       const item = candidateItem as unknown as CodexThreadItem
       itemIds.add(item.id)
       const normalized = normalizeCodexItem(item)
-      if (item.type === "userMessage") displayGroupId = item.id
+      const forkBoundaryId = normalized.role === "user" && !userSeen && !agentSeen
+        ? precedingAgentBoundaryId : undefined
+      if (item.type === "userMessage") {
+        displayGroupId = item.id
+        userSeen = true
+      }
+      if (normalized.role === "agent") agentSeen = true
       messages.push({
         id: item.id,
         ...normalized,
@@ -1122,7 +1145,8 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
         turnStatus: turn.status,
         itemIndex,
         turnComplete: turn.status !== "inProgress",
-        forkable: false,
+        forkable: forkBoundaryId !== undefined,
+        ...(forkBoundaryId === undefined ? {} : { forkBoundaryId }),
         ...(item.type !== "userMessage" && displayGroupId !== undefined ? { displayGroupId } : {}),
       })
     }
@@ -1130,6 +1154,10 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
     if (turn.status === "completed" && lastVisible?.role === "agent" && lastVisible.displayGroupId === displayGroupId) {
       const boundaryIndex = messages.length - 1
       messages[boundaryIndex] = { ...messages[boundaryIndex]!, forkable: true }
+    }
+    if (agentSeen) {
+      const boundary = messages.at(-1)!
+      precedingAgentBoundaryId = boundary.forkable ? boundary.id : undefined
     }
   }
   return messages

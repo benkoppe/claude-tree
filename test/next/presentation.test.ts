@@ -20,6 +20,7 @@ import {
   projectApplicationViewModel,
 } from "../../src/application"
 import type { AgentMessage, AgentSession, NavigationTarget } from "../../src/domain/model"
+import { normalizeCodexThread } from "../../src/infrastructure/providers/codex/provider"
 import {
   makeOpenTuiPresentation,
   presentationTheme,
@@ -700,6 +701,27 @@ test("forks the explicit raw boundary rather than the node's navigation alias", 
     setup.mockInput.pressKey("f")
     await waitFor(() => running.harness.calls.includes("branch:root-1:hidden-tail"))
     expect(running.harness.calls).not.toContain("branch:root-1:message")
+  } finally { await running.stop() }
+})
+
+test("offers Fork on an eligible Codex User node without requiring prompt replay support", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const messages = normalizeCodexThread({ turns: [
+    { id: "first-turn", status: "completed", items: [
+      { id: "answer", type: "agentMessage", text: "Previous answer" },
+      { id: "boundary", type: "reasoning", summary: [] },
+    ] },
+    { id: "next-turn", status: "inProgress", items: [
+      { id: "next-user", type: "userMessage", content: [{ type: "text", text: "Next question" }] },
+    ] },
+  ] })
+  const initial = canonicalView([agentSession("root-1", "Codex user fork", 1)], new Map([["root-1", messages]]), [],
+    "root-1", { kind: "message", preferred: { sessionId: "root-1", messageId: "next-user" }, aliases: [] })
+  const running = await startPresentation(setup.renderer, initial)
+  try {
+    await frame(setup, (value) => value.includes("Next question") && value.includes("f fork"))
+    setup.mockInput.pressKey("f")
+    await waitFor(() => running.harness.calls.includes("branch:root-1:next-user"))
   } finally { await running.stop() }
 })
 

@@ -195,6 +195,8 @@ test("production Codex worker transfers response grouping and hidden fork bounda
       { id: "tool", type: "commandExecution", command: "pwd" },
       { id: "answer", type: "agentMessage", text: "Answer" },
       { id: "tail", type: "reasoning", summary: [] },
+    ] }, { id: "next-turn", status: "inProgress", items: [
+      { id: "next-user", type: "userMessage", content: [{ type: "text", text: "Next question" }] },
     ] }] }
   try {
     await writeFile(join(directory, "codex"), `#!${process.execPath}
@@ -222,11 +224,12 @@ await import(${JSON.stringify(workerEntry)});
       if (read?._tag === "Unavailable") throw new Error(read.reason)
       expect(read?._tag).toBe("Available")
       if (read?._tag !== "Available") throw new Error("Expected readable Codex transcript")
-      expect(read.messages.map((message) => message.displayGroupId)).toEqual([undefined, "u", "u", "u", "u"])
-      expect(read.messages.map((message) => message.forkable)).toEqual([false, false, false, false, true])
+      expect(read.messages.map((message) => message.displayGroupId)).toEqual([undefined, "u", "u", "u", "u", undefined])
+      expect(read.messages.map((message) => message.forkable)).toEqual([false, false, false, false, true, true])
       for (const message of read.messages) {
         expect(message).not.toHaveProperty("rawItem")
         expect(message).not.toHaveProperty("rawTurn")
+        expect(message).not.toHaveProperty("forkBoundaryId")
         expect(message.copyIdentity).toBeDefined()
       }
       yield* reads.close
