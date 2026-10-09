@@ -739,6 +739,15 @@ class ClientImpl implements CodexAppServerClient {
       }
 
       if (this.transport.processGroup) {
+        // Reap a cooperative child before probing its group: Darwin can return
+        // EPERM for a group whose only remaining member is an unreaped zombie.
+        const cooperativeExit = yield* Effect.exit(Effect.interruptible(Effect.tryPromise({
+          try: () => this.transport.exited, catch: (cause) => cause,
+        })).pipe(Effect.timeoutOrElse({
+          duration: this.shutdownTimeoutMs,
+          orElse: () => Effect.void,
+        })))
+        if (Exit.isFailure(cooperativeExit)) failures.push(Cause.squash(cooperativeExit.cause))
         const result = yield* cleanupProcessGroup(this.transport.processGroup, {
           gracePeriodMs: this.shutdownTimeoutMs,
           killPeriodMs: this.shutdownTimeoutMs,
