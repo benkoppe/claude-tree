@@ -1,6 +1,8 @@
 import {
   BoxRenderable,
   CliRenderEvents,
+  InputRenderable,
+  InputRenderableEvents,
   RGBA,
   ScrollBoxRenderable,
   TextAttributes,
@@ -51,6 +53,9 @@ import {
 import { displayWidth, truncateToWidth } from "./text"
 import { presentationTheme as theme } from "./theme"
 import { TERMINAL_RETURN_BAR_HEIGHT } from "../terminal-layout"
+import { SearchClient } from "../infrastructure/search/client"
+import type { SearchDocument } from "../infrastructure/search/index"
+import { cursorRelativeHit, retainedSearchNodeId, retainedSearchRootId, sameSearchDocuments, searchDocuments, searchScope } from "./search"
 
 export const MINIMUM_PRESENTATION_WIDTH = 50
 export const MINIMUM_PRESENTATION_HEIGHT = 12
@@ -73,6 +78,7 @@ const CHROME_HEIGHT = HEADER_HEIGHT + FOOTER_HEIGHT + SEPARATOR_HEIGHT * 2
 const SPINNER_INTERVAL_MS = 80
 const OPERATION_SPINNER_FRAMES = ["|", "/", "-", "\\"] as const
 const HISTORY_LOADING_MESSAGE = "This tree is still loading. You can open it when loading finishes."
+const EMPTY_SEARCH_MATCHES: ReadonlySet<string> = new Set()
 const TERMINAL_RETURN_CONTROL: FooterControl = { key: "Ctrl+Space", description: "back", action: "return" }
 const TERMINAL_RETURN_PREFIX = " c/t · "
 
@@ -88,6 +94,7 @@ export interface OpenTuiProviderIdentity {
 }
 
 export interface OpenTuiPresentationOptions {
+  readonly createSearchClient?: () => Pick<SearchClient, "request" | "close">
   readonly resumeCommand?: string
   readonly setProcessTitle?: (title: string) => void
   readonly setTerminalTitle?: (title: string) => void
@@ -125,6 +132,11 @@ type FooterAction =
   | "about"
   | "details"
   | "return"
+  | "search"
+  | "search-next"
+  | "search-previous"
+  | "search-accept"
+  | "search-close"
 
 interface FooterControl {
   readonly key: string
@@ -190,6 +202,7 @@ type PendingMouseAction =
 const ROOT_CONTROLS: readonly FooterControl[] = [
   { key: "↑↓/jk", description: "select" },
   { key: "Enter", description: "open", action: "enter-root" },
+  { key: "/", description: "search", action: "search" },
   { key: "n", description: "new", action: "new" },
   { key: "d", description: "delete", action: "remove" },
   { key: "x", description: "kill", action: "stop" },
@@ -202,6 +215,7 @@ const GRAPH_CONTROLS: readonly FooterControl[] = [
   { key: "↑↓/kj", description: "edges" },
   { key: "←→/hl", description: "branches" },
   { key: "g/G", description: "top/bottom" },
+  { key: "/", description: "search", action: "search" },
   { key: "Enter", description: "open", action: "open" },
   { key: "f", description: "fork", action: "fork" },
   { key: "c", description: "copy", action: "copy" },
@@ -313,6 +327,20 @@ class OpenTuiPresentationController {
   private readonly errorScroll: ScrollBoxRenderable
   private readonly errorText: ErrorTextRenderable
   private readonly dialogActions: TextRenderable
+  private readonly searchInput: InputRenderable
+  private readonly searchPanel: BoxRenderable
+  private readonly searchQueryLine: BoxRenderable
+  private readonly searchContext: TextRenderable
+  private searchClient: Pick<SearchClient, "request" | "close"> | undefined
+  private searchState: {
+    scope: string; query: string; documents: readonly SearchDocument[]; source: object
+    hits: readonly string[]; selected: number; anchor: string | null
+    matchingNodeIds: ReadonlySet<string>; matchesQuery: string | null; matchesDocuments: readonly SearchDocument[] | undefined
+    excerpt: string; excerptFor: string | null; busy: boolean; open: boolean; acceptWhenReady: boolean; pendingSteps: number; notice: string
+  } | undefined
+  private savedSearch: typeof this.searchState
+  private searchRequestId = 0
+  private searchCorpus: readonly SearchDocument[] | undefined
 
   private viewModel: ApplicationViewModel | undefined
   private selectedRootSessionId: string | null = null
@@ -544,6 +572,41 @@ class OpenTuiPresentationController {
       onMouseUp: this.guardedOnDialogActionsMouseUp,
     })
     this.dialogPanel.add(dialogHeader)
+    this.searchPanel = new BoxRenderable(renderer, {
+      id: "search-panel", visible: false, height: 5, flexShrink: 0, marginX: HORIZONTAL_MARGIN,
+      backgroundColor: theme.background,
+    })
+    this.searchInput = new InputRenderable(renderer, {
+      id: "search-input", visible: false, flexGrow: 1, placeholder: "Search full text",
+      backgroundColor: theme.background, focusedBackgroundColor: theme.background, textColor: theme.textMuted, focusedTextColor: theme.textMuted,
+      onMouseDown: this.guardCallback("Edit search query", (event: MouseEvent) => {
+        if (this.searchState && !this.searchState.open) {
+          event.preventDefault()
+          event.stopPropagation()
+          this.openSearch()
+        }
+      }),
+    })
+    this.searchInput.on(InputRenderableEvents.INPUT, () => {
+      if (!this.searchState?.open) return
+      this.searchState.query = this.searchInput.value
+      this.searchState.notice = ""
+      this.searchState.hits = []
+      this.searchState.matchingNodeIds = EMPTY_SEARCH_MATCHES
+      this.searchState.selected = 0
+      this.searchState.pendingSteps = 0
+      this.updateSearch(true)
+    })
+    this.searchContext = new TextRenderable(renderer, {
+      id: "search-context", flexGrow: 1, fg: theme.textMuted, bg: theme.background,
+      wrapMode: "word", selectable: false, content: "",
+    })
+    this.searchQueryLine = new BoxRenderable(renderer, { id: "search-query-line", visible: false, height: 1, marginX: HORIZONTAL_MARGIN, flexDirection: "row" })
+    this.searchQueryLine.add(new TextRenderable(renderer, { id: "search-prefix", content: "/", width: 1, fg: theme.textMuted, bg: theme.background }))
+    this.searchQueryLine.add(this.searchInput)
+    this.navigator.add(this.searchQueryLine)
+    this.searchPanel.add(this.searchContext)
+    this.navigator.add(this.searchPanel)
     this.dialogPanel.add(this.dialogBody)
     this.dialogPanel.add(this.errorScroll)
     this.dialogPanel.add(this.dialogActions)
@@ -557,6 +620,7 @@ class OpenTuiPresentationController {
     const self = this
     const cleanup = Effect.gen(function*() {
       yield* Effect.sync(() => self.teardown())
+      if (self.searchClient) yield* Effect.promise(() => self.searchClient!.close())
       yield* self.appRuntime.shutdown
     })
     return Effect.uninterruptible(Effect.matchCauseEffect(cleanup, {
@@ -654,6 +718,7 @@ class OpenTuiPresentationController {
       this.pendingStoppedEndpoint = null
     }
     this.reconcileModal(viewModel.modal)
+    this.reconcileSearch()
     const unchangedRoots = previous?.surface._tag === "Roots" && viewModel.surface._tag === "Roots" &&
       previous.surface.roots === viewModel.surface.roots && previousRootSelection === this.selectedRootSessionId &&
       previous.modal === viewModel.modal && previous.refreshing === viewModel.refreshing &&
@@ -694,6 +759,7 @@ class OpenTuiPresentationController {
     this.graphViewportOffset = null
     this.graphNavigationIntent = null
     this.leafPicker = null
+    if (this.searchState) this.updateSearch(this.searchState.busy && this.searchState.open, false, !this.searchState.busy)
     if (this.tooSmall() && this.viewModel?.modal) this.enqueue(this.appRuntime.closeModal)
     this.render()
   }
@@ -709,6 +775,10 @@ class OpenTuiPresentationController {
     }
     if (!surface || this.stopping) return
     try {
+      if (this.searchState?.open) {
+        this.handleSearchKey(key)
+        return
+      }
       if (this.leafPicker) {
         key.stopPropagation()
         this.handleLeafPickerKey(key)
@@ -719,9 +789,18 @@ class OpenTuiPresentationController {
         this.handleModalKey(key)
         return
       }
+      if (this.searchState) {
+        this.handleAcceptedSearchKey(key)
+        return
+      }
       if (isQuestionMarkKey(key) && !key.repeated) {
         key.stopPropagation()
         this.enqueue(this.appRuntime.openModal({ _tag: "About" }))
+        return
+      }
+      if (isUnmodifiedKey(key, "/") && !key.repeated && !this.interactionBlocked()) {
+        key.stopPropagation()
+        this.openSearch()
         return
       }
       if (surface._tag === "Roots") this.handleRootsKey(key)
@@ -738,6 +817,258 @@ class OpenTuiPresentationController {
 
   private rememberConsumedKeyRelease(key: KeyEvent): void {
     if (key.source === "kitty") this.consumedKeyReleases.add(keyIdentity(key))
+  }
+
+  private openSearch(): void {
+    const surface = this.viewModel?.surface
+    if (!surface) return
+    const scope = searchScope(surface)
+    if (!scope) return
+    const source = surface._tag === "Roots" ? surface.roots : surface._tag === "Graph" ? surface.unselectedNodes ?? surface.nodes : surface
+    if (this.searchState?.scope !== scope) this.searchState = {
+      scope, query: "", documents: searchDocuments(surface), source,
+      hits: [], selected: 0, anchor: null, excerpt: "", excerptFor: null, busy: false, open: false, acceptWhenReady: false, pendingSteps: 0, notice: "",
+      matchingNodeIds: EMPTY_SEARCH_MATCHES, matchesQuery: null, matchesDocuments: undefined,
+    }
+    const state = this.searchState!
+    this.savedSearch = state.query.trim() ? { ...state, open: false, acceptWhenReady: false } : undefined
+    state.anchor = this.searchCursor()
+    this.searchInput.visible = true
+    this.searchQueryLine.visible = true
+    this.searchInput.placeholder = surface._tag === "Roots" ? "Search titles" : "Search full text"
+    this.searchInput.value = state.query
+    state.open = true
+    state.acceptWhenReady = false
+    this.searchInput.focus()
+    this.updateSearch(true)
+  }
+
+  private closeSearch(): void {
+    if (this.searchState) this.searchState.open = false
+    this.searchInput.blur()
+    this.render()
+  }
+
+  private dismissSearch(): void {
+    this.closeSearch()
+    this.searchState = undefined
+    this.savedSearch = undefined
+    this.searchCorpus = undefined
+    const id = ++this.searchRequestId
+    if (this.searchClient) void this.searchClient.request({ id, documents: [], query: "" }).catch(() => {})
+  }
+
+  private searchCursor(): string | null {
+    const roots = this.rootsSurface()?.roots
+    return roots ? indexRootViews(roots).bySessionId.get(this.selectedRootSessionId ?? "")?.sessionId ?? null : this.selectedGraphNode()?.id ?? null
+  }
+
+  private jumpSearch(id: string | null): void {
+    if (!id || id === this.searchCursor()) return
+    if (this.graphSurface()) {
+      this.graphViewportOffset = null
+      this.graphNavigationIntent = null
+      this.selectGraphNode(id)
+    } else if (this.rootsSurface()?.roots.some((root) => root.sessionId === id)) this.queueRootSelection(id)
+  }
+
+  private cancelSearch(): void {
+    const anchor = this.searchState?.anchor ?? null
+    this.searchRequestId++
+    this.closeSearch()
+    this.searchState = this.savedSearch
+    this.savedSearch = undefined
+    this.jumpSearch(anchor)
+    if (this.searchState) {
+      const surface = this.viewModel!.surface
+      const documents = searchDocuments(surface)
+      if (!sameSearchDocuments(this.searchState.documents, documents)) this.searchState.documents = documents
+      this.searchState.source = surface._tag === "Roots" ? surface.roots : surface._tag === "Graph" ? surface.unselectedNodes ?? surface.nodes : surface
+      this.searchState.selected = this.searchState.hits.indexOf(anchor ?? "")
+      this.updateSearch(false, true)
+    }
+  }
+
+  private acceptSearch(): void {
+    const state = this.searchState
+    if (!state) return
+    state.acceptWhenReady = state.busy
+    this.closeSearch()
+    this.savedSearch = undefined
+    if (!state.query.trim()) {
+      this.jumpSearch(state.anchor)
+      this.searchState = undefined
+      this.searchRequestId++
+    }
+  }
+
+  private finishSearchForNavigation(): void {
+    if (this.searchState?.open) this.acceptSearch()
+    if (this.searchState) this.searchState.acceptWhenReady = false
+  }
+
+  private reconcileSearch(): void {
+    const state = this.searchState, surface = this.viewModel?.surface
+    if (!state || !surface) return
+    if (state.scope !== searchScope(surface) || this.viewModel?.modal) {
+      this.closeSearch()
+      this.searchState = undefined
+      this.savedSearch = undefined
+      this.searchCorpus = undefined
+      const id = ++this.searchRequestId
+      if (this.searchClient) void this.searchClient.request({ id, documents: [], query: "" }).catch(() => {})
+      return
+    }
+    const source = surface._tag === "Roots" ? surface.roots : surface._tag === "Graph" ? surface.unselectedNodes ?? surface.nodes : surface
+    if (source === state.source) {
+      const cursor = this.searchCursor()
+      if (!state.open && !state.busy && state.excerptFor !== cursor) {
+        state.excerpt = ""
+        state.excerptFor = cursor
+        if (cursor && state.hits.includes(cursor)) {
+          state.selected = state.hits.indexOf(cursor)
+          this.updateSearch(false, false, true)
+        }
+      }
+      return
+    }
+    if (surface._tag === "Graph" && Array.isArray(state.source)) {
+      const previous = state.source as readonly GraphNodeViewModel[]
+      const next = surface.unselectedNodes ?? surface.nodes
+      const selected = retainedSearchNodeId(previous, next, state.hits[state.selected] ?? null)
+      if (selected) state.hits = state.hits.map((id, index) => index === state.selected ? selected : id)
+      state.anchor = retainedSearchNodeId(previous, next, state.anchor)
+      if (this.savedSearch) {
+        this.savedSearch.anchor = retainedSearchNodeId(previous, next, this.savedSearch.anchor)
+        const documents = searchDocuments(surface)
+        if (!sameSearchDocuments(this.savedSearch.documents, documents)) this.savedSearch.documents = documents
+        this.savedSearch.source = source
+      }
+    }
+    if (surface._tag === "Roots" && Array.isArray(state.source)) {
+      const previous = state.source as readonly RootViewModel[]
+      const selected = retainedSearchRootId(previous, surface.roots, state.hits[state.selected] ?? null)
+      if (selected) state.hits = state.hits.map((id, index) => index === state.selected ? selected : id)
+      state.anchor = retainedSearchRootId(previous, surface.roots, state.anchor) ?? this.searchCursor()
+      if (this.savedSearch) {
+        this.savedSearch.anchor = retainedSearchRootId(previous, surface.roots, this.savedSearch.anchor) ?? this.searchCursor()
+        const documents = searchDocuments(surface)
+        if (!sameSearchDocuments(this.savedSearch.documents, documents)) this.savedSearch.documents = documents
+        this.savedSearch.source = source
+      }
+    }
+    state.source = source
+    const documents = searchDocuments(surface)
+    if (sameSearchDocuments(documents, state.documents)) return
+    state.documents = documents
+    this.updateSearch(state.open, true)
+  }
+
+  private updateSearch(anchor = false, replace = false, excerptOnly = false): void {
+    const state = this.searchState
+    if (!state) return
+    this.searchClient ??= this.options.createSearchClient?.() ?? new SearchClient()
+    const id = ++this.searchRequestId
+    const selectedId = anchor ? undefined : state.hits[state.selected]
+    if (state.matchesQuery !== state.query || state.matchesDocuments !== state.documents) state.matchingNodeIds = EMPTY_SEARCH_MATCHES
+    state.busy = !excerptOnly
+    state.excerpt = ""
+    this.render()
+    const documents = replace || this.searchCorpus !== state.documents ? state.documents : undefined
+    this.searchCorpus = state.documents
+    void this.searchClient.request({ id, query: state.query,
+      documents, excerptId: selectedId,
+      excerptLength: Math.max(32, (this.renderer.terminalWidth - 2) * (Math.min(6, Math.max(3, Math.floor(this.renderer.terminalHeight / 4))) - 1) - 12),
+    }).then((response) => {
+      if (this.stopping || this.searchState !== state || id !== this.searchRequestId) return
+      state.busy = false
+      if (response.error) state.notice = response.error
+      state.hits = response.hits
+      if (!excerptOnly) {
+        state.matchingNodeIds = new Set(response.hits)
+        state.matchesQuery = state.query
+        state.matchesDocuments = state.documents
+      }
+      const retained = selectedId ? response.hits.indexOf(selectedId) : -1
+      state.selected = retained >= 0 ? retained : cursorRelativeHit(response.hits, state.documents, state.anchor)
+      if (!state.open && !state.acceptWhenReady && !excerptOnly) state.selected = response.hits.indexOf(this.searchCursor() ?? "")
+      state.excerpt = response.excerpt
+      state.excerptFor = selectedId ?? response.hits[0] ?? null
+      if (state.selected < 0) {
+        state.excerpt = ""
+        state.excerptFor = this.searchCursor()
+      }
+      const pendingSteps = state.pendingSteps
+      state.pendingSteps = 0
+      if (!excerptOnly && response.hits.length && pendingSteps && (state.open || state.acceptWhenReady)) {
+        const next = state.selected + pendingSteps
+        state.notice = next < 0 || next >= response.hits.length ? "Wrapped" : ""
+        state.selected = ((next % response.hits.length) + response.hits.length) % response.hits.length
+      }
+      if (!excerptOnly && (state.open || state.acceptWhenReady)) {
+        this.jumpSearch(response.hits[state.selected] ?? state.anchor)
+        state.acceptWhenReady = false
+      }
+      // Fetch just the selected excerpt, never every response's full content.
+      if (response.hits[state.selected] && response.hits[state.selected] !== (selectedId ?? response.hits[0])) this.updateSearch(false, false, true)
+      else this.render()
+    }).catch((error) => {
+      if (this.stopping || this.searchState !== state || id !== this.searchRequestId) return
+      state.busy = false
+      state.notice = errorMessage(error)
+      this.render()
+    })
+  }
+
+  private handleSearchKey(key: KeyEvent): void {
+    if (isExitKey(key)) { key.stopPropagation(); this.enqueue(this.stop, true, "background") }
+    else if (isUnmodifiedKey(key, "escape")) { key.stopPropagation(); this.cancelSearch() }
+    else if (isEnterKey(key)) { key.stopPropagation(); this.acceptSearch() }
+    else if (isControlKey(key, "n") || isControlKey(key, "p")) {
+      key.stopPropagation()
+      this.stepSearch(key.name === "n" ? 1 : -1)
+    }
+    else if (isUnmodifiedKey(key, "tab")) key.stopPropagation()
+  }
+
+  private handleAcceptedSearchKey(key: KeyEvent): void {
+    key.stopPropagation()
+    const direction = this.graphSurface() ? graphDirection(key) : undefined
+    const movement = this.rootsSurface() && ["up", "down", "j", "k"].some((name) => isUnmodifiedKey(key, name)) ? listNavigationDelta(key) : undefined
+    const step = isUnmodifiedKey(key, "n") || isUnmodifiedKey(key, "]") || isShiftedKey(key, "p") ? 1
+      : isUnmodifiedKey(key, "p") || isUnmodifiedKey(key, "[") || isShiftedKey(key, "n") ? -1 : undefined
+    const back = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape")
+    if (!isExitKey(key) && !back && !isUnmodifiedKey(key, "/") && step === undefined && !direction && movement === undefined) return
+    this.searchState!.acceptWhenReady = false
+    if (isExitKey(key)) this.enqueue(this.stop, true, "background")
+    else if (back) this.dismissSearch()
+    else if (isUnmodifiedKey(key, "/") && !key.repeated) this.openSearch()
+    else if (step !== undefined) this.stepSearch(step)
+    else if (direction) this.moveGraph(direction)
+    else if (movement !== undefined) this.moveRoot(movement)
+  }
+
+  private stepSearch(delta: -1 | 1): void {
+    const state = this.searchState
+    if (!state) return
+    if (state.busy) {
+      if (state.open) state.pendingSteps += delta
+      return
+    }
+    if (!state.hits.length) return
+    const cursor = this.searchCursor()
+    const current = state.hits.indexOf(cursor ?? "")
+    if (current >= 0) state.selected = current
+    else {
+      state.selected = cursorRelativeHit(state.hits, state.documents, cursor)
+      if (delta === 1) state.selected = (state.selected - 1 + state.hits.length) % state.hits.length
+    }
+    const next = state.selected + delta
+    const wrapped = next < 0 || next >= state.hits.length
+    state.selected = (next + state.hits.length) % state.hits.length
+    this.jumpSearch(state.hits[state.selected] ?? null)
+    this.updateSearch(false, false, true)
+    state.notice = wrapped ? "Wrapped" : ""
   }
 
   private handleRootsKey(key: KeyEvent): void {
@@ -1343,6 +1674,18 @@ class OpenTuiPresentationController {
   }
 
   private controlsWithDetails(controls: readonly FooterControl[]): readonly FooterControl[] {
+    if (this.searchState) return this.searchState.open ? [
+      { key: "Ctrl+n/p", description: "hits", action: "search-next" },
+      { key: "Enter", description: "accept", action: "search-accept" },
+      { key: "Esc", description: "cancel", action: "search-close" },
+    ] : [
+      { key: "n", description: "next", action: "search-next" },
+      { key: "p", description: "previous", action: "search-previous" },
+      { key: "/", description: "edit", action: "search" },
+      { key: "Esc", description: "clear", action: "search-close" },
+      { key: this.graphSurface() ? "↑↓←→/hjkl" : "↑↓/jk", description: "move" },
+      { key: "q", description: "close", action: "search-close" },
+    ]
     const selected = this.selectedGraphNode()
     if (selected?._tag === "Message" && selected.forkTarget === undefined) {
       controls = controls.filter((control) => control.action !== "fork")
@@ -1369,6 +1712,14 @@ class OpenTuiPresentationController {
     this.updateTitle()
     const surface = this.viewModel.surface
     const terminal = surface._tag === "Terminal"
+    const searchHeight = !terminal && !this.tooSmall() && this.searchState ? Math.min(6, Math.max(3, Math.floor(this.renderer.terminalHeight / 4))) : 0
+    this.footer.height = this.searchState ? 1 : FOOTER_HEIGHT
+    this.searchQueryLine.visible = searchHeight > 0
+    this.searchInput.visible = searchHeight > 0
+    if (this.searchState && !this.searchState.open && this.searchInput.value !== this.searchState.query) this.searchInput.value = this.searchState.query
+    this.searchPanel.visible = searchHeight > 0
+    this.searchPanel.height = searchHeight
+    this.renderSearchContext()
     this.navigator.visible = !terminal
     this.terminalReturnBar.visible = surface._tag === "Terminal"
     this.dialogOverlay.visible = false
@@ -1401,7 +1752,7 @@ class OpenTuiPresentationController {
     this.headerSeparator.content = separator
     this.footerSeparator.content = separator
     const width = Math.max(1, this.renderer.terminalWidth - HORIZONTAL_MARGIN * 2)
-    const height = Math.max(1, this.renderer.terminalHeight - CHROME_HEIGHT)
+    const height = Math.max(1, this.renderer.terminalHeight - CHROME_HEIGHT - searchHeight)
     if (surface._tag === "Roots") {
       if (this.viewModel.initialLoadPending) {
         this.content.content = styledText([
@@ -1415,6 +1766,7 @@ class OpenTuiPresentationController {
           width,
           this.rootViewportStart,
           this.spinnerFrame,
+          this.searchState?.matchingNodeIds,
         )
         this.rootViewportStart = rendered.startIndex
         this.content.content = rendered.content
@@ -1423,13 +1775,7 @@ class OpenTuiPresentationController {
       const controls = ROOT_CONTROLS.flatMap((control) => control.action !== "enter-root" ? [control]
         : !activation || activation === "loading" ? []
         : [{ ...control, description: activation === "retry" ? "retry" : "open" }])
-      const footer = renderControls(this.controlsWithDetails(controls), this.busyFooterActions(), this.operationFrame())
-      this.footer.content = styledText([
-        ...footer.chunks,
-        chunk("\n", theme.text),
-        ...(this.operationStatusChunks() ?? this.rootStatusChunks()),
-      ])
-      this.footerHitRegions = footer.hitRegions
+      this.renderFooter(controls, this.rootStatusChunks())
     } else {
       const graphSurface = this.graphSurfaceForRendering(surface)
       const rendered = renderGraph(
@@ -1439,16 +1785,11 @@ class OpenTuiPresentationController {
         this.spinnerFrame,
         this.graphViewportOffset ?? undefined,
         this.viewModel.liveSessionIds,
+        this.searchState?.matchingNodeIds,
       )
       this.graphViewportOffset = { x: rendered.offsetX, y: rendered.offsetY }
       this.content.content = rendered.content
-      const footer = renderControls(this.controlsWithDetails(GRAPH_CONTROLS), this.busyFooterActions(), this.operationFrame())
-      this.footer.content = styledText([
-        ...footer.chunks,
-        chunk("\n", theme.text),
-        ...(this.operationStatusChunks() ?? [chunk(this.selectedDescription(), theme.textMuted)]),
-      ])
-      this.footerHitRegions = footer.hitRegions
+      this.renderFooter(GRAPH_CONTROLS, [chunk(this.selectedDescription(), theme.textMuted)])
     }
     this.renderDialog()
     this.updateSpinner()
@@ -1502,6 +1843,43 @@ class OpenTuiPresentationController {
         : []),
       chunk(truncateToWidth(root.title, Math.max(1, this.renderer.terminalWidth - 20)), theme.textMuted),
     ]
+  }
+
+  private renderSearchContext(): void {
+    const state = this.searchState
+    if (!state) return
+    const cursor = this.searchCursor()
+    const position = state.hits.indexOf(cursor ?? "")
+    const count = state.busy || !state.query.trim() ? "— hits" : position >= 0 ? `${position + 1}/${state.hits.length} hits` : `${state.hits.length} hits`
+    const excerpt = state.excerptFor === cursor ? state.excerpt : ""
+    const chunks = [chunk(`${count}\n`, theme.text)]
+    const terms = state.query.trim().split(/\s+/u).filter(Boolean).map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    if (terms.length && excerpt) {
+      const expression = new RegExp(terms.join("|"), "giu")
+      let start = 0
+      for (const match of excerpt.matchAll(expression)) {
+        chunks.push(chunk(excerpt.slice(start, match.index), theme.textMuted))
+        chunks.push(chunk(match[0], theme.selectedText, TextAttributes.BOLD, theme.selected))
+        start = match.index + match[0].length
+      }
+      chunks.push(chunk(excerpt.slice(start), theme.textMuted))
+    }
+    this.searchContext.content = styledText(chunks)
+  }
+
+  private renderFooter(controls: readonly FooterControl[], normal: readonly TextChunk[]): void {
+    const footer = renderControls(this.controlsWithDetails(controls), this.busyFooterActions(), this.operationFrame())
+    const operation = this.operationStatusChunks()
+    const state = this.searchState
+    const prefix = state && operation ? [...operation, chunk(" · ", theme.textMuted)] : []
+    const status = state?.busy ? "Searching…" : state && !state.query.trim() ? "Type to search" : ""
+    const notice = state ? [status, state.notice, this.graphSurface()?.warnings.length ? "Available history only" : ""].filter(Boolean).join(" · ") : ""
+    this.footer.content = styledText([
+      ...prefix, ...footer.chunks,
+      ...(state ? notice ? [chunk(` · ${notice}`, theme.textMuted)] : [] : [chunk("\n", theme.text), ...(operation ?? normal)]),
+    ])
+    const offset = prefix.reduce((width, part) => width + displayWidth(part.text), 0)
+    this.footerHitRegions = footer.hitRegions.map((region) => ({ ...region, startX: region.startX + offset, endX: region.endX + offset }))
   }
 
   private selectedDescription(): string {
@@ -1749,6 +2127,7 @@ class OpenTuiPresentationController {
     if (event.button !== 0 || this.interactionBlocked() || this.viewModel?.modal || this.leafPicker) return
     const action = this.contentMouseActionAt(event)
     if (!action) return
+    this.finishSearchForNavigation()
     event.preventDefault()
     event.stopPropagation()
     this.pendingMouseAction = action
@@ -1766,14 +2145,14 @@ class OpenTuiPresentationController {
     event.preventDefault()
     event.stopPropagation()
     if (action.kind === "root") {
-      if (action.sessionId === this.selectedRootSessionId) this.enterSelectedRoot()
+      if (action.sessionId === this.selectedRootSessionId && !this.searchState) this.enterSelectedRoot()
       else {
         this.queueRootSelection(action.sessionId)
         this.render()
       }
     } else {
       const selected = this.selectedGraphNode()
-      if (action.nodeId === selected?.id) this.openSelected()
+      if (action.nodeId === selected?.id && !this.searchState) this.openSelected()
       else {
         const graph = this.graphSurface()
         const node = graph?.nodes.find((candidate) => candidate.id === action.nodeId)
@@ -1810,6 +2189,7 @@ class OpenTuiPresentationController {
     if (this.interactionBlocked() || this.viewModel?.modal || this.leafPicker) return
     const direction = event.scroll?.direction
     if (!direction) return
+    this.finishSearchForNavigation()
     event.preventDefault()
     event.stopPropagation()
     const distance = Math.max(1, Math.round(event.scroll?.delta ?? 1))
@@ -1867,7 +2247,20 @@ class OpenTuiPresentationController {
   }
 
   private runFooterAction(action: FooterAction): void {
+    if (this.searchState) {
+      this.searchState.acceptWhenReady = false
+      if (action === "search-next") this.stepSearch(1)
+      else if (action === "search-previous") this.stepSearch(-1)
+      else if (action === "search-accept") this.acceptSearch()
+      else if (action === "search-close") {
+        if (this.searchState.open) this.cancelSearch()
+        else this.dismissSearch()
+      } else if (action === "search") this.openSearch()
+      else if (action === "quit") this.enqueue(this.stop, true, "background")
+      return
+    }
     if (action !== "quit" && action !== "about" && this.interactionBlocked()) return
+    this.finishSearchForNavigation()
     if (action === "enter-root") this.enterSelectedRoot()
     else if (action === "new") this.runAction(this.appRuntime.newSession, "terminal:new")
     else if (action === "refresh") this.refresh()
@@ -1880,6 +2273,7 @@ class OpenTuiPresentationController {
     else if (action === "remove") this.showRemovalConfirmation()
     else if (action === "roots") this.showRoots()
     else if (action === "about") this.enqueue(this.appRuntime.openModal({ _tag: "About" }))
+    else if (action === "search") this.openSearch()
   }
 
   private readonly onDialogBackdropMouseDown = (event: MouseEvent) => {
@@ -2160,6 +2554,7 @@ class OpenTuiPresentationController {
   private readonly guardedOnDialogActionsMouseUp = this.guardCallback("Handle dialog input", this.onDialogActionsMouseUp)
 
   private teardown(): void {
+    this.searchInput.blur()
     this.renderDirty = false
     this.renderer.removeFrameCallback(this.prepareFrame)
     this.stopSpinner()

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { stopTestServer } from "./helpers/stop-test-server"
 import { Cause, Deferred, Effect, Exit, Fiber, PubSub } from "effect"
 import { TestClock } from "effect/testing"
@@ -789,6 +789,39 @@ describe("Effect Codex app-server transport", () => {
     })))
 
     expect(transport.signals).toEqual(["SIGTERM", "SIGKILL"])
+  })
+
+  test.each(["absent", "denied", "descendant"] as const)("group cleanup reaps cooperative children and still verifies the whole group (%s)", async (mode) => {
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+    })
+    const pid = 987654321
+    let reaped = false
+    let descendantAlive = mode === "descendant"
+    const groupSignals: Array<string | number | undefined> = []
+    const exited = transport.process.exited.then((code) => { reaped = true; return code })
+    const probe = spyOn(process, "kill").mockImplementation((target, signal) => {
+      expect(target).toBe(-pid)
+      if (!reaped || mode === "denied") throw Object.assign(new Error("permission denied"), { code: "EPERM" })
+      if (descendantAlive) {
+        if (signal !== 0) { groupSignals.push(signal); descendantAlive = false }
+        return true
+      }
+      throw Object.assign(new Error("no such process group"), { code: "ESRCH" })
+    })
+    try {
+      const exit = await Effect.runPromise(Effect.exit(Effect.scoped(Effect.gen(function*() {
+        const client = yield* makeCodexAppServerClient("codex", {
+          spawn: () => ({ ...transport.process, pid, exited }),
+        })
+        yield* client.close()
+      }))))
+      expect(reaped).toBeTrue()
+      expect(Exit.isFailure(exit)).toBe(mode === "denied")
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(CodexCleanupError)
+      expect(probe).toHaveBeenCalled()
+      expect(groupSignals).toEqual(mode === "descendant" ? ["SIGTERM"] : [])
+    } finally { probe.mockRestore() }
   })
 
   test("reports a typed cleanup error and cancels readers when the process survives SIGKILL", async () => {

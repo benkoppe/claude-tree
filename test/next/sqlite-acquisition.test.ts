@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, open, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 
@@ -9,7 +10,7 @@ import { PersistencePlatform, nativePersistencePlatform } from "../../src/infras
 
 for (const stage of ["references", "defect", "interruption"] as const) {
   test(`repository ${stage} during initialization closes its database before returning`, async () => {
-    const directory = await mkdtemp("/tmp/opencode/sqlite-acquisition-")
+    const directory = await mkdtemp(join(tmpdir(), "sqlite-acquisition-"))
     const project = join(directory, "project")
     await mkdir(project)
     let closes = 0
