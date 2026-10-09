@@ -13,6 +13,10 @@ import type { ActiveRefresh, ApplicationModal, ApplicationState } from "./state"
 
 export type RefreshReason = ActiveRefresh["reason"]
 
+export const CONTINUATION_OPERATION_PREFIX = "continuation:"
+export const continuationOperationKey = (target: MessageRef): string =>
+  `${CONTINUATION_OPERATION_PREFIX}${JSON.stringify([target.sessionId, target.messageId])}`
+
 export type ApplicationIntent =
   | { readonly _tag: "Refresh"; readonly reason: "manual" }
   | { readonly _tag: "SelectRoot"; readonly sessionId: string | null; readonly selectionId?: string }
@@ -26,7 +30,7 @@ export type ApplicationIntent =
   | { readonly _tag: "NewSession" }
   | { readonly _tag: "ResumeSession"; readonly sessionId: string; readonly reportFailure: boolean; readonly allowDuplicate?: boolean }
   | { readonly _tag: "OpenEndpoint"; readonly sessionId: string }
-  | { readonly _tag: "BranchFrom"; readonly target: MessageRef }
+  | { readonly _tag: "BranchFrom"; readonly target: MessageRef; readonly continuation?: boolean }
   | { readonly _tag: "ManageBranchVerification"; readonly sessionId: string; readonly action: "cancel" | "retry" }
   | { readonly _tag: "ReturnFromTerminal" }
   | { readonly _tag: "StopSession"; readonly sessionId: string }

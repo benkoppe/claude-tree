@@ -26,6 +26,72 @@ const CHILD = "child:opaque/id"
 const GRANDCHILD = "grandchild:opaque/id"
 
 describe("next conversation graph", () => {
+  test("pruned message leaves retain one lazy destination reachable from every ancestor", () => {
+    const transcript = [message("q", "user", "question", 0), message("a", "agent", "answer", 1),
+      message("later", "user", "deleted", 2)]
+    const graph = buildConversationForest([session(ROOT, 20)], new Map([[ROOT, transcript]]), [],
+      [messageRemoval([{ sessionId: ROOT, messageId: "later" }])]).graphs[0]!
+    const leaf = nodes(graph).find((node) => node.preview === "answer")!
+    const endpoints = reachableSessionEndpoints(graph, graph.rootNodeId)
+    expect(endpoints).toHaveLength(1)
+    expect(endpoints[0]!.endpoint.continuation).toEqual({ target: { sessionId: ROOT, messageId: "a" }, deferred: true })
+    expect(reachableSessionEndpoints(graph, leaf.id)).toHaveLength(1)
+    expect(graph.endpointBySessionId.has(ROOT)).toBeFalse()
+    expect(graph.sessionIds.has(ROOT)).toBeTrue()
+    expect(layoutConversationGraph(graph, 100, new Set([ROOT])).nodes.has(endpoints[0]!.endpoint.id)).toBeFalse()
+    expect(visibleGraphNodeId(graph, endpoints[0]!.endpoint.id, new Set([ROOT]))).toBe(leaf.id)
+    expect(indexReachableSessionEndpoints(graph).get(leaf.id)).toEqual(reachableSessionEndpoints(graph, leaf.id))
+  })
+
+  test("a replay continuation binds its user leaf without inventing copied-user ancestry", () => {
+    const parent = [message("q", "user", "question", 0), message("a", "agent", "answer", 1),
+      message("u", "user", "replay me", 2), message("tail", "agent", "deleted", 3)]
+    const child = [message("cq", "user", "question", 0), message("ca", "agent", "answer", 1)]
+    const bound = { ...relation(CHILD, ROOT, "a", shared(parent, child, 2)), continuationMessageId: "u" }
+    const removals = [messageRemoval([{ sessionId: ROOT, messageId: "tail" }])]
+    const graph = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, parent], [CHILD, child]]), [bound], removals).graphs[0]!
+    const leaf = nodes(graph).find((node) => node.preview === "replay me")!
+    expect(leaf.aliases).toEqual([{ sessionId: ROOT, messageId: "u" }])
+    const endpoint = reachableSessionEndpoints(graph, leaf.id)[0]!.endpoint
+    expect(endpoint.session.id).toBe(CHILD)
+    expect(endpoint.continuation?.deferred).toBeFalse()
+    const rewound = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, parent], [CHILD, child.slice(0, 1)]]), [bound], removals).graphs[0]!
+    expect(rewound.endpointBySessionId.has(CHILD)).toBeTrue()
+    expect(reachableSessionEndpoints(rewound, leaf.id)[0]!.endpoint.continuation?.deferred).toBeTrue()
+    const removedChild = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, parent], [CHILD, child]]), [bound], [...removals, endpointRemoval(CHILD, "ca")]).graphs[0]!
+    expect(reachableSessionEndpoints(removedChild, leaf.id)[0]!.endpoint.continuation?.deferred).toBeTrue()
+  })
+
+  test("a zero-prefix replay continuation reuses its child at the family origin", () => {
+    const parent = [message("q", "user", "first prompt", 0)]
+    const graph = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, parent], [CHILD, []]]), [{ ...relation(CHILD, ROOT, "q", []), continuationMessageId: "q" }],
+      [endpointRemoval(ROOT, "q")]).graphs[0]!
+    const leaf = nodes(graph)[0]!
+    const endpoint = reachableSessionEndpoints(graph, leaf.id)[0]!.endpoint
+    expect(endpoint.session.id).toBe(CHILD)
+    expect(endpoint.continuation?.deferred).toBeFalse()
+  })
+
+  test("deleting one branch preserves both ordinary and deferred leaf choices", () => {
+    const parent = [message("q", "user", "question", 0), message("a", "agent", "answer", 1),
+      message("parent-tail", "user", "keep", 2)]
+    const child = [message("cq", "user", "question", 0), message("ca", "agent", "answer", 1),
+      message("child-user", "user", "child prompt", 2), message("child-tail", "agent", "delete", 3)]
+    const graph = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, parent], [CHILD, child]]), [relation(CHILD, ROOT, "a", shared(parent, child, 2))],
+      [messageRemoval([{ sessionId: CHILD, messageId: "child-tail" }])]).graphs[0]!
+    const endpoints = reachableSessionEndpoints(graph, graph.rootNodeId)
+    expect(endpoints).toHaveLength(2)
+    expect(endpoints.filter(({ endpoint }) => endpoint.continuation?.deferred)).toHaveLength(1)
+    expect(endpoints.find(({ endpoint }) => endpoint.continuation)?.endpoint.continuation?.target)
+      .toEqual({ sessionId: CHILD, messageId: "child-user" })
+    expect(endpoints.some(({ endpoint }) => endpoint.session.id === ROOT && !endpoint.continuation)).toBeTrue()
+  })
+
   test("consolidates Codex commentary, tools, and hidden fork boundaries across copied history and rewinds", () => {
     const turns: CodexTurn[] = [{ id: "turn", status: "completed", error: null, items: [
       { id: "u", type: "userMessage", content: [{ type: "text", text: "Question" }] },

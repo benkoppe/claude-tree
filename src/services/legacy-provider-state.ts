@@ -13,6 +13,7 @@ const BranchRelationSchema = Schema.Struct({
   childSessionId: Schema.NonEmptyString, parentSessionId: Schema.NonEmptyString, sourceMessageId: Schema.NonEmptyString,
   sharedMessages: Schema.Array(Schema.Struct({ parentMessageId: Schema.NonEmptyString, childMessageId: Schema.NonEmptyString })),
   createdAt: Schema.NonEmptyString,
+  continuationMessageId: Schema.optionalKey(Schema.NonEmptyString),
 })
 const RemovalSchema = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("tree"), rootSessionId: Schema.NonEmptyString,

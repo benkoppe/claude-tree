@@ -21,6 +21,7 @@ import type {
   NavigationTarget,
 } from "../domain/model"
 import type { ConversationGraph, ConversationGraphNode } from "../domain/conversation-graph"
+import { continuationSessionId } from "../domain/conversation-graph"
 import type {
   BranchRelation,
   ConversationRemoval,
@@ -64,6 +65,8 @@ import {
   ApplicationShutdownError,
   IntentRejectedError,
   RemovalOperationError,
+  CONTINUATION_OPERATION_PREFIX,
+  continuationOperationKey,
   type ApplicationIntent,
   type ApplicationIntentEffect,
   type ApplicationIntentError,
@@ -123,6 +126,7 @@ export interface AppRuntime {
   readonly resumeSession: (sessionId: string, allowDuplicate?: boolean) => ApplicationIntentEffect
   readonly openEndpoint: (sessionId: string) => ApplicationIntentEffect
   readonly branchFrom: (target: MessageRef) => ApplicationIntentEffect
+  readonly openContinuation: (target: MessageRef) => ApplicationIntentEffect
   readonly manageBranchVerification: (sessionId: string, action: "cancel" | "retry") => ApplicationIntentEffect
   readonly returnFromTerminal: ApplicationIntentEffect
   readonly stopSession: (sessionId: string) => ApplicationIntentEffect
@@ -243,7 +247,7 @@ export function makeAppRuntime(
     const navigation = yield* makeNavigationWriter(options.metadata, (cause) =>
       Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }), options.navigationSaveIntervalMs)
     const preparedTerminals = new Map<string, PreparedTerminal>()
-    const verificationReceipts = new Map<string, { readonly receipt: BranchVerificationReceipt; readonly key: string }>()
+    const verificationReceipts = new Map<string, { readonly receipt: BranchVerificationReceipt; readonly key: string; readonly continuationKey?: string }>()
     const owners = new Map<string, OwnerCursor>()
     const unclaimedOwnerEvents = new Map<string, OwnerCursor["buffered"]>()
     const commandExecutor = makeCommandExecutor<ActorCommand>(commandScope, (completion) => Queue.offer(
@@ -1179,7 +1183,10 @@ export function makeAppRuntime(
         const verification = outcome.outcome.verification
         if (verification) {
           if (verification.receipt && verification.status !== "contradicted") {
-            verificationReceipts.set(outcome.outcome.session.id, { receipt: verification.receipt, key: message.key })
+            const retained = verificationReceipts.get(outcome.outcome.session.id)
+            const continuationKey = retained?.continuationKey ?? (message.key.startsWith(CONTINUATION_OPERATION_PREFIX) ? message.key : undefined)
+            verificationReceipts.set(outcome.outcome.session.id, { receipt: verification.receipt, key: message.key,
+              ...(continuationKey ? { continuationKey } : {}) })
           } else verificationReceipts.delete(outcome.outcome.session.id)
           yield* publish({ _tag: "BranchVerificationChanged", sessionId: outcome.outcome.session.id, verification: {
             status: verification.status === "pending" ? "paused" : verification.status,
@@ -1459,10 +1466,40 @@ export function makeAppRuntime(
 
     const processIntent = (envelope: IntentEnvelope): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function*() {
-        const intent = envelope.intent
+        let intent = envelope.intent
+        let continuationKey: string | undefined
         if (!accepting || state.shutdown !== "running") {
           yield* reject(envelope.reply, intent._tag, "shutting-down", "Application is shutting down")
           return
+        }
+        if (intent._tag === "BranchFrom" && intent.continuation) {
+          const target = intent.target
+          const graph = selectConversationForest(state).graphBySessionId.get(target.sessionId)
+          const node = graph && [...graph.nodes.values()].find((node) => node.kind === "message" &&
+            node.aliases.some((alias) => alias.sessionId === target.sessionId && alias.messageId === target.messageId))
+          if (!graph || !node || node.kind !== "message") {
+            yield* reject(envelope.reply, intent._tag, "invalid", "This continuation is no longer in the navigator")
+            return
+          }
+          const bound = state.relations.filter((relation) => relation.parentSessionId === target.sessionId &&
+            relation.continuationMessageId === target.messageId && continuationSessionId(graph, relation) !== undefined)
+            .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.childSessionId.localeCompare(right.childSessionId))[0]
+          if (bound) intent = { _tag: "OpenEndpoint", sessionId: bound.childSessionId }
+          else {
+            continuationKey = continuationOperationKey(node.aliases[0] ?? target)
+            if (activeCommands.has(continuationKey) || [...verificationReceipts.values()].some((retained) =>
+              retained.key === continuationKey || retained.continuationKey === continuationKey)) {
+              yield* reject(envelope.reply, intent._tag, "busy", "This continuation is already being created; manage its existing fork verification instead")
+              return
+            }
+            if (!node.forkTarget || node.childIds.some((id) => {
+              const child = graph.nodes.get(id)
+              return child?.kind !== "endpoint" || !child.continuation
+            })) {
+              yield* reject(envelope.reply, intent._tag, "invalid", "This leaf is not a supported historical branch boundary")
+              return
+            }
+          }
         }
         if (intent._tag === "EnterRoot") {
           const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
@@ -1639,7 +1676,7 @@ export function makeAppRuntime(
             }
             yield* startOperation("verification", envelope.reply, intent._tag)
             const key = `verify:${envelope.correlationId}`
-            verificationReceipts.set(intent.sessionId, { receipt: retained.receipt, key })
+            verificationReceipts.set(intent.sessionId, { ...retained, key })
             yield* publish({ _tag: "BranchVerificationChanged", sessionId: intent.sessionId, verification: {
               status: "verifying", reason: "Verifying captured fork history (read-only)", retryable: true,
             } })
@@ -1654,7 +1691,7 @@ export function makeAppRuntime(
               return
             }
             yield* startOperation("fork", envelope.reply, intent._tag)
-            const key = `branch:${envelope.correlationId}`
+            const key = continuationKey ?? `branch:${envelope.correlationId}`
             yield* launch(key, {
               _tag: "Branch",
               requestGeneration: navigatorRequestGeneration,
@@ -1662,7 +1699,7 @@ export function makeAppRuntime(
               reply: envelope.reply,
             }, operations.branch(intent.target, (receipt) => Queue.offer(inbox, {
               _tag: "BranchCreated", receipt, key,
-            }).pipe(Effect.asVoid)), false)
+            }).pipe(Effect.asVoid), intent.continuation), false)
             return
           }
           case "ReturnFromTerminal":
@@ -1768,7 +1805,8 @@ export function makeAppRuntime(
         if (state.shutdown !== "running") return
         const sessionId = message.receipt.session.id
         if (state.terminals.has(sessionId) || state.branchVerifications.get(sessionId)?.status === "independent") return
-        verificationReceipts.set(sessionId, { receipt: message.receipt, key: message.key })
+        verificationReceipts.set(sessionId, { receipt: message.receipt, key: message.key,
+          ...(message.key.startsWith(CONTINUATION_OPERATION_PREFIX) ? { continuationKey: message.key } : {}) })
         yield* publish({ _tag: "LocalSessionProjected", session: message.receipt.session,
           transcript: { _tag: "Unavailable", reason: "Created fork history has not been verified" } })
         const active = activeCommands.has(message.key)
@@ -2385,6 +2423,7 @@ export function makeAppRuntime(
       resumeSession: (sessionId, allowDuplicate) => request({ _tag: "ResumeSession", sessionId, reportFailure: true, ...(allowDuplicate ? { allowDuplicate: true } : {}) }),
       openEndpoint: (sessionId) => request({ _tag: "OpenEndpoint", sessionId }),
       branchFrom: (target) => request({ _tag: "BranchFrom", target }),
+      openContinuation: (target) => request({ _tag: "BranchFrom", target, continuation: true }),
       manageBranchVerification: (sessionId, action) => request({ _tag: "ManageBranchVerification", sessionId, action }),
       returnFromTerminal: request({ _tag: "ReturnFromTerminal" }),
       stopSession: (sessionId) => request({ _tag: "StopSession", sessionId }),

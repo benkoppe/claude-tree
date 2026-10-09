@@ -955,7 +955,8 @@ describe("persisted removals", () => {
     const graph = forest.graphs[0]!
     expect(messagePreviews(graph)).toEqual(["A"])
     expect(graph.endpointBySessionId.size).toBe(0)
-    expect([...graph.sessionIds]).toEqual([])
+    expect([...graph.sessionIds]).toEqual([ROOT])
+    expect(reachableSessionEndpoints(graph, graph.rootNodeId)[0]?.endpoint.continuation?.deferred).toBeTrue()
     expect(graph.nodes.get(graph.rootNodeId)).toMatchObject({
       kind: "message", aliases: [{ sessionId: ROOT, messageId: messages[0]!.id }],
     })
@@ -972,7 +973,8 @@ describe("persisted removals", () => {
 
     expect(messagePreviews(graph)).toEqual(["still visible"])
     expect(graph.endpointBySessionId.has(ROOT)).toBe(false)
-    expect([...graph.nodes.values()].some((node) => node.kind === "endpoint")).toBeFalse()
+    expect([...graph.nodes.values()].filter((node) => node.kind === "endpoint")).toHaveLength(1)
+    expect(reachableSessionEndpoints(graph, graph.rootNodeId)[0]?.endpoint.continuation?.deferred).toBeTrue()
   })
 
   test("prunes every branch below a shared branch-point alias", () => {

@@ -17,6 +17,7 @@ import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provid
 import { normalizeCodexThread } from "../../src/infrastructure/providers/codex/provider"
 import type { CodexTurn } from "../../src/infrastructure/providers/codex/app-server"
 import { selectConversationForest } from "../../src/application/selectors"
+import { projectGraphViewModel } from "../../src/application/view-model"
 import { available } from "../../src/application/state"
 import { isTranscriptPrefix, reconcileTranscript, sameTranscript } from "../../src/application/history-reconciliation"
 
@@ -3930,6 +3931,180 @@ describe("application actor", () => {
     expect(result.state.branchVerifications.has(child.session.id)).toBeFalse()
   })
 })
+
+describe("lazy continuations", () => {
+  test.each(["agent", "user"] as const)("opens a pruned %s leaf once and resumes its child after restart", async (role) => {
+    const fixture = continuationFixture()
+    let forks = 0
+    const provider: AgentProviderApi = { ...fixture.options.provider, branchFrom: (target) => Effect.sync(() => {
+      forks++
+      expect(target).toEqual({ sessionId: ROOT, messageId: role === "agent" ? "a" : "u" })
+      addContinuationChild(fixture)
+      return fixture.branchOutcome
+    }) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const options = { ...fixture.options, provider }
+      const runtime = yield* makeAppRuntime(options)
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* pruneContinuation(runtime, role)
+      const before = yield* runtime.getState
+      const view = projectGraphViewModel(before, ROOT)
+      const ancestor = view.nodes.find((node) => node._tag === "Message" && node.preview === "question")!
+      expect(ancestor.reachableEndpoints).toHaveLength(1)
+      const target = ancestor.reachableEndpoints[0]!.continuationTarget!
+      expect(target.messageId).toBe(role === "agent" ? "a" : "u")
+      expect(forks).toBe(0)
+      yield* runtime.openContinuation(target)
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: "continuation-child" })
+      expect([...selectConversationForest(yield* runtime.getState).graphs[0]!.sessionIds]).toEqual(["continuation-child"])
+      const persisted = yield* fixture.options.metadata.loadMetadata
+      expect(persisted.relations[0]).toMatchObject({ sourceMessageId: "a", continuationMessageId: target.messageId })
+      expect(persisted.relations[0]!.sharedMessages.map((pair) => pair.parentMessageId)).toEqual(["q", "a"])
+      yield* runtime.returnFromTerminal
+      yield* runtime.openContinuation(target)
+      expect(forks).toBe(1)
+      yield* runtime.shutdown
+      const resumed = yield* makeAppRuntime(options)
+      yield* waitForState(resumed, (state) => !state.refresh.initialPending &&
+        state.terminals.get("continuation-child")?.phase === "running")
+      yield* resumed.openContinuation(target)
+      expect((yield* resumed.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: "continuation-child" })
+      expect(forks).toBe(1)
+    })))
+  })
+
+  test("concurrent Opens admit one mutation and do not supersede its focus", async () => {
+    const fixture = continuationFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let forks = 0
+      const provider: AgentProviderApi = { ...fixture.options.provider, branchFrom: () => Effect.gen(function*() {
+        forks++
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+        addContinuationChild(fixture)
+        return fixture.branchOutcome
+      }) }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* pruneContinuation(runtime, "agent")
+      const target = { sessionId: ROOT, messageId: "a" }
+      const first = yield* Effect.forkChild(runtime.openContinuation(target))
+      yield* Deferred.await(entered)
+      const rejected = yield* Effect.exit(runtime.openContinuation(target))
+      expect(Exit.isFailure(rejected)).toBeTrue()
+      expect(forks).toBe(1)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(first)
+      expect((yield* runtime.getState).surface).toMatchObject({ _tag: "Terminal", sessionId: "continuation-child" })
+    })))
+  })
+
+  test("unavailable verification and read-only retry retain the continuation admission key", async () => {
+    const fixture = continuationFixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const verifying = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const validated = fixture.branchOutcome
+      if (validated._tag !== "ValidatedBranch") throw new Error("Expected fixture branch")
+      let forks = 0
+      const receipt: BranchVerificationReceipt = { session: validated.session,
+        verify: Deferred.succeed(verifying, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(validated)) }
+      const provider: AgentProviderApi = { ...fixture.options.provider, branchFrom: () => Effect.sync(() => {
+        forks++
+        addContinuationChild(fixture)
+        return { _tag: "CreatedIndependentSession" as const, session: validated.session, transcript: { _tag: "Missing" as const },
+          reason: "Read unavailable", verification: { status: "unavailable" as const, reasonCode: "read-failed" as const, receipt } }
+      }) }
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* pruneContinuation(runtime, "user")
+      const target = { sessionId: ROOT, messageId: "u" }
+      yield* runtime.openContinuation(target)
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openContinuation(target)))).toBeTrue()
+      const retry = yield* Effect.forkChild(runtime.manageBranchVerification(validated.session.id, "retry"))
+      yield* Deferred.await(verifying)
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openContinuation(target)))).toBeTrue()
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(retry)
+      expect((yield* runtime.getState).relations[0]?.continuationMessageId).toBe("u")
+      expect(fixture.calls).not.toContain("show:continuation-child")
+      yield* runtime.openContinuation(target)
+      expect(fixture.calls).toContain("show:continuation-child")
+      expect(forks).toBe(1)
+    })))
+  })
+
+  test("unsupported and removed leaves fail before a provider mutation", async () => {
+    const fixture = continuationFixture()
+    const read = fixture.snapshot.transcripts.get(ROOT)!
+    if (read._tag !== "Available") throw new Error("Expected fixture transcript")
+    fixture.snapshot = snapshot(fixture.snapshot.sessions, new Map([[ROOT,
+      read.messages.map((message) => message.id === "u" ? { ...message, forkable: false } : message)]]))
+    let forks = 0
+    const provider: AgentProviderApi = { ...fixture.options.provider, branchFrom: () => Effect.sync(() => {
+      forks++; return fixture.branchOutcome
+    }) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* pruneContinuation(runtime, "user")
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openContinuation({ sessionId: ROOT, messageId: "u" })))).toBeTrue()
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openContinuation({ sessionId: ROOT, messageId: "tail" })))).toBeTrue()
+      expect(forks).toBe(0)
+    })))
+  })
+
+  test("an ambiguous lazy fork reconciles without guessing a child or repeating the mutation", async () => {
+    const fixture = continuationFixture()
+    let forks = 0
+    const provider: AgentProviderApi = { ...fixture.options.provider, branchFrom: () => Effect.sync(() => {
+      forks++
+      addContinuationChild(fixture)
+      return { _tag: "AmbiguousBranchMutation" as const, providerId: "test", parentSessionId: ROOT, sourceMessageId: "a",
+        reason: "Mutation may have committed", reconciliation: "full-snapshot" as const }
+    }) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, provider })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      yield* pruneContinuation(runtime, "agent")
+      expect(Exit.isFailure(yield* Effect.exit(runtime.openContinuation({ sessionId: ROOT, messageId: "a" })))).toBeTrue()
+      yield* runtime.refresh()
+      expect(forks).toBe(1)
+      expect((yield* runtime.getState).relations).toEqual([])
+      expect(fixture.calls.some((call) => call.startsWith("show:"))).toBeFalse()
+      expect(selectConversationForest(yield* runtime.getState).graphs).toHaveLength(2)
+    })))
+  })
+})
+
+function continuationFixture(): Fixture {
+  const fixture = makeFixture()
+  fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, [
+    message("q", "user", "question", 0), message("a", "agent", "answer", 1),
+    message("u", "user", "next question", 2), message("tail", "agent", "deleted answer", 3),
+  ]]]))
+  fixture.branchOutcome = { _tag: "ValidatedBranch", ...prepared("continuation-child", "Continuation"),
+    derivation: { childSessionId: "continuation-child", parentSessionId: ROOT, sourceMessageId: "a",
+      sharedMessages: [{ parentMessageId: "q", childMessageId: "cq" }, { parentMessageId: "a", childMessageId: "ca" }] },
+    transcript: available([message("cq", "user", "question", 0), message("ca", "agent", "answer", 1)]),
+  }
+  return fixture
+}
+
+function addContinuationChild(fixture: Fixture): void {
+  const branch = fixture.branchOutcome
+  if (branch._tag !== "ValidatedBranch" || !branch.transcript) throw new Error("Expected fixture branch")
+  fixture.snapshot = { sessions: [...fixture.snapshot.sessions.filter((session) => session.id !== branch.session.id), branch.session],
+    transcripts: new Map([...fixture.snapshot.transcripts, [branch.session.id, branch.transcript]]) }
+}
+
+function pruneContinuation(runtime: AppRuntime, role: "agent" | "user") {
+  return runtime.remove({ kind: "subtree", target: { kind: "message", aliases: [
+    { sessionId: ROOT, messageId: role === "agent" ? "u" : "tail" },
+  ] }, createdAt: "2026-10-08T00:00:00.000Z" }, [ROOT])
+}
 
 interface Fixture {
   options: Parameters<typeof makeAppRuntime>[0]

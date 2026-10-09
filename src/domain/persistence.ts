@@ -4,6 +4,7 @@ export interface BranchRelation {
   readonly childSessionId: string
   readonly parentSessionId: string
   readonly sourceMessageId: string
+  readonly continuationMessageId?: string
   readonly sharedMessages: readonly {
     readonly parentMessageId: string
     readonly childMessageId: string

@@ -86,6 +86,8 @@ export interface BranchDerivation {
   readonly parentSessionId: string
   readonly sourceMessageId: string
   readonly sharedMessages: readonly SharedMessage[]
+  /** Application-owned lazy continuation anchor in the parent, not provider copy evidence. */
+  readonly continuationMessageId?: string
 }
 
 export interface AgentSessionSnapshot {

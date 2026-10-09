@@ -11,7 +11,7 @@ import { PersistencePlatform, nativePersistencePlatform } from "../../src/infras
 import { makeProviderStateRepository, type ProviderStateRepositoryApi, type ProviderStateRepositoryOptions } from "../../src/services/provider-state-repository"
 import { makeMetadataWorker } from "../../src/infrastructure/metadata/worker-service"
 import { runStateCommand } from "../../src/infrastructure/metadata/state-commands"
-import { databasePath, nativeStateDatabasePlatform, openStateDatabase, sqliteTransaction, type DatabaseSchemaPolicy, type StateDatabasePlatform } from "../../src/infrastructure/metadata/database"
+import { DATABASE_VERSION, databasePath, nativeStateDatabasePlatform, openStateDatabase, sqliteTransaction, type DatabaseSchemaPolicy, type StateDatabasePlatform } from "../../src/infrastructure/metadata/database"
 import { readMigrationFiles } from "drizzle-orm/migrator"
 
 const directories: string[] = []
@@ -61,6 +61,48 @@ test("relation conflicts and cycles roll back without modifying valid ancestry",
   expect((await run(repository.loadMetadata)).relations).toEqual([relation("child")])
   await run(repository.saveRelation({ ...relation("empty"), sharedMessages: [] }))
   expect((await run(repository.loadMetadata)).relations).toHaveLength(2)
+})
+
+test("continuation anchors survive repository and worker round trips and identity adoption", async () => {
+  const options = await fixture()
+  const repository = await open(options)
+  const continuation = { ...relation("child"), continuationMessageId: "unsubmitted-user" }
+  await run(repository.saveRelation(continuation))
+  await run(repository.close)
+  const worker = await run(makeMetadataWorker(options))
+  expect((await run(worker.loadMetadata)).relations).toEqual([continuation])
+  await run(worker.replaceIdentity("child", "adopted-child", { kind: "temporary-adoption" }))
+  await run(worker.close)
+  expect((await run((await open(options)).loadMetadata)).relations).toEqual([{ ...continuation, childSessionId: "adopted-child" }])
+})
+
+test("the production v1 migration preserves ancestry and adds nullable continuation anchors", async () => {
+  const options = await fixture()
+  const folder = join(options.stateHome, "v1-migrations")
+  await cp("src/infrastructure/metadata/migrations", folder, { recursive: true })
+  const journalPath = join(folder, "meta/_journal.json")
+  const journal = JSON.parse(await readFile(journalPath, "utf8"))
+  journal.entries = journal.entries.slice(0, 1)
+  await writeFile(journalPath, JSON.stringify(journal))
+  const old = await run(openStateDatabase(options.stateHome, false, { version: 1, folder,
+    migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }))
+  const date = "2026-01-01T00:00:00.000Z"
+  old.db.query("INSERT INTO projects VALUES (?, ?, ?, ?)").run("project", options.projectDirectory, date, date)
+  old.db.query("INSERT INTO project_providers VALUES (?, ?, ?, NULL, NULL)").run("scope", "project", "claude")
+  old.db.query("INSERT INTO session_refs VALUES (?, ?, ?)").run("parent-ref", "scope", "root")
+  old.db.query("INSERT INTO session_refs VALUES (?, ?, ?)").run("child-ref", "scope", "child")
+  old.db.query("INSERT INTO branch_relations VALUES (?, ?, ?, ?, ?)").run("child-ref", "scope", "parent-ref", "a", date)
+  old.db.query("INSERT INTO shared_message_mappings VALUES (?, ?, ?, ?)").run("child-ref", 0, "a", "copy-a")
+  await old.close()
+  const repository = await open(options)
+  expect((await run(repository.loadMetadata)).relations).toEqual([{ childSessionId: "child", parentSessionId: "root",
+    sourceMessageId: "a", sharedMessages: [{ parentMessageId: "a", childMessageId: "copy-a" }], createdAt: date }])
+  using db = new Database(repository.statePath, { readonly: true })
+  expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: DATABASE_VERSION })
+  expect(db.query("SELECT continuation_message_id FROM branch_relations").get()).toEqual({ continuation_message_id: null })
+  expect(db.query("PRAGMA foreign_key_check").all()).toEqual([])
+  expect(db.query<{ strict: number }, []>("SELECT strict FROM pragma_table_list WHERE name = 'branch_relations'").get()?.strict).toBe(1)
+  expect((await readdir(join(options.stateHome, "claude-tree"))).filter((name) => name.includes("before-v2"))).toHaveLength(1)
 })
 
 test("workspace writes do not query ancestry and temporary adoption retains local references", async () => {
@@ -202,10 +244,11 @@ async function upgradePolicy(options: Awaited<ReturnType<typeof fixture>>, fail 
   await cp("src/infrastructure/metadata/migrations", folder, { recursive: true })
   const journalPath = join(folder, "meta/_journal.json")
   const journal = JSON.parse(await readFile(journalPath, "utf8"))
-  journal.entries.push({ idx: 1, version: "6", when: journal.entries[0].when + 1, tag: "0001_upgrade", breakpoints: true })
+  const tag = `${String(DATABASE_VERSION).padStart(4, "0")}_upgrade`
+  journal.entries.push({ idx: DATABASE_VERSION, version: "6", when: journal.entries.at(-1).when + 1, tag, breakpoints: true })
   await writeFile(journalPath, JSON.stringify(journal))
-  await writeFile(join(folder, "0001_upgrade.sql"), `CREATE TABLE upgrade_marker (value TEXT NOT NULL) STRICT;\n--> statement-breakpoint\n${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('upgraded');"}\n--> statement-breakpoint\nPRAGMA user_version = 2;\n--> statement-breakpoint\n${extraSql}`)
-  return { version: 2, folder, migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
+  await writeFile(join(folder, `${tag}.sql`), `CREATE TABLE upgrade_marker (value TEXT NOT NULL) STRICT;\n--> statement-breakpoint\n${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('upgraded');"}\n--> statement-breakpoint\nPRAGMA user_version = ${DATABASE_VERSION + 1};\n--> statement-breakpoint\n${extraSql}`)
+  return { version: DATABASE_VERSION + 1, folder, migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
 }
 
 test("forward migration requires exclusive access, backs up, and rejects downgrade", async () => {
@@ -216,7 +259,7 @@ test("forward migration requires exclusive access, backs up, and rejects downgra
   const upgraded = await run(openStateDatabase(options.stateHome, true, policy))
   expect(upgraded.db.query("SELECT value FROM upgrade_marker").get()).toEqual({ value: "upgraded" })
   await upgraded.close()
-  const backups = (await readdir(join(options.stateHome, "claude-tree"))).filter((name) => name.includes("before-v2"))
+  const backups = (await readdir(join(options.stateHome, "claude-tree"))).filter((name) => name.includes(`before-v${DATABASE_VERSION + 1}`))
   expect(backups).toHaveLength(1)
   expect((await stat(join(options.stateHome, "claude-tree", backups[0]!))).mode & 0o777).toBe(0o600)
   await expect(open(options)).rejects.toThrow("Unsupported")
@@ -228,13 +271,13 @@ test("failed forward migration rolls back DDL, ledger, and compatibility version
   await expect(run(openStateDatabase(options.stateHome, true, policy))).rejects.toThrow()
   const reopened = await open(options)
   using db = new Database(reopened.statePath, { readonly: true })
-  expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
+  expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: DATABASE_VERSION })
   expect(db.query("SELECT name FROM sqlite_master WHERE name = 'upgrade_marker'").all()).toEqual([])
 })
 
 for (const [name, sql, error] of [
   ["foreign keys", "CREATE TABLE upgrade_child (parent TEXT REFERENCES projects(project_id) DEFERRABLE INITIALLY DEFERRED) STRICT;\n--> statement-breakpoint\nINSERT INTO upgrade_child VALUES ('missing');", "foreign key integrity"],
-  ["schema version", "PRAGMA user_version = 3;", "schema version"],
+  ["schema version", `PRAGMA user_version = ${DATABASE_VERSION + 2};`, "schema version"],
   ["migration history", "UPDATE __drizzle_migrations SET hash = 'invalid';", "migration history"],
   ["application identity", "PRAGMA application_id = 123;", "application identity"],
 ] as const) test(`migration validation of ${name} rolls back before commit`, async () => {
@@ -247,12 +290,12 @@ for (const [name, sql, error] of [
   const identity = before.query("PRAGMA application_id").get()
   await expect(run(openStateDatabase(options.stateHome, true, await upgradePolicy(options, false, sql)))).rejects.toThrow(error)
   using after = new Database(path, { readonly: true })
-  expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
+  expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: DATABASE_VERSION })
   expect(after.query("PRAGMA application_id").get()).toEqual(identity)
   expect(after.query("SELECT * FROM __drizzle_migrations").all()).toEqual(history)
   expect(after.query("SELECT name FROM sqlite_master WHERE name LIKE 'upgrade_%'").all()).toEqual([])
   expect((await run((await open(options)).loadMetadata)).relations).toEqual([relation("retained")])
-  const backups = (await readdir(join(options.stateHome, "claude-tree"))).filter((entry) => entry.includes("before-v2"))
+  const backups = (await readdir(join(options.stateHome, "claude-tree"))).filter((entry) => entry.includes(`before-v${DATABASE_VERSION + 1}`))
   expect(backups).toHaveLength(1)
 })
 
@@ -334,22 +377,23 @@ for (const fail of [false, true]) test(`skipped-version migrations ${fail ? "rol
   const second = await upgradePolicy(options)
   const journalPath = join(second.folder, "meta/_journal.json")
   const journal = JSON.parse(await readFile(journalPath, "utf8"))
-  journal.entries.push({ idx: 2, version: "6", when: journal.entries[1].when + 1, tag: "0002_upgrade", breakpoints: true })
+  const tag = `${String(DATABASE_VERSION + 1).padStart(4, "0")}_upgrade`
+  journal.entries.push({ idx: DATABASE_VERSION + 1, version: "6", when: journal.entries.at(-1).when + 1, tag, breakpoints: true })
   await writeFile(journalPath, JSON.stringify(journal))
-  await writeFile(join(second.folder, "0002_upgrade.sql"), `${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('third');"}\n--> statement-breakpoint\nPRAGMA user_version = 3;`)
-  const policy: DatabaseSchemaPolicy = { version: 3, folder: second.folder,
+  await writeFile(join(second.folder, `${tag}.sql`), `${fail ? "INSERT INTO upgrade_marker VALUES (NULL);" : "INSERT INTO upgrade_marker VALUES ('third');"}\n--> statement-breakpoint\nPRAGMA user_version = ${DATABASE_VERSION + 2};`)
+  const policy: DatabaseSchemaPolicy = { version: DATABASE_VERSION + 2, folder: second.folder,
     migrations: readMigrationFiles({ migrationsFolder: second.folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
   if (fail) {
     await expect(run(openStateDatabase(options.stateHome, true, policy))).rejects.toThrow("NOT NULL")
     using db = new Database(repository.statePath, { readonly: true })
-    expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 1 })
-    expect(db.query("SELECT count(*) AS count FROM __drizzle_migrations").get()).toEqual({ count: 1 })
+    expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: DATABASE_VERSION })
+    expect(db.query("SELECT count(*) AS count FROM __drizzle_migrations").get()).toEqual({ count: DATABASE_VERSION })
     expect(db.query("SELECT name FROM sqlite_master WHERE name = 'upgrade_marker'").all()).toEqual([])
   } else {
     const database = await run(openStateDatabase(options.stateHome, true, policy))
     try {
-      expect(database.db.query("PRAGMA user_version").get()).toEqual({ user_version: 3 })
-      expect(database.db.query("SELECT count(*) AS count FROM __drizzle_migrations").get()).toEqual({ count: 3 })
+      expect(database.db.query("PRAGMA user_version").get()).toEqual({ user_version: DATABASE_VERSION + 2 })
+      expect(database.db.query("SELECT count(*) AS count FROM __drizzle_migrations").get()).toEqual({ count: DATABASE_VERSION + 2 })
       expect(database.db.query("SELECT value FROM upgrade_marker ORDER BY rowid").all()).toEqual([{ value: "upgraded" }, { value: "third" }])
     } finally { await database.close() }
   }
@@ -359,9 +403,9 @@ test("failed initial validation rolls back the ledger and leaves a pristine data
   const options = await fixture()
   const folder = join(options.stateHome, "initial-migrations")
   await cp("src/infrastructure/metadata/migrations", folder, { recursive: true })
-  const sqlPath = join(folder, "0000_initial.sql")
-  await writeFile(sqlPath, (await readFile(sqlPath, "utf8")).replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;"))
-  const policy: DatabaseSchemaPolicy = { version: 1, folder,
+  const sqlPath = join(folder, "0001_lazy_continuations.sql")
+  await writeFile(sqlPath, (await readFile(sqlPath, "utf8")).replace(`PRAGMA user_version = ${DATABASE_VERSION};`, `PRAGMA user_version = ${DATABASE_VERSION + 1};`))
+  const policy: DatabaseSchemaPolicy = { version: DATABASE_VERSION, folder,
     migrations: readMigrationFiles({ migrationsFolder: folder }).map((entry) => ({ hash: entry.hash, when: entry.folderMillis })) }
   await expect(run(openStateDatabase(options.stateHome, false, policy))).rejects.toThrow("schema version")
   using db = new Database(databasePath(options.stateHome), { readonly: true })
