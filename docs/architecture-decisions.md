@@ -74,6 +74,8 @@ Every surviving message leaf retains an opening destination after pruning. If re
 
 Sessions and forks not created or recorded by `claude-tree` should still be usable. When their ancestry cannot be established reliably, show them as independent roots rather than guessing from message content.
 
+An explicit Open or Resume of a known persisted session does not require a successful cached history read. A missing-history observation is not a terminal admission decision: let the provider attempt resume through normal identity and ownership checks, and report an actual launch failure. Do not require a preliminary refresh or invent readable history; graph activation and historical branching retain their history requirements.
+
 ## Claude User Messages Replay From The Previous Agent
 
 Forking an agent message copies the transcript through that exact SDK message. Forking a user message has different semantics: copy through its nearest earlier agent, then open the child with the selected user text in Claude's composer without submitting it. Transcript order is authoritative, and adjacent messages may have the same role.

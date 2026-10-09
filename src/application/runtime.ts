@@ -1588,10 +1588,6 @@ export function makeAppRuntime(
               return
             }
             yield* retireVerification(intent.sessionId)
-            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
-              yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
-              return
-            }
             const session = selectProjectedData(state).sessions.get(intent.sessionId)
             if (!session || session.transient) {
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not resumable`)
@@ -1634,10 +1630,6 @@ export function makeAppRuntime(
             }
             if (running) {
               yield* reject(envelope.reply, intent._tag, "busy", `Session ${intent.sessionId} is ${running.phase}`)
-              return
-            }
-            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
-              yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
               return
             }
             const session = selectProjectedData(state).sessions.get(intent.sessionId)
