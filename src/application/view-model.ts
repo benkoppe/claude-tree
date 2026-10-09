@@ -73,6 +73,7 @@ export interface MessageNodeViewModel extends PositionedNodeViewModel {
   readonly preview: string
   readonly text?: string
   readonly aliases: readonly MessageRef[]
+  readonly forkTarget?: MessageRef
 }
 
 export interface EndpointNodeViewModel extends PositionedNodeViewModel {
@@ -411,6 +412,7 @@ function messageViewModel(
     preview: node.preview,
     text: node.text ?? "",
     aliases: node.aliases,
+    ...(node.forkTarget === undefined ? {} : { forkTarget: node.forkTarget }),
     target: { kind: "message", preferred, aliases: node.aliases },
   }
 }

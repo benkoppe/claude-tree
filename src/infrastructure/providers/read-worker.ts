@@ -18,10 +18,11 @@ const PROGRESS_CHARACTER_BUDGET = 1_000_000
 // Provider-specific payloads remain inside this read boundary. Forks independently
 // reread and validate their source; the actor consumes normalized history only.
 function messageForActor(message: AgentMessage): AgentMessage {
-  const { id, role, preview, ordinal, visible, text, displayGroupId, turnComplete, copyIdentity, historyBoundary, historical } = message
+  const { id, role, preview, ordinal, visible, text, displayGroupId, forkable, turnComplete, copyIdentity, historyBoundary, historical } = message
   return { id, role, preview, ordinal, visible,
     ...(text === undefined ? {} : { text }),
     ...(displayGroupId === undefined ? {} : { displayGroupId }),
+    ...(forkable === undefined ? {} : { forkable }),
     ...(turnComplete === undefined ? {} : { turnComplete }),
     ...(copyIdentity === undefined ? {} : { copyIdentity }),
     ...(historyBoundary === undefined ? {} : { historyBoundary }),

@@ -14,8 +14,11 @@ import { makeShutdownSignals, reportCliFailures, runPresentationLifecycle, runSc
 import { PROGRAM_NAME } from "../../src/program"
 import { ClaudeTerminalObserver } from "../../src/infrastructure/providers/claude/terminal-observer"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
+import { normalizeCodexThread } from "../../src/infrastructure/providers/codex/provider"
+import type { CodexTurn } from "../../src/infrastructure/providers/codex/app-server"
 import { selectConversationForest } from "../../src/application/selectors"
 import { available } from "../../src/application/state"
+import { isTranscriptPrefix, reconcileTranscript, sameTranscript } from "../../src/application/history-reconciliation"
 
 import {
   ApplicationShutdownError,
@@ -62,6 +65,23 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  test("Codex branch eligibility changes refresh history without changing logical message identity", () => {
+    const turn: CodexTurn = { id: "turn", status: "inProgress", items: [
+      { id: "answer", type: "agentMessage", text: "Answer" },
+      { id: "tail", type: "reasoning", summary: [] },
+    ] }
+    const previous = normalizeCodexThread({ turns: [turn] })
+    const completed = normalizeCodexThread({ turns: [{ ...turn, status: "completed" }] })
+    expect(isTranscriptPrefix(previous, completed)).toBeTrue()
+    expect(sameTranscript(previous, completed)).toBeFalse()
+    const result = reconcileTranscript({ _tag: "Available", messages: previous },
+      { _tag: "Available", messages: completed }, false, undefined, undefined, undefined, undefined)
+    expect(result.accepted).toBeTrue()
+    expect(result.candidate).toBeUndefined()
+    expect(result.read).toEqual({ _tag: "Available", messages: completed })
+    expect(sameTranscript(completed, completed.map((message) => ({ ...message, forkable: false })))).toBeFalse()
+  })
+
   test.each(["new", "open"] as const)("%s progress spans preparation and acquisition despite caller interruption", async (kind) => {
     const fixture = makeFixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -1939,6 +1959,55 @@ describe("application actor", () => {
     expect(state.unviewedSessionIds.has(ROOT)).toBeTrue()
     expect(fixture.incrementalReads).toContainEqual([ROOT])
     expect(fixture.incrementalReads.some((ids) => ids.includes(CHILD))).toBeFalse()
+  })
+
+  test("settles a live Codex response atomically into one grouped Agent with its full-turn fork boundary", async () => {
+    const fixture = makeFixture()
+    const turn: CodexTurn = { id: "turn", status: "inProgress", items: [
+      { id: "q", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+      { id: "comment", type: "agentMessage", text: "Checking" },
+      { id: "tool", type: "commandExecution", command: "pwd" },
+      { id: "answer", type: "agentMessage", text: "Answer" },
+      { id: "tail", type: "reasoning", summary: [] },
+    ] }
+    fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT,
+      normalizeCodexThread({ turns: [{ ...turn, items: turn.items.slice(0, 1) }] }),
+    ]]))
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, completionDelaysMs: [100] })
+      yield* runtime.resumeSession(ROOT)
+      yield* runtime.handleTerminalActivity(activity("owner-1", 1, ROOT, "working", true))
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT, normalizeCodexThread({ turns: [turn] })]]))
+      yield* runtime.returnFromTerminal
+      yield* runtime.refresh()
+      const working = yield* runtime.getViewModel
+      if (working.surface._tag !== "Graph") throw new Error("Expected navigator graph")
+      expect(working.surface.nodes.filter((node) => node._tag === "Message").map((node) => node.preview)).toEqual(["Question"])
+      expect(working.surface.nodes.filter((node) => node._tag === "Endpoint").map((node) => node.status)).toEqual(["working"])
+
+      fixture.snapshot = snapshot([session(ROOT, "Root")], new Map([[ROOT,
+        normalizeCodexThread({ turns: [{ ...turn, status: "completed" }] }),
+      ]]))
+      yield* runtime.handleTerminalActivity(activity("owner-1", 2, ROOT, "idle", false))
+      yield* TestClock.adjust(100)
+      yield* waitForState(runtime, (state) => state.unviewedSessionIds.has(ROOT))
+      const completed = yield* runtime.getViewModel
+      if (completed.surface._tag !== "Graph") throw new Error("Expected navigator graph")
+      const messages = completed.surface.nodes.filter((node) => node._tag === "Message")
+      expect(messages.map((node) => node.preview)).toEqual(["Question", "Checking Answer"])
+      expect(messages[1]?.text).toBe("Checking\n\nAnswer")
+      expect(messages[1]?.forkTarget).toEqual({ sessionId: ROOT, messageId: "tail" })
+      expect(completed.surface.nodes.some((node) => node._tag === "Endpoint" && node.status === "working")).toBeFalse()
+      yield* runtime.selectGraph(ROOT, { kind: "message", preferred: { sessionId: ROOT, messageId: "comment" },
+        aliases: [{ sessionId: ROOT, messageId: "comment" }] })
+      const restored = yield* runtime.getViewModel
+      if (restored.surface._tag !== "Graph") throw new Error("Expected navigator graph")
+      expect(restored.surface.nodes.find((node) => node.selected)?.id).toBe(messages[1]?.id)
+      yield* runtime.selectRoot(ROOT)
+      const roots = yield* runtime.getViewModel
+      if (roots.surface._tag !== "Roots") throw new Error("Expected catalogue")
+      expect(roots.surface.roots[0]?.messageCount).toBe(2)
+    }).pipe(Effect.provide(TestClock.layer()))))
   })
 
   test("automatically confirms a shortened transcript after one manual refresh", async () => {

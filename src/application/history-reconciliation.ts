@@ -163,7 +163,8 @@ export function isTranscriptPrefix(prefix: readonly AgentMessage[], transcript: 
 
 export function sameTranscript(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
   return left === right || (left.length === right.length && left.every((message, index) =>
-    sameLogicalMessage(message, right[index]) && message.historical === right[index]?.historical && message.turnComplete === right[index]?.turnComplete))
+    sameLogicalMessage(message, right[index]) && message.historical === right[index]?.historical && message.turnComplete === right[index]?.turnComplete &&
+    message.forkable === right[index]?.forkable))
 }
 
 function sameLogicalMessage(left: AgentMessage, right: AgentMessage | undefined): boolean {

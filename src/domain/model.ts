@@ -17,6 +17,8 @@ export interface AgentMessage {
   readonly ordinal: number
   readonly visible: boolean
   readonly displayGroupId?: string
+  /** Mutable branch eligibility, not message identity; absent defers admission to the provider. */
+  readonly forkable?: boolean
   readonly turnComplete?: boolean
   readonly copyIdentity?: string
   /** Provider-confirmed context compaction, not a user rewind or new prompt. */

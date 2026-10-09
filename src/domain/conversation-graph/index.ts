@@ -90,8 +90,10 @@ export function buildConversationForest(
   for (const [sessionId, transcript] of transcripts) {
     const lastVisible = transcript.findLast((message) => message.visible)
     if (!lastVisible) continue
+    const groupEnd = lastVisible.displayGroupId === undefined ? lastVisible
+      : transcript.findLast((message) => message.displayGroupId === lastVisible.displayGroupId)!
     const ids = displayGroupEndIdsBySession.get(sessionId) ?? new Set<string>()
-    ids.add(lastVisible.id)
+    ids.add(groupEnd.id)
     displayGroupEndIdsBySession.set(sessionId, ids)
   }
   propagateSharedMessageIds(displayGroupEndIdsBySession, relations)
@@ -204,24 +206,24 @@ function repairForkTargets(
   graphs: readonly ConversationGraph[],
   transcripts: ReadonlyMap<string, readonly AgentMessage[]>,
 ): void {
-  const currentMessageIds = new Map(
+  const currentForkableIds = new Map(
     [...transcripts].map(([sessionId, transcript]) => [
       sessionId,
-      new Set(transcript.map((message) => message.id)),
+      new Set(transcript.filter((message) => message.forkable !== false).map((message) => message.id)),
     ]),
   )
   for (const graph of graphs) {
     for (const node of graph.nodes.values()) {
-      if (node.kind !== "message") continue
+      if (node.kind === "origin") continue
       if (
         node.forkTarget &&
-        currentMessageIds.get(node.forkTarget.sessionId)?.has(node.forkTarget.messageId)
+        currentForkableIds.get(node.forkTarget.sessionId)?.has(node.forkTarget.messageId)
       ) {
         continue
       }
-      const target = [...node.aliases].reverse().find((alias) =>
-        currentMessageIds.get(alias.sessionId)?.has(alias.messageId)
-      )
+      const target = node.kind === "message" ? [...node.aliases].reverse().find((alias) =>
+        currentForkableIds.get(alias.sessionId)?.has(alias.messageId)
+      ) : undefined
       if (target) node.forkTarget = target
       else delete node.forkTarget
     }
@@ -1009,6 +1011,11 @@ function projectSharedPath(
   let openDisplayGroup: { id: string; group: ProjectedSharedGroup } | undefined
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index]!
+    if (!message.visible && message.displayGroupId !== undefined && openDisplayGroup?.id === message.displayGroupId) {
+      openDisplayGroup.group.indexes.push(index)
+      if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+      continue
+    }
     if (!message.visible && !exactBranchPoints.has(message.id)) {
       if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
       continue
@@ -1057,6 +1064,18 @@ function appendSessionMessages(
   for (let index = startIndex; index < transcript.length; index += 1) {
     const message = transcript[index]
     if (!message) continue
+    if (!message.visible && message.displayGroupId !== undefined && openDisplayGroup?.id === message.displayGroupId) {
+      const node = graph.nodes.get(openDisplayGroup.nodeId)
+      if (node?.kind === "message") {
+        const alias = { sessionId, messageId: message.id }
+        addAlias(node, alias)
+        if (message.forkable) node.forkTarget = alias
+        context.rawLogicalNodeIds[index] = node.id
+        context.nodeIdByMessageId.set(message.id, node.id)
+      }
+      if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
+      continue
+    }
     if (!message.visible && !exactBranchPoints.has(message.id)) {
       if (displayGroupEndPoints.has(message.id)) openDisplayGroup = undefined
       continue

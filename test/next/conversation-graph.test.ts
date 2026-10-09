@@ -14,6 +14,8 @@ import {
   visibleGraphNodeId,
 } from "../../src/domain/graph-layout"
 import type { AgentMessage, AgentSession, MessageRef } from "../../src/domain/model"
+import { normalizeCodexThread } from "../../src/infrastructure/providers/codex/provider"
+import type { CodexTurn } from "../../src/infrastructure/providers/codex/app-server"
 import type {
   BranchRelation,
   ConversationRemoval,
@@ -24,6 +26,71 @@ const CHILD = "child:opaque/id"
 const GRANDCHILD = "grandchild:opaque/id"
 
 describe("next conversation graph", () => {
+  test("consolidates Codex commentary, tools, and hidden fork boundaries across copied history and rewinds", () => {
+    const turns: CodexTurn[] = [{ id: "turn", status: "completed", error: null, items: [
+      { id: "u", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+      { id: "reasoning", type: "reasoning", summary: [] },
+      { id: "a1", type: "agentMessage", text: "Checking\n  detail", phase: "commentary" },
+      { id: "tool", type: "commandExecution", command: "pwd" },
+      { id: "a2", type: "agentMessage", text: "Final 🌲\n", phase: "final_answer" },
+      { id: "tail", type: "agentMessage", text: " " },
+    ] }]
+    const parent = normalizeCodexThread({ turns })
+    const child = normalizeCodexThread({ turns: turns.map((turn) => ({ ...turn, id: `copy-${turn.id}`,
+      items: turn.items.map((item) => ({ ...item, id: `copy-${item.id}` })),
+    })) })
+    const standalone = buildConversationForest([session(ROOT, 20)], new Map([[ROOT, parent]]), []).graphs[0]!
+    expect(nodes(standalone).map((node) => node.role)).toEqual(["user", "agent"])
+    const response = nodes(standalone)[1]!
+    expect(response.preview).toBe("Checking detail Final 🌲")
+    expect(response.text).toBe("Checking\n  detail\n\nFinal 🌲\n")
+    expect(resolveForkTarget(standalone, response.id)).toEqual({ sessionId: ROOT, messageId: "tail" })
+    expect(resolveForkTarget(standalone, nodes(standalone)[0]!.id)).toBeUndefined()
+    for (const retainedParent of [parent, [], parent.slice(0, 1)]) {
+      const graph = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+        new Map([[ROOT, retainedParent], [CHILD, child]]),
+        [relation(CHILD, ROOT, "tail", shared(parent, child, parent.length))]).graphs[0]!
+      expect(graph.warnings).toEqual([])
+      expect(nodes(graph).map((node) => node.role)).toEqual(["user", "agent"])
+      const grouped = nodes(graph)[1]!
+      expect(grouped.text).toBe(response.text)
+      expect(grouped.aliases).toContainEqual({ sessionId: ROOT, messageId: "a1" })
+      expect(grouped.aliases).toContainEqual({ sessionId: CHILD, messageId: "copy-tail" })
+      const target = resolveForkTarget(graph, grouped.id)!
+      expect(["tail", "copy-tail"]).toContain(target.messageId)
+      expect((target.sessionId === ROOT ? retainedParent : child).find((message) => message.id === target.messageId)?.forkable).toBeTrue()
+      expect(graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)?.parentId).toBe(grouped.id)
+    }
+    const removed = buildConversationForest([session(ROOT, 20)], new Map([[ROOT, parent]]), [],
+      [messageRemoval([{ sessionId: ROOT, messageId: "a1" }])]).graphs[0]!
+    expect(nodes(removed).map((node) => node.role)).toEqual(["user"])
+  })
+
+  test("keeps Codex turns and steering inputs ordered and exposes only completed final boundaries", () => {
+    const turns: CodexTurn[] = [{ id: "first", status: "completed", error: null, items: [
+      { id: "a1", type: "agentMessage", text: "Before steering" },
+      { id: "steer", type: "userMessage", content: [{ type: "text", text: "New input" }] },
+      { id: "a2", type: "agentMessage", text: "After steering" },
+      { id: "tail", type: "reasoning", summary: [] },
+    ] }, { id: "second", status: "inProgress", error: null, items: [
+      { id: "a3", type: "agentMessage", text: "Next turn" },
+      { id: "a4", type: "agentMessage", text: "Still working" },
+    ] }]
+    for (const status of ["inProgress", "interrupted", "failed", "completed"] as const) {
+      const transcript = normalizeCodexThread({ turns: [turns[0]!, { ...turns[1]!, status }] })
+      const graph = buildConversationForest([session(ROOT, 20)], new Map([[ROOT, transcript]]), []).graphs[0]!
+      expect(nodes(graph).map((node) => node.preview)).toEqual([
+        "Before steering", "New input", "After steering", "Next turn Still working",
+      ])
+      expect(nodes(graph).map((node) => resolveForkTarget(graph, node.id)?.messageId)).toEqual([
+        undefined, undefined, "tail", status === "completed" ? "a4" : undefined,
+      ])
+      expect(resolveForkTarget(graph, graph.endpointBySessionId.get(ROOT)!)).toEqual(
+        status === "completed" ? { sessionId: ROOT, messageId: "a4" } : undefined,
+      )
+    }
+  })
+
   test("preserves grouped full text across shared history and exact fork boundaries", () => {
     const parent = [
       { ...message("u", "user", "question", 0), text: "Question\n  detail" },

@@ -184,3 +184,54 @@ test("production worker reads real SDK transcripts, flushes a partial batch, and
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test("production Codex worker transfers response grouping and hidden fork boundaries without raw payloads", async () => {
+  const directory = await realpath(await mkdtemp("/tmp/opencode/claude-tree-codex-read-"))
+  const options = { providerId: "codex" as const, projectPath: directory }
+  const thread = { id: "worker-thread", name: "Worker", preview: "Question", updatedAt: 1,
+    cwd: directory, gitInfo: null, turns: [{ id: "turn", status: "completed", items: [
+      { id: "u", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+      { id: "comment", type: "agentMessage", text: "Checking" },
+      { id: "tool", type: "commandExecution", command: "pwd" },
+      { id: "answer", type: "agentMessage", text: "Answer" },
+      { id: "tail", type: "reasoning", summary: [] },
+    ] }] }
+  try {
+    await writeFile(join(directory, "codex"), `#!${process.execPath}
+import { createInterface } from "node:readline";
+const thread = ${JSON.stringify(thread)};
+for await (const line of createInterface({ input: process.stdin })) {
+  const request = JSON.parse(line);
+  if (request.id === undefined) continue;
+  const result = request.method === "initialize" ? {} : request.method === "thread/read" ? { thread } : null;
+  process.stdout.write(JSON.stringify({ id: request.id, result }) + "\\n");
+}
+`, { mode: 0o700 })
+    const workerEntry = new URL("../../src/infrastructure/providers/read-worker.ts", import.meta.url).href
+    const bootstrap = join(directory, "worker.ts")
+    await writeFile(bootstrap, `
+const which = Bun.which;
+Bun.which = (command, options) => command === "codex" ? ${JSON.stringify(join(directory, "codex"))} : which(command, options);
+await import(${JSON.stringify(workerEntry)});
+`)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const reads = yield* makeProviderReads(options, () => new Worker(bootstrap, {
+        workerData: options,
+      }))
+      const read = (yield* reads.readTranscripts([thread.id])).get(thread.id)
+      if (read?._tag === "Unavailable") throw new Error(read.reason)
+      expect(read?._tag).toBe("Available")
+      if (read?._tag !== "Available") throw new Error("Expected readable Codex transcript")
+      expect(read.messages.map((message) => message.displayGroupId)).toEqual([undefined, "u", "u", "u", "u"])
+      expect(read.messages.map((message) => message.forkable)).toEqual([false, false, false, false, true])
+      for (const message of read.messages) {
+        expect(message).not.toHaveProperty("rawItem")
+        expect(message).not.toHaveProperty("rawTurn")
+        expect(message.copyIdentity).toBeDefined()
+      }
+      yield* reads.close
+    })))
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
