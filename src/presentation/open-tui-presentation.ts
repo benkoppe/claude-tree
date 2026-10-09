@@ -1085,10 +1085,12 @@ class OpenTuiPresentationController {
       this.showError(`${this.provider.displayName} does not support historical branching`)
       return
     }
-    const target = selected.target.kind === "message"
-      ? selected.target.preferred
-      : selected.aliases.at(-1)
-    if (target) this.runAction(this.appRuntime.branchFrom(target), `fork:${target.sessionId}:${target.messageId}`)
+    if (selected.forkTarget === undefined) {
+      this.showError("This node is not a supported historical branch boundary; select the final response of a completed turn")
+      return
+    }
+    const target = selected.forkTarget
+    this.runAction(this.appRuntime.branchFrom(target), `fork:${target.sessionId}:${target.messageId}`)
   }
 
   private showStopConfirmation(): void {
@@ -1323,6 +1325,10 @@ class OpenTuiPresentationController {
   }
 
   private controlsWithDetails(controls: readonly FooterControl[]): readonly FooterControl[] {
+    const selected = this.selectedGraphNode()
+    if (selected?._tag === "Message" && selected.forkTarget === undefined) {
+      controls = controls.filter((control) => control.action !== "fork")
+    }
     const verification = this.selectedVerification()
     const withVerification: readonly FooterControl[] = verification ? [{
       key: "v", description: verification[1].status === "verifying" ? "verifying fork · cancel" : "retry verification", action: "verification",

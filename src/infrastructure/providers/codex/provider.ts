@@ -695,7 +695,7 @@ export class CodexProvider implements AgentProviderApi {
         "Codex can only branch from the final agent message of a completed turn, not a user message",
       ))
     }
-    if (selected.role === "system") {
+    if (selected.role === "system" && !selected.forkable) {
       return Effect.fail(this.protocolError(
         "branchFrom",
         "Codex can only branch from the final agent message of a completed turn, not a system item",
@@ -714,10 +714,10 @@ export class CodexProvider implements AgentProviderApi {
         `Codex can only branch from a completed turn; this turn is ${turn.status}`,
       ))
     }
-    if (selected.itemIndex !== turn.items.length - 1) {
+    if (!selected.forkable || selected.itemIndex !== turn.items.length - 1) {
       return Effect.fail(this.protocolError(
         "branchFrom",
-        "Codex can only branch from the final agent item of a completed turn",
+        "Codex can only branch from the final response boundary of a completed turn",
       ))
     }
     return Effect.void
@@ -1098,6 +1098,8 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
     }
     const turn = candidateTurn as unknown as CodexTurn
     turnIds.add(turn.id)
+    const turnStart = messages.length
+    let displayGroupId = turn.items[0]?.id
     for (const [itemIndex, sourceItem] of turn.items.entries()) {
       const candidateItem: unknown = sourceItem
       if (!isRecord(candidateItem) || typeof candidateItem.id !== "string" ||
@@ -1108,6 +1110,7 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
       const item = candidateItem as unknown as CodexThreadItem
       itemIds.add(item.id)
       const normalized = normalizeCodexItem(item)
+      if (item.type === "userMessage") displayGroupId = item.id
       messages.push({
         id: item.id,
         ...normalized,
@@ -1119,7 +1122,14 @@ export function normalizeCodexThread(thread: Pick<CodexThread, "turns">): readon
         turnStatus: turn.status,
         itemIndex,
         turnComplete: turn.status !== "inProgress",
+        forkable: false,
+        ...(item.type !== "userMessage" && displayGroupId !== undefined ? { displayGroupId } : {}),
       })
+    }
+    const lastVisible = messages.slice(turnStart).findLast((message) => message.visible)
+    if (turn.status === "completed" && lastVisible?.role === "agent" && lastVisible.displayGroupId === displayGroupId) {
+      const boundaryIndex = messages.length - 1
+      messages[boundaryIndex] = { ...messages[boundaryIndex]!, forkable: true }
     }
   }
   return messages

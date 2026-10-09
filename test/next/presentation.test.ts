@@ -688,6 +688,39 @@ test("forks the newly selected graph node without waiting for publication", asyn
   }
 })
 
+test("forks the explicit raw boundary rather than the node's navigation alias", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const initial = linearGraph("root-1", "Completed turn", "Consolidated answer")
+  if (initial.surface._tag !== "Graph") throw new Error("Expected graph")
+  const view = { ...initial, surface: { ...initial.surface, nodes: initial.surface.nodes.map((node) =>
+    node._tag === "Message" ? { ...node, forkTarget: { sessionId: "root-1", messageId: "hidden-tail" } } : node) } }
+  const running = await startPresentation(setup.renderer, view)
+  try {
+    await frame(setup, (value) => value.includes("Consolidated answer") && value.includes("f fork"))
+    setup.mockInput.pressKey("f")
+    await waitFor(() => running.harness.calls.includes("branch:root-1:hidden-tail"))
+    expect(running.harness.calls).not.toContain("branch:root-1:message")
+  } finally { await running.stop() }
+})
+
+test("does not offer or dispatch Fork for an unsupported response boundary", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const initial = linearGraph("root-1", "Incomplete turn", "Partial answer")
+  if (initial.surface._tag !== "Graph") throw new Error("Expected graph")
+  const view = { ...initial, surface: { ...initial.surface, nodes: initial.surface.nodes.map((node) => {
+    if (node._tag !== "Message") return node
+    const { forkTarget: _, ...unavailable } = node
+    return unavailable
+  }) } }
+  const running = await startPresentation(setup.renderer, view)
+  try {
+    await frame(setup, (value) => value.includes("Partial answer") && !value.includes("f fork"))
+    setup.mockInput.pressKey("f")
+    await frame(setup, (value) => value.includes("not a supported historical branch boundary"))
+    expect(running.harness.calls.some((call) => call.startsWith("branch:"))).toBeFalse()
+  } finally { await running.stop() }
+})
+
 test("a stalled manual refresh does not block navigation or forking", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const initial = branchingGraph("root-1", "Refresh concurrency")
@@ -2208,6 +2241,7 @@ function messageNode(
     role: "user",
     preview,
     aliases: [ref],
+    forkTarget: ref,
   }
 }
 

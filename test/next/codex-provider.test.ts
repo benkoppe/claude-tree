@@ -4,6 +4,7 @@ import { Deferred, Effect, Fiber, PubSub } from "effect"
 import { TestClock } from "effect/testing"
 
 import { NullTerminalObserver } from "../../src/domain/model"
+import { buildConversationForest, resolveForkTarget } from "../../src/domain/conversation-graph"
 import {
   PersistenceError,
   ProviderError,
@@ -366,7 +367,7 @@ describe("Effect Codex provider", () => {
     for (const [target, reason] of [
       ["user", "not a user message"],
       ["system", "not a system item"],
-      ["agent-mid", "final agent item"],
+      ["agent-mid", "final response boundary"],
       ["agent-working", "this turn is inProgress"],
       ["absent", "no longer available"],
     ] as const) {
@@ -378,6 +379,97 @@ describe("Effect Codex provider", () => {
       expect(error.message).toContain(reason)
       expect(client.forkCalls).toHaveLength(0)
     }
+  })
+
+  test("groups responses by turn and steering input without changing raw copy evidence", () => {
+    const source = thread(ROOT, [turn("first", "completed", [
+      user("u1", [{ type: "text", text: "Question" }]),
+      { id: "a1", type: "agentMessage", text: "Checking\n  detail", phase: "commentary" },
+      { id: "tool", type: "commandExecution", command: "pwd" },
+      { id: "a2", type: "agentMessage", text: "Answer", phase: "final_answer" },
+      { id: "tail", type: "agentMessage", text: " " },
+    ]), turn("second", "inProgress", [
+      { id: "a3", type: "agentMessage", text: "Starting" },
+      user("steer", [{ type: "text", text: "Change direction" }]),
+      { id: "a4", type: "agentMessage", text: "Continuing" },
+    ])])
+    const normalized = normalizeCodexThread(source)
+    expect(normalized.map((message) => message.displayGroupId)).toEqual([
+      undefined, "u1", "u1", "u1", "u1", "a3", undefined, "steer",
+    ])
+    expect(normalized.filter((message) => message.forkable).map((message) => message.id)).toEqual(["tail"])
+    expect(normalized.map((message) => message.rawItem)).toEqual(source.turns.flatMap((turn) => turn.items))
+    expect(normalized.map((message) => message.ordinal)).toEqual(normalized.map((_, index) => index))
+    expect(normalized[1]?.text).toBe("Checking\n  detail")
+    const completed = normalizeCodexThread(thread(ROOT, [source.turns[0]!, { ...source.turns[1]!, status: "completed" }]))
+    expect(completed.map((message) => message.displayGroupId)).toEqual(normalized.map((message) => message.displayGroupId))
+    expect(completed.filter((message) => message.forkable).map((message) => message.id)).toEqual(["tail", "a4"])
+  })
+
+  test("does not mistake an unanswered hidden user input for a trailing response boundary", () => {
+    const messages = normalizeCodexThread(thread(ROOT, [turn("turn", "completed", [
+      { id: "answer", type: "agentMessage", text: "Earlier answer" },
+      user("empty-input", []),
+      { id: "tail", type: "reasoning", summary: [] },
+    ])]))
+    expect(messages.every((message) => message.forkable === false)).toBeTrue()
+    expect(messages.map((message) => message.displayGroupId)).toEqual(["answer", undefined, "empty-input"])
+  })
+
+  test.each(["reasoning", "commandExecution", "agentMessage"])("forks the full turn through a hidden %s tail", async (type) => {
+    const parent = thread(ROOT, [turn("parent-turn", "completed", [
+      user("u", [{ type: "text", text: "Question" }]),
+      { id: "comment", type: "agentMessage", text: "Checking" },
+      { id: "answer", type: "agentMessage", text: "Answer", phase: "final_answer" },
+      { id: "tail", type, text: " " },
+    ]), turn("later", "completed", [{ id: "later-answer", type: "agentMessage", text: "Later" }])])
+    const child = thread(CHILD, [{ ...parent.turns[0]!, id: "child-turn",
+      items: parent.turns[0]!.items.map((item) => ({ ...item, id: `copy-${item.id}` })),
+    }])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : child), forkThread: () => Effect.succeed(child) })
+    const provider = providerWith(client)
+    const rejected = await Effect.runPromise(Effect.flip(provider.branchFrom({ sessionId: ROOT, messageId: "answer" })))
+    expect(rejected).toBeInstanceOf(ProviderProtocolError)
+    expect(client.forkCalls).toHaveLength(0)
+    const sourceGraph = buildConversationForest([{ id: ROOT, title: "Parent", lastModified: 1 }],
+      new Map([[ROOT, normalizeCodexThread(parent)]]), []).graphs[0]!
+    const response = [...sourceGraph.nodes.values()].find((node) => node.kind === "message" && node.preview === "Checking Answer")!
+    const target = resolveForkTarget(sourceGraph, response.id)!
+    expect(target).toEqual({ sessionId: ROOT, messageId: "tail" })
+    const outcome = await Effect.runPromise(provider.branchFrom(target))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(client.forkCalls).toEqual([{ threadId: ROOT, turnId: "parent-turn", cwd: "/project" }])
+    expect(outcome.derivation.sourceMessageId).toBe("tail")
+    expect(outcome.derivation.sharedMessages).toEqual(parent.turns[0]!.items.map((item) => ({
+      parentMessageId: item.id, childMessageId: `copy-${item.id}`,
+    })))
+    const forkedGraph = buildConversationForest([
+      { id: ROOT, title: "Parent", lastModified: 1 }, outcome.session,
+    ], new Map([[ROOT, normalizeCodexThread(parent)], [CHILD, normalizeCodexThread(child)]]), [{
+      ...outcome.derivation, createdAt: "2026-10-08T00:00:00.000Z",
+    }]).graphs[0]!
+    expect(forkedGraph.warnings).toEqual([])
+    expect([...forkedGraph.nodes.values()].filter((node) => node.kind === "message").map((node) => node.preview)).toEqual([
+      "Question", "Checking Answer", "Later",
+    ])
+  })
+
+  test("rejects corrupted hidden-tail copy evidence rather than validating only visible text", async () => {
+    const parent = thread(ROOT, [turn("parent-turn", "completed", [
+      { id: "answer", type: "agentMessage", text: "Answer" },
+      { id: "tail", type: "commandExecution", command: "pwd" },
+    ])])
+    const child = thread(CHILD, [turn("child-turn", "completed", [
+      { id: "copy-answer", type: "agentMessage", text: "Answer" },
+      { id: "copy-tail", type: "commandExecution", command: "ls" },
+    ])])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : child), forkThread: () => Effect.succeed(child) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "tail" }))
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected rejected copy evidence")
+    expect(outcome.verification?.status).toBe("contradicted")
+    expect(client.forkCalls).toHaveLength(1)
   })
 
   test("forks exactly once, rereads the child, and validates the exact copied prefix", async () => {
