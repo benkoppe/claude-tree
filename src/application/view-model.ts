@@ -111,6 +111,7 @@ export type SurfaceViewModel =
 
 export interface ApplicationViewModel {
   readonly branchVerifications?: ApplicationState["branchVerifications"]
+  readonly pendingOperations: ApplicationState["pendingOperations"]
   readonly selectionId: string | null
   readonly surface: SurfaceViewModel
   readonly modal: ApplicationModal | null
@@ -201,6 +202,8 @@ export function indexRootViews(roots: readonly RootViewModel[]): RootViewIndex {
 
 export function projectApplicationViewModel(state: ApplicationState): ApplicationViewModel {
   return {
+    branchVerifications: state.branchVerifications,
+    pendingOperations: state.pendingOperations,
     selectionId: state.selectionId,
     surface: projectSurface(state),
     modal: state.modal,

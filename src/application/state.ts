@@ -129,8 +129,12 @@ export interface BranchVerificationState {
   readonly retryable: boolean
 }
 
+export type ApplicationOperationKind = "fork" | "verification" | "new" | "open" | "stop" | "remove" | "return"
+
 export interface ApplicationState {
   readonly branchVerifications: ReadonlyMap<string, BranchVerificationState>
+  /** Actor-admitted workflows, retained across command-stage handoffs. Never persisted. */
+  readonly pendingOperations: ReadonlyMap<number, ApplicationOperationKind>
   /** Invocation-local recency; metadata-only writes do not count as conversation activity. */
   readonly conversationActivity: ReadonlyMap<string, number>
   /** Latest read outcome, independent of retained accepted history. */
@@ -173,6 +177,7 @@ export function makeInitialApplicationState(
 ): ApplicationState {
   return {
     branchVerifications: new Map(),
+    pendingOperations: new Map(),
     conversationActivity: new Map(),
     historyStatus: new Map(),
     selectionId: null,

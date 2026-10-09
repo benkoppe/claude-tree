@@ -33,6 +33,7 @@ import { describeSession, historyStatusForRead, selectCatalogueFamilies, selectF
 import type {
   ActiveRefresh,
   ApplicationModal,
+  ApplicationOperationKind,
   ApplicationState,
   BranchVerificationState,
   ApplicationSurface,
@@ -44,6 +45,8 @@ export const MAX_COMPLETION_REFRESH_ATTEMPTS = HISTORY_RETRY_DELAYS_MS.length
 
 export type StateEvent =
   | { readonly _tag: "BranchVerificationChanged"; readonly sessionId: string; readonly verification?: BranchVerificationState }
+  | { readonly _tag: "OperationStarted"; readonly id: number; readonly kind: ApplicationOperationKind }
+  | { readonly _tag: "OperationsFinished"; readonly ids: readonly number[] }
   | { readonly _tag: "PreparedRefreshPublished"; readonly base: ApplicationState; readonly candidate: ApplicationState }
   | { readonly _tag: "RefreshProgress"; readonly key: string; readonly generation: number; readonly snapshot: AgentSessionSnapshot }
   | { readonly _tag: "RefreshStarted"; readonly refresh: ActiveRefresh; readonly replaceAll?: boolean }
@@ -86,10 +89,18 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
     }
     case "PreparedRefreshPublished": {
       const next: ApplicationState = { ...event.candidate, surface: state.surface, selectionId: state.selectionId,
+        pendingOperations: state.pendingOperations,
         modal: event.candidate.modal === event.base.modal ? state.modal : event.candidate.modal }
       const previousGraph = state.surface._tag === "Graph" ? selectConversationForest(state).graphBySessionId.get(state.surface.familySessionId) : undefined
       const nextGraph = next.surface._tag === "Graph" ? selectConversationForest(next).graphBySessionId.get(next.surface.familySessionId) : undefined
       return previousGraph && previousGraph === nextGraph ? next : repairNavigatorSurface(next)
+    }
+    case "OperationStarted":
+      return { ...state, pendingOperations: new Map(state.pendingOperations).set(event.id, event.kind) }
+    case "OperationsFinished": {
+      const pendingOperations = new Map(state.pendingOperations)
+      for (const id of event.ids) pendingOperations.delete(id)
+      return pendingOperations.size === state.pendingOperations.size ? state : { ...state, pendingOperations }
     }
     case "RefreshProgress": {
       const refresh = state.refresh.active.get(event.key)
@@ -322,6 +333,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
         ...state,
         shutdown: "shutting-down",
         branchVerifications: new Map(),
+        pendingOperations: new Map(),
         terminals: new Map([...state.terminals].map(([id, terminal]) => [id, { ...terminal, pendingSubmission: undefined }])),
         modal: null,
         pendingCompletions: new Map(),

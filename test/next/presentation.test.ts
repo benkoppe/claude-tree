@@ -6,6 +6,7 @@ import { Deferred, Effect, Fiber, SubscriptionRef } from "effect"
 import type {
   AppRuntime,
   ApplicationModal,
+  ApplicationOperationKind,
   ApplicationViewModel,
   ApplicationState,
   GraphNodeViewModel,
@@ -66,6 +67,37 @@ test("verification progress has a cancel action and paused verification has a di
     await waitFor(() => running.harness.calls.includes("verification:retry:root-1"))
     expect(running.harness.calls.some((call) => call.startsWith("branch:"))).toBeFalse()
   } finally { await running.stop() }
+})
+
+test("read-only verification retry animates and cancellation restores its shortcut on unchanged root rows", async () => {
+  const setup = await createTestRenderer({ width: 140, height: 24 })
+  const roots = idleRootsView()
+  const clock = controlSpinnerClock()
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, roots)
+    await frame(setup, (value) => value.includes("Conversation roots"))
+    await Effect.runPromise(running.harness.update({ ...roots, pendingOperations: new Map([[1, "verification"]]),
+      branchVerifications: new Map([["root-1", { status: "verifying", reason: "Reading captured fork history", retryable: true }]]),
+    }))
+    await frame(setup, (value) => value.includes("| verifying fork · cancel") && value.includes("| Verifying fork history"))
+    clock.tick!()
+    await frame(setup, (value) => value.includes("/ verifying fork · cancel"))
+    setup.mockInput.pressKey("v")
+    await waitFor(() => running!.harness.calls.includes("verification:cancel:root-1"))
+    await Effect.runPromise(running.harness.update({ ...roots,
+      branchVerifications: new Map([["root-1", { status: "paused", reason: "Child preserved independently", retryable: true }]]),
+    }))
+    await frame(setup, (value) => value.includes("v retry verification") && !value.includes("Verifying fork history"))
+    expect(clock.cleared).toBeTrue()
+    // No other root-row or operation change can invalidate this next publication.
+    await Effect.runPromise(running.harness.update({ ...roots, branchVerifications: new Map() }))
+    await frame(setup, (value) => !value.includes("retry verification"))
+    expect(running.harness.calls.some((call) => call.startsWith("branch:"))).toBeFalse()
+  } finally {
+    try { await running?.stop() }
+    finally { clock.restore() }
+  }
 })
 
 test("renders roots and preserves directional graph navigation intent", async () => {
@@ -188,35 +220,159 @@ test("loading rows animate without a global refresh or a working terminal and st
   const roots: ApplicationViewModel = { ...ready, refreshing: false, surface: { ...ready.surface,
     roots: [{ ...ready.surface.roots[0]!, activation: "loading", history: { _tag: "Loading" } }],
   } }
-  const originalSetTimeout = globalThis.setTimeout
-  const originalClearTimeout = globalThis.clearTimeout
-  const handle = {} as ReturnType<typeof setTimeout>
-  let tick: (() => void) | undefined
-  let cleared = false
-  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
-    if (args[1] !== 80) return Reflect.apply(originalSetTimeout, globalThis, args)
-    const callback = args[0]
-    if (typeof callback !== "function") throw new Error("Expected animation callback")
-    tick = () => callback()
-    return handle
-  }) as typeof setTimeout)
-  const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((value) => {
-    if (value === handle) cleared = true
-    else Reflect.apply(originalClearTimeout, globalThis, [value])
-  })
+  const clock = controlSpinnerClock()
   let running: Awaited<ReturnType<typeof startPresentation>> | undefined
   try {
     running = await startPresentation(setup.renderer, roots)
     await frame(setup, (value) => value.includes("⠋ Loading"))
-    expect(tick).toBeDefined()
-    tick!()
+    expect(clock.tick).toBeDefined()
+    clock.tick!()
     await frame(setup, (value) => value.includes("⠙ Loading"))
     await Effect.runPromise(running.harness.update({ ...ready, surface: { ...ready.surface, roots: [ready.surface.roots[0]!] } }))
     await frame(setup, (value) => value.includes("Enter open") && !value.includes("Loading"))
-    expect(cleared).toBeTrue()
+    expect(clock.cleared).toBeTrue()
   } finally {
     try { await running?.stop() }
-    finally { timer.mockRestore(); clearTimer.mockRestore() }
+    finally { clock.restore() }
+  }
+})
+
+test.each([
+  { kind: "fork", key: "f", description: "fork", label: "Forking", roots: false },
+  { kind: "new", key: "n", description: "new", label: "Creating session", roots: true },
+  { kind: "open", key: "Enter", description: "open", label: "Opening session", roots: false },
+  { kind: "stop", key: "x", description: "kill", label: "Stopping", roots: false },
+  { kind: "stop", key: "x", description: "kill", label: "Stopping", roots: true },
+  { kind: "remove", key: "d", description: "delete", label: "Deleting", roots: false },
+  { kind: "remove", key: "d", description: "delete", label: "Deleting", roots: true },
+] as const)("animates $kind progress (roots: $roots) without refresh and restores the shortcut", async ({ kind, key, description, label, roots }) => {
+  const setup = await createTestRenderer({ width: 140, height: 24 })
+  const initial = roots ? idleRootsView() : linearGraph("root-1", "Operation progress", "question")
+  const clock = controlSpinnerClock()
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, { ...initial, pendingOperations: new Map([[1, kind]]) })
+    await frame(setup, (value) => value.includes(`| ${description}`) && value.includes(`| ${label}`))
+    expect(clock.tick).toBeDefined()
+    clock.tick!()
+    await frame(setup, (value) => value.includes(`/ ${description}`) && value.includes(`/ ${label}`))
+    await Effect.runPromise(running.harness.update(initial))
+    await frame(setup, (value) => value.includes(`${key} ${description}`) && !value.includes(label))
+    expect(clock.cleared).toBeTrue()
+  } finally {
+    try { await running?.stop() }
+    finally { clock.restore() }
+  }
+})
+
+test("concurrent operation progress survives view changes and stops only after the last operation", async () => {
+  const setup = await createTestRenderer({ width: 140, height: 24 })
+  const initial = linearGraph("root-1", "Concurrent operations", "question")
+  const pendingOperations = new Map<number, ApplicationOperationKind>([[1, "fork"], [2, "fork"], [3, "open"]])
+  const clock = controlSpinnerClock()
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, { ...initial, pendingOperations })
+    await frame(setup, (value) => value.includes("| fork") && value.includes("Forking (2) · Opening session"))
+    await Effect.runPromise(running.harness.update({ ...idleRootsView(), pendingOperations }))
+    await frame(setup, (value) => value.includes("Conversation roots") && value.includes("Forking (2)"))
+    await Effect.runPromise(running.harness.update({ ...idleRootsView(), pendingOperations: new Map([[2, "fork"]]) }))
+    clock.tick!()
+    await frame(setup, (value) => value.includes("/ Forking") && !value.includes("Opening session") && !value.includes("Forking (2)"))
+    expect(clock.cleared).toBeFalse()
+    await Effect.runPromise(running.harness.update(idleRootsView()))
+    await frame(setup, (value) => !value.includes("Forking"))
+    expect(clock.cleared).toBeTrue()
+  } finally {
+    try { await running?.stop() }
+    finally { clock.restore() }
+  }
+})
+
+test("operation animation leaves refresh, keyboard input, and footer mouse targets intact", async () => {
+  const setup = await createTestRenderer({ width: 160, height: 24 })
+  const initial = linearGraph("root-1", "Clickable progress", "question")
+  const running = await startPresentation(setup.renderer, { ...initial, refreshing: true,
+    pendingOperations: new Map([[1, "open"], [2, "fork"]]),
+  })
+  try {
+    const rendered = await frame(setup, (value) => /[|/\\-] open [|/\\-] fork/u.test(value) && /[|/\\-] refresh/u.test(value))
+    // Replacing Enter changes the positions of every following footer control.
+    const refresh = coordinateOf(rendered, rendered.match(/[|/\\-] refresh/u)![0])
+    await setup.mockMouse.click(refresh.x, refresh.y)
+    await waitFor(() => running.harness.calls.includes("refresh"))
+    setup.mockInput.pressArrow("down")
+    await waitFor(() => running.harness.calls.some((call) => call.startsWith("select-graph:")))
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.filter((call) => call === "refresh").length === 2)
+  } finally { await running.stop() }
+})
+
+test("terminal-return progress animates only the host-owned bottom bar", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const initial: ApplicationViewModel = { ...baseView(), surface: {
+    _tag: "Terminal", sessionId: "root-1", title: "Stock terminal", status: "idle", draft: undefined,
+  }, pendingOperations: new Map([[1, "return"]]) }
+  const clock = controlSpinnerClock()
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, initial)
+    const first = await frame(setup, (value) => value.includes("c/t · | back"))
+    expect(first).not.toContain("Conversation roots")
+    clock.tick!()
+    await frame(setup, (value) => value.includes("c/t · / back"))
+    await Effect.runPromise(running.harness.update({ ...initial, pendingOperations: new Map() }))
+    await frame(setup, (value) => value.includes("Ctrl+Space back"))
+    expect(clock.cleared).toBeTrue()
+  } finally {
+    try { await running?.stop() }
+    finally { clock.restore() }
+  }
+})
+
+test("working-agent animation continues after an operation settles", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 })
+  const roots = rootsView()
+  const clock = controlSpinnerClock()
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, { ...roots, pendingOperations: new Map([[1, "new"]]) })
+    await frame(setup, (value) => value.includes("Creating session") && value.includes("⠋"))
+    await Effect.runPromise(running.harness.update(roots))
+    await frame(setup, (value) => !value.includes("Creating session"))
+    expect(clock.cleared).toBeFalse()
+    clock.tick!()
+    await frame(setup, (value) => value.includes("⠙"))
+    await Effect.runPromise(running.harness.update(idleRootsView()))
+    await frame(setup, (value) => !value.includes("⠙"))
+    expect(clock.cleared).toBeTrue()
+  } finally {
+    try { await running?.stop() }
+    finally { clock.restore() }
+  }
+})
+
+test("progress survives a clipped footer and undersized resize, and teardown releases its timer", async () => {
+  const setup = await createTestRenderer({ width: 50, height: 12 })
+  const initial = linearGraph("root-1", "Narrow progress", "question")
+  const clock = controlSpinnerClock()
+  let running: Awaited<ReturnType<typeof startPresentation>> | undefined
+  try {
+    running = await startPresentation(setup.renderer, { ...initial, pendingOperations: new Map([[1, "new"], [2, "fork"]]) })
+    await frame(setup, (value) => value.includes("| Creating session · Forking"))
+    setup.resize(40, 8)
+    await frame(setup, (value) => value.includes("Resize to at least"))
+    expect(clock.cleared).toBeTrue()
+    clock.cleared = false
+    setup.resize(50, 12)
+    await frame(setup, (value) => value.includes("| Creating session · Forking"))
+    clock.tick!()
+    await frame(setup, (value) => value.includes("/ Creating session · Forking"))
+    await running.stop()
+    expect(clock.cleared).toBeTrue()
+  } finally {
+    try { await running?.stop() }
+    finally { clock.restore() }
   }
 })
 
@@ -1594,6 +1750,28 @@ interface RuntimeHarness {
   readonly update: (viewModel: ApplicationViewModel) => Effect.Effect<void>
 }
 
+function controlSpinnerClock() {
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  const handle = {} as ReturnType<typeof setTimeout>
+  const clock = { tick: undefined as (() => void) | undefined, cleared: false, restore: () => {
+    timer.mockRestore()
+    clearTimer.mockRestore()
+  } }
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+    if (args[1] !== 80) return Reflect.apply(originalSetTimeout, globalThis, args)
+    const callback = args[0]
+    if (typeof callback !== "function") throw new Error("Expected animation callback")
+    clock.tick = () => callback()
+    return handle
+  }) as typeof setTimeout)
+  const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((value) => {
+    if (value === handle) clock.cleared = true
+    else Reflect.apply(originalClearTimeout, globalThis, [value])
+  })
+  return clock
+}
+
 interface RuntimeActionOverrides {
   readonly enterRoot?: (sessionId: string) => Effect.Effect<unknown, unknown>
   readonly selectRoot?: (sessionId: string | null, publishSelection: () => Effect.Effect<boolean>) => Effect.Effect<unknown, unknown>
@@ -1839,6 +2017,12 @@ function rootsView(firstTitle = "First conversation"): ApplicationViewModel {
   }
 }
 
+function idleRootsView(): ApplicationViewModel {
+  const view = rootsView()
+  if (view.surface._tag !== "Roots") throw new Error("Expected roots")
+  return { ...view, surface: { ...view.surface, roots: view.surface.roots.map((root) => ({ ...root, status: "idle" })) } }
+}
+
 function linearGraph(familySessionId: string, title: string, preview: string): ApplicationViewModel {
   const message = messageNode("message", preview, 24, 0, [], ["endpoint"], true, familySessionId)
   const endpoint = endpointNode("endpoint", familySessionId, title, 24, 4, ["message"], false)
@@ -1986,6 +2170,7 @@ function endpointNode(
 
 function baseView(): Omit<ApplicationViewModel, "surface"> {
   return {
+    pendingOperations: new Map(),
     selectionId: null,
     modal: null,
     refreshing: false,
