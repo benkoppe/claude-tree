@@ -9,6 +9,13 @@ Claude Code is used by default; pass --codex to use Codex.
     Restore saved navigation and reopen the visible provider session, if any.
     Hidden agents are not restarted. Find the current resume command in About.
 
+Application state (no interactive terminal required):
+  state import-json [--codex] [PROJECT]  explicitly import strict v3 metadata
+  state export [--codex] [PROJECT]       print private application metadata
+  state check                           validate the SQLite database
+  state backup DESTINATION              create a consistent private snapshot
+  Close all legacy invocations before importing. Provider transcripts are unchanged.
+
 History diagnostics (Claude Code):
   --diagnose-history SESSION_ID [PROJECT]
     Read one session through the production history resolver and print a sanitized

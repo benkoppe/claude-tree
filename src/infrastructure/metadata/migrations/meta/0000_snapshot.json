@@ -1,0 +1,945 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "63b2da8e-abc4-4202-bda3-d1c6594e7a95",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "tables": {
+    "shared_message_mappings": {
+      "name": "shared_message_mappings",
+      "columns": {
+        "child_session_ref_id": {
+          "name": "child_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "parent_message_id": {
+          "name": "parent_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "child_message_id": {
+          "name": "child_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "shared_message_mappings_child_session_ref_id_parent_message_id_unique": {
+          "name": "shared_message_mappings_child_session_ref_id_parent_message_id_unique",
+          "columns": [
+            "child_session_ref_id",
+            "parent_message_id"
+          ],
+          "isUnique": true
+        },
+        "shared_message_mappings_child_session_ref_id_child_message_id_unique": {
+          "name": "shared_message_mappings_child_session_ref_id_child_message_id_unique",
+          "columns": [
+            "child_session_ref_id",
+            "child_message_id"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "shared_message_mappings_child_session_ref_id_branch_relations_child_session_ref_id_fk": {
+          "name": "shared_message_mappings_child_session_ref_id_branch_relations_child_session_ref_id_fk",
+          "tableFrom": "shared_message_mappings",
+          "tableTo": "branch_relations",
+          "columnsFrom": [
+            "child_session_ref_id"
+          ],
+          "columnsTo": [
+            "child_session_ref_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "shared_message_mappings_child_session_ref_id_ordinal_pk": {
+          "columns": [
+            "child_session_ref_id",
+            "ordinal"
+          ],
+          "name": "shared_message_mappings_child_session_ref_id_ordinal_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "mapping_ordinal": {
+          "name": "mapping_ordinal",
+          "value": "\"shared_message_mappings\".\"ordinal\" >= 0"
+        },
+        "mapping_nonempty": {
+          "name": "mapping_nonempty",
+          "value": "length(\"shared_message_mappings\".\"parent_message_id\") > 0 AND length(\"shared_message_mappings\".\"child_message_id\") > 0"
+        }
+      }
+    },
+    "projects": {
+      "name": "projects",
+      "columns": {
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "current_path": {
+          "name": "current_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "projects_current_path_unique": {
+          "name": "projects_current_path_unique",
+          "columns": [
+            "current_path"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "project_path_absolute": {
+          "name": "project_path_absolute",
+          "value": "substr(\"projects\".\"current_path\", 1, 1) = '/'"
+        }
+      }
+    },
+    "branch_relations": {
+      "name": "branch_relations",
+      "columns": {
+        "child_session_ref_id": {
+          "name": "child_session_ref_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "parent_session_ref_id": {
+          "name": "parent_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "source_message_id": {
+          "name": "source_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "relation_parent": {
+          "name": "relation_parent",
+          "columns": [
+            "scope_id",
+            "parent_session_ref_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "branch_relations_scope_id_child_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "branch_relations_scope_id_child_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "branch_relations",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "child_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "branch_relations_scope_id_parent_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "branch_relations_scope_id_parent_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "branch_relations",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "parent_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "distinct_parent": {
+          "name": "distinct_parent",
+          "value": "\"branch_relations\".\"child_session_ref_id\" <> \"branch_relations\".\"parent_session_ref_id\""
+        },
+        "source_nonempty": {
+          "name": "source_nonempty",
+          "value": "length(\"branch_relations\".\"source_message_id\") > 0"
+        }
+      }
+    },
+    "removal_message_aliases": {
+      "name": "removal_message_aliases",
+      "columns": {
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "removal_id": {
+          "name": "removal_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_ref_id": {
+          "name": "session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "removal_alias_session": {
+          "name": "removal_alias_session",
+          "columns": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "removal_message_aliases_scope_id_removal_id_removals_scope_id_removal_id_fk": {
+          "name": "removal_message_aliases_scope_id_removal_id_removals_scope_id_removal_id_fk",
+          "tableFrom": "removal_message_aliases",
+          "tableTo": "removals",
+          "columnsFrom": [
+            "scope_id",
+            "removal_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "removal_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "removal_message_aliases_scope_id_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "removal_message_aliases_scope_id_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "removal_message_aliases",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "removal_message_aliases_removal_id_session_ref_id_message_id_pk": {
+          "columns": [
+            "removal_id",
+            "session_ref_id",
+            "message_id"
+          ],
+          "name": "removal_message_aliases_removal_id_session_ref_id_message_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "removal_alias_nonempty": {
+          "name": "removal_alias_nonempty",
+          "value": "length(\"removal_message_aliases\".\"message_id\") > 0"
+        }
+      }
+    },
+    "removal_members": {
+      "name": "removal_members",
+      "columns": {
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "removal_id": {
+          "name": "removal_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_ref_id": {
+          "name": "session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "removal_member_session": {
+          "name": "removal_member_session",
+          "columns": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "removal_members_scope_id_removal_id_removals_scope_id_removal_id_fk": {
+          "name": "removal_members_scope_id_removal_id_removals_scope_id_removal_id_fk",
+          "tableFrom": "removal_members",
+          "tableTo": "removals",
+          "columnsFrom": [
+            "scope_id",
+            "removal_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "removal_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "removal_members_scope_id_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "removal_members_scope_id_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "removal_members",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "removal_members_removal_id_session_ref_id_pk": {
+          "columns": [
+            "removal_id",
+            "session_ref_id"
+          ],
+          "name": "removal_members_removal_id_session_ref_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "removals": {
+      "name": "removals",
+      "columns": {
+        "removal_id": {
+          "name": "removal_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "root_session_ref_id": {
+          "name": "root_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "endpoint_session_ref_id": {
+          "name": "endpoint_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "after_message_id": {
+          "name": "after_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "semantic_key": {
+          "name": "semantic_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "removals_scope_id_removal_id_unique": {
+          "name": "removals_scope_id_removal_id_unique",
+          "columns": [
+            "scope_id",
+            "removal_id"
+          ],
+          "isUnique": true
+        },
+        "removals_scope_id_semantic_key_unique": {
+          "name": "removals_scope_id_semantic_key_unique",
+          "columns": [
+            "scope_id",
+            "semantic_key"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "removals_scope_id_project_providers_scope_id_fk": {
+          "name": "removals_scope_id_project_providers_scope_id_fk",
+          "tableFrom": "removals",
+          "tableTo": "project_providers",
+          "columnsFrom": [
+            "scope_id"
+          ],
+          "columnsTo": [
+            "scope_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "removals_scope_id_root_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "removals_scope_id_root_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "removals",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "root_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "removals_scope_id_endpoint_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "removals_scope_id_endpoint_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "removals",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "endpoint_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "removal_variant": {
+          "name": "removal_variant",
+          "value": "(\"removals\".\"kind\" = 'tree' AND \"removals\".\"root_session_ref_id\" IS NOT NULL AND \"removals\".\"endpoint_session_ref_id\" IS NULL AND \"removals\".\"after_message_id\" IS NULL)\n    OR (\"removals\".\"kind\" = 'message' AND \"removals\".\"root_session_ref_id\" IS NULL AND \"removals\".\"endpoint_session_ref_id\" IS NULL AND \"removals\".\"after_message_id\" IS NULL)\n    OR (\"removals\".\"kind\" = 'endpoint' AND \"removals\".\"root_session_ref_id\" IS NULL AND \"removals\".\"endpoint_session_ref_id\" IS NOT NULL)"
+        },
+        "removal_boundary": {
+          "name": "removal_boundary",
+          "value": "\"removals\".\"after_message_id\" IS NULL OR length(\"removals\".\"after_message_id\") > 0"
+        }
+      }
+    },
+    "project_providers": {
+      "name": "project_providers",
+      "columns": {
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "provider_id": {
+          "name": "provider_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "legacy_import_digest": {
+          "name": "legacy_import_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "legacy_imported_at": {
+          "name": "legacy_imported_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "project_providers_project_id_provider_id_unique": {
+          "name": "project_providers_project_id_provider_id_unique",
+          "columns": [
+            "project_id",
+            "provider_id"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "project_providers_project_id_projects_project_id_fk": {
+          "name": "project_providers_project_id_projects_project_id_fk",
+          "tableFrom": "project_providers",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "import_pair": {
+          "name": "import_pair",
+          "value": "(\"project_providers\".\"legacy_import_digest\" IS NULL) = (\"project_providers\".\"legacy_imported_at\" IS NULL)"
+        }
+      }
+    },
+    "session_refs": {
+      "name": "session_refs",
+      "columns": {
+        "session_ref_id": {
+          "name": "session_ref_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "provider_session_id": {
+          "name": "provider_session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "session_refs_scope_id_provider_session_id_unique": {
+          "name": "session_refs_scope_id_provider_session_id_unique",
+          "columns": [
+            "scope_id",
+            "provider_session_id"
+          ],
+          "isUnique": true
+        },
+        "session_refs_scope_id_session_ref_id_unique": {
+          "name": "session_refs_scope_id_session_ref_id_unique",
+          "columns": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "session_refs_scope_id_project_providers_scope_id_fk": {
+          "name": "session_refs_scope_id_project_providers_scope_id_fk",
+          "tableFrom": "session_refs",
+          "tableTo": "project_providers",
+          "columnsFrom": [
+            "scope_id"
+          ],
+          "columnsTo": [
+            "scope_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "session_nonempty": {
+          "name": "session_nonempty",
+          "value": "length(\"session_refs\".\"provider_session_id\") > 0"
+        }
+      }
+    },
+    "workspace_message_aliases": {
+      "name": "workspace_message_aliases",
+      "columns": {
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "workspace_id": {
+          "name": "workspace_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_ref_id": {
+          "name": "session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "workspace_alias_session": {
+          "name": "workspace_alias_session",
+          "columns": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "workspace_message_aliases_scope_id_workspace_id_workspaces_scope_id_workspace_id_fk": {
+          "name": "workspace_message_aliases_scope_id_workspace_id_workspaces_scope_id_workspace_id_fk",
+          "tableFrom": "workspace_message_aliases",
+          "tableTo": "workspaces",
+          "columnsFrom": [
+            "scope_id",
+            "workspace_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "workspace_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "workspace_message_aliases_scope_id_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "workspace_message_aliases_scope_id_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "workspace_message_aliases",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "workspace_message_aliases_scope_id_workspace_id_session_ref_id_message_id_pk": {
+          "columns": [
+            "scope_id",
+            "workspace_id",
+            "session_ref_id",
+            "message_id"
+          ],
+          "name": "workspace_message_aliases_scope_id_workspace_id_session_ref_id_message_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "workspace_alias_nonempty": {
+          "name": "workspace_alias_nonempty",
+          "value": "length(\"workspace_message_aliases\".\"message_id\") > 0"
+        }
+      }
+    },
+    "workspaces": {
+      "name": "workspaces",
+      "columns": {
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "workspace_id": {
+          "name": "workspace_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "view": {
+          "name": "view",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "selected_session_ref_id": {
+          "name": "selected_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "family_session_ref_id": {
+          "name": "family_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "target_kind": {
+          "name": "target_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "target_session_ref_id": {
+          "name": "target_session_ref_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "target_message_id": {
+          "name": "target_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "workspaces_scope_id_project_providers_scope_id_fk": {
+          "name": "workspaces_scope_id_project_providers_scope_id_fk",
+          "tableFrom": "workspaces",
+          "tableTo": "project_providers",
+          "columnsFrom": [
+            "scope_id"
+          ],
+          "columnsTo": [
+            "scope_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "workspaces_scope_id_selected_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "workspaces_scope_id_selected_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "workspaces",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "selected_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "workspaces_scope_id_family_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "workspaces_scope_id_family_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "workspaces",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "family_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "workspaces_scope_id_target_session_ref_id_session_refs_scope_id_session_ref_id_fk": {
+          "name": "workspaces_scope_id_target_session_ref_id_session_refs_scope_id_session_ref_id_fk",
+          "tableFrom": "workspaces",
+          "tableTo": "session_refs",
+          "columnsFrom": [
+            "scope_id",
+            "target_session_ref_id"
+          ],
+          "columnsTo": [
+            "scope_id",
+            "session_ref_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "workspaces_scope_id_workspace_id_pk": {
+          "columns": [
+            "scope_id",
+            "workspace_id"
+          ],
+          "name": "workspaces_scope_id_workspace_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "workspace_nonempty": {
+          "name": "workspace_nonempty",
+          "value": "length(\"workspaces\".\"workspace_id\") > 0"
+        },
+        "workspace_variant": {
+          "name": "workspace_variant",
+          "value": "(\"workspaces\".\"view\" = 'roots' AND \"workspaces\".\"family_session_ref_id\" IS NULL AND \"workspaces\".\"target_kind\" IS NULL AND \"workspaces\".\"target_session_ref_id\" IS NULL AND \"workspaces\".\"target_message_id\" IS NULL)\n    OR (\"workspaces\".\"view\" = 'terminal' AND \"workspaces\".\"selected_session_ref_id\" IS NULL AND \"workspaces\".\"family_session_ref_id\" IS NULL AND \"workspaces\".\"target_kind\" IS NULL AND \"workspaces\".\"target_session_ref_id\" IS NOT NULL AND \"workspaces\".\"target_message_id\" IS NULL)\n    OR (\"workspaces\".\"view\" = 'graph' AND \"workspaces\".\"selected_session_ref_id\" IS NULL AND \"workspaces\".\"family_session_ref_id\" IS NOT NULL AND \"workspaces\".\"target_session_ref_id\" IS NOT NULL AND \"workspaces\".\"target_kind\" IS NOT NULL AND\n      ((\"workspaces\".\"target_kind\" = 'endpoint' AND \"workspaces\".\"target_message_id\" IS NULL) OR (\"workspaces\".\"target_kind\" = 'message' AND \"workspaces\".\"target_message_id\" IS NOT NULL AND length(\"workspaces\".\"target_message_id\") > 0)))"
+        }
+      }
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

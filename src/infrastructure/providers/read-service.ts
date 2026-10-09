@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads"
 
 import { Deferred, Effect, Exit, Queue, Scope } from "effect"
+import { workerEntry } from "../worker-entry"
 
 import { ProviderError } from "../../domain/errors"
 import type { AgentSession, AgentSessionSnapshot, TranscriptRead } from "../../domain/model"
@@ -19,7 +20,7 @@ export interface ProviderReads {
 
 export function makeProviderReads(
   options: ProviderReadWorkerOptions,
-  createWorker: () => Worker = () => new Worker(new URL("./read-worker.ts", import.meta.url), { workerData: options }),
+  createWorker: () => Worker = () => new Worker(workerEntry(new URL("./read-worker.ts", import.meta.url), "src/infrastructure/providers/read-worker.ts"), { workerData: options }),
 ): Effect.Effect<ProviderReads, ProviderError, Scope.Scope> {
   return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
     const ready = yield* Deferred.make<void, ProviderError>()

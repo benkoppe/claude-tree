@@ -25,7 +25,7 @@ export type ApplicationMetadataFacet = Pick<
   | "saveNavigation"
   | "updateMetadata"
   | "commitRemoval"
->
+> & Partial<Pick<ProviderStateRepositoryApi, "saveRelation" | "removeExactRelation">>
 
 export interface PersistedBranch {
   readonly prepared: PreparedTerminal
@@ -76,7 +76,7 @@ export function makeApplicationOperations(options: {
     Effect.suspend(() =>
       reconcileMutation(
         options.metadata,
-        Effect.suspend(() => options.metadata.updateMetadata((state) => {
+        options.metadata.saveRelation ? options.metadata.saveRelation(relation) : Effect.suspend(() => options.metadata.updateMetadata((state) => {
           const existing = state.relations.find((candidate) => candidate.childSessionId === relation.childSessionId)
           if (existing) {
             if (!isDeepStrictEqual(existing, relation)) {
@@ -152,7 +152,7 @@ export function rollbackPersistedBranch(
 ): Effect.Effect<void, PersistenceError> {
   return Effect.suspend(() => reconcileMutation(
     metadata,
-    Effect.suspend(() => metadata.updateMetadata((state) => ({
+    metadata.removeExactRelation ? metadata.removeExactRelation(relation) : Effect.suspend(() => metadata.updateMetadata((state) => ({
       ...state,
       relations: state.relations.filter((candidate) => !isDeepStrictEqual(candidate, relation)),
     }))).pipe(Effect.asVoid),

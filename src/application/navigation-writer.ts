@@ -15,7 +15,7 @@ export interface NavigationWriter {
 }
 
 interface PendingNavigation {
-  readonly navigation: NavigationState
+  readonly save: Effect.Effect<void, PersistenceError>
   readonly json: string
   readonly waiters: Deferred.Deferred<void, PersistenceError>[]
 }
@@ -84,7 +84,7 @@ export function makeNavigationWriter(
           return
         }
         current = pending
-        const exit = yield* Effect.exit(Effect.suspend(() => repository.saveNavigation(pending.navigation)))
+        const exit = yield* Effect.exit(pending.save)
         current = undefined
         if (Exit.isSuccess(exit)) lastFailure = undefined
         else lastFailure = Cause.squash(exit.cause) as PersistenceError
@@ -111,11 +111,12 @@ export function makeNavigationWriter(
         if (queued === undefined && current?.json === json) {
           if (waiter) current.waiters.push(waiter)
         } else if (queued?.json === json) {
+          queued = { ...queued, save: repository.saveNavigation(navigation) }
           if (waiter) queued.waiters.push(waiter)
         }
         else {
           queued = {
-            navigation,
+            save: repository.saveNavigation(navigation),
             json,
             waiters: [...(queued?.waiters ?? []), ...(waiter ? [waiter] : [])],
           }

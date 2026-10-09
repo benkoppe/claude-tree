@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads"
 
 import { Deferred, Effect, Scope } from "effect"
+import { workerEntry } from "../worker-entry"
 
 import { prepareForest } from "../../application/forest-projection"
 import { selectProjectedData, selectProjectedRelations, selectVisibleEndpointSessionIds } from "../../application/selectors"
@@ -16,7 +17,7 @@ export interface ProjectionService {
 }
 
 export function makeProjectionService(
-  createWorker: () => Worker = () => new Worker(new URL("./worker.ts", import.meta.url)),
+  createWorker: () => Worker = () => new Worker(workerEntry(new URL("./worker.ts", import.meta.url), "src/infrastructure/projection/worker.ts")),
 ): Effect.Effect<ProjectionService, unknown, Scope.Scope> {
   return Effect.uninterruptible(Effect.gen(function*() {
     const pending = new Map<number, Deferred.Deferred<Extract<ProjectionResponse, { _tag: "Projected" }>, Error>>()
