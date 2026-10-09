@@ -136,6 +136,56 @@ test("renders roots and preserves directional graph navigation intent", async ()
   }
 })
 
+test("arrow keys visit adjacent shorter drafts outside the viewport and reverse without skipping", async () => {
+  const setup = await createTestRenderer({ width: 50, height: 18 })
+  const running = await startPresentation(setup.renderer, unequalDepthGraph([13, 8, 7]))
+  try {
+    await frame(setup, () => isSelected(setup, "left draft"))
+    expect(setup.captureCharFrame()).not.toContain("middle draft")
+    setup.mockInput.pressArrow("right")
+    await frame(setup, () => isSelected(setup, "middle draft"))
+    await waitFor(() => running.harness.calls.includes("select-graph:endpoint:middle"))
+    expect(running.harness.calls).toContain("select-graph:endpoint:middle")
+    expect(running.harness.calls).not.toContain("select-graph:endpoint:right")
+    setup.mockInput.pressArrow("right")
+    await frame(setup, () => isSelected(setup, "right draft"))
+    setup.mockInput.pressArrow("left")
+    await frame(setup, () => isSelected(setup, "middle draft"))
+    setup.mockInput.pressArrow("left")
+    await frame(setup, () => isSelected(setup, "left draft"))
+  } finally { await running.stop() }
+})
+
+test.each(["resize", "graph geometry"] as const)("%s resets the preferred horizontal depth after visiting a short branch", async (change) => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const graph = unequalDepthGraph([8, 3, 8])
+  const running = await startPresentation(setup.renderer, graph)
+  try {
+    await frame(setup, () => isSelected(setup, "left draft"))
+    setup.mockInput.pressArrow("right")
+    await frame(setup, () => isSelected(setup, "middle draft"))
+    await waitFor(() => running.harness.calls.includes("select-graph:endpoint:middle"))
+    if (change === "resize") setup.resize(100, 30)
+    else {
+      if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+      await Effect.runPromise(running.harness.update({
+        ...graph,
+        surface: {
+          ...graph.surface, selectedNodeId: "middle-endpoint", worldWidth: graph.surface.worldWidth + 2,
+          nodes: graph.surface.nodes.map((node) => ({
+            ...node, x: node.x + 2, selected: node.id === "middle-endpoint",
+          })),
+        },
+      }))
+    }
+    await frame(setup, () => isSelected(setup, "middle draft"))
+    setup.mockInput.pressArrow("right")
+    await frame(setup, () => isSelected(setup, "right step 2"))
+    await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:right-message-2"))
+    expect(running.harness.calls).toContain("select-graph:message:root-1:right-message-2")
+  } finally { await running.stop() }
+})
+
 test("loading root activation is ignored without blocking movement or queuing a future open", async () => {
   const setup = await createTestRenderer({ width: 100, height: 24 })
   const ready = rootsView()
@@ -2036,6 +2086,28 @@ function branchingGraph(familySessionId: string, title: string): ApplicationView
   const leftEndpoint = endpointNode("left-endpoint", "left", "Left leaf", 2, 8, ["left-message"], false)
   const rightEndpoint = endpointNode("right-endpoint", "right", "Right leaf", 38, 8, ["right-message"], false)
   return graphView(familySessionId, title, [source, left, right, leftEndpoint, rightEndpoint])
+}
+
+function unequalDepthGraph(lengths: readonly number[]): ApplicationViewModel {
+  const nodes: GraphNodeViewModel[] = []
+  const branches = ["left", "middle", "right"]
+  lengths.forEach((length, index) => {
+    const branch = branches[index]!
+    for (let depth = 0; depth < length - 1; depth++) {
+      nodes.push(messageNode(
+        `${branch}-message-${depth}`, `${branch} step ${depth}`, index * 36, depth * 4,
+        depth === 0 ? [] : [`${branch}-message-${depth - 1}`],
+        [depth === length - 2 ? `${branch}-endpoint` : `${branch}-message-${depth + 1}`],
+        false, "root-1",
+      ))
+    }
+    nodes.push(endpointNode(
+      `${branch}-endpoint`, branch, `${branch} session`, index * 36, (length - 1) * 4,
+      length === 1 ? [] : [`${branch}-message-${length - 2}`], index === 0,
+      { text: `${branch} draft`, exact: false },
+    ))
+  })
+  return withLiveSessions(graphView("root-1", "Unequal branches", nodes), branches)
 }
 
 function endpointGraph(sessionId = "endpoint"): ApplicationViewModel {
