@@ -66,6 +66,61 @@ const ROOT = "root"
 const CHILD = "child"
 
 describe("application actor", () => {
+  test.each(["resume", "open"] as const)("explicit %s attempts a known session despite cached missing history without refreshing", async (action) => {
+    const fixture = makeFixture()
+    fixture.snapshot = { ...fixture.snapshot, transcripts: new Map([[ROOT, { _tag: "Missing" }]]) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime(fixture.options)
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      expect((yield* runtime.getState).historyStatus.get(ROOT)).toEqual({ _tag: "Missing" })
+      const loads = fixture.fullLoads
+      yield* (action === "resume" ? runtime.resumeSession(ROOT) : runtime.openEndpoint(ROOT))
+      const state = yield* runtime.getState
+      expect(state.surface).toMatchObject({ _tag: "Terminal", sessionId: ROOT })
+      expect(state.terminals.get(ROOT)?.phase).toBe("running")
+      expect(state.historyStatus.get(ROOT)).toEqual({ _tag: "Missing" })
+      expect(fixture.calls).toEqual([`show:${ROOT}`])
+      expect(fixture.fullLoads).toBe(loads)
+      expect(fixture.incrementalReads).toEqual([])
+      expect(state.modal).toBeNull()
+    })))
+  })
+
+  test.each(["resume", "open"] as const)("explicit %s with cached missing history still reports provider resume failure", async (action) => {
+    const fixture = makeFixture()
+    fixture.snapshot = { ...fixture.snapshot, transcripts: new Map([[ROOT, { _tag: "Missing" }]]) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: { ...fixture.options.terminals,
+        show: () => Effect.fail(new ProviderError({ providerId: "test", operation: "resume", message: "Provider could not resume the session" })),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      expect(Exit.isFailure(yield* Effect.exit(action === "resume" ? runtime.resumeSession(ROOT) : runtime.openEndpoint(ROOT)))).toBeTrue()
+      const state = yield* runtime.getState
+      expect(state.surface._tag).not.toBe("Terminal")
+      expect(state.terminals.size).toBe(0)
+      expect(state.pendingOperations.size).toBe(0)
+      expect(state.modal).toMatchObject({ _tag: "Error", message: expect.stringContaining("Provider could not resume the session") })
+      expect(fixture.incrementalReads).toEqual([])
+    })))
+  })
+
+  test.each(["resume", "open"] as const)("explicit %s with cached missing history still requires ownership admission", async (action) => {
+    const fixture = makeFixture()
+    fixture.snapshot = { ...fixture.snapshot, transcripts: new Map([[ROOT, { _tag: "Missing" }]]) }
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* makeAppRuntime({ ...fixture.options, terminals: { ...fixture.options.terminals,
+        show: () => Effect.fail(new SessionOwnedError({ providerId: "test", sessionId: ROOT, ownerPid: 202 })),
+      } })
+      yield* waitForState(runtime, (state) => !state.refresh.initialPending)
+      expect(Exit.isFailure(yield* Effect.exit(action === "resume" ? runtime.resumeSession(ROOT) : runtime.openEndpoint(ROOT)))).toBeTrue()
+      const state = yield* runtime.getState
+      expect(state.surface._tag).not.toBe("Terminal")
+      expect(state.terminals.size).toBe(0)
+      expect(state.pendingOperations.size).toBe(0)
+      expect(state.modal).toMatchObject({ _tag: "ConfirmOpenSession", sessionId: ROOT, ownerPid: 202 })
+    })))
+  })
+
   test("Codex branch eligibility changes refresh history without changing logical message identity", () => {
     const turn: CodexTurn = { id: "turn", status: "inProgress", items: [
       { id: "answer", type: "agentMessage", text: "Answer" },
