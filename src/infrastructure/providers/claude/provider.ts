@@ -445,6 +445,8 @@ export class ClaudeProvider implements AgentProviderApi {
         }
         const receipt: BranchVerificationReceipt = {
           session: childSession,
+          prepared: { session: childSession, acquireLaunch: this.acquireLaunch("resume", childId, replayText) },
+          origin: { childSessionId: childId, parentSessionId: target.sessionId, sourceMessageId: forkMessage.id },
           verify: Effect.suspend(() => this.makeDeadline("validateFork", this.forkValidationTimeoutMs).pipe(
             Effect.flatMap((validationDeadline) => this.prepareCreatedFork(childSession, target.sessionId,
               forkMessage.id, sourcePrefix, validationDeadline, replayText, receipt)))),
@@ -730,8 +732,9 @@ export class ClaudeProvider implements AgentProviderApi {
       _tag: "NotValidated" as const,
       transcript: { _tag: "Unavailable" as const, reason: error.message },
       reason: `Fork ${childSessionId} was created, but its history could not be validated: ${error.message}`,
-      status: "unavailable" as const,
-      reasonCode: this.failureCode(error, childSessionId) === "timeout" ? "deadline" as const
+      status: error.cause instanceof ContradictoryForkRecordsError ? "contradicted" as const : "unavailable" as const,
+      reasonCode: error.cause instanceof ContradictoryForkRecordsError ? "copy-mismatch" as const
+        : this.failureCode(error, childSessionId) === "timeout" ? "deadline" as const
         : error._tag === "ProviderProtocolError" ? "unsupported" as const : "read-failed" as const,
     })))
   }
@@ -1276,6 +1279,8 @@ export function claudeProviderLayer(
 export const layer = claudeProviderLayer
 export const makeClaudeProviderLayer = claudeProviderLayer
 
+class ContradictoryForkRecordsError extends Error {}
+
 function normalizeConversationRecords(entries: readonly SessionStoreEntry[]): readonly ConversationRecord[] {
   const records: ConversationRecord[] = []
   const identities = new Map<string, SessionStoreEntry>()
@@ -1286,7 +1291,7 @@ function normalizeConversationRecords(entries: readonly SessionStoreEntry[]): re
     }
     const previous = identities.get(entry.uuid)
     if (previous && (previous.type !== entry.type || !isDeepStrictEqual(previous.message, entry.message))) {
-      throw new Error(`Physical conversation record ${entry.uuid} has contradictory repeated payloads`)
+      throw new ContradictoryForkRecordsError(`Physical conversation record ${entry.uuid} has contradictory repeated payloads`)
     }
     identities.set(entry.uuid, entry)
     const provenance = entry.forkedFrom
@@ -1320,17 +1325,14 @@ function validateFork(
   activeChild: readonly ClaudeMessage[],
   physicalChild: readonly ConversationRecord[],
 ): ForkValidation {
-  if (physicalChild.length > sourcePrefix.records.length) {
-    return {
-      _tag: "Invalid",
-      reason: "its physical copied prefix continues beyond the requested source boundary",
-    }
-  }
+  // Native continuation records are not part of the original fork copy. Every
+  // copied occurrence still has to match, including occurrences after the boundary.
+  const copiedChild = physicalChild.filter((record) => record.forkedFrom !== undefined)
 
   const childByParentId = new Map<string, ConversationRecord>()
   const parentByChildId = new Map<string, string>()
-  for (const [index, parent] of sourcePrefix.records.slice(0, physicalChild.length).entries()) {
-    const child = physicalChild[index]
+  for (const [index, parent] of sourcePrefix.records.slice(0, copiedChild.length).entries()) {
+    const child = copiedChild[index]
     if (child === undefined) {
       return { _tag: "Short", reason: "its physical copied prefix is incomplete" }
     }
@@ -1355,7 +1357,30 @@ function validateFork(
     parentByChildId.set(child.id, parent.id)
   }
 
-  const incomplete = physicalChild.length < sourcePrefix.records.length
+  const incomplete = copiedChild.length < sourcePrefix.records.length
+  for (const record of copiedChild.slice(sourcePrefix.records.length)) {
+    const sourceId = parentByChildId.get(record.id)
+    const original = sourceId ? childByParentId.get(sourceId) : undefined
+    if (!original || record.type !== original.type || !isDeepStrictEqual(record.message, original.message) ||
+      record.forkedFrom?.sessionId !== parentSessionId || record.forkedFrom.messageUuid !== sourceId) {
+      return { _tag: "Invalid", reason: "its physical copied prefix continues beyond the requested source boundary or re-emits contradictory copy evidence" }
+    }
+  }
+  for (const record of physicalChild) {
+    const sourceId = parentByChildId.get(record.id)
+    const original = sourceId ? childByParentId.get(sourceId) : undefined
+    if (original && (record.type !== original.type || !isDeepStrictEqual(record.message, original.message))) {
+      return { _tag: "Invalid", reason: "a copied identity was re-emitted with a contradictory role or payload" }
+    }
+  }
+
+  // Once the child has continued, its active path may rewind or compact away
+  // from the fork boundary. The complete original physical copy still proves ancestry.
+  if (!incomplete && physicalChild.some((record) => record.forkedFrom === undefined)) {
+    return { _tag: "Valid", sharedMessages: sourcePrefix.historyMessageIds.map((parentMessageId) => ({
+      parentMessageId, childMessageId: childByParentId.get(parentMessageId)!.id,
+    })) }
+  }
 
   // Physical copy order proves integrity; SDK reconstruction defines graph order.
   let orders = [sourcePrefix.activeMessageIds, sourcePrefix.historyMessageIds].map((ids) => ({
@@ -1366,9 +1391,11 @@ function validateFork(
     length: ids.length,
     previous: -1,
   }))
-  const physicalByChildId = new Map(physicalChild.map((record) => [record.id, record]))
+  const physicalByChildId = new Map(copiedChild.map((record) => [record.id, record]))
+  const nativeIds = new Set(physicalChild.filter((record) => record.forkedFrom === undefined).map((record) => record.id))
 
   for (const child of activeChild) {
+    if (nativeIds.has(child.id) && !parentByChildId.has(child.id)) continue
     const physical = physicalByChildId.get(child.id)
     if (physical === undefined && incomplete) continue
     if (
@@ -1393,7 +1420,7 @@ function validateFork(
   }
   if (incomplete) return {
     _tag: "Short",
-    reason: `its physical copied prefix is incomplete (expected ${sourcePrefix.records.length} records; found ${physicalChild.length})`,
+    reason: `its physical copied prefix is incomplete (expected ${sourcePrefix.records.length} records; found ${copiedChild.length})`,
   }
   if (!orders.some((order) => order.previous === order.length - 1)) {
     return {

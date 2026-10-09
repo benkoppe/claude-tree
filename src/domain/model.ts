@@ -90,6 +90,14 @@ export interface BranchDerivation {
   readonly continuationMessageId?: string
 }
 
+/** Requested placement only; never message correspondence or persisted ancestry. */
+export interface ProvisionalBranch {
+  readonly childSessionId: string
+  readonly parentSessionId: string
+  readonly sourceMessageId: string
+  readonly continuationMessageId?: string
+}
+
 export interface AgentSessionSnapshot {
   readonly sessions: readonly AgentSession[]
   readonly transcripts: ReadonlyMap<string, TranscriptRead>

@@ -19,7 +19,7 @@ claude-tree --codex /path/to/project
 
 `claude-tree` does not create Git worktrees or restore files to their state at the fork point.
 
-If a fork's saved history is slow to become readable, the navigator shows verification progress. Use the displayed `v` action to cancel verification or retry it without creating another fork. The child remains an independent session until its ancestry is verified; opening it independently discards the pending verification evidence. Verification receipts last only for the current invocation.
+Confirmed forks open without waiting for ancestry verification. The navigator shows a provisional, unverified branch while its copied history is checked in the background. Unavailable history keeps that provisional placement; contradictory copy evidence moves the child to an independent tree without stopping its terminal. Use `e details` for warnings and Refresh to retry unavailable verification—neither creates another fork. Shared history is merged only after ancestry is verified and saved. Provisional placement and verification evidence last only for the current invocation; an unresolved child remains independently resumable after restart.
 
 ## Quick Start
 

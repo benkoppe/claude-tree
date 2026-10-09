@@ -541,7 +541,7 @@ describe("Effect Codex provider", () => {
     const child = thread(CHILD, [{ ...firstTurn, id: "copied-turn", items: firstTurn.items.map((item) => ({ ...item, id: `copy-${item.id}` })) }])
     let visible = false
     const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : visible ? child
-      : thread(CHILD, [{ ...child.turns[0]!, items: child.turns[0]!.items.slice(0, 1) }])), forkThread: () => Effect.succeed(child) })
+      : thread(CHILD, [{ ...child.turns[0]!, items: child.turns[0]!.items.slice(0, 1) }])), forkThread: () => Effect.succeed(thread(CHILD, [])) })
     const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "selected-user" }))
     if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected pending fork evidence")
     expect(outcome.verification?.status).toBe("pending")
@@ -556,6 +556,42 @@ describe("Effect Codex provider", () => {
     expect(verified.derivation.sharedMessages).toHaveLength(firstTurn.items.length)
     expect(client.forkCalls).toHaveLength(1)
     expect(client.readCalls.filter((id) => id === ROOT)).toHaveLength(1)
+  })
+
+  test("verification accepts later native child turns without extending shared ancestry", async () => {
+    const first = copiedTurn("first", "Original", "first")
+    const parent = thread(ROOT, [first])
+    const initial = thread(CHILD, [])
+    const continued = thread(CHILD, [first, copiedTurn("native", "New answer", "native")])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : continued),
+      forkThread: () => Effect.succeed(initial) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "first-agent-Original" }))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
+    expect(outcome.derivation.sharedMessages).toHaveLength(first.items.length)
+    expect(client.forkCalls).toHaveLength(1)
+  })
+
+  test("complete original fork evidence remains valid when the child's current path rewinds", async () => {
+    const first = copiedTurn("first", "Original", "first")
+    const initial = thread(CHILD, [first])
+    const replacement = thread(CHILD, [copiedTurn("replacement", "New answer", "replacement")])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? thread(ROOT, [first]) : replacement),
+      forkThread: () => Effect.succeed(initial) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "first-agent-Original" }))
+    expect(outcome._tag).toBe("ValidatedBranch")
+    expect(client.readCalls).toEqual([ROOT])
+  })
+
+  test("a replacement current path without complete original evidence is unavailable rather than contradicted", async () => {
+    const first = copiedTurn("first", "Original", "first")
+    const replacement = thread(CHILD, [copiedTurn("replacement", "New answer", "replacement")])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? thread(ROOT, [first]) : replacement),
+      forkThread: () => Effect.succeed(thread(CHILD, [])) })
+    const outcome = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "first-agent-Original" }))
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("Expected unavailable evidence")
+    expect(outcome.verification?.status).toBe("unavailable")
   })
 
   test("rejects a user fork whose child copied the excluded prompt", async () => {
@@ -628,7 +664,7 @@ describe("Effect Codex provider", () => {
     expect(client.forkCalls).toHaveLength(1)
   })
 
-  test("forks exactly once, rereads the child, and validates the exact copied prefix", async () => {
+  test("forks exactly once and validates complete returned copy evidence without a redundant child read", async () => {
     const parent = thread(ROOT, [turn("parent-turn", "completed", [
       user("parent-user", [{ type: "text", text: "Question" }]),
       { id: "parent-agent", type: "agentMessage", text: "Answer", phase: "final_answer" },
@@ -648,7 +684,7 @@ describe("Effect Codex provider", () => {
     expect(outcome._tag).toBe("ValidatedBranch")
     if (outcome._tag !== "ValidatedBranch") throw new Error(outcome.reason)
     expect(client.forkCalls).toEqual([{ threadId: ROOT, turnId: "parent-turn", cwd: "/project" }])
-    expect(client.readCalls).toEqual([ROOT, CHILD])
+    expect(client.readCalls).toEqual([ROOT])
     expect(outcome.derivation.sharedMessages).toEqual([
       { parentMessageId: "parent-user", childMessageId: "child-user" },
       { parentMessageId: "parent-agent", childMessageId: "child-agent" },
@@ -805,7 +841,7 @@ describe("Effect Codex provider", () => {
     const client = fakeClient({
       readThread: (id) => id === ROOT ? Effect.succeed(parent) : visible ? Effect.succeed(child)
         : Effect.fail(new CodexRpcError({ method: "thread/read", code: -32600, message: "missing rollout", data: { appErrorCode: "rollout_not_found" } })),
-      forkThread: () => Effect.succeed(child),
+      forkThread: () => Effect.succeed(thread(CHILD, [])),
     })
     const result = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
     if (result._tag !== "CreatedIndependentSession") throw new Error("expected pending child")
@@ -881,7 +917,7 @@ describe("Effect Codex provider", () => {
     for (const { childRead, expectedTranscript } of cases) {
       const client = fakeClient({
         readThread: (id) => id === ROOT ? Effect.succeed(parent) : childRead,
-        forkThread: () => Effect.succeed(child),
+        forkThread: () => Effect.succeed(thread(CHILD, [])),
       })
       const outcome = await Effect.runPromise(
         providerWith(client).branchFrom({ sessionId: ROOT, messageId: "parent-agent" }),

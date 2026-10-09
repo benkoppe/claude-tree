@@ -124,7 +124,9 @@ export function makeApplicationOperations(options: {
 
   const branch: ApplicationOperations["branch"] = (target, created, continuation) => Effect.gen(function*() {
     const decorateReceipt = (receipt: BranchVerificationReceipt): BranchVerificationReceipt => ({
+      ...receipt,
       session: receipt.session,
+      ...(continuation && receipt.origin ? { origin: { ...receipt.origin, continuationMessageId: target.messageId } } : {}),
       verify: receipt.verify.pipe(Effect.map((outcome) => decorateOutcome(outcome))),
     })
     function decorateOutcome(outcome: ValidatedBranch | CreatedIndependentSession): ValidatedBranch | CreatedIndependentSession

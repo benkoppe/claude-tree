@@ -28,11 +28,73 @@ import type {
 const ROOT = "root"
 
 describe("application state reducer", () => {
-  test("projects captured branch-verification state for production progress and cancellation controls", () => {
+  test("projects captured background branch-verification state", () => {
     const state = reduceApplicationState(loadedState(), { _tag: "BranchVerificationChanged", sessionId: ROOT,
       verification: { status: "verifying", reason: "Verifying captured history", retryable: true },
     })
     expect(projectApplicationViewModel(state).branchVerifications).toBe(state.branchVerifications)
+  })
+
+  test.each([
+    ["promote", "Graph"], ["detach", "Graph"],
+    ["promote", "Terminal"], ["detach", "Terminal"],
+  ] as const)("%s preserves a verified origin descendant's semantic selection on %s", (change, surface) => {
+    const parent = [message("q", "user", "question", 0), message("a", "agent", "answer", 1)]
+    const child = parent.map((message) => ({ ...message, id: `c${message.id}` }))
+    const replay = [message("new", "user", "replacement prompt", 0)]
+    const sessions = [session(ROOT, "Root"), session("child", "Child"), session("replay", "Replay")]
+    const origin = { childSessionId: "child", parentSessionId: ROOT, sourceMessageId: "a" }
+    const target = { kind: "message" as const, preferred: { sessionId: "replay", messageId: "new" }, aliases: [{ sessionId: "replay", messageId: "new" }] }
+    const navigator = { _tag: "Graph" as const, familySessionId: ROOT, target }
+    const state: ApplicationState = { ...makeInitialApplicationState({ relations: [{
+      childSessionId: "replay", parentSessionId: "child", sourceMessageId: "cq", sharedMessages: [], createdAt: "2026-10-09T00:00:00.000Z",
+    }] }),
+      provider: { sessions: new Map(sessions.map((session) => [session.id, session])),
+        transcripts: new Map([[ROOT, available(parent)], ["child", available(child)], ["replay", available(replay)]]) },
+      branchVerifications: new Map([["child", { origin, status: "verifying", reason: "Checking copy", retryable: true }]]),
+      surface: surface === "Graph" ? navigator : { _tag: "Terminal", sessionId: "replay", returnTo: navigator },
+      terminals: new Map([["replay", { ownerId: "owner", phase: "running", activity: "idle" }]]),
+    }
+    const settled = change === "promote" ? reduceApplicationState(state, {
+      _tag: "PersistedBranchProjected", session: sessions[1]!, relation: { ...origin, createdAt: "2026-10-09T00:00:00.000Z",
+        sharedMessages: parent.map((message, index) => ({ parentMessageId: message.id, childMessageId: child[index]!.id })),
+      },
+    }) : reduceApplicationState(state, {
+      _tag: "BranchVerificationChanged", sessionId: "child", verification: { origin, status: "contradicted", reason: "Copy mismatch", retryable: false },
+    })
+    const selected = settled.surface._tag === "Terminal" ? settled.surface.returnTo : settled.surface
+    expect(selected).toEqual({ _tag: "Graph", familySessionId: change === "promote" ? ROOT : "child", target })
+    expect(settled.surface._tag).toBe(surface)
+    expect(settled.terminals).toBe(state.terminals)
+    const graph = selectConversationForest(settled).graphBySessionId.get("replay")!
+    const head = [...graph.nodes.values()].find((node) => node.kind === "message" && node.aliases.some((alias) => alias.sessionId === "replay"))!
+    expect(head.parentId).toBe(graph.originNodeId)
+    expect(head.provisional).toBeUndefined()
+  })
+
+  test.each([false, true])("an unattached unread provisional child has its own navigable row (running=%s)", (running) => {
+    const child = session("unattached", "Unattached child")
+    const base = loadedState()
+    const state: ApplicationState = { ...base,
+      provider: { ...base.provider, transcripts: new Map([[ROOT, available([message("q", "user", "question", 0)])]]) },
+      local: { sessions: new Map([[child.id, child]]), transcripts: new Map([[child.id, { _tag: "Unavailable", reason: "Not readable" }]]), temporarySessionIds: new Set() },
+      branchVerifications: new Map([[child.id, { origin: { childSessionId: child.id, parentSessionId: ROOT, sourceMessageId: "a" },
+        status: "unavailable", reason: "Cannot establish copy evidence", retryable: true }]]),
+      historyStatus: new Map([[ROOT, { _tag: "Ready" }], [child.id, { _tag: "Unavailable", reason: "Not readable" }]]),
+      terminals: running ? new Map([[child.id, { ownerId: "owner", phase: "running", activity: "idle" }]]) : new Map(),
+    }
+    const roots = projectRootsViewModel(state)
+    expect(roots.map((root) => root.sessionId).sort()).toEqual([ROOT, child.id].sort())
+    const row = roots.find((root) => root.sessionId === child.id)!
+    expect(row.memberSessionIds).toEqual([child.id])
+    expect(row.activation).toBe("open")
+    expect(projectGraphViewModel(state, child.id).nodes.some((node) => node._tag === "Endpoint" && node.session.id === child.id)).toBeTrue()
+    const restored: ApplicationState = { ...state, provider: { ...state.provider, transcripts: new Map([[ROOT,
+      available([message("q", "user", "question", 0), message("a", "agent", "answer", 1)])]]) } }
+    const joined = projectRootsViewModel(restored)
+    expect(joined).toHaveLength(1)
+    expect(joined[0]!.memberSessionIds).toEqual(expect.arrayContaining([ROOT, child.id]))
+    expect(restored.branchVerifications).toBe(state.branchVerifications)
   })
 
   test("operation status is independent of graph topology and survives prepared refresh publication", () => {

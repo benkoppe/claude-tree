@@ -26,6 +26,115 @@ const CHILD = "child:opaque/id"
 const GRANDCHILD = "grandchild:opaque/id"
 
 describe("next conversation graph", () => {
+  test("provisional placement joins independent paths without merging message aliases", () => {
+    const parent = [message("q", "user", "question", 0), message("a", "agent", "answer", 1)]
+    const child = [message("cq", "user", "question", 0), message("ca", "agent", "answer", 1)]
+    const inputs = [session(ROOT, 20), session(CHILD, 10)]
+    const transcripts = new Map([[ROOT, parent], [CHILD, child]])
+    const forest = buildConversationForest(inputs, transcripts, [], [], [{ childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "a" }])
+    expect(forest.graphs).toHaveLength(1)
+    const graph = forest.graphs[0]!
+    expect(forest.graphBySessionId.get(CHILD)).toBe(graph)
+    expect(nodes(graph)).toHaveLength(4)
+    const source = nodes(graph).find((node) => node.aliases.some((alias) => alias.messageId === "a"))!
+    const start = nodes(graph).find((node) => node.aliases.some((alias) => alias.messageId === "cq"))!
+    expect(start.parentId).toBe(source.id)
+    expect(start.provisional).toBeTrue()
+    expect(nodes(graph).every((node) => node.aliases.length === 1)).toBeTrue()
+    expect(buildConversationForest(inputs, transcripts, []).graphs).toHaveLength(2)
+  })
+
+  test("an unread provisional child still has an endpoint at the requested origin", () => {
+    const forest = buildConversationForest([session(ROOT, 20), session(CHILD, 10)],
+      new Map([[ROOT, [message("a", "agent", "answer", 0)]]]), [], [],
+      [{ childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "a" }])
+    const graph = forest.graphs[0]!
+    const endpoint = graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)!
+    expect(endpoint.provisional).toBeTrue()
+    expect(graph.nodes.get(endpoint.parentId!)?.kind).toBe("message")
+  })
+
+  test("provisional origins close grouped Agent messages at the exact requested boundary", () => {
+    const parent = [
+      { ...message("a", "agent", "first part", 0), displayGroupId: "turn" },
+      { ...message("later", "agent", "later part", 1), displayGroupId: "turn" },
+    ]
+    const graph = buildConversationForest([session(ROOT, 20), session(CHILD, 10)], new Map([[ROOT, parent]]), [], [],
+      [{ childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "a" }]).graphs[0]!
+    const endpoint = graph.nodes.get(graph.endpointBySessionId.get(CHILD)!)!
+    const source = graph.nodes.get(endpoint.parentId!) as MessageGraphNode
+    expect(source.preview).toBe("first part")
+    expect(source.aliases).toEqual([{ sessionId: ROOT, messageId: "a" }])
+    expect(nodes(graph).some((node) => node.preview === "later part")).toBeTrue()
+  })
+
+  test.each([false, true])("verified zero-prefix descendants retain family-origin placement (populated=%s)", (populated) => {
+    const parent = [message("a", "agent", "answer", 0)]
+    const child = [message("cq", "user", "copied question", 0)]
+    const grandchild = populated ? [message("new", "user", "new prompt", 0)] : []
+    const forest = buildConversationForest([session(GRANDCHILD, 30), session(CHILD, 20), session(ROOT, 10)],
+      new Map([[ROOT, parent], [CHILD, child], [GRANDCHILD, grandchild]]),
+      [relation(GRANDCHILD, CHILD, "cq", [])], [],
+      [{ childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "a" }])
+    expect(forest.graphs).toHaveLength(1)
+    const graph = forest.graphs[0]!
+    const endpoint = graph.nodes.get(graph.endpointBySessionId.get(GRANDCHILD)!)!
+    const start = populated ? nodes(graph).find((node) => node.aliases.some((alias) => alias.sessionId === GRANDCHILD))! : endpoint
+    expect(start.parentId).toBe(graph.originNodeId)
+    expect(start.provisional).toBeUndefined()
+    expect(endpoint.provisional).toBeUndefined()
+    expect(nodes(graph).find((node) => node.aliases.some((alias) => alias.sessionId === CHILD))?.provisional).toBeTrue()
+    expect(graph.warnings).toEqual([])
+  })
+
+  test.each([false, true])("verified descendants restore prefixes at the provisional path's entry point (omitted=%s)", (omitted) => {
+    const parent = [message("a", "agent", "parent answer", 0)]
+    const child = [message("cq", "user", "question", 0), message("ca", "agent", "answer", 1)]
+    const grandchild = [message("gq", "user", "question", 0), message("ga", "agent", "answer", 1), message("new", "user", "new", 2)]
+    const graph = buildConversationForest([session(ROOT, 10), session(CHILD, 20), session(GRANDCHILD, 30)],
+      new Map([[ROOT, parent], [CHILD, omitted ? child.slice(1) : child], [GRANDCHILD, grandchild]]),
+      [relation(GRANDCHILD, CHILD, "ca", shared(child, grandchild, 2))], [],
+      [{ childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "a" }]).graphs[0]!
+    expect(graph.sessionIds).toEqual(new Set([ROOT, CHILD, GRANDCHILD]))
+    expect(graph.warnings).toEqual([])
+    const source = nodes(graph).find((node) => node.aliases.some((alias) => alias.sessionId === ROOT))!
+    const head = nodes(graph).find((node) => node.aliases.some((alias) => alias.messageId === "cq"))!
+    expect(head.parentId).toBe(source.id)
+    expect(head.provisional).toBeTrue()
+    expect(head.aliases).toEqual(expect.arrayContaining([{ sessionId: CHILD, messageId: "cq" }, { sessionId: GRANDCHILD, messageId: "gq" }]))
+    expect(head.aliases.some((alias) => alias.sessionId === ROOT)).toBeFalse()
+    expect(graph.nodes.get(graph.endpointBySessionId.get(GRANDCHILD)!)?.provisional).toBeUndefined()
+  })
+
+  test("nested provisional paths are independent of attachment order and do not merge aliases", () => {
+    const branches = [
+      { childSessionId: GRANDCHILD, parentSessionId: CHILD, sourceMessageId: "ca" },
+      { childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "a" },
+    ]
+    const transcripts = new Map([[ROOT, [message("a", "agent", "answer", 0)]],
+      [CHILD, [message("ca", "agent", "child answer", 0)]], [GRANDCHILD, [message("ga", "agent", "grandchild answer", 0)]]])
+    const sessions = [session(GRANDCHILD, 30), session(CHILD, 20), session(ROOT, 10)]
+    const graph = buildConversationForest(sessions, transcripts, [], [], branches).graphs[0]!
+    expect(buildConversationForest(sessions.toReversed(), transcripts, [], [], branches.toReversed()).graphs[0]).toEqual(graph)
+    const child = nodes(graph).find((node) => node.aliases[0]?.sessionId === CHILD)!
+    const grandchild = nodes(graph).find((node) => node.aliases[0]?.sessionId === GRANDCHILD)!
+    expect(child.provisional).toBeTrue()
+    expect(grandchild.provisional).toBeTrue()
+    expect(grandchild.parentId).toBe(child.id)
+    expect(nodes(graph).every((node) => node.aliases.length === 1)).toBeTrue()
+  })
+
+  test("verified attachments take precedence over an outstanding provisional placement", () => {
+    const parent = [message("q", "user", "question", 0)]
+    const child = [message("cq", "user", "question", 0)]
+    const graph = buildConversationForest([session(ROOT, 10), session(CHILD, 20)], new Map([[ROOT, parent], [CHILD, child]]),
+      [relation(CHILD, ROOT, "q", shared(parent, child, 1))], [],
+      [{ childSessionId: CHILD, parentSessionId: ROOT, sourceMessageId: "q" }]).graphs[0]!
+    expect(nodes(graph)).toHaveLength(1)
+    expect(nodes(graph)[0]?.provisional).toBeUndefined()
+    expect(nodes(graph)[0]?.aliases).toHaveLength(2)
+  })
+
   test("pruned message leaves retain one lazy destination reachable from every ancestor", () => {
     const transcript = [message("q", "user", "question", 0), message("a", "agent", "answer", 1),
       message("later", "user", "deleted", 2)]

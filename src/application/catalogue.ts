@@ -78,6 +78,7 @@ export function describeSession(state: ApplicationState, sessionId: string): str
 }
 
 const catalogueCache = new WeakMap<ApplicationState["provider"]["sessions"], {
+  branchVerifications: ApplicationState["branchVerifications"]
   local: ApplicationState["local"]["sessions"]
   relations: ApplicationState["relations"]
   families: readonly CatalogueFamily[]
@@ -85,15 +86,21 @@ const catalogueCache = new WeakMap<ApplicationState["provider"]["sessions"], {
 
 export function selectCatalogueFamilies(state: ApplicationState): readonly CatalogueFamily[] {
   const cached = catalogueCache.get(state.provider.sessions)
-  if (cached && cached.local === state.local.sessions && cached.relations === state.relations) return cached.families
+  if (cached && cached.local === state.local.sessions && cached.relations === state.relations && cached.branchVerifications === state.branchVerifications) return cached.families
   const sessions = new Map([...state.provider.sessions, ...state.local.sessions])
-  const families = [...groupSessionFamilies(sessions, state.relations).values()].map((group) => {
-    const children = new Set(group.relations.map((relation) => relation.childSessionId))
+  const families = [...groupSessionFamilies(sessions, state.relations, selectProvisionalBranches(state)).values()].map((group) => {
+    const children = new Set([...group.relations, ...group.provisionalBranches].map((relation) => relation.childSessionId))
     return {
       root: group.sessions.find((session) => !children.has(session.id)) ?? group.sessions[0]!,
       sessionIds: new Set(group.sessions.map((session) => session.id)),
     }
   })
-  catalogueCache.set(state.provider.sessions, { local: state.local.sessions, relations: state.relations, families })
+  catalogueCache.set(state.provider.sessions, { local: state.local.sessions, relations: state.relations, branchVerifications: state.branchVerifications, families })
   return families
+}
+
+export function selectProvisionalBranches(state: ApplicationState) {
+  return [...state.branchVerifications.values()].flatMap((verification) =>
+    verification.origin && verification.status !== "contradicted" && verification.status !== "independent"
+      ? [verification.origin] : [])
 }

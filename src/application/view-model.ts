@@ -15,6 +15,7 @@ import type { AgentMessage, AgentSession, MessageRef, NavigationTarget } from ".
 import {
   selectAggregateStatus,
   selectConversationForest,
+  selectNavigationFamilies,
   selectProjectedData,
   selectRootActivation,
   selectSessionStatus,
@@ -24,7 +25,7 @@ import {
   type SessionStatus,
 } from "./selectors"
 import type { ApplicationModal, ApplicationState } from "./state"
-import { selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryDetails, type FamilyHistoryStatus } from "./catalogue"
+import { selectFamilyHistoryStatus, selectHistoryDetails, type FamilyHistoryStatus } from "./catalogue"
 
 export interface RootViewModel {
   readonly activation: RootActivation
@@ -39,6 +40,7 @@ export interface RootViewModel {
 }
 
 interface PositionedNodeViewModel {
+  readonly provisional?: true
   readonly id: string
   readonly parentIds: readonly string[]
   readonly childIds: readonly string[]
@@ -248,7 +250,7 @@ export function projectRootsViewModel(state: ApplicationState): readonly RootVie
   })
   const pendingIds = new Set<string>()
   const pendingRoots: RootViewModel[] = []
-  for (const family of selectCatalogueFamilies(state)) {
+  for (const family of selectNavigationFamilies(state)) {
       const history = selectFamilyHistoryStatus(state, family.sessionIds)
       if (history._tag === "Ready") continue
       const memberSessionIds = [...family.sessionIds]
@@ -317,6 +319,7 @@ export function projectGraphViewModel(
       const parentIds = node.parentId && layout.nodes.has(node.parentId) ? [node.parentId] : []
       const childIds = node.childIds.filter((childId) => layout.nodes.has(childId))
       const position = {
+        ...(node.provisional ? { provisional: node.provisional } : {}),
         id: node.id,
         parentIds,
         childIds,

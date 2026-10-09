@@ -24,6 +24,7 @@ import {
   selectConversationForest,
   selectFamilyRootSessionId,
   selectFamilySessionIds,
+  selectNavigationFamilies,
   selectProjectedTranscript,
   selectTranscriptRead,
   selectVisibleEndpointSessionIds,
@@ -85,7 +86,7 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       const branchVerifications = new Map(state.branchVerifications)
       if (event.verification) branchVerifications.set(event.sessionId, event.verification)
       else branchVerifications.delete(event.sessionId)
-      return { ...state, branchVerifications }
+      return repairBranchSurface({ ...state, branchVerifications }, event.sessionId)
     }
     case "PreparedRefreshPublished": {
       const next: ApplicationState = { ...event.candidate, surface: state.surface, selectionId: state.selectionId,
@@ -220,10 +221,14 @@ export function reduceApplicationState(state: ApplicationState, event: StateEven
       return projectLocalSession(state, event.session, event.transcript, event.temporary)
     case "PersistedBranchProjected": {
       const projected = projectLocalSession(state, event.session, event.transcript, event.session.transient)
-      return {
+      const branchVerifications = new Map(projected.branchVerifications)
+      branchVerifications.delete(event.session.id)
+      return repairBranchSurface({
         ...projected,
+        historyStatus: event.transcript === undefined && state.historyStatus.has(event.session.id) ? state.historyStatus : projected.historyStatus,
+        branchVerifications,
         relations: upsertRelation(projected.relations, event.relation),
-      }
+      }, event.session.id)
     }
     case "TransientSessionRolledBack":
       return rollbackTransient(state, event.sessionId, event.restoreTo)
@@ -1159,6 +1164,20 @@ function stoppedSessionSurface(state: ApplicationState, sessionId: string): Navi
   return state.surface
 }
 
+function repairBranchSurface(state: ApplicationState, sessionId: string): ApplicationState {
+  if (state.surface._tag === "Terminal") {
+    if (state.surface.sessionId !== sessionId) {
+      const repaired = repairNavigatorSurface({ ...state, surface: state.surface.returnTo })
+      return { ...state, surface: { ...state.surface, returnTo: repaired.surface as NavigatorSurface } }
+    }
+    const familySessionId = selectFamilyRootSessionId(state, sessionId)
+    return { ...state, surface: { ...state.surface, returnTo: {
+      _tag: "Graph", familySessionId, target: { kind: "endpoint", sessionId },
+    } } }
+  }
+  return repairNavigatorSurface(state)
+}
+
 function repairNavigatorSurface(
   state: ApplicationState,
   preferred?: NavigatorSurface,
@@ -1169,7 +1188,7 @@ function repairNavigatorSurface(
   if (requested._tag === "Roots") {
     // The first successful read is not a navigation request.
     if (requested.selectedSessionId === null) return { ...state, surface: requested }
-    const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(requested.selectedSessionId!))
+    const family = selectNavigationFamilies(state).find((family) => family.sessionIds.has(requested.selectedSessionId!))
     if (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready") {
       const removed = state.removals.some((removal) => removal.kind === "tree" &&
         (family.sessionIds.has(removal.rootSessionId) || removal.memberSessionIds.some((id) => family.sessionIds.has(id))))
@@ -1188,7 +1207,8 @@ function repairNavigatorSurface(
     }
   }
 
-  const graph = forest.graphBySessionId.get(requested.familySessionId) ??
+  const targetSessionId = requested.target.kind === "endpoint" ? requested.target.sessionId : requested.target.preferred.sessionId
+  const graph = forest.graphBySessionId.get(targetSessionId) ?? forest.graphBySessionId.get(requested.familySessionId) ??
     forest.graphByRootSessionId.get(requested.familySessionId)
   if (!graph) {
     return {

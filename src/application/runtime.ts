@@ -49,10 +49,11 @@ import { replaceSessionIdInProjectState } from "../services/provider-state-repos
 import { HISTORY_RETRY_DELAYS_MS, HISTORY_CONFIRMATION_DELAY_MS } from "../services/lifecycle-policy"
 import { causeFailures, errorDetails, errorSummary as errorMessage } from "../error-format"
 import { makeNavigationWriter } from "./navigation-writer"
+import { projectRemovalImpact } from "./removal-projection"
 import { makeScopeClose } from "../services/close-operation"
 import { makeCleanupBudget } from "../services/cleanup-budget"
 import { makeCommandExecutor, type CommandCompleted } from "./command-executor"
-import { describeSession, selectCatalogueFamilies, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
+import { describeSession, selectFamilyHistoryStatus, selectHistoryStatus } from "./catalogue"
 import {
   makeApplicationOperations,
   rollbackPersistedBranch,
@@ -79,7 +80,7 @@ import {
   reduceApplicationState,
   type StateEvent,
 } from "./reducer"
-import { selectConversationForest, selectProjectedData, selectRootActivation } from "./selectors"
+import { selectConversationForest, selectNavigationFamilies, selectProjectedData, selectRootActivation } from "./selectors"
 import {
   invalidatedRefreshSessionIds,
   makeInitialApplicationState,
@@ -127,7 +128,6 @@ export interface AppRuntime {
   readonly openEndpoint: (sessionId: string) => ApplicationIntentEffect
   readonly branchFrom: (target: MessageRef) => ApplicationIntentEffect
   readonly openContinuation: (target: MessageRef) => ApplicationIntentEffect
-  readonly manageBranchVerification: (sessionId: string, action: "cancel" | "retry") => ApplicationIntentEffect
   readonly returnFromTerminal: ApplicationIntentEffect
   readonly stopSession: (sessionId: string) => ApplicationIntentEffect
   readonly remove: (
@@ -185,7 +185,8 @@ type ActorCommand =
   | { readonly _tag: "Refresh"; readonly refresh: ActiveRefresh; readonly reply?: IntentEnvelope["reply"]; readonly enterRoot?: { readonly sessionId: string; readonly requestGeneration: number } }
   | { readonly _tag: "PrepareNew"; readonly requestGeneration: number; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "PrepareResume"; readonly requestGeneration: number; readonly session: AgentSession; readonly reportFailure: boolean; readonly allowDuplicate?: boolean; readonly startupRestore?: boolean; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"] }
-  | { readonly _tag: "Branch"; readonly requestGeneration: number; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"]; readonly verificationSessionId?: string }
+  | { readonly _tag: "Branch"; readonly requestGeneration: number; readonly restoreTo: NavigatorSurface; readonly reply: IntentEnvelope["reply"]; readonly target?: MessageRef }
+  | { readonly _tag: "VerifyBranch"; readonly sessionId: string; readonly admission: "handed-off" | "deferred"; readonly target?: MessageRef }
   | { readonly _tag: "Show"; readonly requestGeneration: number; readonly prepared: PreparedTerminal; readonly identityGeneration: number; readonly restoreTo: NavigatorSurface; readonly reportFailure: boolean; readonly persistFailureFallback?: boolean; readonly rollbackRelation?: BranchRelation; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Hide"; readonly reply: IntentEnvelope["reply"] }
   | { readonly _tag: "Stop"; readonly sessionId: string; readonly ownerId: string; readonly identityGeneration: number; readonly reply: IntentEnvelope["reply"] }
@@ -248,6 +249,7 @@ export function makeAppRuntime(
       Queue.offer(inbox, { _tag: "BackgroundFailure", operation: "Save navigation", cause }), options.navigationSaveIntervalMs)
     const preparedTerminals = new Map<string, PreparedTerminal>()
     const verificationReceipts = new Map<string, { readonly receipt: BranchVerificationReceipt; readonly key: string; readonly continuationKey?: string }>()
+    const retiredBranchCommands = new Set<string>()
     const owners = new Map<string, OwnerCursor>()
     const unclaimedOwnerEvents = new Map<string, OwnerCursor["buffered"]>()
     const commandExecutor = makeCommandExecutor<ActorCommand>(commandScope, (completion) => Queue.offer(
@@ -415,7 +417,7 @@ export function makeAppRuntime(
       yield* commandExecutor.start(key, token, command, effect)
     })
 
-    const retireVerification = (sessionId: string, reason = "Opening the child independently ended ancestry verification"): Effect.Effect<void> => Effect.gen(function*() {
+    const retireVerification = (sessionId: string, reason = "Navigator removal ended ancestry verification"): Effect.Effect<void> => Effect.gen(function*() {
       const retained = verificationReceipts.get(sessionId)
       const prepared = state.branchVerifications.get(sessionId)?.status === "prepared"
       if (!retained && !prepared) return
@@ -744,6 +746,19 @@ export function makeAppRuntime(
       }, operations.prepareResume(session), false)
     })
 
+    const retryVerification = (sessionId: string): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
+      const retained = verificationReceipts.get(sessionId)
+      if (!retained || activeCommands.has(retained.key)) return
+      const key = `verify:${nextCommandToken}`
+      verificationReceipts.set(sessionId, { ...retained, key })
+      yield* publish({ _tag: "BranchVerificationChanged", sessionId, verification: {
+        ...state.branchVerifications.get(sessionId),
+        status: "verifying", reason: "Verifying fork ancestry in the background", retryable: true,
+      } })
+      yield* launch(key, { _tag: "VerifyBranch", sessionId, admission: "deferred",
+      }, operations.verifyBranch(retained.receipt), false)
+    })
+
     let processMessageWithBoundary: (message: ActorMessage) => Effect.Effect<void, never, Scope.Scope>
 
     const claimBufferedOwnerEvents = (ownerId: string): Effect.Effect<void, never, Scope.Scope> =>
@@ -947,7 +962,10 @@ export function makeAppRuntime(
       prepared?: PreparedRefreshPublication,
     ): Effect.Effect<void, never, Scope.Scope> => Effect.gen(function*() {
       const active = activeCommands.get(message.key)
-      if (!active || active.token !== message.token) return
+      if (!active || active.token !== message.token) {
+        retiredBranchCommands.delete(message.key)
+        return
+      }
       activeCommands.delete(message.key)
       const command = message.command
       const exit = message.exit
@@ -1025,7 +1043,7 @@ export function makeAppRuntime(
             } else {
               const graph = projectGraphViewModel(state, command.enterRoot.sessionId)
               const node = graph.nodes.find((node) => node.selected)
-              const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(command.enterRoot!.sessionId))
+              const family = selectNavigationFamilies(state).find((family) => family.sessionIds.has(command.enterRoot!.sessionId))
               const history = selectFamilyHistoryStatus(state, family?.sessionIds ?? [command.enterRoot.sessionId])
               const problem = history._tag === "Unavailable" ? history.issues.map((issue) => `${describeSession(state, issue.sessionId)}\n${issue.reason}`).join("\n\n") : undefined
               if (!node) {
@@ -1119,34 +1137,35 @@ export function makeAppRuntime(
         return
       }
 
-      if (command._tag === "Branch") {
+      if (command._tag === "Branch" || command._tag === "VerifyBranch") {
         if (Exit.isFailure(exit)) {
           for (const [sessionId, retained] of verificationReceipts) {
             if (retained.key === message.key) yield* publish({ _tag: "BranchVerificationChanged", sessionId, verification: {
+              ...state.branchVerifications.get(sessionId),
               status: "unavailable", reason: `Verification stopped: ${errorMessage(Cause.squash(exit.cause))}`, retryable: true,
             } })
           }
-          yield* failReply(command.reply, commandIntent(command), commandOperation(command), Cause.squash(exit.cause))
+          if (command._tag === "Branch") yield* failReply(command.reply, commandIntent(command), commandOperation(command), Cause.squash(exit.cause))
           return
         }
         const outcome = exit.value as PersistedBranch | IndependentBranch
         if ("prepared" in outcome) {
           verificationReceipts.delete(outcome.prepared.session.id)
-          yield* publish({ _tag: "BranchVerificationChanged", sessionId: outcome.prepared.session.id })
           yield* publish({
             _tag: "PersistedBranchProjected",
-            session: outcome.prepared.session,
+            session: command._tag === "VerifyBranch"
+              ? selectProjectedData(state).sessions.get(outcome.prepared.session.id) ?? outcome.prepared.session : outcome.prepared.session,
             relation: outcome.relation,
-            ...(outcome.transcript === undefined ? {} : { transcript: outcome.transcript }),
+            ...(command._tag === "Branch" && outcome.transcript !== undefined ? { transcript: outcome.transcript } : {}),
           })
-          if (command.verificationSessionId) {
-            if (outcome.prepared.session.transient) {
+          yield* startNavigation(state.surface)
+          if (command._tag === "VerifyBranch") {
+            if (command.admission === "deferred" && outcome.prepared.session.transient) {
               preparedTerminals.set(outcome.prepared.session.id, outcome.prepared)
               yield* publish({ _tag: "BranchVerificationChanged", sessionId: outcome.prepared.session.id, verification: {
                 status: "prepared", retryable: false, reason: "Ancestry saved; open this prepared replay to start its provider session",
               } })
             }
-            yield* Deferred.succeed(command.reply, undefined)
             return
           }
           yield* startShow(
@@ -1160,6 +1179,7 @@ export function makeAppRuntime(
           return
         }
         if (outcome.outcome._tag === "AmbiguousBranchMutation") {
+          if (command._tag === "VerifyBranch") return
           yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: outcome.outcome.reason } })
           yield* startRefresh(
             "ambiguity",
@@ -1172,7 +1192,7 @@ export function makeAppRuntime(
           yield* failReply(command.reply, "BranchFrom", "Create branch", outcome.outcome.reason, false)
           return
         }
-        yield* publish({
+        if (command._tag === "Branch") yield* publish({
           _tag: "LocalSessionProjected",
           session: outcome.outcome.session,
           transcript: outcome.outcome.transcript,
@@ -1189,12 +1209,15 @@ export function makeAppRuntime(
               ...(continuationKey ? { continuationKey } : {}) })
           } else verificationReceipts.delete(outcome.outcome.session.id)
           yield* publish({ _tag: "BranchVerificationChanged", sessionId: outcome.outcome.session.id, verification: {
+            ...state.branchVerifications.get(outcome.outcome.session.id),
             status: verification.status === "pending" ? "paused" : verification.status,
             reason: outcome.outcome.reason, retryable: verificationReceipts.has(outcome.outcome.session.id),
           } })
-          yield* Deferred.succeed(command.reply, undefined)
+          yield* startNavigation(state.surface)
+          if (command._tag === "Branch") yield* Deferred.succeed(command.reply, undefined)
           return
         }
+        if (command._tag === "VerifyBranch") return
         yield* publish({ _tag: "ModalOpened", modal: { _tag: "Error", message: outcome.outcome.reason } })
         if (outcome.outcome.acquireLaunch) {
           yield* startShow({
@@ -1487,9 +1510,14 @@ export function makeAppRuntime(
           if (bound) intent = { _tag: "OpenEndpoint", sessionId: bound.childSessionId }
           else {
             continuationKey = continuationOperationKey(node.aliases[0] ?? target)
-            if (activeCommands.has(continuationKey) || [...verificationReceipts.values()].some((retained) =>
-              retained.key === continuationKey || retained.continuationKey === continuationKey)) {
-              yield* reject(envelope.reply, intent._tag, "busy", "This continuation is already being created; manage its existing fork verification instead")
+            const pendingChild = [...verificationReceipts].find(([, retained]) =>
+              retained.key === continuationKey || retained.continuationKey === continuationKey)
+            if (pendingChild) {
+              yield* processIntent({ ...envelope, intent: { _tag: "OpenEndpoint", sessionId: pendingChild[0] } })
+              return
+            }
+            if (activeCommands.has(continuationKey)) {
+              yield* reject(envelope.reply, intent._tag, "busy", "This continuation is already being created")
               return
             }
             if (!node.forkTarget || node.childIds.some((id) => {
@@ -1502,7 +1530,7 @@ export function makeAppRuntime(
           }
         }
         if (intent._tag === "EnterRoot") {
-          const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
+          const family = selectNavigationFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
           if (family && selectRootActivation(state, family.sessionIds) === "loading") {
             yield* reject(envelope.reply, intent._tag, "busy", "Conversation is loading")
             return
@@ -1523,6 +1551,7 @@ export function makeAppRuntime(
         }
         switch (intent._tag) {
           case "Refresh":
+            for (const sessionId of verificationReceipts.keys()) yield* retryVerification(sessionId)
             yield* startRefresh("manual", new Set(), undefined, undefined, envelope.reply)
             return
           case "SelectRoot": {
@@ -1533,7 +1562,7 @@ export function makeAppRuntime(
             return
           }
           case "EnterRoot": {
-            const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
+            const family = selectNavigationFamilies(state).find((family) => family.sessionIds.has(intent.sessionId))
             if (family && selectRootActivation(state, family.sessionIds) === "retry") {
               const refresh: ActiveRefresh = { key: "refresh:navigation", generation: state.refresh.generation + 1,
                 reason: "terminal-return", mode: "incremental", sessionIds: family.sessionIds }
@@ -1587,8 +1616,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "invalid", "This replay has not started; use Open after ancestry verification succeeds")
               return
             }
-            yield* retireVerification(intent.sessionId)
-            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
+            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing" && !verificationReceipts.has(intent.sessionId)) {
               yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
               return
             }
@@ -1620,7 +1648,6 @@ export function makeAppRuntime(
               } else yield* reject(envelope.reply, intent._tag, "invalid", "Retry ancestry verification before opening this unstarted replay")
               return
             }
-            yield* retireVerification(intent.sessionId)
             const running = state.terminals.get(intent.sessionId)
             if (running?.phase === "running") {
               const prepared = preparedTerminals.get(intent.sessionId)
@@ -1636,7 +1663,7 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "busy", `Session ${intent.sessionId} is ${running.phase}`)
               return
             }
-            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing") {
+            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing" && !verificationReceipts.has(intent.sessionId)) {
               yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
               return
             }
@@ -1656,35 +1683,6 @@ export function makeAppRuntime(
             }, operations.prepareResume(session), false)
             return
           }
-          case "ManageBranchVerification": {
-            const retained = verificationReceipts.get(intent.sessionId)
-            if (!retained) {
-              yield* reject(envelope.reply, intent._tag, "invalid", "No captured ancestry evidence remains for this child")
-              return
-            }
-            if (intent.action === "cancel") {
-              yield* supersede(retained.key, "Ancestry verification was cancelled; the child was preserved independently")
-              yield* publish({ _tag: "BranchVerificationChanged", sessionId: intent.sessionId, verification: {
-                status: "paused", reason: "Verification cancelled; child preserved independently", retryable: true,
-              } })
-              yield* Deferred.succeed(envelope.reply, undefined)
-              return
-            }
-            if (activeCommands.has(retained.key)) {
-              yield* reject(envelope.reply, intent._tag, "busy", "This child's ancestry verification is already running")
-              return
-            }
-            yield* startOperation("verification", envelope.reply, intent._tag)
-            const key = `verify:${envelope.correlationId}`
-            verificationReceipts.set(intent.sessionId, { ...retained, key })
-            yield* publish({ _tag: "BranchVerificationChanged", sessionId: intent.sessionId, verification: {
-              status: "verifying", reason: "Verifying captured fork history (read-only)", retryable: true,
-            } })
-            yield* launch(key, { _tag: "Branch", requestGeneration: navigatorRequestGeneration,
-              restoreTo: navigatorSurface(intent.sessionId), reply: envelope.reply, verificationSessionId: intent.sessionId,
-            }, operations.verifyBranch(retained.receipt), false)
-            return
-          }
           case "BranchFrom": {
             if (selectHistoryStatus(state, intent.target.sessionId)._tag === "Limited") {
               yield* reject(envelope.reply, intent._tag, "invalid", "Historical coverage is incomplete; refresh to establish a verified fork prefix")
@@ -1694,6 +1692,7 @@ export function makeAppRuntime(
             const key = continuationKey ?? `branch:${envelope.correlationId}`
             yield* launch(key, {
               _tag: "Branch",
+              target: intent.target,
               requestGeneration: navigatorRequestGeneration,
               restoreTo: navigatorSurface(intent.target.sessionId),
               reply: envelope.reply,
@@ -1750,8 +1749,21 @@ export function makeAppRuntime(
               intent.affectedSessionIds,
               operationGeneration,
             )
-            for (const sessionId of canonical.affectedSessionIds) yield* retireVerification(sessionId,
-              "Navigator removal discarded captured fork verification")
+            const impact = projectRemovalImpact(state, canonical.removal)
+            for (const sessionId of new Set([...verificationReceipts.keys(), ...state.branchVerifications.keys()])) {
+              const origin = state.branchVerifications.get(sessionId)?.origin ?? verificationReceipts.get(sessionId)?.receipt.origin
+              if (impact.removesEndpoint(sessionId) || impact.removesSession(sessionId) ||
+                (origin && (impact.removesSession(origin.parentSessionId) || impact.removesMessage({
+                  sessionId: origin.parentSessionId, messageId: origin.sourceMessageId,
+                })))) yield* retireVerification(sessionId, "Navigator removal discarded captured fork verification")
+            }
+            for (const [key, active] of activeCommands) {
+              if (active.command._tag === "Branch" && active.command.target &&
+                (impact.removesSession(active.command.target.sessionId) || impact.removesMessage(active.command.target))) {
+                retiredBranchCommands.add(key)
+                yield* supersede(key, "Navigator removal cancelled this fork's pending launch and ancestry verification")
+              }
+            }
             pendingRemovals.set(key, {
               removal: canonical.removal,
               affectedSessionIds: canonical.affectedSessionIds,
@@ -1804,16 +1816,33 @@ export function makeAppRuntime(
       if (message._tag === "BranchCreated") return Effect.gen(function*() {
         if (state.shutdown !== "running") return
         const sessionId = message.receipt.session.id
-        if (state.terminals.has(sessionId) || state.branchVerifications.get(sessionId)?.status === "independent") return
+        if (retiredBranchCommands.delete(message.key)) {
+          yield* publish({ _tag: "LocalSessionProjected", session: message.receipt.session })
+          yield* publish({ _tag: "BranchVerificationChanged", sessionId, verification: {
+            status: "independent", retryable: false, reason: "Fork created after navigator removal; preserved independently",
+          } })
+          return
+        }
+        if (state.branchVerifications.get(sessionId)?.status === "independent") return
         verificationReceipts.set(sessionId, { receipt: message.receipt, key: message.key,
           ...(message.key.startsWith(CONTINUATION_OPERATION_PREFIX) ? { continuationKey: message.key } : {}) })
         yield* publish({ _tag: "LocalSessionProjected", session: message.receipt.session,
-          transcript: { _tag: "Unavailable", reason: "Created fork history has not been verified" } })
+          transcript: { _tag: "Unavailable", reason: "Created fork history has not been read" } })
         const active = activeCommands.has(message.key)
         yield* publish({ _tag: "BranchVerificationChanged", sessionId, verification: {
+          ...(message.receipt.origin ? { origin: message.receipt.origin } : {}),
           status: active ? "verifying" : "paused", retryable: true,
           reason: active ? "Fork created; verifying history" : "Fork created after cancellation; ancestry remains unverified",
         } })
+        const activeCommand = activeCommands.get(message.key)
+        const command = activeCommand?.command
+        if (activeCommand && command?._tag === "Branch" && message.receipt.prepared) {
+          activeCommands.set(message.key, { ...activeCommand, command: {
+            _tag: "VerifyBranch", sessionId, admission: "handed-off",
+            ...(command.target ? { target: command.target } : {}),
+          } })
+          yield* startShow(message.receipt.prepared, command.restoreTo, command.reply, true, command.requestGeneration)
+        }
       })
       if (message._tag === "RefreshPrepared") return Effect.gen(function*() {
         if (state.shutdown !== "running") {
@@ -2091,10 +2120,17 @@ export function makeAppRuntime(
       })
     }
 
-    processMessageWithBoundary = (message) => Effect.catchCause(
-      Effect.suspend(() => processMessage(message)).pipe(Effect.andThen(reconcileSubmissionDiscovery)),
-      (cause) => containMessageDefect(message, cause),
-    ).pipe(Effect.ensuring(settleOperations))
+    processMessageWithBoundary = (message) => Effect.suspend(() => {
+      // Completion may have queued before the actor handed its reply to Show.
+      // Resolve the actor-owned command phase for both completion and recovery.
+      const active = message._tag === "CommandCompleted" ? activeCommands.get(message.key) : undefined
+      const current = message._tag === "CommandCompleted" && active?.token === message.token
+        ? { ...message, command: active.command } : message
+      return Effect.catchCause(
+        processMessage(current).pipe(Effect.andThen(reconcileSubmissionDiscovery)),
+        (cause) => containMessageDefect(current, cause),
+      )
+    }).pipe(Effect.ensuring(settleOperations))
 
     const settleActorAbandonment = Effect.gen(function*() {
       accepting = false
@@ -2424,7 +2460,6 @@ export function makeAppRuntime(
       openEndpoint: (sessionId) => request({ _tag: "OpenEndpoint", sessionId }),
       branchFrom: (target) => request({ _tag: "BranchFrom", target }),
       openContinuation: (target) => request({ _tag: "BranchFrom", target, continuation: true }),
-      manageBranchVerification: (sessionId, action) => request({ _tag: "ManageBranchVerification", sessionId, action }),
       returnFromTerminal: request({ _tag: "ReturnFromTerminal" }),
       stopSession: (sessionId) => request({ _tag: "StopSession", sessionId }),
       remove: (removal, affectedSessionIds, requestId = `removal-${nextRemovalRequestId++}`) =>
@@ -2456,7 +2491,8 @@ function commandIntent(command: ActorCommand): ApplicationIntent["_tag"] {
     case "Refresh": return command.enterRoot ? "EnterRoot" : "Refresh"
     case "PrepareNew": return "NewSession"
     case "PrepareResume": return "ResumeSession"
-    case "Branch": return command.verificationSessionId ? "ManageBranchVerification" : "BranchFrom"
+    case "Branch": return "BranchFrom"
+    case "VerifyBranch": return "Refresh"
     case "Show": return "OpenEndpoint"
     case "Hide": return "ReturnFromTerminal"
     case "Stop": return "StopSession"
@@ -2523,7 +2559,8 @@ function commandOperation(command: ActorCommand): string {
     case "Refresh": return command.enterRoot ? "Load conversation" : "Refresh conversations"
     case "PrepareNew": return "Create session"
     case "PrepareResume": return "Resume session"
-    case "Branch": return command.verificationSessionId ? "Verify created branch" : "Create branch"
+    case "Branch": return "Create branch"
+    case "VerifyBranch": return "Verify created branch"
     case "Show": return "Open session"
     case "Hide": return "Return to navigator"
     case "Stop": return "Stop session"
@@ -2545,7 +2582,6 @@ function intentOperation(intent: ApplicationIntent["_tag"]): string {
     case "ResumeSession": return "Resume session"
     case "OpenEndpoint": return "Open session"
     case "BranchFrom": return "Create branch"
-    case "ManageBranchVerification": return "Verify created branch"
     case "ReturnFromTerminal": return "Return to navigator"
     case "StopSession": return "Stop session"
     case "Remove": return "Remove conversation"
@@ -2710,7 +2746,7 @@ function restoreNavigatorSurface(
       ? forest.graphBySessionId.get(navigation.selectedSessionId) ??
         forest.graphByRootSessionId.get(navigation.selectedSessionId)
       : undefined
-    const family = selectCatalogueFamilies(state).find((family) => family.sessionIds.has(navigation.selectedSessionId ?? ""))
+    const family = selectNavigationFamilies(state).find((family) => family.sessionIds.has(navigation.selectedSessionId ?? ""))
     return { _tag: "Roots", selectedSessionId: graph?.rootSessionId ??
       (family && selectFamilyHistoryStatus(state, family.sessionIds)._tag !== "Ready" ? family.root.id : null) }
   }
