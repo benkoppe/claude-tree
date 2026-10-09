@@ -223,37 +223,65 @@ export function directionalMove(
   const preferredCoordinate = continuingIntent
     ? intent.preferredCoordinate
     : perpendicularCenter(selected, axis)
-  const eligibleNodes = axis === "vertical"
-    ? verticalCandidates(layout, selected, direction)
-    : [...layout.nodes.values()].filter((candidate) => candidate.node.id !== selectedNodeId)
   const exactReturnNodeId =
     continuingIntent && oppositeDirection(intent.lastDirection) === direction
       ? intent.returnNodeId
       : undefined
-  const candidates = eligibleNodes
-    .map((candidate) =>
-      directionalCandidate(
-        selected,
-        candidate,
-        direction,
-        preferredCoordinate,
-        candidate.node.id === exactReturnNodeId,
+  const nextNodeId = axis === "horizontal"
+    ? horizontalDestination(layout, selected, direction, preferredCoordinate, exactReturnNodeId)
+    : verticalCandidates(layout, selected, direction)
+      .map((candidate) =>
+        directionalCandidate(
+          selected,
+          candidate,
+          direction,
+          preferredCoordinate,
+          candidate.node.id === exactReturnNodeId,
+        )
       )
-    )
-    .filter((candidate): candidate is DirectionalCandidate => candidate !== undefined)
-    .sort(compareDirectionalCandidates)
-  const next = candidates[0]
-  if (!next) return undefined
+      .filter((candidate): candidate is DirectionalCandidate => candidate !== undefined)
+      .sort(compareDirectionalCandidates)[0]?.nodeId
+  if (!nextNodeId) return undefined
   return {
-    nodeId: next.nodeId,
+    nodeId: nextNodeId,
     intent: {
       axis,
       preferredCoordinate,
-      atNodeId: next.nodeId,
+      atNodeId: nextNodeId,
       returnNodeId: selectedNodeId,
       lastDirection: direction,
     },
   }
+}
+
+function horizontalDestination(
+  layout: ConversationGraphLayout,
+  selected: PositionedGraphNode,
+  direction: GraphDirection,
+  preferredCoordinate: number,
+  exactReturnNodeId: string | undefined,
+): string | undefined {
+  let next: DirectionalCandidate | undefined
+  for (const positioned of layout.nodes.values()) {
+    const center = perpendicularCenter(positioned, "horizontal")
+    if (center > preferredCoordinate) continue
+    if (center < preferredCoordinate && positioned.node.childIds.some((id) => layout.nodes.has(id))) {
+      continue
+    }
+    const candidate = directionalCandidate(
+      selected, positioned, direction, preferredCoordinate, positioned.node.id === exactReturnNodeId,
+    )
+    if (!candidate) continue
+    if (!next || compareHorizontalCandidates(candidate, next) < 0) next = candidate
+  }
+  return next?.nodeId
+}
+
+function compareHorizontalCandidates(left: DirectionalCandidate, right: DirectionalCandidate): number {
+  if (left.exactReturn !== right.exactReturn) return left.exactReturn ? -1 : 1
+  return left.primary - right.primary ||
+    left.secondaryCenterDistance - right.secondaryCenterDistance ||
+    compareVisualOrder(left, right)
 }
 
 interface DirectionalCandidate {
