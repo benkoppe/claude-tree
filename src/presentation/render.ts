@@ -43,30 +43,33 @@ interface PreparedRootRow {
   readonly text: string
   readonly normal: readonly TextChunk[]
   readonly selected: readonly TextChunk[]
+  readonly matching: readonly TextChunk[]
+  readonly selectedMatching: readonly TextChunk[]
   readonly loadingMarker: { readonly chunkIndex: number; readonly textOffset: number } | undefined
 }
 const rootRows = new WeakMap<RootViewModel, PreparedRootRow>()
 
-function prepareRootRow(root: RootViewModel, width: number, messageWidth: number, branchWidth: number): PreparedRootRow {
-  const key = `${width}:${messageWidth}:${branchWidth}`
+function prepareRootRow(root: RootViewModel, width: number, messageWidth: number, branchWidth: number, searchActive: boolean): PreparedRootRow {
+  const key = `${width}:${messageWidth}:${branchWidth}:${searchActive}`
   const cached = rootRows.get(root)
   if (cached?.key === key) return cached
-  const counts = root.activation === "loading" ? `${BRAILLE_SPINNER_FRAMES[0]} Loading`
+  const normalCounts = root.activation === "loading" ? `${BRAILLE_SPINNER_FRAMES[0]} Loading`
     : root.activation === "retry" ? "History unavailable · Enter to retry"
     : root.history._tag === "Unavailable" ? "History unavailable"
     : `${root.history._tag === "Limited" ? "History gap  " : ""}${String(root.messageCount).padStart(messageWidth)} ${(root.messageCount === 1 ? "message" : "messages").padEnd(8)}  ${String(root.memberSessionIds.length).padStart(branchWidth)} ${(root.memberSessionIds.length === 1 ? "branch" : "branches").padEnd(8)}`
   const titleX = 4
-  const metadataX = Math.max(titleX, width - displayWidth(counts) - 1)
+  const counts = searchActive && root.activation === "retry" ? "History unavailable" : normalCounts
+  const metadataX = Math.max(titleX, width - displayWidth(normalCounts) - 1)
   const title = truncateToWidth(root.title, Math.max(0, metadataX - titleX - 2))
   const metadata = metadataX > titleX ? truncateToWidth(counts, width - metadataX - 1) : ""
   const gap = " ".repeat(Math.max(0, metadataX - titleX - displayWidth(title)))
   const ending = " ".repeat(Math.max(0, width - metadataX - displayWidth(metadata)))
   let loadingMarker: PreparedRootRow["loadingMarker"]
-  const makeChunks = (selected: boolean) => {
-    const bg = selected ? theme.selected : theme.background
+  const makeChunks = (selected: boolean, matching = false) => {
+    const bg = selected ? theme.selected : matching ? theme.searchMatchBackground : theme.background
     const fg = selected ? theme.selectedText : theme.text
     const chunks = [
-      chunk(" ", fg, TextAttributes.NONE, bg),
+      chunk(matching ? "▌" : " ", matching && !selected ? theme.searchMatchMarker : fg, TextAttributes.NONE, bg),
       chunk(title, fg, selected ? TextAttributes.BOLD : TextAttributes.NONE, bg),
       chunk(gap, fg, TextAttributes.NONE, bg),
     ]
@@ -80,7 +83,8 @@ function prepareRootRow(root: RootViewModel, width: number, messageWidth: number
     )
     return chunks
   }
-  const row = { key, text: ` ${title}${gap}${metadata}${ending}`, normal: makeChunks(false), selected: makeChunks(true), loadingMarker }
+  const row = { key, text: ` ${title}${gap}${metadata}${ending}`, normal: makeChunks(false), selected: makeChunks(true),
+    matching: makeChunks(false, true), selectedMatching: makeChunks(true, true), loadingMarker }
   rootRows.set(root, row)
   return row
 }
@@ -179,12 +183,13 @@ export function renderRoots(
   width: number,
   viewportStart = 0,
   spinnerFrame = 0,
+  matchingRootIds?: ReadonlySet<string>,
 ): RenderedRoots {
   const safeWidth = Math.max(1, width)
   const safeHeight = Math.max(1, height)
   if (roots.length === 0) {
     const canvas = new SparseCanvas()
-    canvas.write(0, 0, truncateToWidth("No conversations · press n to start one", safeWidth), {
+    canvas.write(0, 0, truncateToWidth(matchingRootIds === undefined ? "No conversations · press n to start one" : "No conversations", safeWidth), {
       ...DEFAULT_STYLE,
       fg: theme.textMuted,
     })
@@ -192,6 +197,7 @@ export function renderRoots(
   }
 
   const index = indexRootViews(roots)
+  const selectedRootId = index.bySessionId.get(selectedSessionId ?? "")?.sessionId
   const selectedIndex = index.positions.get(selectedSessionId ?? "") ?? 0
   const maximumStart = Math.max(0, roots.length - safeHeight)
   let start = clamp(viewportStart, 0, maximumStart)
@@ -203,21 +209,24 @@ export function renderRoots(
   const lines: string[] = []
   for (let position = start; position < end; position += 1) {
     const root = roots[position]!
-    const selected = root.sessionId === selectedSessionId
+    const selected = root.sessionId === selectedRootId
+    const matching = matchingRootIds?.has(root.sessionId) === true
     const status = statusMarker(root.status, spinnerFrame)
     chunks.push(chunk(" ", theme.text))
     if (safeWidth > 1) chunks.push(chunk(status, statusColor(root.status), TextAttributes.BOLD))
     if (safeWidth > 2) chunks.push(chunk(" ", theme.text))
     let body = ""
     if (safeWidth > 3) {
-      const row = prepareRootRow(root, safeWidth, index.messageCountWidth, index.branchCountWidth)
+      const row = prepareRootRow(root, safeWidth, index.messageCountWidth, index.branchCountWidth, matchingRootIds !== undefined)
       const marker = BRAILLE_SPINNER_FRAMES[spinnerFrame % BRAILLE_SPINNER_FRAMES.length]!
-      for (const [index, item] of (selected ? row.selected : row.normal).entries()) {
+      const style = matching ? selected ? row.selectedMatching : row.matching : selected ? row.selected : row.normal
+      for (const [index, item] of style.entries()) {
         chunks.push({ ...item, ...(index === row.loadingMarker?.chunkIndex ? { text: marker } : {}) })
       }
       body = row.loadingMarker
         ? row.text.slice(0, row.loadingMarker.textOffset) + marker + row.text.slice(row.loadingMarker.textOffset + 1)
         : row.text
+      if (matching) body = `▌${body.slice(1)}`
     }
     lines.push((` ${status} `.slice(0, Math.min(3, safeWidth)) + body).trimEnd())
     if (lines.length < safeHeight) chunks.push(chunk("\n", theme.text))
@@ -237,6 +246,7 @@ export function renderGraph(
   spinnerFrame: number,
   viewportOffset?: ViewportOffset,
   liveSessionIds: ReadonlySet<string> = new Set(),
+  matchingNodeIds?: ReadonlySet<string>,
 ): RenderedGraph {
   const width = Math.max(1, viewportWidth)
   const height = Math.max(1, viewportHeight)
@@ -264,7 +274,7 @@ export function renderGraph(
   }
   for (const node of intersecting(index.nodes, offsetY, offsetY + height)) {
     if (node.x < offsetX + width && node.x + node.width > offsetX) {
-      drawNode(canvas, node, spinnerFrame, liveSessionIds, node.id === selected?.id)
+      drawNode(canvas, node, spinnerFrame, liveSessionIds, node.id === selected?.id, node._tag === "Message" && matchingNodeIds?.has(node.id) === true)
     }
   }
   return {
@@ -303,10 +313,11 @@ function drawNode(
   spinnerFrame: number,
   liveSessionIds: ReadonlySet<string>,
   selected: boolean,
+  matching: boolean,
 ): void {
   const background = selected
     ? theme.selected
-    : node._tag === "Endpoint"
+    : matching ? theme.searchMatchBackground : node._tag === "Endpoint"
       ? theme.sessionElement
       : theme.element
   const foreground = selected ? theme.selectedText : theme.text
@@ -314,6 +325,10 @@ function drawNode(
   const heading = { ...style, attributes: TextAttributes.BOLD }
   const contentWidth = Math.max(0, node.width - 4)
   canvas.paint(node.x, node.y, node.width, node.height, style)
+  if (matching) {
+    const markerStyle = { ...style, fg: selected ? theme.selectedText : theme.searchMatchMarker }
+    for (let row = 0; row < node.height; row++) canvas.write(node.x, node.y + row, "▌", markerStyle)
+  }
 
   if (node._tag === "Message") {
     const kind = node.role === "agent"
