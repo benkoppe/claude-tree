@@ -78,7 +78,7 @@ async function buildPlatform(version: string): Promise<void> {
     })
     if (!result.success) throw new AggregateError(result.logs, "Release compilation failed")
   }
-  await compile(["src/cli.ts", "src/infrastructure/metadata/worker.ts", "src/infrastructure/providers/read-worker.ts", "src/infrastructure/projection/worker.ts"], join(directory, "claude-tree"))
+  await compile(["src/cli.ts", "src/infrastructure/metadata/worker.ts", "src/infrastructure/providers/read-worker.ts", "src/infrastructure/projection/worker.ts", "src/infrastructure/search/worker.ts"], join(directory, "claude-tree"))
   await compile(["src/diagnostics/history-process.ts"], join(directory, "claude-tree-history"))
   await cp("src/infrastructure/metadata/migrations", join(directory, "migrations"), { recursive: true })
   for (const file of ["LICENSE", "THIRD_PARTY_LICENSES"]) await cp(file, join(directory, file))
