@@ -68,13 +68,16 @@ export function reconcileTranscript(
     ? previous.messages.slice(0, targetIndex)
     : retained._tag === "Available" ? retained.messages : []
   const replacement = terminal?.replacement
-  if (incoming._tag === "Available" && (
-    (replacement && ((!replacement.settled && !isTranscriptPrefix(replacement.prefix, incoming.messages)) ||
-      incoming.messages.some((message) => replacement.discardedMessageIds.has(message.id)))) ||
-    (!replacement && targetIndex >= 0 && (!isTranscriptPrefix(baseline, incoming.messages) ||
-      (previous?._tag === "Available" && incoming.messages.some((message) =>
-        previous.messages.slice(targetIndex).some((old) => old.id === message.id)))))
-  )) return { read: retained, accepted: false }
+  if (incoming._tag === "Available") {
+    if (replacement) {
+      if ((!replacement.settled && !isTranscriptPrefix(replacement.prefix, incoming.messages)) ||
+        incoming.messages.some((message) => replacement.discardedMessageIds.has(message.id))) return { read: retained, accepted: false }
+    } else if (targetIndex >= 0 && previous?._tag === "Available") {
+      if (!isTranscriptPrefix(baseline, incoming.messages)) return { read: retained, accepted: false }
+      const discardedAnchorIds = new Set(previous.messages.slice(targetIndex).map((message) => message.id))
+      if (incoming.messages.some((message) => discardedAnchorIds.has(message.id))) return { read: retained, accepted: false }
+    }
+  }
   const unexpectedReplacement = incoming._tag === "Available" && previous?._tag === "Available" &&
     !isTranscriptPrefix(previous.messages, incoming.messages) && !anchor && (!replacement || replacement.settled)
   const replacedCompletedTurn = unexpectedReplacement && completion !== undefined &&

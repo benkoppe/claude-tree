@@ -1616,10 +1616,6 @@ export function makeAppRuntime(
               yield* reject(envelope.reply, intent._tag, "invalid", "This replay has not started; use Open after ancestry verification succeeds")
               return
             }
-            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing" && !verificationReceipts.has(intent.sessionId)) {
-              yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
-              return
-            }
             const session = selectProjectedData(state).sessions.get(intent.sessionId)
             if (!session || session.transient) {
               yield* reject(envelope.reply, intent._tag, "invalid", `Session ${intent.sessionId} is not resumable`)
@@ -1661,10 +1657,6 @@ export function makeAppRuntime(
             }
             if (running) {
               yield* reject(envelope.reply, intent._tag, "busy", `Session ${intent.sessionId} is ${running.phase}`)
-              return
-            }
-            if (selectHistoryStatus(state, intent.sessionId)._tag === "Missing" && !verificationReceipts.has(intent.sessionId)) {
-              yield* reject(envelope.reply, intent._tag, "invalid", "Session history was not found; refresh before resuming")
               return
             }
             const session = selectProjectedData(state).sessions.get(intent.sessionId)

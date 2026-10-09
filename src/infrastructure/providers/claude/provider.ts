@@ -39,7 +39,7 @@ import {
 } from "../../../services/provider"
 import { ClaudeTerminalObserver } from "./terminal-observer"
 import { makeClaudeLifecycleHooks } from "./lifecycle-hooks"
-import { NavigationHistoryError, projectNavigationHistory } from "./navigation-history"
+import { NavigationHistoryError, projectNavigationHistoryFromEvidence } from "./navigation-history"
 import { RecordEvidence } from "./record-evidence"
 import { markCompactionSummaries, normalizeTranscript, normalizePreview, sourceRole, type ClaudeMessage } from "./transcript"
 export { formatMessage, extractUserPromptText } from "./transcript"
@@ -290,15 +290,16 @@ export class ClaudeProvider implements AgentProviderApi {
           }
           const entries = yield* this.traced(trace, "session-records", sessionId,
             this.readSessionEntries(sessionId, "readTranscripts", readDeadline), (entries) => entries.length)
-          const sdkContext = this.contextSnapshot(context, entries)
+          const evidence = new RecordEvidence(entries, new Map([[sessionId, entries]]), trace)
+          const sdkContext = this.contextSnapshot(context, entries, evidence)
           const navigation = yield* this.traced(trace, "navigation-history", sessionId,
-            this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline, trace), (messages) => messages.length).pipe(Effect.result)
+            this.readNavigationHistory(sessionId, context, entries, "readTranscripts", readDeadline, trace, evidence), (messages) => messages.length).pipe(Effect.result)
           if (navigation._tag === "Success") return { _tag: "Available" as const, messages: navigation.success, context: sdkContext }
           const error = navigation.failure
           const gap = error.cause
           if (!(gap instanceof NavigationHistoryError) || gap.kind !== "history-gap") return yield* Effect.fail(error)
           yield* Effect.try({
-            try: () => this.validateContextSnapshot(sessionId, context, entries),
+            try: () => this.validateContextSnapshot(sessionId, context, evidence),
             catch: (cause) => this.protocolError("readTranscripts", "SDK context does not match the imported session records", cause),
           }).pipe(Effect.tapError(() => Effect.sync(() => trace?.fail("validation", "active-record-mismatch", sessionId))))
           return { _tag: "Available" as const, messages: sdkContext.messages, context: sdkContext,
@@ -887,8 +888,8 @@ export class ClaudeProvider implements AgentProviderApi {
     })
   }
 
-  private contextSnapshot(context: ClaudeActiveContext, entries: readonly SessionStoreEntry[]): NonNullable<Extract<TranscriptRead, { _tag: "Available" }>["context"]> {
-    const records = new RecordEvidence(entries).current.effective
+  private contextSnapshot(context: ClaudeActiveContext, entries: readonly SessionStoreEntry[], evidence = new RecordEvidence(entries)): NonNullable<Extract<TranscriptRead, { _tag: "Available" }>["context"]> {
+    const records = evidence.current.effective
     const boundaryId = context.systemIds.findLast((id) => {
       const record = records.get(id)
       return record?.type === "system" && record.subtype === "compact_boundary"
@@ -896,8 +897,8 @@ export class ClaudeProvider implements AgentProviderApi {
     return { messages: markCompactionSummaries(context.messages, [...records.values()]), boundaryId }
   }
 
-  private validateContextSnapshot(sessionId: string, context: ClaudeActiveContext, entries: readonly SessionStoreEntry[]): void {
-    const records = new RecordEvidence(entries).current.effective
+  private validateContextSnapshot(sessionId: string, context: ClaudeActiveContext, evidence: RecordEvidence): void {
+    const records = evidence.current.effective
     for (const message of context.messages) {
       const record = records.get(message.id)
       if (!record || record.type !== message.sourceType || !isDeepStrictEqual(record.message, message.rawMessage)) {
@@ -914,12 +915,13 @@ export class ClaudeProvider implements AgentProviderApi {
     operation: string,
     deadline: OperationDeadline,
     trace?: HistoryTrace,
+    evidence = new RecordEvidence(entries, new Map([[sessionId, entries]]), trace),
   ): Effect.Effect<readonly ClaudeMessage[], ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const active = context.messages
       const projection = yield* this.projectNavigationHistoryWithProvenance(sessionId, entries, [
         ...active.map((message) => message.id), ...(context.systemAnchorId ? [context.systemAnchorId] : []),
-      ], operation, deadline, trace)
+      ], operation, deadline, evidence, trace)
       if (!projection.changed) return markCompactionSummaries(active, projection.sourceRecords)
       const messages = yield* this.traced(trace, "sdk-reconstruction", sessionId,
         this.readStoredTranscript(sessionId, projection.records, operation, deadline, context.systemAnchorId, trace), (messages) => messages.length)
@@ -947,15 +949,16 @@ export class ClaudeProvider implements AgentProviderApi {
     selectedIds: readonly string[],
     operation: string,
     deadline: OperationDeadline,
+    evidence: RecordEvidence,
     trace?: HistoryTrace,
-  ): Effect.Effect<ReturnType<typeof projectNavigationHistory>, ProviderError | ProviderProtocolError> {
+  ): Effect.Effect<ReturnType<typeof projectNavigationHistoryFromEvidence>, ProviderError | ProviderProtocolError> {
     return Effect.gen({ self: this }, function*() {
       const ancestors = new Map<string, readonly SessionStoreEntry[]>([[sessionId, entries]])
       let attemptNumber = 0
       while (true) {
         trace?.projection(++attemptNumber, "started", { selected: selectedIds.length })
         const attempt = yield* Effect.try({
-          try: () => projectNavigationHistory(entries, selectedIds, ancestors, trace),
+          try: () => projectNavigationHistoryFromEvidence(evidence.withSnapshots(ancestors), selectedIds, trace),
           catch: (cause) => cause,
         }).pipe(Effect.match({
           onSuccess: (projection) => ({ _tag: "Projected" as const, projection }),
