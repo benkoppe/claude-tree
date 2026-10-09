@@ -538,7 +538,7 @@ async function syncParentDirectory(
   }
 }
 
-function createDirectoryDurably(
+export function createDirectoryDurably(
   platform: PersistencePlatformApi,
   path: string,
 ): Effect.Effect<void, unknown> {
@@ -564,7 +564,7 @@ function createDirectoryDurably(
   })
 }
 
-async function syncDirectory(platform: PersistencePlatformApi, path: string): Promise<void> {
+export async function syncDirectory(platform: PersistencePlatformApi, path: string): Promise<void> {
   let handle: Awaited<ReturnType<PersistencePlatformApi["open"]>> | undefined
   try {
     handle = await platform.open(path, "r")

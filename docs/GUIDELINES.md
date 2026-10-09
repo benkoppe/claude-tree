@@ -29,8 +29,10 @@ For a larger workload, use `BENCHMARK_SESSIONS=1000 BENCHMARK_RECORDS=100 bun ru
 
 ## Persistence
 
-- Provider state schema v3 is strict and reset-only. Do not add implicit migration, deletion, quarantine, fallback parsing, or automatic recreation for incompatible persisted state.
-- Write related metadata and per-instance navigation through the unified provider-state transaction when they must remain atomic. Workspace resume copies the requested navigation into a fresh invocation; it never shares a navigation writer with the original workspace.
+- Application metadata lives in one private XDG SQLite database. Projects and session references have stable application identities; provider identities remain opaque. Do not persist transcripts, provider catalogue caches, or terminal ownership.
+- Commit schema declarations and reviewed SQL migrations together. Use STRICT tables, scoped foreign keys, WAL, FULL synchronization, and short transactions. Upgrade only with exclusive OS schema access; never migrate underneath live persistence clients. Reject unknown schemas and corrupt state without deletion, fallback parsing, or recreation.
+- Legacy v3 JSON is accepted only by the explicit importer, with its original strict structural, semantic, and canonical validation. Leave source files untouched and require legacy invocations to be closed before cutover.
+- Write related metadata and per-instance navigation in one SQLite transaction when they must remain atomic. Workspace resume copies the requested navigation into a fresh invocation; it never shares a navigation writer with the original workspace. Navigation saves update only their workspace, not all shared metadata.
 - Treat provider mutations as ambiguous after they may have been sent and their response is unavailable. Do not retry or infer success; reconcile from a full provider snapshot.
 - Never persist terminal owners, launch-resource inventories, or identity-adoption journals. Provider sidecars and temporary capability artifacts have ordinary scoped cleanup, not startup recovery.
 

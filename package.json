@@ -24,6 +24,8 @@
   },
   "scripts": {
     "start": "bun run src/cli.ts",
+    "db:generate": "drizzle-kit generate",
+    "build:release": "bun run scripts/build-release.ts",
     "test": "bun test",
     "benchmark:responsiveness": "bun run scripts/benchmark-responsiveness.ts",
     "typecheck": "tsc --noEmit",
@@ -36,12 +38,14 @@
     "@effect/platform-node-shared": "4.0.0-rc.112",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@opentui/core": "0.5.9",
+    "drizzle-orm": "0.45.3",
     "effect": "4.0.0-rc.112",
     "web-tree-sitter": "0.25.10",
     "zod": "4.5.4"
   },
   "devDependencies": {
     "@types/bun": "1.4.0",
+    "drizzle-kit": "0.31.11",
     "typescript": "5.9.3"
   },
   "engines": {

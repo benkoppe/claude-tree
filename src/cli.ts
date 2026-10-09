@@ -3,6 +3,7 @@
 import { createCliRenderer, type CliRenderer } from "@opentui/core"
 import { BunRuntime } from "@effect/platform-bun"
 import { Cause, Deferred, Effect, Scope } from "effect"
+import { join } from "node:path"
 
 import { CLI_HELP } from "./cli-help"
 import { causeFailures, errorSummary as failureMessage } from "./error-format"
@@ -10,8 +11,8 @@ import { parseCliArguments, resolveProjectDirectory, type CliOptions } from "./c
 import { setProcessTitle } from "./process-title"
 import { PROCESS_TITLE_PREFIX, PROGRAM_NAME, PROGRAM_VERSION } from "./program"
 import { makeAppRuntime } from "./application"
-import { PersistencePlatform, nativePersistencePlatform } from "./infrastructure/metadata/platform"
-import { makeNavigationPersistenceWorker } from "./infrastructure/metadata/navigation-persistence"
+import { makeMetadataWorker } from "./infrastructure/metadata/worker-service"
+import { nativePersistencePlatform } from "./infrastructure/metadata/platform"
 import { makeProviderReads, withProviderReads } from "./infrastructure/providers/read-service"
 import { makeProjectionService } from "./infrastructure/projection/service"
 import { makeLiveHerdrReporter, reportApplicationToHerdr } from "./infrastructure/herdr"
@@ -24,7 +25,6 @@ import {
 } from "./infrastructure/terminal"
 import { makeOpenTuiPresentation, presentationTheme } from "./presentation"
 import type { AgentProviderApi } from "./services/provider"
-import { makeProviderStateRepository } from "./services/provider-state-repository"
 import {
   makeTerminalSupervisor,
   type TerminalSupervisorEvents,
@@ -96,6 +96,12 @@ export function makeCliProgram(environment: CliProgramEnvironment): Effect.Effec
       yield* Effect.sync(() => environment.writeStdout(JSON.stringify(report, null, 2) + "\n"))
       return
     }
+    if (options.command === "state") {
+      const commands = yield* Effect.promise(() => import("./infrastructure/metadata/state-commands"))
+      const result = yield* commands.runStateCommand(options)
+      yield* Effect.sync(() => environment.writeStdout(result + "\n"))
+      return
+    }
     if (!environment.stdinIsTTY || !environment.stdoutIsTTY) {
       return yield* Effect.fail(new Error("claude-tree requires an interactive terminal"))
     }
@@ -122,34 +128,26 @@ export function composeProductionApplication(
       try: () => resolveProjectDirectory(options.project),
       catch: toError,
     })
+    const repository = yield* makeMetadataWorker({ projectDirectory: projectPath, providerId: options.provider,
+      ...(options.resumeWorkspaceId ? { resumeWorkspaceId: options.resumeWorkspaceId } : {}) })
+    yield* repository.saveNavigation((yield* repository.loadMetadata).navigation ?? { view: "roots", selectedSessionId: null })
     const localProvider = yield* makeProvider(options.provider, projectPath)
     const reads = yield* makeProviderReads({ providerId: options.provider, projectPath })
     const provider = withProviderReads(localProvider, reads)
     const projection = yield* makeProjectionService()
     const renderer = yield* makeOpenTuiRenderer()
-    const persistenceOptions = { projectDirectory: projectPath, providerId: provider.id,
-      ...(options.resumeWorkspaceId ? { resumeWorkspaceId: options.resumeWorkspaceId } : {}) }
-    const repository = yield* makeProviderStateRepository(persistenceOptions).pipe(
-      Effect.provideService(PersistencePlatform, nativePersistencePlatform),
-    )
-    yield* repository.saveNavigation((yield* repository.loadMetadata).navigation ?? { view: "roots", selectedSessionId: null })
-    const navigation = yield* makeNavigationPersistenceWorker({ providerId: provider.id,
-      projectDirectory: repository.projectPath,
-      instanceId: repository.instanceId,
-      stateHome: nativePersistencePlatform.stateHome(),
-    })
     const herdr = yield* makeLiveHerdrReporter()
     const bridge = makeTerminalEventBridge()
     const terminals = yield* makeTerminalSupervisor({
       renderer: new OpenTuiTerminalRenderer(renderer),
       processes: new BunPtyProcessFactory(),
-      guard: makeSessionGuard(repository.statePath, provider.id),
+      guard: makeSessionGuard(join(nativePersistencePlatform.stateHome(), "claude-tree", "session-guards"), provider.id),
       metadata: repository,
       events: bridge.events,
     })
     yield* composeApplicationLifecycle(
-      makeAppRuntime({ provider, metadata: { ...repository, saveNavigation: navigation.saveNavigation }, terminals,
-        closeNavigationPersistence: navigation.close, closeProviderReads: reads.close,
+      makeAppRuntime({ provider, metadata: repository, terminals,
+        closeNavigationPersistence: repository.close, closeProviderReads: reads.close,
         prepareProjection: projection.prepare, closeProjection: projection.close }),
       (appRuntime) => {
         bridge.bind(appRuntime.terminalEvents)

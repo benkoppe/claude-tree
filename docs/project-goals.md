@@ -46,6 +46,6 @@ Provider-specific session formats, branching rules, launch arguments, and termin
 - Automatically isolating branches into Git worktrees.
 - Reconstructing or editing provider transcript files by hand.
 - Automatically recovering orphaned processes, reservations, launch artifacts, or identity journals after a crash.
-- Automatically migrating or deleting incompatible application state. The persistence format is reset-only and requires an explicit user reset.
+- Silently deleting, resetting, or guessing incompatible application state. Recognized SQLite schemas use tested forward migrations; legacy JSON import is explicit, and unknown or corrupt state is preserved and rejected.
 
 Implementation details may evolve when better tools or APIs become available. Preserve the experience and boundaries above rather than treating an early implementation as permanent.
