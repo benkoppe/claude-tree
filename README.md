@@ -13,6 +13,8 @@ claude-tree --codex /path/to/project
 
 `claude-tree` does not create Git worktrees or restore files to their state at the fork point.
 
+If a fork's saved history is slow to become readable, the navigator shows verification progress. Use the displayed `v` action to cancel verification or retry it without creating another fork. The child remains an independent session until its ancestry is verified; opening it independently discards the pending verification evidence. Verification receipts last only for the current invocation.
+
 ## Quick Start
 
 `claude-tree` is project-scoped. Run it inside your project folder.

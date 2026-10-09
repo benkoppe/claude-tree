@@ -96,7 +96,7 @@ export function databasePath(stateHome: string): string {
 }
 
 export function openStateDatabase(stateHome: string, requireExisting = false, policy: DatabaseSchemaPolicy = schemaPolicy, platform: StateDatabasePlatform = nativeStateDatabasePlatform): Effect.Effect<StateDatabase, unknown> {
-  return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+  return Effect.uninterruptible(Effect.gen(function*() {
     const path = databasePath(stateHome)
     const lock = platform.fileLocker()
     yield* createDirectoryDurably(nativePersistencePlatform, dirname(path))
@@ -118,7 +118,7 @@ export function openStateDatabase(stateHome: string, requireExisting = false, po
           while (!lock(startup.fd, 2 | 4)) yield* Effect.sleep(LOCK_RETRY_INTERVAL_MS)
           while (!lock(schemaGate.fd, 1 | 4)) yield* Effect.sleep(LOCK_RETRY_INTERVAL_MS)
         })
-        yield* restore(acquire)
+        yield* Effect.interruptible(acquire)
         return yield* Effect.tryPromise({ try: async () => {
           let exists = true
           try { await stat(path) } catch (error) { if (isErrorCode(error, "ENOENT")) exists = false; else throw error }

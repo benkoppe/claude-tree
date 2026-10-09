@@ -628,7 +628,7 @@ describe("Effect Claude provider", () => {
     expect(forkCalls).toBe(1)
   })
 
-  test("returns ambiguity when fork creation times out and never retries after late settlement", async () => {
+  test("a fork deadline retains native settlement and never retries a late rejection", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     const forkStarted = Deferred.makeUnsafe<void>()
     let forkCalls = 0
@@ -658,17 +658,19 @@ describe("Effect Claude provider", () => {
           }))
           yield* Deferred.await(forkStarted)
           yield* TestClock.adjust(10)
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          rejectFork?.(new Error("late fork rejection"))
           return yield* Fiber.join(fiber)
         }),
         TestClock.layer(),
       ))
 
-      expect(outcome).toEqual({
+      expect(outcome).toMatchObject({
         _tag: "AmbiguousBranchMutation",
         providerId: "claude",
         parentSessionId: ROOT,
         sourceMessageId: "parent-1",
-        reason: "Claude forkSession timed out after 10ms; Claude may have created a child session",
+        reason: expect.stringContaining("late fork rejection"),
         reconciliation: "full-snapshot",
       })
       expect(forkCalls).toBe(1)
@@ -681,19 +683,15 @@ describe("Effect Claude provider", () => {
     }
   })
 
-  test("ignores a late fork success after timeout without retrying or validating it", async () => {
+  test("retains a late fork success after its observation deadline without repeating creation", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
     const forkStarted = Deferred.makeUnsafe<void>()
     let forkCalls = 0
-    let childReads = 0
     let resolveFork: ((result: { readonly sessionId: string }) => void) | undefined
     const provider = providerWith({
       messages: {
         [ROOT]: parent,
-        [CHILD]: () => {
-          childReads += 1
-          return []
-        },
+        [CHILD]: [],
       },
       physical: { [ROOT]: parent },
       forkSession: () => new Promise((resolve) => {
@@ -714,16 +712,21 @@ describe("Effect Claude provider", () => {
         }))
         yield* Deferred.await(forkStarted)
         yield* TestClock.adjust(10)
+        expect(fiber.pollUnsafe()).toBeUndefined()
+        resolveFork?.({ sessionId: CHILD })
+        yield* TestClock.adjust(100)
         return yield* Fiber.join(fiber)
       }),
       TestClock.layer(),
     ))
 
-    expect(outcome._tag).toBe("AmbiguousBranchMutation")
-    resolveFork?.({ sessionId: CHILD })
+    expect(outcome._tag).toBe("CreatedIndependentSession")
+    if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected known child")
+    expect(outcome.session.id).toBe(CHILD)
+    expect(outcome.verification?.receipt).toBeDefined()
     await new Promise<void>((resolve) => setImmediate(resolve))
     expect(forkCalls).toBe(1)
-    expect(childReads).toBe(0)
+    expect(outcome.verification?.status).toBe("unavailable")
   })
 
   test("queues reconciliation and preserves interruption after forkSession invocation", async () => {
@@ -750,7 +753,9 @@ describe("Effect Claude provider", () => {
         messageId: "parent-1",
       }))
       await Effect.runPromise(Deferred.await(forkStarted))
-      await Effect.runPromise(Fiber.interrupt(fiber))
+      const interruption = Effect.runPromise(Fiber.interrupt(fiber))
+      rejectFork?.(new Error("late interrupted rejection"))
+      await interruption
       const exit = await Effect.runPromise(Fiber.await(fiber))
 
       expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
@@ -773,10 +778,11 @@ describe("Effect Claude provider", () => {
     }
   })
 
-  test("queues reconciliation when interrupted after the fork child ID is known", async () => {
+  test("preserves a known child receipt instead of reporting ambiguity when verification is cancelled", async () => {
     const parent = [message(ROOT, "parent-1", "assistant", "answer")]
 
-    const signal = await Effect.runPromise(Effect.gen(function*() {
+    let receipt: import("../../src/services/provider").BranchVerificationReceipt | undefined
+    await Effect.runPromise(Effect.gen(function*() {
       const childReadStarted = yield* Deferred.make<void>()
       const provider = providerWith({
         messages: {
@@ -791,19 +797,81 @@ describe("Effect Claude provider", () => {
       const fiber = yield* Effect.forkChild(provider.branchFrom({
         sessionId: ROOT,
         messageId: "parent-1",
-      }))
+      }, (created) => Effect.sync(() => { receipt = created })))
       yield* Deferred.await(childReadStarted)
       yield* Fiber.interrupt(fiber)
-      return yield* provider.takeBranchMutationReconciliation
+      const pending = yield* Effect.forkChild(provider.takeBranchMutationReconciliation)
+      yield* Effect.yieldNow
+      expect(pending.pollUnsafe()).toBeUndefined()
+      yield* Fiber.interrupt(pending)
     }))
 
-    expect(signal).toMatchObject({
-      _tag: "AmbiguousBranchMutation",
-      providerId: "claude",
-      parentSessionId: ROOT,
-      sourceMessageId: "parent-1",
-      reconciliation: "full-snapshot",
-    })
+    expect(receipt?.session.id).toBe(CHILD)
+  })
+
+  test("an explicit validation budget stops pending observation without losing the confirmed child", async () => {
+    const parent = [message(ROOT, "p1", "assistant", "Answer")]
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [] },
+      physical: { [ROOT]: parent, [CHILD]: [] }, retryDelays: [], forkValidationTimeoutMs: 10 })
+    await Effect.runPromise(Effect.gen(function*() {
+      const waiting = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p1" }))
+      yield* TestClock.adjust(20)
+      const result = yield* Fiber.join(waiting)
+      if (result._tag !== "CreatedIndependentSession") throw new Error("expected known child")
+      expect(result.session.id).toBe(CHILD)
+      expect(result.verification?.status).toBe("unavailable")
+      expect(result.verification?.reasonCode).toBe("deadline")
+      expect(result.verification?.receipt).toBeDefined()
+    }).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("a short copied prefix containing contradictory provenance is not classified as pending", async () => {
+    const parent = [message(ROOT, "p1", "user", "Question"), message(ROOT, "p2", "assistant", "Answer")]
+    const copied = copyMessage(parent[0]!, CHILD, "c1")
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [copied] },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copied, ROOT, "wrong-source")] }, retryDelays: [] })
+    const result = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "p2" }))
+    expect(result._tag).toBe("CreatedIndependentSession")
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected independent")
+    expect(result.verification?.status).toBe("contradicted")
+    expect(result.verification?.reasonCode).toBe("copy-mismatch")
+  })
+
+  test("an incomplete physical snapshot cannot mask a contradictory already-observed active record", async () => {
+    const parent = [message(ROOT, "p1", "user", "Question"), message(ROOT, "p2", "assistant", "Answer")]
+    const copied = copyMessage(parent[0]!, CHILD, "c1")
+    const changed = { ...copied, message: { role: "user", content: "Changed question" } }
+    const provider = providerWith({ messages: { [ROOT]: parent, [CHILD]: [changed] },
+      physical: { [ROOT]: parent, [CHILD]: [copiedRecord(copied, ROOT, "p1")] }, retryDelays: [] })
+    const result = await Effect.runPromise(provider.branchFrom({ sessionId: ROOT, messageId: "p2" }))
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected independent child")
+    expect(result.verification?.status).toBe("contradicted")
+  })
+
+  test("a late native success during interruption publishes the confirmed child before finalization ends", async () => {
+    const parent = [message(ROOT, "p1", "assistant", "Answer")]
+    const started = Deferred.makeUnsafe<void>()
+    let finish!: (value: { sessionId: string }) => void
+    let child: string | undefined
+    let calls = 0
+    const provider = providerWith({ messages: { [ROOT]: parent }, physical: { [ROOT]: parent },
+      forkSession: () => new Promise((resolve) => { calls++; finish = resolve; Deferred.doneUnsafe(started, Effect.void) }) })
+    await Effect.runPromise(Effect.gen(function*() {
+      const running = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p1" },
+        (receipt) => Effect.sync(() => { child = receipt.session.id })))
+      yield* Deferred.await(started)
+      const interrupt = yield* Effect.forkChild(Fiber.interrupt(running))
+      yield* Effect.yieldNow
+      expect(interrupt.pollUnsafe()).toBeUndefined()
+      finish({ sessionId: CHILD })
+      yield* Fiber.join(interrupt)
+      expect(child).toBe(CHILD)
+      const reconciliation = yield* Effect.forkChild(provider.takeBranchMutationReconciliation)
+      yield* Effect.yieldNow
+      expect(reconciliation.pollUnsafe()).toBeUndefined()
+      yield* Fiber.interrupt(reconciliation)
+    }))
+    expect(calls).toBe(1)
   })
 
   test("returns CreatedIndependentSession after post-create payload validation fails", async () => {
@@ -833,7 +901,8 @@ describe("Effect Claude provider", () => {
     expect(outcome.session.id).toBe(CHILD)
     expect(outcome.transcript._tag).toBe("Available")
     expect(outcome.reason).toContain("physical copied prefix does not exactly match")
-    expect(outcome.acquireLaunch).toBeDefined()
+    expect(outcome.acquireLaunch).toBeUndefined()
+    expect(outcome.verification?.status).toBe("contradicted")
   })
 
   test("returns CreatedIndependentSession after bounded post-create reads remain unavailable", async () => {

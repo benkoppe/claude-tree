@@ -3,25 +3,28 @@ import { isDeepStrictEqual } from "node:util"
 import { join } from "node:path"
 import { stat } from "node:fs/promises"
 import { and, asc, eq } from "drizzle-orm"
-import { Cause, Effect } from "effect"
+import { Effect, Scope } from "effect"
 
 import { PersistenceError, SessionRemovedError } from "../../domain/errors"
 import type { MessageRef, NavigationState } from "../../domain/model"
 import type { BranchRelation, ConversationRemoval, ProjectState, ProviderState } from "../../domain/persistence"
 import { canonicalizeAndValidate, canonicalizeRemoval, decodeState, removalIdentity, replaceSessionIdInProjectState,
   type ProviderStateRepositoryApi, type ProviderStateRepositoryOptions } from "../../services/legacy-provider-state"
-import { databaseOrm, openStateDatabase, sqliteTransaction } from "./database"
-import { PersistencePlatform, isErrorCode } from "./platform"
+import { databaseOrm, openStateDatabase, sqliteTransaction, type StateDatabase } from "./database"
+import { makeCloseOperation } from "../../services/close-operation"
+import { PersistencePlatform, isErrorCode, type PersistencePlatformApi } from "./platform"
 import { decodeStrict, readJsonIfPresent, withTransactionLock } from "./storage"
 import { Schema } from "effect"
 import * as s from "./schema"
 
-export function makeSqliteRepository(options: ProviderStateRepositoryOptions): Effect.Effect<ProviderStateRepositoryApi, PersistenceError, PersistencePlatform> {
+export function makeSqliteRepository(options: ProviderStateRepositoryOptions,
+  openDatabase: typeof openStateDatabase = openStateDatabase,
+): Effect.Effect<ProviderStateRepositoryApi, PersistenceError, PersistencePlatform | Scope.Scope> {
   return Effect.gen(function*() {
     const platform = yield* PersistencePlatform
     const instanceId = options.instanceId ?? platform.instanceId
     const projectPath = yield* Effect.tryPromise({ try: () => platform.realpath(options.projectDirectory), catch: (e) => e })
-    if (!instanceId || !/^[a-z0-9][a-z0-9-]*$/.test(options.providerId)) throw new Error("Invalid workspace or provider identity")
+    if (!instanceId || !/^[a-z0-9][a-z0-9-]*$/.test(options.providerId)) return yield* Effect.fail(new Error("Invalid workspace or provider identity"))
     const home = options.stateHome ?? platform.stateHome()
     const legacyDirectory = join(home, "claude-tree", "v2", "projects", createHash("sha256").update(projectPath).digest("hex"))
     const legacyProvider = join(legacyDirectory, "providers", options.providerId)
@@ -32,13 +35,28 @@ export function makeSqliteRepository(options: ProviderStateRepositoryOptions): E
       }
       return false
     }, catch: (e) => e })
-    const database = yield* openStateDatabase(home, options.requireExisting || !!options.resumeWorkspaceId)
+    return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+      const database = yield* openDatabase(home, options.requireExisting || !!options.resumeWorkspaceId)
+      const close = makeCloseOperation(Effect.tryPromise({ try: database.close, catch: (cause) => cause }), true)
+      yield* Effect.addFinalizer(() => close.pipe(Effect.orDie))
+      return yield* restore(initializeRepository(database, close, options, platform, instanceId, projectPath, legacyDirectory, legacyProvider, legacyPath, legacyPresent)).pipe(
+        Effect.onExit((exit) => exit._tag === "Failure" ? close : Effect.void),
+      )
+    }))
+  }).pipe(Effect.mapError((cause) => cause instanceof PersistenceError ? cause : new PersistenceError({
+    operation: "open state", path: options.projectDirectory, message: cause instanceof Error ? cause.message : String(cause), cause,
+  })))
+}
+
+function initializeRepository(database: StateDatabase, close: Effect.Effect<void, unknown>, options: ProviderStateRepositoryOptions,
+  platform: PersistencePlatformApi, instanceId: string, projectPath: string,
+  legacyDirectory: string, legacyProvider: string, legacyPath: string, legacyPresent: boolean,
+): Effect.Effect<ProviderStateRepositoryApi, unknown> {
+  return Effect.gen(function*() {
     const db = database.db
-    const identityResult = yield* Effect.exit(Effect.tryPromise({ try: () => stat(database.path), catch: (e) => e }))
-    if (identityResult._tag === "Failure") { yield* Effect.promise(database.close); return yield* Effect.failCause(identityResult.cause) }
-    const databaseIdentity = identityResult.value
+    const databaseIdentity = yield* Effect.tryPromise({ try: () => stat(database.path), catch: (e) => e })
     const orm = databaseOrm(db)
-    const scopeResult = yield* Effect.exit(sqliteTransaction(db, () => {
+    const { project, scope } = yield* sqliteTransaction(db, () => {
       let project = orm.select().from(s.projects).where(eq(s.projects.path, projectPath)).get()
       let scope = project && orm.select().from(s.scopes).where(and(eq(s.scopes.projectId, project.id), eq(s.scopes.providerId, options.providerId))).get()
       if (legacyPresent && !scope?.importDigest && !options.importLegacy) throw new Error(`Legacy state requires explicit import. Close legacy invocations, then run claude-tree state import-json ${options.providerId === "codex" ? "--codex " : ""}${JSON.stringify(projectPath)}. Existing files were left untouched.`)
@@ -52,11 +70,9 @@ export function makeSqliteRepository(options: ProviderStateRepositoryOptions): E
         orm.insert(s.scopes).values(scope).run()
       }
       return { project, scope }
-    }))
-    if (scopeResult._tag === "Failure") { yield* Effect.promise(database.close); return yield* Effect.failCause(scopeResult.cause) }
-    const { project, scope } = scopeResult.value
+    })
     let closed = false
-    const knownRefs = new Map(orm.select().from(s.sessions).where(eq(s.sessions.scopeId, scope.id)).all().map((row) => [row.providerSessionId, row.id]))
+    const knownRefs = yield* Effect.try({ try: () => new Map(orm.select().from(s.sessions).where(eq(s.sessions.scopeId, scope.id)).all().map((row) => [row.providerSessionId, row.id])), catch: (cause) => cause })
     let referenceUndo: Map<string, string | undefined> | undefined
     const rememberRef = (id: string, reference: string) => {
       if (referenceUndo && !referenceUndo.has(id)) referenceUndo.set(id, knownRefs.get(id))
@@ -219,7 +235,7 @@ export function makeSqliteRepository(options: ProviderStateRepositoryOptions): E
     }
     const api: ProviderStateRepositoryApi = {
       projectId: project.id, scopeId: scope.id, projectPath, statePath: database.path, instanceId,
-      close: Effect.suspend(() => { closed = true; return Effect.tryPromise({ try: database.close, catch: (e) => failure("close state", e) }) }),
+      close: Effect.suspend(() => { closed = true; return close.pipe(Effect.mapError((e) => failure("close state", e))) }),
       load: transaction("load state", read), loadMetadata: transaction("load metadata", () => metadata(read())),
       saveNavigation: (navigation) => transaction("save navigation", () => writeNavigation(instanceId, navigation)),
       saveRelation: (relation) => transaction("save relation", () => {
@@ -268,13 +284,13 @@ export function makeSqliteRepository(options: ProviderStateRepositoryOptions): E
       if (options.importLegacy) {
         const imported = yield* withTransactionLock(platform, join(legacyProvider, "state.lock"), Effect.gen(function*() {
           const manifest = yield* readJsonIfPresent(platform, join(legacyDirectory, "project.json"))
-          const decodedManifest = decodeStrict(Schema.Struct({ schemaVersion: Schema.Literal(3), projectPath: Schema.NonEmptyString }), manifest)
-          if (decodedManifest.projectPath !== projectPath) throw new Error("Legacy manifest belongs to another project")
+           const decodedManifest = yield* Effect.try({ try: () => decodeStrict(Schema.Struct({ schemaVersion: Schema.Literal(3), projectPath: Schema.NonEmptyString }), manifest), catch: (cause) => cause })
+           if (decodedManifest.projectPath !== projectPath) return yield* Effect.fail(new Error("Legacy manifest belongs to another project"))
           const leases = yield* Effect.result(Effect.tryPromise({ try: () => platform.readDirectory(join(legacyProvider, "leases")), catch: (e) => e }))
-          if (leases._tag === "Success") throw new Error("Obsolete lease layout cannot be imported")
+           if (leases._tag === "Success") return yield* Effect.fail(new Error("Obsolete lease layout cannot be imported"))
           if (!isErrorCode(leases.failure, "ENOENT")) return yield* Effect.fail(leases.failure)
           const value = yield* readJsonIfPresent(platform, legacyPath)
-          const state = decodeState(value, { projectDirectory: legacyDirectory })
+           const state = yield* Effect.try({ try: () => decodeState(value, { projectDirectory: legacyDirectory }), catch: (cause) => cause })
           return { state, digest: createHash("sha256").update(JSON.stringify(value)).digest("hex") }
         }))
         yield* transaction("import legacy state", () => {
@@ -294,14 +310,9 @@ export function makeSqliteRepository(options: ProviderStateRepositoryOptions): E
       })
       yield* api.load
     })
-    const initialized = yield* Effect.exit(initialize)
-    if (initialized._tag === "Failure") { yield* api.close; return yield* Effect.failCause(initialized.cause) }
-    return api
-  }).pipe(Effect.catchCause((failure) => {
-    if (Cause.hasInterruptsOnly(failure)) return Effect.interrupt
-    const cause = Cause.squash(failure)
-    return Effect.fail(cause instanceof PersistenceError ? cause : new PersistenceError({ operation: "open state", path: options.projectDirectory, message: cause instanceof Error ? cause.message : String(cause), cause }))
-  }))
+     yield* initialize
+     return api
+   })
 }
 
 function sortedLocalAliases(aliases: string[][]): string[][] {

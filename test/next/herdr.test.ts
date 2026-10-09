@@ -98,6 +98,29 @@ test("state reports follow the displayed surface rather than unrelated backgroun
   })))
   expect(reports).toEqual(["idle", "blocked", "working"])
 })
+test("completed terminal status clears working and heartbeats idle rather than requiring a done CLI state", async () => {
+  const base = projectApplicationViewModel(makeInitialApplicationState())
+  const views: ApplicationViewModel[] = [
+    { ...base, surface: { _tag: "Terminal", sessionId: "codex", title: "Codex", status: "working", draft: undefined } },
+    { ...base, surface: { _tag: "Terminal", sessionId: "codex", title: "Codex", status: "live", draft: undefined } },
+  ]
+  const calls: string[][] = []
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const reporter = yield* makeLiveHerdrReporter({ env, execute: (argv) => Effect.sync(() => { calls.push([...argv]) }) })
+    const working = Deferred.makeUnsafe<void>()
+    const changed = Stream.fromIterable(views).pipe(Stream.tap((view) => view.surface._tag === "Terminal" && view.surface.status === "live"
+      ? Deferred.await(working) : Effect.void))
+    yield* reportApplicationToHerdr(reporter, changed, resume)
+    yield* eventually(() => calls.length === 1)
+    expect(calls[0]![9]).toBe("working")
+    yield* Deferred.succeed(working, undefined)
+    yield* eventually(() => calls.length === 2)
+    expect(calls[1]![9]).toBe("idle")
+    yield* TestClock.adjust(HERDR_HEARTBEAT_INTERVAL_MS)
+    yield* eventually(() => calls.length === 3)
+    expect(calls[2]![9]).toBe("idle")
+  })).pipe(Effect.provide(TestClock.layer())))
+})
 test("bounds and detaches an unresponsive Herdr child without blocking later reporting", async () => {
   const signals: (number | NodeJS.Signals)[] = []
   let unrefs = 0

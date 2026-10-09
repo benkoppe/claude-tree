@@ -507,7 +507,8 @@ describe("Effect Codex provider", () => {
           yield* Deferred.await(releaseRead)
           return parent
         }),
-        forkThread: () => Effect.gen(function*() {
+        forkThread: (_id, _turn, _cwd, dispatched) => Effect.gen(function*() {
+          dispatched?.()
           yield* Deferred.succeed(forkStarted, undefined)
           return yield* Effect.never
         }),
@@ -527,6 +528,79 @@ describe("Effect Codex provider", () => {
     expect(outcome._tag).toBe("AmbiguousBranchMutation")
     if (outcome._tag !== "AmbiguousBranchMutation") throw new Error("expected ambiguity")
     expect(outcome.reason).toContain("overall deadline after thread/fork dispatch")
+  })
+
+  test("an explicit Codex deadline during child verification preserves the confirmed child instead of mutation ambiguity", async () => {
+    const started = Deferred.makeUnsafe<void>()
+    const parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
+    const client = fakeClient({ readThread: (id) => id === ROOT ? Effect.succeed(parent)
+      : Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)) })
+    const provider = providerWith(client, { metadataDeadlineMs: 10 })
+    await Effect.runPromise(Effect.gen(function*() {
+      const waiting = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+      yield* Deferred.await(started)
+      yield* TestClock.adjust(10)
+      const result = yield* Fiber.join(waiting)
+      if (result._tag !== "CreatedIndependentSession") throw new Error("expected known child")
+      expect(result.session.id).toBe(CHILD)
+      expect(result.verification?.status).toBe("unavailable")
+      expect(result.verification?.reasonCode).toBe("deadline")
+      expect(result.verification?.receipt).toBeDefined()
+      expect(client.forkCalls).toHaveLength(1)
+    }).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("read-only verification retries a missing child against captured source evidence after the parent changes", async () => {
+    let parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
+    const child = thread(CHILD, [turn("c-turn", "completed", [{ id: "c-agent", type: "agentMessage", text: "Answer" }])])
+    let visible = false
+    const client = fakeClient({
+      readThread: (id) => id === ROOT ? Effect.succeed(parent) : visible ? Effect.succeed(child)
+        : Effect.fail(new CodexRpcError({ method: "thread/read", code: -32600, message: "missing rollout", data: { appErrorCode: "rollout_not_found" } })),
+      forkThread: () => Effect.succeed(child),
+    })
+    const result = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected pending child")
+    expect(result.verification?.status).toBe("pending")
+    parent = thread(ROOT, [])
+    visible = true
+    const receipt = result.verification?.receipt
+    if (!receipt) throw new Error("expected verification receipt")
+    expect((await Effect.runPromise(receipt.verify))._tag).toBe("ValidatedBranch")
+    expect(client.forkCalls).toHaveLength(1)
+    expect(client.readCalls.filter((id) => id === ROOT)).toHaveLength(1)
+  })
+
+  test("a cancellation before transport dispatch does not report a mutation ambiguity", async () => {
+    const started = Deferred.makeUnsafe<void>()
+    const parent = thread(ROOT, [turn("p-turn", "completed", [{ id: "p-agent", type: "agentMessage", text: "Answer" }])])
+    const client = fakeClient({ readThread: () => Effect.succeed(parent),
+      forkThread: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)) })
+    const provider = providerWith(client)
+    await Effect.runPromise(Effect.gen(function*() {
+      const running = yield* Effect.forkChild(provider.branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(running)
+      const reconciliation = yield* Effect.forkChild(provider.takeBranchMutationReconciliation)
+      yield* Effect.yieldNow
+      expect(reconciliation.pollUnsafe()).toBeUndefined()
+      yield* Fiber.interrupt(reconciliation)
+    }))
+  })
+
+  test("a short Codex prefix still rejects contradictory copied payloads", async () => {
+    const parent = thread(ROOT, [turn("p-turn", "completed", [
+      { id: "p-user", type: "userMessage", content: [{ type: "text", text: "Question" }] },
+      { id: "p-agent", type: "agentMessage", text: "Answer" },
+    ])])
+    const child = thread(CHILD, [turn("c-turn", "completed", [
+      { id: "c-user", type: "userMessage", content: [{ type: "text", text: "Wrong question" }] },
+    ])])
+    const client = fakeClient({ readThread: (id) => Effect.succeed(id === ROOT ? parent : child), forkThread: () => Effect.succeed(child) })
+    const result = await Effect.runPromise(providerWith(client).branchFrom({ sessionId: ROOT, messageId: "p-agent" }))
+    if (result._tag !== "CreatedIndependentSession") throw new Error("expected independent child")
+    expect(result.verification?.status).toBe("contradicted")
+    expect(client.forkCalls).toHaveLength(1)
   })
 
   test("returns an independent child for every post-create read or prefix failure", async () => {
@@ -568,7 +642,8 @@ describe("Effect Codex provider", () => {
       if (outcome._tag !== "CreatedIndependentSession") throw new Error("expected independent")
       expect(outcome.session.id).toBe(CHILD)
       expect(outcome.transcript._tag).toBe(expectedTranscript)
-      expect(outcome.acquireLaunch).toBeDefined()
+      expect(outcome.acquireLaunch).toBeUndefined()
+      expect(outcome.verification?.receipt).toBeDefined()
       expect(client.forkCalls).toHaveLength(1)
     }
   })
@@ -1355,14 +1430,16 @@ describe("Codex sidecar", () => {
     })
   })
 
-  test("requests file-handle closure when token fsync exceeds its acquisition timeout", async () => {
+  test("retains a native fsync and closes its handle only after late completion", async () => {
     const opened: string[] = []
     const closed: string[] = []
     let syncStarted = false
+    let releaseSync!: () => void
+    const directoryRemoved = Deferred.makeUnsafe<void>()
     const handle = (path: string): CodexSidecarFileHandle => ({
       sync: () => {
         syncStarted = true
-        return new Promise<void>(() => undefined)
+        return new Promise<void>((resolve) => { releaseSync = resolve })
       },
       close: async () => { closed.push(path) },
     })
@@ -1376,21 +1453,27 @@ describe("Codex sidecar", () => {
           opened.push(path)
           return handle(path)
         },
-        removeDirectory: async () => {},
+        removeDirectory: async () => { Deferred.doneUnsafe(directoryRemoved, Effect.void) },
       }, { acquisitionTimeoutMs: 10, cleanupTimeoutMs: 10 })))
       yield* Effect.promise(() => waitUntil(() => syncStarted))
       yield* TestClock.adjust(10)
-      return yield* Fiber.join(fiber).pipe(Effect.flip)
+      yield* TestClock.adjust(10)
+      const failure = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(closed).toEqual([])
+      releaseSync()
+      yield* Deferred.await(directoryRemoved)
+      return failure
     }), TestClock.layer()))
 
-    expect(error).toMatchObject({ operation: "token" })
+    expect(error).toMatchObject({ operation: "acquire-rollback" })
     expect(opened).toEqual(["/tmp/injected-codex-fsync/token"])
     expect(closed).toEqual(["/tmp/injected-codex-fsync/token"])
   })
 
-  test("times out an interruptible token write and rolls back its directory without sleeps", async () => {
+  test("reports a timed-out native write as incomplete and removes its directory after it settles", async () => {
     const removed: string[] = []
     let releaseWrite!: () => void
+    const directoryRemoved = Deferred.makeUnsafe<void>()
 
     const error = await Effect.runPromise(Effect.provide(Effect.gen(function*() {
       const writeStarted = yield* Deferred.make<void>()
@@ -1402,17 +1485,20 @@ describe("Codex sidecar", () => {
             releaseWrite = resolve
           })
         },
-        removeDirectory: async (path) => { removed.push(path) },
+        removeDirectory: async (path) => { removed.push(path); Deferred.doneUnsafe(directoryRemoved, Effect.void) },
       }, { acquisitionTimeoutMs: 10, cleanupTimeoutMs: 10 })))
       yield* Deferred.await(writeStarted)
       yield* TestClock.adjust(10)
+      yield* TestClock.adjust(10)
       const failure = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(removed).toEqual([])
       releaseWrite()
+      yield* Deferred.await(directoryRemoved)
       return failure
     }), TestClock.layer()))
 
     expect(error).toBeInstanceOf(CodexSidecarError)
-    expect(error).toMatchObject({ operation: "token" })
+    expect(error).toMatchObject({ operation: "acquire-rollback" })
     expect(removed).toEqual(["/tmp/injected-codex-timeout"])
   })
 
@@ -1433,10 +1519,12 @@ describe("Codex sidecar", () => {
         removeDirectory: async (path) => { removed.push(path) },
       }, { acquisitionTimeoutMs: 1_000, cleanupTimeoutMs: 10 })))
       yield* Deferred.await(writeStarted)
-      yield* Fiber.interrupt(fiber)
-      const exit = yield* Fiber.await(fiber)
+      fiber.interruptUnsafe()
+      yield* Effect.yieldNow
+      expect(removed).toEqual([])
+      expect(fiber.pollUnsafe()).toBeUndefined()
       releaseWrite()
-      return exit
+      return yield* Fiber.await(fiber)
     }))
 
     expect(result._tag).toBe("Failure")
@@ -1672,9 +1760,9 @@ function fakeClient(overrides: Partial<CodexAppServerClient> = {}): FakeClient {
       readCalls.push(id)
       return overrides.readThread?.(id, includeTurns) ?? Effect.succeed(thread(id))
     },
-    forkThread(threadId, turnId, cwd) {
+    forkThread(threadId, turnId, cwd, dispatched) {
       forkCalls.push({ threadId, turnId, cwd })
-      return overrides.forkThread?.(threadId, turnId, cwd) ?? Effect.succeed(thread(CHILD))
+      return overrides.forkThread?.(threadId, turnId, cwd, dispatched) ?? Effect.succeed(thread(CHILD))
     },
     close: overrides.close ?? (() => Effect.void),
   }

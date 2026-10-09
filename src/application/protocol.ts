@@ -27,6 +27,7 @@ export type ApplicationIntent =
   | { readonly _tag: "ResumeSession"; readonly sessionId: string; readonly reportFailure: boolean; readonly allowDuplicate?: boolean }
   | { readonly _tag: "OpenEndpoint"; readonly sessionId: string }
   | { readonly _tag: "BranchFrom"; readonly target: MessageRef }
+  | { readonly _tag: "ManageBranchVerification"; readonly sessionId: string; readonly action: "cancel" | "retry" }
   | { readonly _tag: "ReturnFromTerminal" }
   | { readonly _tag: "StopSession"; readonly sessionId: string }
   | {

@@ -6,7 +6,6 @@ import type { ProviderTerminalEvent } from "../../src/services/provider"
 
 import {
   CodexCleanupError,
-  CodexConnectionError,
   CodexMutationAmbiguousError,
   CodexProcessError,
   CodexProtocolError,
@@ -238,8 +237,8 @@ describe("Effect Codex app-server transport", () => {
     expect(error).toBeInstanceOf(CodexCleanupError)
     expect(error.cause).toBeInstanceOf(AggregateError)
     expect((error.cause as AggregateError).errors).toHaveLength(2)
-    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL"])
-    expect(transport.unrefs).toBe(2)
+    expect(transport.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
+    expect(transport.unrefs).toBe(3)
   })
 
   test("initializes and correlates split, out-of-order JSONL responses", async () => {
@@ -379,6 +378,35 @@ describe("Effect Codex app-server transport", () => {
       expect(yield* Effect.flip(Fiber.join(read))).toBeInstanceOf(CodexRequestTimeout)
       releaseWrite?.()
     })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("interruption at the spawn handoff still owns and closes the new transport", async () => {
+    const transport = fakeProcess(() => {})
+    await Effect.runPromise(Effect.gen(function*() {
+      let acquisition: Fiber.Fiber<unknown, unknown>
+      acquisition = yield* Effect.forkChild(Effect.scoped(Effect.yieldNow.pipe(Effect.andThen(makeCodexAppServerClient("codex", {
+        spawn: () => { acquisition.interruptUnsafe(); return transport.process },
+      })))))
+      expect(Exit.isFailure(yield* Fiber.await(acquisition))).toBeTrue()
+      expect(transport.ended).toBeTrue()
+      expect(transport.unrefs).toBeGreaterThan(0)
+      expect(transport.messages).toEqual([])
+    }))
+  })
+
+  test("a rejected native write settles dispatch without permanently poisoning resource cleanup", async () => {
+    const transport = fakeProcess((message, controls) => {
+      if (message.method === "initialize") controls.respond(message.id, {})
+    }, { write(data, messages) {
+      return messages.some((message) => message.method === "thread/read")
+        ? Promise.reject(new Error("native write rejected")) : data.length
+    } })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeCodexAppServerClient("codex", { spawn: () => transport.process })
+      expect(yield* Effect.flip(client.readThread("failed"))).toBeInstanceOf(CodexProcessError)
+      yield* client.close()
+      yield* client.close()
+    })))
   })
 
   test("interruption removes a request blocked in serialized write", async () => {
@@ -855,7 +883,32 @@ describe("Effect Codex app-server transport", () => {
 })
 
 describe("Effect Codex sidecar and TUI proxy", () => {
-  test("bounds sidecar connection attempts", async () => {
+  test("interruption at socket allocation closes the owned transport before acquisition settles", async () => {
+    class ControlledSocket extends EventTarget {
+      readyState: number = WebSocket.CONNECTING
+      terminated = 0
+      terminate() {
+        this.terminated++
+        this.readyState = WebSocket.CLOSED
+        this.dispatchEvent(Object.assign(new Event("close"), { code: 1000 }))
+      }
+      close() { if (this.readyState !== WebSocket.CLOSED) this.terminate() }
+      send() { throw new Error("Cancelled acquisition must not dispatch") }
+    }
+    const socket = new ControlledSocket()
+    await Effect.runPromise(Effect.gen(function*() {
+      let acquisition: Fiber.Fiber<unknown, unknown>
+      acquisition = yield* Effect.forkChild(Effect.scoped(Effect.yieldNow.pipe(Effect.andThen(connectCodexAppServerSidecar("ws://127.0.0.1:12345", {
+        bearerToken: "token",
+        createWebSocket: () => { acquisition.interruptUnsafe(); return socket as unknown as WebSocket },
+      })))))
+      expect(Exit.isFailure(yield* Fiber.await(acquisition))).toBeTrue()
+      expect(socket.readyState).toBe(WebSocket.CLOSED)
+      expect(socket.terminated).toBe(1)
+    }))
+  })
+
+  test("bounds sidecar connection attempts and reports unconfirmed rollback", async () => {
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
@@ -873,10 +926,11 @@ describe("Effect Codex sidecar and TUI proxy", () => {
         connectCodexAppServerSidecar(`ws://127.0.0.1:${server.port}`, {
           bearerToken: "sidecar-secret",
           connectTimeoutMs: 10,
+          shutdownTimeoutMs: 10,
         }),
       )).catch((cause: unknown) => cause)
-      expect(error).toBeInstanceOf(CodexConnectionError)
-      expect(error).toMatchObject({ url: `ws://127.0.0.1:${server.port}` })
+      expect(error).toBeInstanceOf(CodexCleanupError)
+      expect(error).toMatchObject({ message: "Codex app-server acquisition failed and rollback was incomplete" })
     } finally {
       await stopTestServer(server)
     }

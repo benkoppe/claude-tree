@@ -4,6 +4,8 @@ import { createCliRenderer, type CliRenderer } from "@opentui/core"
 import { BunRuntime } from "@effect/platform-bun"
 import { Cause, Deferred, Effect, Scope } from "effect"
 import { join } from "node:path"
+import { writeSync } from "node:fs"
+import { constants } from "node:os"
 
 import { CLI_HELP } from "./cli-help"
 import { causeFailures, errorSummary as failureMessage } from "./error-format"
@@ -213,15 +215,24 @@ export function runScopedApplication<E>(
 
 export function makeShutdownSignals(
   target: ShutdownSignalTarget = process,
+  forceExit: ((signal: ShutdownSignal) => void) | undefined = target === process ? forceShutdownExit : undefined,
 ): Effect.Effect<ShutdownSignalResource, Error, Scope.Scope> {
   return Effect.acquireRelease(
     Effect.try({
       try: () => {
         const requested = Deferred.makeUnsafe<ShutdownSignal>()
+        let forced = false
         const handlers = new Map<ShutdownSignal, () => void>()
         try {
           for (const signal of SHUTDOWN_SIGNALS) {
             const handler = () => {
+              if (Deferred.isDoneUnsafe(requested)) {
+                if (!forced && forceExit) {
+                  forced = true
+                  forceExit(signal)
+                }
+                return
+              }
               Deferred.doneUnsafe(requested, Effect.succeed(signal))
             }
             handlers.set(signal, handler)
@@ -243,6 +254,17 @@ export function makeShutdownSignals(
       wait: Deferred.await(requested).pipe(Effect.andThen(Effect.interrupt)),
     })),
   )
+}
+
+function forceShutdownExit(signal: ShutdownSignal): never {
+  // Terminal restoration is best-effort; it must not prevent the warning or exit.
+  try { if (process.stdin.isTTY) process.stdin.setRawMode(false) } catch {}
+  try { if (process.stdout.isTTY) writeSync(1, "\x1b[0m\x1b[?25h\x1b[?1049l") } catch {}
+  try {
+    writeSync(2, "Forced exit: pending writes and resource cleanup are unconfirmed; child processes may remain running.\n")
+  } finally {
+    process.exit(128 + constants.signals[signal])
+  }
 }
 
 export function makeTerminalEventBridge(): TerminalEventBridge {

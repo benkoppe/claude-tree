@@ -1,23 +1,17 @@
 import { stripVTControlCharacters } from "node:util"
 
 import { Effect } from "effect"
+import { isProcessGroupAlive, waitForProcessGroupExit } from "../process-group"
+import { providerEnvironment } from "../provider-environment"
 
 import type { TerminalLaunch } from "../../services/provider"
 import type {
   TerminalProcess,
   TerminalProcessCallbacks,
   TerminalProcessFactory,
+  TerminalOutputSettlement,
 } from "./types"
 import { TerminalSpawnCleanupError } from "./types"
-
-const NESTED_HERDR_ENVIRONMENT_KEYS = [
-  "HERDR_ENV",
-  "HERDR_BIN_PATH",
-  "HERDR_SOCKET_PATH",
-  "HERDR_PANE_ID",
-  "HERDR_TAB_ID",
-  "HERDR_WORKSPACE_ID",
-] as const
 
 const OUTPUT_TAIL_BYTES = 8 * 1_024
 
@@ -29,17 +23,22 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
   ): TerminalProcess {
     let pty: Bun.Terminal | undefined
     let outputTail = Buffer.alloc(0)
-    let resolvePtyDrained!: () => void
-    const ptyDrained = new Promise<void>((resolve) => {
-      resolvePtyDrained = resolve
+    let resolveOutput!: (settlement: TerminalOutputSettlement) => void
+    let outputSettled = false
+    const ptyOutput = new Promise<TerminalOutputSettlement>((resolve) => {
+      resolveOutput = resolve
     })
-    const environment: NodeJS.ProcessEnv = {
+    const settleOutput = (settlement: TerminalOutputSettlement) => {
+      if (outputSettled) return
+      outputSettled = true
+      resolveOutput(settlement)
+    }
+    const environment = providerEnvironment({
       ...globalThis.process.env,
       ...launch.env,
       TERM: "xterm-256color",
       COLORTERM: "truecolor",
-    }
-    for (const key of NESTED_HERDR_ENVIRONMENT_KEYS) delete environment[key]
+    })
 
     const subprocess = Bun.spawn([...launch.command], {
       cwd: launch.cwd,
@@ -56,8 +55,11 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
           outputTail = Buffer.from(combined.subarray(start))
           callbacks.onOutput(data)
         },
-        exit() {
-          resolvePtyDrained()
+        exit(terminal, status) {
+          // Bun also invokes exit on explicit close; that is not drain evidence.
+          settleOutput(terminal.closed ? { _tag: "Closed" } : {
+            _tag: "Ended", status: status === 0 ? "eof" : "error-or-hangup",
+          })
           callbacks.onPtyClosed()
         },
       },
@@ -82,7 +84,7 @@ export class BunPtyProcessFactory implements TerminalProcessFactory {
       throw new Error("Bun did not create a pseudo-terminal for the agent")
     }
 
-    return new BunPtyProcess(subprocess, pty, ptyDrained, () => stripVTControlCharacters(outputTail.toString("utf8"))
+    return new BunPtyProcess(subprocess, pty, ptyOutput, settleOutput, () => stripVTControlCharacters(outputTail.toString("utf8"))
       .replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim())
   }
 }
@@ -95,20 +97,12 @@ function signalGroup(pid: number, signal: NodeJS.Signals, failures: unknown[]): 
   }
 }
 
-function isProcessGroupAlive(pid: number): boolean {
-  try {
-    globalThis.process.kill(-pid, 0)
-    return true
-  } catch (error) {
-    return !isNoSuchProcessError(error)
-  }
-}
-
 class BunPtyProcess implements TerminalProcess {
   constructor(
     private readonly subprocess: Bun.Subprocess,
     private readonly pty: Bun.Terminal,
-    readonly ptyDrained: Promise<void>,
+    readonly ptyOutput: Promise<TerminalOutputSettlement>,
+    private readonly settleOutput: (settlement: TerminalOutputSettlement) => void,
     private readonly readOutputTail: () => string,
   ) {}
 
@@ -154,26 +148,16 @@ class BunPtyProcess implements TerminalProcess {
   }
 
   isGroupAlive(): boolean {
-    try {
-      globalThis.process.kill(-this.subprocess.pid, 0)
-      return true
-    } catch (error) {
-      return !isNoSuchProcessError(error)
-    }
+    return isProcessGroupAlive(this.subprocess.pid)
   }
 
   waitForGroupExit(timeoutMs: number): Effect.Effect<boolean> {
-    return Effect.promise(async () => {
-      const deadline = performance.now() + timeoutMs
-      while (this.isGroupAlive() && performance.now() < deadline) {
-        await Bun.sleep(Math.min(10, Math.max(0, deadline - performance.now())))
-      }
-      return !this.isGroupAlive()
-    })
+    return waitForProcessGroupExit(() => this.isGroupAlive(), timeoutMs)
   }
 
   closePty(): void {
     if (!this.pty.closed) this.pty.close()
+    if (this.pty.closed) this.settleOutput({ _tag: "Closed" })
   }
 
   unref(): void {

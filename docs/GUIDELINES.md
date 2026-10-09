@@ -16,7 +16,7 @@ Follow general code best practices, such as:
 - Keep `effect`, `@effect/platform-bun`, and `@effect/platform-node-shared` pinned to the same tested release. The shared adapter needs an explicit runtime dependency because the Bun adapter's prerelease range can resolve an incompatible newer adapter when installing the packed application without the repository lockfile.
 - Model long-lived processes, scopes, subscriptions, temporary files, and terminal surfaces as acquired resources with explicit, idempotent cleanup. Finalizers are mandatory backstops, not substitutes for a lifecycle API that can report incomplete cleanup.
 - Keep application-state mutation behind the application actor. Asynchronous commands and callbacks should return typed events carrying stable owner and sequence identities rather than retaining mutable state references.
-- Keep normal resource cleanup bounded and idempotent. Cleanup state is process-local; do not introduce persisted orphan recovery. OS-held session guards are advisory across invocations, with a user-confirmed override, and release automatically when the application exits.
+- Keep normal resource cleanup completion-driven and idempotent, without default observation deadlines. Explicit caller deadlines may report incomplete cleanup but never prove release; retain time windows for signal escalation. Cleanup state is process-local; do not introduce persisted orphan recovery. OS-held session guards are advisory across invocations, with a user-confirmed override, and release automatically when the application exits.
 - Test timeouts, retries, heartbeats, and escalation with Effect's `TestClock` or controlled deferred values. Do not add real sleeps to deterministic unit tests.
 
 ## Responsiveness Benchmark
@@ -34,6 +34,7 @@ For a larger workload, use `BENCHMARK_SESSIONS=1000 BENCHMARK_RECORDS=100 bun ru
 - Legacy v3 JSON is accepted only by the explicit importer, with its original strict structural, semantic, and canonical validation. Leave source files untouched and require legacy invocations to be closed before cutover.
 - Write related metadata and per-instance navigation in one SQLite transaction when they must remain atomic. Workspace resume copies the requested navigation into a fresh invocation; it never shares a navigation writer with the original workspace. Navigation saves update only their workspace, not all shared metadata.
 - Treat provider mutations as ambiguous after they may have been sent and their response is unavailable. Do not retry or infer success; reconcile from a full provider snapshot.
+- Preserve a confirmed fork child separately from ancestry verification. Pending visibility is not contradictory evidence. Verification retries are read-only and use captured source evidence; never repeat the mutation, auto-launch an unverified child, or persist a verification receipt. Retain uncancellable mutation settlement through finalization, including late confirmed child identities.
 - Never persist terminal owners, launch-resource inventories, or identity-adoption journals. Provider sidecars and temporary capability artifacts have ordinary scoped cleanup, not startup recovery.
 
 ## Agents
