@@ -4,7 +4,11 @@
 
 `claude-tree` turns a project's agent conversations into a navigable message tree, making it much easier to manage large & winding sessions without a long, linear history. Sessions that are out of view keep running in the background in their provider's native interface.
 
-![claude-tree showing branching conversations with live sessions and new updates](docs/images/conversation-tree.png)
+<p align="center">
+  <img src="docs/images/conversation-tree.png"
+       alt="claude-tree showing branching conversations with live sessions and new updates"
+       width="600">
+</p>
 
 Claude Code is selected by default. Pass `--codex` to use Codex, and optionally pass the project directory:
 
