@@ -2,7 +2,7 @@
 
 `/tree` (from `pi` agent) for Claude Code and other agents.
 
-`claude-tree` turns a project's agent conversations into a navigable message tree, making it much easier to manage large & winding sessions without a long, linear history. Sessions that are out of view keep running in the background in their provider's native interface.
+`claude-tree` frees you from a linear history & turns a project's agent conversations into a navigable message tree. Every leaf corresponds to a distinct session:
 
 <p align="center">
   <img src="docs/images/conversation-tree.png"
@@ -10,16 +10,12 @@
        width="600">
 </p>
 
-Claude Code is selected by default. Pass `--codex` to use Codex, and optionally pass the project directory:
+Claude Code is used by default. To use codex, pass `--codex`. Optionally, you can pass the project directory:
 
 ```sh
 claude-tree /path/to/project
 claude-tree --codex /path/to/project
 ```
-
-`claude-tree` does not create Git worktrees or restore files to their state at the fork point.
-
-If a fork's saved history is slow to become readable, the navigator shows verification progress. Use the displayed `v` action to cancel verification or retry it without creating another fork. The child remains an independent session until its ancestry is verified; opening it independently discards the pending verification evidence. Verification receipts last only for the current invocation.
 
 ## Quick Start
 
