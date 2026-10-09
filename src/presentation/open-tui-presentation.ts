@@ -26,7 +26,7 @@ import type {
   RootViewModel,
 } from "../application"
 import { indexRootViews } from "../application/view-model"
-import { IntentRejectedError } from "../application/protocol"
+import { continuationOperationKey, IntentRejectedError } from "../application/protocol"
 import {
   directionalMove,
   topVisibleGraphNodeId,
@@ -54,6 +54,16 @@ import { TERMINAL_RETURN_BAR_HEIGHT } from "../terminal-layout"
 
 export const MINIMUM_PRESENTATION_WIDTH = 50
 export const MINIMUM_PRESENTATION_HEIGHT = 12
+
+function uniqueOpenDestinations(options: readonly ReachableEndpointViewModel[]): ReachableEndpointViewModel[] {
+  const seen = new Set<string>()
+  return options.filter((option) => {
+    const id = option.destinationId ?? option.session.id
+    if (seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+}
 
 const HORIZONTAL_MARGIN = 1
 const HEADER_HEIGHT = 2
@@ -610,10 +620,12 @@ class OpenTuiPresentationController {
         const selected = picker.familySessionId === viewModel.surface.familySessionId
           ? viewModel.surface.nodes.find((node) => node.id === picker.sourceNodeId)
           : undefined
-        const selectedSessionId = picker.options[picker.selectedIndex]?.session.id
+        const selectedOption = picker.options[picker.selectedIndex]
+        const selectedDestinationId = selectedOption?.destinationId ?? selectedOption?.session.id
         const destinations = new Set<string>()
         const options: PickerOption[] = []
-        for (const endpoint of selected?.reachableEndpoints ?? []) {
+        const reachable = selected?.reachableEndpoints ?? []
+        for (const endpoint of picker.action === "open" ? uniqueOpenDestinations(reachable) : reachable) {
           if (picker.action === "open") options.push(endpoint)
           else if (endpoint.visibleNodeId && !destinations.has(endpoint.visibleNodeId)) {
             destinations.add(endpoint.visibleNodeId)
@@ -623,10 +635,14 @@ class OpenTuiPresentationController {
             })
           }
         }
+        const visibleSelection = picker.action === "jump" && selectedOption?.visibleNodeId
+          ? options.findIndex((option) => option.visibleNodeId === selectedOption.visibleNodeId)
+          : -1
         this.leafPicker = options.length === 0 ? null : {
           ...picker,
           options,
-          selectedIndex: Math.max(0, options.findIndex((option) => option.session.id === selectedSessionId)),
+          selectedIndex: Math.max(0, visibleSelection >= 0 ? visibleSelection : options.findIndex((option) =>
+            (option.destinationId ?? option.session.id) === selectedDestinationId)),
           viewportStart: Math.min(picker.viewportStart, options.length - 1),
         }
       }
@@ -1030,13 +1046,12 @@ class OpenTuiPresentationController {
   private openSelected(): void {
     const selected = this.selectedGraphNode()
     if (!selected) return
-    const options = [...selected.reachableEndpoints]
+    const options = uniqueOpenDestinations(selected.reachableEndpoints)
     if (options.length === 0) {
       this.showError(`No ${this.provider.displayName} session is reachable from this node`)
     } else if (options.length === 1) {
       this.preferredOpenSession = null
-      const sessionId = options[0]!.session.id
-      this.runAction(this.appRuntime.openEndpoint(sessionId), `terminal:${sessionId}`)
+      this.openLeaf(options[0]!)
     } else {
       const preferred = this.preferredOpenSession
       const preferredIndex = preferred && preferred.familySessionId === this.graphSurface()?.familySessionId &&
@@ -1260,7 +1275,16 @@ class OpenTuiPresentationController {
       return
     }
     this.preferredOpenSession = null
-    this.runAction(this.appRuntime.openEndpoint(option.session.id), `terminal:${option.session.id}`)
+    this.openLeaf(option)
+  }
+
+  private openLeaf(option: ReachableEndpointViewModel): void {
+    const target = option.continuationTarget
+    if (target) {
+      this.runAction(this.appRuntime.openContinuation(target), continuationOperationKey(target))
+    } else {
+      this.runAction(this.appRuntime.openEndpoint(option.session.id), `terminal:${option.session.id}`)
+    }
   }
 
   private runAction(action: Effect.Effect<unknown, unknown>, key: string): void {
@@ -1587,7 +1611,7 @@ class OpenTuiPresentationController {
       const distance = option.distance === 0
         ? "selected leaf"
         : `${option.distance} ${option.distance === 1 ? "node" : "nodes"} down`
-      const suffix = `  ${distance} · ${option.session.id.slice(0, 8)}`
+      const suffix = `  ${distance} · ${option.continuationTarget ? "fork on open" : option.session.id.slice(0, 8)}`
       const titleWidth = Math.max(0, width - displayWidth(marker) - displayWidth(suffix))
       const title = `${truncateToWidth(option.session.title, titleWidth)}${suffix}`
       const markerColor = statusColor(option.status, false)

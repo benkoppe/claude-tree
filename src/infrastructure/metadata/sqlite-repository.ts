@@ -161,12 +161,14 @@ function initializeRepository(database: StateDatabase, close: Effect.Effect<void
         const mappings = grouped.get(row.child) ?? []
         if (mappings.some((entry, index) => entry.ordinal !== index)) throw new Error("Shared message mapping ordinals are not contiguous")
         return { childSessionId: sessionId(refs, row.child), parentSessionId: sessionId(refs, row.parent), sourceMessageId: row.source, createdAt: row.createdAt,
+          ...(row.continuation === null ? {} : { continuationMessageId: row.continuation }),
           sharedMessages: mappings.map((entry) => ({ parentMessageId: entry.parentMessage, childMessageId: entry.childMessage })) }
       })
     }
     const writeRelation = (relation: BranchRelation) => {
       const child = ref(relation.childSessionId)
-      orm.insert(s.relations).values({ child, scopeId: scope.id, parent: ref(relation.parentSessionId), source: relation.sourceMessageId, createdAt: relation.createdAt }).run()
+      orm.insert(s.relations).values({ child, scopeId: scope.id, parent: ref(relation.parentSessionId), source: relation.sourceMessageId, createdAt: relation.createdAt,
+        continuation: relation.continuationMessageId ?? null }).run()
       relation.sharedMessages.forEach((mapping, ordinal) => orm.insert(s.mappings).values({ child, ordinal, parentMessage: mapping.parentMessageId, childMessage: mapping.childMessageId }).run())
     }
     const readRemovals = (): readonly ConversationRemoval[] => {

@@ -59,6 +59,8 @@ export interface EndpointForkViewModel {
 }
 
 export interface ReachableEndpointViewModel {
+  readonly continuationTarget?: MessageRef
+  readonly destinationId?: string
   readonly session: AgentSession
   readonly status: SessionStatus
   readonly draft: import("../domain/model").DraftPreview | undefined
@@ -440,9 +442,11 @@ function projectReachableEndpoints(
   visibleEndpointSessionIds: ReadonlySet<string>,
 ): readonly ReachableEndpointViewModel[] {
   return endpoints.map(({ endpoint, distance }) => ({
+    destinationId: endpoint.continuation?.deferred ? endpoint.id : endpoint.session.id,
+    ...(endpoint.continuation?.deferred ? { continuationTarget: endpoint.continuation.target } : {}),
     session: endpoint.session,
-    status: selectSessionStatus(state, endpoint.session.id),
-    draft: state.drafts.get(endpoint.session.id),
+    status: endpoint.continuation?.deferred ? "idle" : selectSessionStatus(state, endpoint.session.id),
+    draft: endpoint.continuation?.deferred ? undefined : state.drafts.get(endpoint.session.id),
     fork: endpoint.fork ? { ...endpoint.fork } : undefined,
     distance,
     visibleNodeId: visibleGraphNodeId(graph, endpoint.id, visibleEndpointSessionIds) ?? null,

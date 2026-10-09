@@ -21,11 +21,13 @@ export const sessions = sqliteTable("session_refs", {
 export const relations = sqliteTable("branch_relations", {
   child: id("child_session_ref_id").primaryKey(), scopeId: id("scope_id"), parent: id("parent_session_ref_id"),
   source: id("source_message_id"), createdAt: id("created_at"),
+  continuation: text("continuation_message_id"),
 }, (t) => [
   foreignKey({ columns: [t.scopeId, t.child], foreignColumns: [sessions.scopeId, sessions.id] }),
   foreignKey({ columns: [t.scopeId, t.parent], foreignColumns: [sessions.scopeId, sessions.id] }),
   check("distinct_parent", sql`${t.child} <> ${t.parent}`), check("source_nonempty", sql`length(${t.source}) > 0`),
   index("relation_parent").on(t.scopeId, t.parent),
+  check("continuation_nonempty", sql`${t.continuation} IS NULL OR length(${t.continuation}) > 0`),
 ])
 
 export const mappings = sqliteTable("shared_message_mappings", {

@@ -44,7 +44,7 @@ Message tree:
   Left/Right or h/l move across branches
   g / G           jump to the top / a reachable leaf
   Click           select a card; click the selected card to open it
-  Enter           open or resume the session ending at the selected node
+  Enter           open a reachable leaf; pruned leaves fork on first Open
   f               fork the selected provider-supported message
   d               delete the selected node and visual descendants from the tree
   x               kill the selected live endpoint after confirmation
@@ -58,8 +58,8 @@ Delete confirmation:
   Enter           confirm the selected choice
   q or Escape     cancel
   Deletion cannot be undone in claude-tree; provider transcripts and project files remain
-  Affected live sessions stop first; ancestors remain forkable
-  A deleted original leaf cannot be opened from that path
+  Affected live sessions stop first; surviving leaves remain openable
+  Open lazily forks at the surviving leaf using provider-supported boundaries
 
 Kill confirmation:
   Arrows, h/j/k/l, or Tab choose Kill or Cancel

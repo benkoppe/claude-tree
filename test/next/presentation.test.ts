@@ -1546,6 +1546,51 @@ test("opens a reachable leaf through the keyboard picker", async () => {
   }
 })
 
+test.each(["question", "answer"])("Enter on surviving %s opens its lazy leaf, and G still reaches that leaf", async (selected) => {
+  const setup = await createTestRenderer({ width: 100, height: 30 })
+  const graph = canonicalView([agentSession("root", "Pruned conversation", 1)], new Map([["root", [
+    agentMessage("q", "question", 0), { ...agentMessage("a", "answer", 1), role: "agent" },
+    agentMessage("tail", "deleted", 2),
+  ]]]), [], "root", { kind: "message", preferred: { sessionId: "root", messageId: selected === "question" ? "q" : "a" }, aliases: [] },
+  [{ kind: "subtree", target: { kind: "message", aliases: [{ sessionId: "root", messageId: "tail" }] }, createdAt: "2026-10-08T00:00:00.000Z" }])
+  const running = await startPresentation(setup.renderer, graph)
+  try {
+    await frame(setup, (value) => value.includes("Pruned conversation"))
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("branch:root:a:continuation"))
+    expect(running.harness.calls).not.toContain("open:root")
+    setup.mockInput.pressKey("G")
+    await waitFor(() => running.harness.calls.includes("select-graph:message:root:a"))
+  } finally { await running.stop() }
+})
+
+test("the Open leaf picker offers lazy and ordinary destinations together", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 })
+  const parent = [agentMessage("q", "question", 0), { ...agentMessage("a", "answer", 1), role: "agent" as const },
+    agentMessage("tail", "keep", 2)]
+  const child = [agentMessage("cq", "question", 0), { ...agentMessage("ca", "answer", 1), role: "agent" as const },
+    agentMessage("cu", "child prompt", 2), { ...agentMessage("ct", "delete", 3), role: "agent" as const }]
+  const graph = canonicalView([agentSession("root", "Original", 1), agentSession("child", "Pruned child", 1)],
+    new Map([["root", parent], ["child", child]]), [{ childSessionId: "child", parentSessionId: "root", sourceMessageId: "a",
+      sharedMessages: [{ parentMessageId: "q", childMessageId: "cq" }, { parentMessageId: "a", childMessageId: "ca" }],
+      createdAt: "2026-01-01T00:00:00.000Z" }], "root", { kind: "message", preferred: { sessionId: "root", messageId: "q" }, aliases: [] },
+    [{ kind: "subtree", target: { kind: "message", aliases: [{ sessionId: "child", messageId: "ct" }] }, createdAt: "2026-10-08T00:00:00.000Z" }])
+  const running = await startPresentation(setup.renderer, graph)
+  try {
+    await frame(setup, (value) => value.includes("child prompt"))
+    setup.mockInput.pressEnter()
+    const picker = await frame(setup, (value) => value.includes("Open leaf") && value.includes("fork on open"))
+    expect(picker).toContain("Original")
+    expect(picker).toContain("Pruned child")
+    if (!isSelected(setup, "Pruned child")) {
+      setup.mockInput.pressArrow("down")
+      await frame(setup, () => isSelected(setup, "Pruned child"))
+    }
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("branch:child:cu:continuation"))
+  } finally { await running.stop() }
+})
+
 test("refreshes jump destinations after relocation without losing the selected leaf", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const graph = branchingGraph("root-1", "Relocated leaves")
@@ -1596,6 +1641,33 @@ test("closes a leaf picker when its source disappears", async () => {
   } finally {
     await running.stop()
   }
+})
+
+test("Jump to Leaf preserves the visible destination when two leaves open the same session", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 })
+  const original = branchingGraph("root-1", "Shared continuation")
+  if (original.surface._tag !== "Graph") throw new Error("Expected graph")
+  const graph = { ...original, surface: { ...original.surface, nodes: original.surface.nodes.map((node) => ({
+    ...node, reachableEndpoints: node.reachableEndpoints.map((endpoint) => ({ ...endpoint,
+      destinationId: "shared", session: { ...endpoint.session, id: "shared" },
+    })),
+  })) } }
+  const running = await startPresentation(setup.renderer, graph)
+  try {
+    await frame(setup, (value) => value.includes("branch source"))
+    setup.mockInput.pressKey("G")
+    await frame(setup, (value) => value.includes("Jump to Leaf"))
+    if (!isSelected(setup, "Left leaf")) {
+      setup.mockInput.pressArrow("down")
+      await frame(setup, () => isSelected(setup, "Left leaf"))
+    }
+    await Effect.runPromise(running.harness.update({ ...graph, surface: { ...graph.surface,
+      nodes: graph.surface.nodes.map((node) => ({ ...node, reachableEndpoints: [...node.reachableEndpoints].reverse() })),
+    } }))
+    await frame(setup, () => isSelected(setup, "Left leaf"))
+    setup.mockInput.pressEnter()
+    await waitFor(() => running.harness.calls.includes("select-graph:endpoint:left"))
+  } finally { await running.stop() }
 })
 
 test("opens saved hidden endpoints and preserves canonical leaf ordering", async () => {
@@ -2060,6 +2132,10 @@ function makeHarness(
         })
         return true
       }),
+      openContinuation: (target: { sessionId: string; messageId: string }) => Effect.sync(() => {
+        calls.push(`branch:${target.sessionId}:${target.messageId}:continuation`)
+        return true
+      }),
       branchFrom: (target: { sessionId: string; messageId: string }) => Effect.sync(() => {
         calls.push(`branch:${target.sessionId}:${target.messageId}`)
         return true
@@ -2441,9 +2517,11 @@ function canonicalView(
   relations: ApplicationState["relations"],
   familySessionId: string,
   target: NavigationTarget,
+  removals: ApplicationState["removals"] = [],
 ): ApplicationViewModel {
   const initial = makeInitialApplicationState({
     relations,
+    removals,
     surface: { _tag: "Graph", familySessionId, target },
   })
   const state: ApplicationState = {

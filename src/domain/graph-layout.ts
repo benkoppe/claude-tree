@@ -205,6 +205,7 @@ function isPositionedNode(
 ): boolean {
   if (node.kind === "message") return true
   if (node.kind === "origin") return false
+  if (node.continuation) return false
   if (visibleEndpointSessionIds.has(node.session.id)) return true
   return isMaterializedForkEndpoint(graph, node)
 }

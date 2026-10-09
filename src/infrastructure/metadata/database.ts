@@ -15,8 +15,9 @@ import { createDirectoryDurably, syncDirectory } from "./storage"
 import { backupDatabase } from "./backup"
 import journal from "./migrations/meta/_journal.json" with { type: "json" }
 import initialSql from "./migrations/0000_initial.sql" with { type: "text" }
+import continuationSql from "./migrations/0001_lazy_continuations.sql" with { type: "text" }
 
-export const DATABASE_VERSION = 1
+export const DATABASE_VERSION = 2
 export const DATABASE_APPLICATION_ID = 0x43545245
 const LOCK_RETRY_INTERVAL_MS = 10
 const migrationFolder = isStandaloneExecutable ? join(dirname(process.execPath), "migrations") : new URL("./migrations", import.meta.url).pathname
@@ -28,7 +29,8 @@ export interface DatabaseSchemaPolicy {
   readonly migrations: readonly { readonly hash: string; readonly when: number }[]
 }
 const schemaPolicy: DatabaseSchemaPolicy = { version: DATABASE_VERSION, folder: migrationFolder,
-  migrations: [{ hash: initialMigrationHash, when: journal.entries[0]!.when }] }
+  migrations: [{ hash: initialMigrationHash, when: journal.entries[0]!.when },
+    { hash: createHash("sha256").update(continuationSql).digest("hex"), when: journal.entries[1]!.when }] }
 
 /** Drizzle's prepare() statements otherwise outlive close() on the pinned Bun runtime. */
 export function databaseOrm(db: Database) {

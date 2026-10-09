@@ -28,6 +28,8 @@ export interface SessionEndpointNode extends GraphNodeBase {
   kind: "endpoint"
   session: AgentSession
   forkTarget?: ForkTarget
+  /** A navigator continuation, collapsed onto its surviving message leaf. */
+  continuation?: { target: MessageRef; deferred: boolean }
   fork?: {
     sourceNodeId: string
     createdAt: string
@@ -199,7 +201,7 @@ export function buildConversationForest(
   for (const session of [...sessions].sort(compareSessions)) buildRoot(session)
 
   repairForkTargets(graphs, transcripts)
-  return applyConversationRemovals(graphs, graphBySessionId, removals)
+  return applyConversationRemovals(graphs, graphBySessionId, removals, sessionsById, relations)
 }
 
 function repairForkTargets(
@@ -239,7 +241,10 @@ function applyConversationRemovals(
   rawGraphs: readonly ConversationGraph[],
   rawGraphBySessionId: ReadonlyMap<string, ConversationGraph>,
   removals: readonly ConversationRemoval[],
+  sessionsById: ReadonlyMap<string, AgentSession>,
+  relations: readonly BranchRelation[],
 ): ConversationForest {
+  const hasRecordedContinuations = relations.some((relation) => relation.continuationMessageId !== undefined)
   const messageNodesBySessionId = new Map<
     string,
     Map<string, IndexedMessageNode[]>
@@ -339,6 +344,7 @@ function applyConversationRemovals(
       if (!graph.nodes.has(endpointId)) graph.endpointBySessionId.delete(sessionId)
     }
     graph.sessionIds = new Set(graph.endpointBySessionId.keys())
+    if (removedNodeIds.size > 0 || hasRecordedContinuations) appendContinuations(graph, sessionsById, relations)
 
     const origin = graph.nodes.get(graph.originNodeId)
     graph.rootNodeId = origin?.kind === "origin" ? (origin.childIds[0] ?? "") : ""
@@ -354,12 +360,68 @@ function applyConversationRemovals(
     graphByRootSessionId.set(graph.rootSessionId, graph)
     for (const sessionId of graph.sessionIds) graphBySessionId.set(sessionId, graph)
   }
+  const survivingGraphs = new Set(graphs)
+  for (const relation of relations) {
+    if (relation.continuationMessageId === undefined) continue
+    const matches = messageNodesBySessionId.get(relation.parentSessionId)?.get(relation.continuationMessageId) ?? []
+    const match = matches.find(({ graph, nodeId }) => survivingGraphs.has(graph) && graph.nodes.has(nodeId) &&
+      continuationSessionId(graph, relation) !== undefined)
+    if (match) graphBySessionId.set(relation.parentSessionId, match.graph)
+  }
   return {
     graphs,
     graphBySessionId,
     graphByRootSessionId,
     warnings: graphs.flatMap((graph) => graph.warnings),
   }
+}
+
+function appendContinuations(
+  graph: ConversationGraph,
+  sessionsById: ReadonlyMap<string, AgentSession>,
+  relations: readonly BranchRelation[],
+): void {
+  const continuations = new Map<string, Map<string, BranchRelation>>()
+  for (const relation of [...relations].sort(compareRelations)) {
+    if (continuationSessionId(graph, relation) === undefined) continue
+    const messageId = relation.continuationMessageId!
+    const messages = continuations.get(relation.parentSessionId) ?? new Map<string, BranchRelation>()
+    if (!messages.has(messageId)) messages.set(messageId, relation)
+    continuations.set(relation.parentSessionId, messages)
+  }
+  for (const node of [...graph.nodes.values()]) {
+    if (node.kind !== "message") continue
+    let bound: BranchRelation | undefined
+    for (const alias of node.aliases) {
+      const relation = continuations.get(alias.sessionId)?.get(alias.messageId)
+      if (relation) bound ??= relation
+    }
+    if (node.childIds.length !== 0) continue
+    const target = bound
+      ? { sessionId: bound.parentSessionId, messageId: bound.continuationMessageId! }
+      : node.forkTarget ?? [...node.aliases].reverse().find((alias) => sessionsById.has(alias.sessionId))
+    if (!target) continue
+    const session = sessionsById.get(bound?.childSessionId ?? target.sessionId)
+    if (!session) continue
+    const id = `continuation:${node.id}`
+    graph.nodes.set(id, {
+      id, kind: "endpoint", parentId: node.id, childIds: [], session,
+      continuation: { target, deferred: bound === undefined },
+    })
+    node.childIds.push(id)
+    if (!bound) graph.sessionIds.add(target.sessionId)
+    graph.sessionIds.add(session.id)
+  }
+}
+
+export function continuationSessionId(graph: ConversationGraph, relation: BranchRelation): string | undefined {
+  if (relation.continuationMessageId === undefined) return undefined
+  const endpoint = graph.nodes.get(graph.endpointBySessionId.get(relation.childSessionId) ?? "")
+  if (endpoint?.kind !== "endpoint") return undefined
+  if (relation.sharedMessages.length === 0 || (endpoint.fork && isAncestorNode(graph, endpoint.fork.sourceNodeId, endpoint.id))) {
+    return relation.childSessionId
+  }
+  return undefined
 }
 
 function detachedPathRootNodeId(graph: ConversationGraph, endpointId: string): string {
@@ -1354,6 +1416,7 @@ function collectExactBranchPointIds(
   for (const relation of relations) {
     const ids = idsBySession.get(relation.parentSessionId) ?? new Set()
     ids.add(relation.sourceMessageId)
+    if (relation.continuationMessageId !== undefined) ids.add(relation.continuationMessageId)
     idsBySession.set(relation.parentSessionId, ids)
   }
   propagateSharedMessageIds(idsBySession, relations)

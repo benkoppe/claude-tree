@@ -18,6 +18,7 @@ import type {
   ValidatedBranch,
   BranchCreated,
   BranchVerificationReceipt,
+  CreatedIndependentSession,
 } from "../services/provider"
 import { awaitBranchVerification } from "../services/branch-verification"
 import type { TerminalCleanupError, TerminalSupervisorApi } from "../services/terminal-supervisor"
@@ -48,7 +49,7 @@ export interface ApplicationOperations {
   readonly reconcileActivity: TerminalSupervisorApi["reconcileActivity"]
   readonly prepareNew: Effect.Effect<PreparedTerminal, unknown>
   readonly prepareResume: AgentProviderApi["prepareResume"]
-  readonly branch: (target: Parameters<AgentProviderApi["branchFrom"]>[0], created?: BranchCreated) => Effect.Effect<
+  readonly branch: (target: Parameters<AgentProviderApi["branchFrom"]>[0], created?: BranchCreated, continuation?: boolean) => Effect.Effect<
     PersistedBranch | IndependentBranch,
     unknown
   >
@@ -121,8 +122,23 @@ export function makeApplicationOperations(options: {
     }
   })
 
-  const branch: ApplicationOperations["branch"] = (target, created) => Effect.gen(function*() {
-    let outcome = yield* options.provider.branchFrom(target, created)
+  const branch: ApplicationOperations["branch"] = (target, created, continuation) => Effect.gen(function*() {
+    const decorateReceipt = (receipt: BranchVerificationReceipt): BranchVerificationReceipt => ({
+      session: receipt.session,
+      verify: receipt.verify.pipe(Effect.map((outcome) => decorateOutcome(outcome))),
+    })
+    function decorateOutcome(outcome: ValidatedBranch | CreatedIndependentSession): ValidatedBranch | CreatedIndependentSession
+    function decorateOutcome(outcome: BranchOutcome): BranchOutcome
+    function decorateOutcome(outcome: BranchOutcome): BranchOutcome {
+      if (!continuation || outcome._tag === "AmbiguousBranchMutation") return outcome
+      if (outcome._tag === "ValidatedBranch") return { ...outcome,
+        derivation: { ...outcome.derivation, continuationMessageId: target.messageId } }
+      return { ...outcome, ...(outcome.verification?.receipt ? {
+        verification: { ...outcome.verification, receipt: decorateReceipt(outcome.verification.receipt) },
+      } : {}) }
+    }
+    let outcome = decorateOutcome(yield* options.provider.branchFrom(target,
+      created ? (receipt) => created(decorateReceipt(receipt)) : undefined))
     if (outcome._tag === "CreatedIndependentSession" && outcome.verification?.status === "pending" && outcome.verification.receipt) {
       outcome = yield* awaitBranchVerification(outcome.verification.receipt, outcome)
     }
