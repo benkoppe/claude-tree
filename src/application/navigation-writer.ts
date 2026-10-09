@@ -2,6 +2,7 @@ import { Cause, Deferred, Effect, Exit, Scope } from "effect"
 
 import { PersistenceError } from "../domain/errors"
 import type { NavigationState } from "../domain/model"
+import { makeCloseOperation, makeScopeClose } from "../services/close-operation"
 
 export interface NavigationMetadataFacet {
   readonly saveNavigation: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
@@ -11,7 +12,7 @@ export interface NavigationWriter {
   readonly schedule: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly write: (navigation: NavigationState) => Effect.Effect<void, PersistenceError>
   readonly flush: Effect.Effect<void, PersistenceError>
-  readonly close: Effect.Effect<void>
+  readonly close: Effect.Effect<void, PersistenceError>
 }
 
 interface PendingNavigation {
@@ -20,7 +21,6 @@ interface PendingNavigation {
   readonly waiters: Deferred.Deferred<void, PersistenceError>[]
 }
 
-const DRAIN_SCOPE_CLOSE_TIMEOUT_MS = 100
 export const NAVIGATION_SAVE_INTERVAL_MS = 200
 
 export function makeNavigationWriter(
@@ -31,32 +31,30 @@ export function makeNavigationWriter(
   return Effect.gen(function*() {
     const drainScope = yield* Scope.make("sequential")
     let closed = false
-    const close = Effect.suspend(() => {
+    const closeScope = makeScopeClose(drainScope)
+    const close = makeCloseOperation(Effect.suspend(() => {
       closed = true
-      return Scope.closeUnsafe(drainScope, Exit.void) ?? Effect.void
-    })
-    yield* Effect.addFinalizer(() => Effect.interruptible(close).pipe(Effect.timeoutOrElse({
-      duration: DRAIN_SCOPE_CLOSE_TIMEOUT_MS,
-      orElse: () => Effect.void,
-    })))
+      return flush.pipe(Effect.ensuring(closeScope))
+    }))
+    yield* Effect.addFinalizer(() => close.pipe(Effect.catch((error) => Effect.logError(error))))
     let draining = false
     let current: PendingNavigation | undefined
     let queued: PendingNavigation | undefined
-    let lastFailure: PersistenceError | undefined
+    let lastFailure: Cause.Cause<PersistenceError> | undefined
     const idleWaiters = new Set<Deferred.Deferred<void, PersistenceError>>()
     let wake = Deferred.makeUnsafe<void>()
     let immediate = false
 
-    const completeIdle = (failure?: PersistenceError): Effect.Effect<void> => Effect.gen(function*() {
+    const completeIdle = (failure?: Cause.Cause<PersistenceError>): Effect.Effect<void> => Effect.gen(function*() {
       const waiters = [...idleWaiters]
       idleWaiters.clear()
       for (const waiter of waiters) {
-        if (failure) yield* Deferred.fail(waiter, failure)
+        if (failure) yield* Deferred.failCause(waiter, failure)
         else yield* Deferred.succeed(waiter, undefined)
       }
     })
 
-    const failOutstanding = (failure: PersistenceError): Effect.Effect<void> => Effect.gen(function*() {
+    const failOutstanding = (failure: Cause.Cause<PersistenceError>): Effect.Effect<void> => Effect.gen(function*() {
       const pending = [current, queued].filter(
         (value): value is PendingNavigation => value !== undefined,
       )
@@ -65,7 +63,7 @@ export function makeNavigationWriter(
       draining = false
       lastFailure = failure
       for (const item of pending) {
-        for (const waiter of item.waiters) yield* Deferred.fail(waiter, failure)
+        for (const waiter of item.waiters) yield* Deferred.failCause(waiter, failure)
       }
       yield* completeIdle(failure)
     })
@@ -87,14 +85,19 @@ export function makeNavigationWriter(
         const exit = yield* Effect.exit(pending.save)
         current = undefined
         if (Exit.isSuccess(exit)) lastFailure = undefined
-        else lastFailure = Cause.squash(exit.cause) as PersistenceError
+        else lastFailure = exit.cause
         for (const waiter of pending.waiters) yield* Deferred.done(waiter, exit)
-        if (lastFailure && pending.waiters.length === 0) yield* reportFailure(lastFailure)
+        if (lastFailure && pending.waiters.length === 0) {
+          const failure = Cause.squash(lastFailure)
+          yield* reportFailure(failure instanceof PersistenceError ? failure : new PersistenceError({
+            operation: "save navigation", path: "", message: "Navigation writer failed unexpectedly", cause: lastFailure,
+          }))
+        }
         if (queued === undefined) immediate = false
       }
     }).pipe(
       Effect.onExit((exit) => Exit.isFailure(exit) && draining
-        ? failOutstanding(Cause.squash(exit.cause) as PersistenceError)
+        ? failOutstanding(exit.cause)
         : Effect.void),
     )
 
@@ -139,7 +142,7 @@ export function makeNavigationWriter(
 
     const flush = Effect.gen(function*() {
       if (!draining && queued === undefined) {
-        return lastFailure ? yield* Effect.fail(lastFailure) : undefined
+        return lastFailure ? yield* Effect.failCause(lastFailure) : undefined
       }
       const waiter = yield* Deferred.make<void, PersistenceError>()
       idleWaiters.add(waiter)

@@ -101,6 +101,11 @@ export interface CreatedIndependentSession {
   readonly session: AgentSession
   readonly transcript: TranscriptRead
   readonly reason: string
+  readonly verification?: {
+    readonly status: "pending" | "unavailable" | "contradicted" | "persistence-failed"
+    readonly reasonCode: "missing" | "incomplete" | "read-failed" | "unsupported" | "copy-mismatch" | "metadata-failed" | "deadline"
+    readonly receipt?: BranchVerificationReceipt
+  }
   readonly acquireLaunch?: Effect.Effect<
     AcquiredTerminalLaunch,
     ProviderError | ProviderProtocolError,
@@ -118,6 +123,14 @@ export interface AmbiguousBranchMutation {
 }
 
 export type BranchOutcome = ValidatedBranch | CreatedIndependentSession | AmbiguousBranchMutation
+
+/** The provider retains captured source evidence; verification never mutates a session. */
+export interface BranchVerificationReceipt {
+  readonly session: AgentSession
+  readonly verify: Effect.Effect<ValidatedBranch | CreatedIndependentSession, ProviderError | ProviderProtocolError>
+}
+
+export type BranchCreated = (receipt: BranchVerificationReceipt) => Effect.Effect<void>
 
 export interface BranchMutationReconciliationSignal {
   readonly take: Effect.Effect<AmbiguousBranchMutation>
@@ -180,6 +193,7 @@ export interface AgentProviderApi {
   ) => Effect.Effect<PreparedTerminal, ProviderError | ProviderProtocolError>
   readonly branchFrom: (
     target: MessageRef,
+    created?: BranchCreated,
   ) => Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError>
 }
 

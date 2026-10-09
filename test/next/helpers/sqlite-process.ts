@@ -1,10 +1,11 @@
-import { Effect } from "effect"
+import { Effect, Exit, Scope } from "effect"
 import { Database } from "bun:sqlite"
 import { PersistencePlatform, nativePersistencePlatform } from "../../../src/infrastructure/metadata/platform"
 import { makeProviderStateRepository } from "../../../src/services/provider-state-repository"
 
-const repository = await Effect.runPromise(makeProviderStateRepository({ projectDirectory: process.argv[2]!, stateHome: process.argv[3]!,
-  providerId: "claude", instanceId: process.argv[4]! }).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform)))
+const scope = Scope.makeUnsafe()
+const repository = await Effect.runPromise(Scope.provide(makeProviderStateRepository({ projectDirectory: process.argv[2]!, stateHome: process.argv[3]!,
+  providerId: "claude", instanceId: process.argv[4]! }).pipe(Effect.provideService(PersistencePlatform, nativePersistencePlatform)), scope))
 try {
   if (process.argv[5] === "crash") {
     const db = new Database(repository.statePath)
@@ -16,4 +17,4 @@ try {
   }
   for (let index = 0; index < 20; index++) await Effect.runPromise(repository.saveRelation({ childSessionId: `${process.argv[4]}-${index}`,
     parentSessionId: "root", sourceMessageId: "source", sharedMessages: [], createdAt: "2026-01-01T00:00:00.000Z" }))
-} finally { await Effect.runPromise(repository.close) }
+} finally { await Effect.runPromise(Scope.close(scope, Exit.void)) }

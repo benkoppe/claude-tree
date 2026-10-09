@@ -33,11 +33,15 @@ export interface TerminalProcessCallbacks {
   readonly onPtyClosed: () => void
 }
 
+export type TerminalOutputSettlement =
+  | { readonly _tag: "Ended"; readonly status: "eof" | "error-or-hangup" }
+  | { readonly _tag: "Closed" }
+
 export interface TerminalProcess {
   readonly pid: number
   readonly processGroupId: number
   readonly exited: Promise<number>
-  readonly ptyDrained: Promise<void>
+  readonly ptyOutput: Promise<TerminalOutputSettlement>
   readonly exitCode: number | null
   readonly ptyOpen: boolean
   readonly outputTail?: string

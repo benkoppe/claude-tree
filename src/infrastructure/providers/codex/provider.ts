@@ -21,6 +21,10 @@ import {
   type AgentProviderApi,
   type AmbiguousBranchMutation,
   type BranchOutcome,
+  type BranchCreated,
+  type BranchVerificationReceipt,
+  type CreatedIndependentSession,
+  type ValidatedBranch,
   makeBranchMutationReconciliationSignal,
   type PreparedTerminal,
   type TerminalLaunch,
@@ -29,7 +33,8 @@ import {
   type TerminalTransitionRequest,
   type ProviderTerminalEvent,
 } from "../../../services/provider"
-import { PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS } from "../../../services/lifecycle-policy"
+import { makeCloseOperation, makeScopeClose } from "../../../services/close-operation"
+import { CleanupDeadline, makeCleanupBudget } from "../../../services/cleanup-budget"
 import { optionalOperationTimeout, withOperationTimeout } from "../../../services/operation-deadline"
 import {
   CodexMutationAmbiguousError,
@@ -63,10 +68,8 @@ import {
 
 const TRANSCRIPT_READ_CONCURRENCY = 16
 const OVERLOAD_RETRY_DELAYS_MS = [25, 50, 100, 200]
-const OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS = PROVIDER_RESOURCE_CLEANUP_TIMEOUT_MS
 const SIDECAR_RETRY_DELAY_MS = 10
 const TOKEN_ENVIRONMENT_VARIABLE = "CLAUDE_TREE_CODEX_TOKEN"
-const METADATA_CLEANUP_TIMEOUT_MS = 10_000
 const THREAD_LIST_PAGE_LIMIT = 100
 const SNAPSHOT_SESSION_LIMIT = 10_000
 
@@ -166,7 +169,7 @@ export class CodexProvider implements AgentProviderApi {
   private readonly readConcurrency: number
   private readonly overloadRetryDelays: readonly number[]
   private readonly metadataDeadlineMs: number | undefined
-  private readonly metadataCleanupTimeoutMs: number
+  private readonly metadataCleanupTimeoutMs: number | undefined
   private readonly maxThreadListPages: number
   private readonly maxSnapshotSessions: number
   private readonly branchMutationReconciliations = makeBranchMutationReconciliationSignal()
@@ -195,7 +198,7 @@ export class CodexProvider implements AgentProviderApi {
     )
     this.overloadRetryDelays = options.overloadRetryDelaysMs ?? OVERLOAD_RETRY_DELAYS_MS
     this.metadataDeadlineMs = optionalOperationTimeout(options.metadataDeadlineMs)
-    this.metadataCleanupTimeoutMs = optionalOperationTimeout(options.metadataCleanupTimeoutMs) ?? METADATA_CLEANUP_TIMEOUT_MS
+    this.metadataCleanupTimeoutMs = optionalOperationTimeout(options.metadataCleanupTimeoutMs)
     this.maxThreadListPages = positiveInteger(options.maxThreadListPages, THREAD_LIST_PAGE_LIMIT)
     this.maxSnapshotSessions = positiveInteger(options.maxSnapshotSessions, SNAPSHOT_SESSION_LIMIT)
     this.takeBranchMutationReconciliation = this.branchMutationReconciliations.take
@@ -269,9 +272,11 @@ export class CodexProvider implements AgentProviderApi {
 
   branchFrom(
     target: MessageRef,
+    created?: BranchCreated,
   ): Effect.Effect<BranchOutcome, ProviderError | ProviderProtocolError> {
     let mutationMayHaveDispatched = false
     let deadlineExpired = false
+    let knownChild: BranchVerificationReceipt | undefined
     const operation = this.withServer((server) => Effect.gen({ self: this }, function*() {
       yield* this.validateSessionId(target.sessionId, "branchFrom")
       const parentThread = yield* this.requireThread(server, target.sessionId, "branchFrom")
@@ -293,11 +298,11 @@ export class CodexProvider implements AgentProviderApi {
       yield* this.validateForkTarget(selected, parentThread)
 
       const copiedParent = parentTranscript.slice(0, selectedIndex + 1)
-      mutationMayHaveDispatched = true
       const mutation = yield* server.forkThread(
         target.sessionId,
         selected.turnId,
         this.projectPath,
+        () => { mutationMayHaveDispatched = true },
       ).pipe(
         Effect.map((thread) => ({ _tag: "Success" as const, thread })),
         Effect.catch((error) => Effect.succeed({ _tag: "Failure" as const, error })),
@@ -327,58 +332,14 @@ export class CodexProvider implements AgentProviderApi {
       }
       const now = yield* Clock.currentTimeMillis
       const provisionalSession = provisionalSessionFromThread(childThread, now)
-      let transcript: TranscriptRead = {
-        _tag: "Unavailable",
-        reason: `The created Codex transcript ${childThread.id} has not been read`,
+      const receipt: BranchVerificationReceipt = {
+        session: provisionalSession,
+        verify: Effect.suspend(() => this.withServer((reader) => this.verifyCreatedFork(reader, receipt,
+          target.sessionId, selected.id, copiedParent), "validateFork", true)),
       }
-
-      return yield* Effect.gen({ self: this }, function*() {
-        yield* this.validateSessionId(childThread.id, "branchFrom")
-        const childRead = yield* this.readThreadWithOverloadRetry(server, childThread.id).pipe(
-          Effect.mapError((error) => this.mapTransportError("validateFork", error)),
-        )
-        if (!(yield* this.threadBelongsToProject(childRead))) {
-          return ambiguity(
-            `Codex fork child ${childThread.id} resolved outside the canonical project after dispatch`,
-          )
-        }
-        const childTranscript = yield* this.normalizeThread(childRead, "validateFork")
-        transcript = { _tag: "Available", messages: childTranscript }
-        yield* this.validateCopiedPrefix(childThread.id, copiedParent, childTranscript)
-        const session = yield* this.sessionFromThread(childRead, "validateFork")
-        return {
-          _tag: "ValidatedBranch" as const,
-          session,
-          transcript,
-          acquireLaunch: this.acquireObservedLaunch("resume", session.id),
-          derivation: {
-            childSessionId: session.id,
-            parentSessionId: target.sessionId,
-            sourceMessageId: selected.id,
-            sharedMessages: copiedParent.map((message, index) => ({
-              parentMessageId: message.id,
-              childMessageId: childTranscript[index]!.id,
-            })),
-          },
-        }
-      }).pipe(
-        Effect.catch((error) => {
-          if (isMissingCodexThreadErrorCause(error.cause)) transcript = { _tag: "Missing" }
-          else if (transcript._tag !== "Available") {
-            transcript = { _tag: "Unavailable", reason: error.message }
-          }
-          const launchable = isValidSessionId(provisionalSession.id)
-          return Effect.succeed({
-            _tag: "CreatedIndependentSession" as const,
-            session: provisionalSession,
-            transcript,
-            reason: `Fork ${provisionalSession.id || "(unknown)"} was created, but ${error.message}`,
-            ...(launchable
-              ? { acquireLaunch: this.acquireObservedLaunch("resume", provisionalSession.id) }
-              : {}),
-          })
-        }),
-      )
+      yield* Effect.uninterruptible(Effect.sync(() => { knownChild = receipt }).pipe(
+        Effect.andThen(created ? created(receipt) : Effect.void)))
+      return yield* this.verifyCreatedFork(server, receipt, target.sessionId, selected.id, copiedParent)
     }), "branchFrom")
     const ambiguity = (reason: string): AmbiguousBranchMutation => ({
       _tag: "AmbiguousBranchMutation",
@@ -392,7 +353,12 @@ export class CodexProvider implements AgentProviderApi {
       Effect.tap(() => Effect.sync(() => {
         deadlineExpired = true
       })),
-      Effect.flatMap(() => mutationMayHaveDispatched
+      Effect.flatMap((): Effect.Effect<BranchOutcome, ProviderError> => knownChild
+        ? Effect.succeed({ _tag: "CreatedIndependentSession" as const, session: knownChild.session,
+          transcript: { _tag: "Unavailable" as const, reason: "Verification observation deadline expired" },
+          reason: "Fork was created; verification observation deadline expired",
+          verification: { status: "unavailable" as const, reasonCode: "deadline" as const, receipt: knownChild } })
+        : mutationMayHaveDispatched
         ? Effect.succeed(ambiguity(
             `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline after thread/fork dispatch`,
           ))
@@ -401,12 +367,66 @@ export class CodexProvider implements AgentProviderApi {
             `Codex branchFrom exceeded the ${this.metadataDeadlineMs}ms overall deadline`,
           ))),
     )
-    const interruptibleOperation = operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !deadlineExpired
+    const interruptibleOperation = operation.pipe(Effect.onInterrupt(() => mutationMayHaveDispatched && !knownChild && !deadlineExpired
         ? Effect.sync(() => this.branchMutationReconciliations.offer(ambiguity(
             "Codex thread/fork was interrupted after dispatch and may have created a child thread",
           )))
         : Effect.void))
     return this.metadataDeadlineMs === undefined ? interruptibleOperation : Effect.raceFirst(interruptibleOperation, deadline)
+  }
+
+  private verifyCreatedFork(
+    server: CodexAppServerClient,
+    receipt: BranchVerificationReceipt,
+    parentSessionId: string,
+    sourceMessageId: string,
+    copiedParent: readonly CodexMessage[],
+  ): Effect.Effect<ValidatedBranch | CreatedIndependentSession, ProviderError | ProviderProtocolError> {
+    let transcript: TranscriptRead = { _tag: "Missing" }
+    let contradiction = false
+    const read = Effect.gen({ self: this }, function*() {
+      const childRead = yield* this.readThreadWithOverloadRetry(server, receipt.session.id).pipe(
+        Effect.mapError((error) => this.mapTransportError("validateFork", error)),
+      )
+      if (!(yield* this.threadBelongsToProject(childRead))) {
+        contradiction = true
+        return yield* Effect.fail(this.protocolError("validateFork", "The confirmed fork child resolved outside the canonical project"))
+      }
+      const childTranscript = yield* this.normalizeThread(childRead, "validateFork")
+      transcript = { _tag: "Available", messages: childTranscript }
+      contradiction = true
+      yield* this.validateCopiedPrefix(receipt.session.id, copiedParent.slice(0, childTranscript.length), childTranscript)
+      contradiction = false
+      if (childTranscript.length < copiedParent.length) return {
+        _tag: "CreatedIndependentSession" as const, session: receipt.session, transcript,
+        reason: "The created Codex copied prefix is not complete yet",
+        verification: { status: "pending" as const, reasonCode: "incomplete" as const, receipt },
+      }
+      const session = yield* this.sessionFromThread(childRead, "validateFork")
+      return {
+        _tag: "ValidatedBranch" as const, session, transcript,
+        acquireLaunch: this.acquireObservedLaunch("resume", session.id),
+        derivation: {
+          childSessionId: session.id, parentSessionId, sourceMessageId,
+          sharedMessages: copiedParent.map((message, index) => ({ parentMessageId: message.id, childMessageId: childTranscript[index]!.id })),
+        },
+      }
+    })
+    return read.pipe(Effect.catch((error) => {
+      const missing = isMissingCodexThreadErrorCause(error.cause)
+      if (missing) transcript = { _tag: "Missing" }
+      else if (transcript._tag !== "Available") transcript = { _tag: "Unavailable", reason: error.message }
+      return Effect.succeed({
+        _tag: "CreatedIndependentSession" as const, session: receipt.session, transcript,
+        reason: `Fork ${receipt.session.id} was created, but ${error.message}`,
+        verification: {
+          status: missing ? "pending" as const : contradiction ? "contradicted" as const : "unavailable" as const,
+          reasonCode: missing ? "missing" as const : contradiction ? "copy-mismatch" as const
+            : error._tag === "ProviderProtocolError" ? "unsupported" as const : "read-failed" as const,
+          receipt,
+        },
+      })
+    }))
   }
 
   private withServer<A>(
@@ -426,7 +446,7 @@ export class CodexProvider implements AgentProviderApi {
       )))
       if (Exit.isFailure(acquisition)) {
         const scopeCleanup = yield* Effect.exit(this.boundedServerCleanup(
-          Scope.close(scope, acquisition),
+          makeScopeClose(scope, acquisition),
           operation,
         ))
         if (Exit.isFailure(scopeCleanup)) {
@@ -439,14 +459,10 @@ export class CodexProvider implements AgentProviderApi {
       }
 
       const outcome = yield* Effect.exit(restore(use(acquisition.value)))
-      const explicitCleanup = yield* Effect.exit(this.boundedServerCleanup(
-        acquisition.value.close(),
-        operation,
-      ))
-      const scopeCleanup = yield* Effect.exit(this.boundedServerCleanup(
-        Scope.close(scope, outcome),
-        operation,
-      ))
+      const budget = yield* makeCleanupBudget(this.metadataCleanupTimeoutMs)
+      const expired = () => this.providerError(operation, `Codex ${operation} app-server cleanup exceeded ${this.metadataCleanupTimeoutMs}ms`)
+      const explicitCleanup = yield* Effect.exit(budget.observe(acquisition.value.close(), expired).pipe(Effect.provideService(CleanupDeadline, budget)))
+      const scopeCleanup = yield* Effect.exit(budget.observe(makeScopeClose(scope, outcome), expired).pipe(Effect.provideService(CleanupDeadline, budget)))
       const cleanupFailures = [explicitCleanup, scopeCleanup].flatMap((exit) =>
         Exit.isFailure(exit) ? [Cause.squash(exit.cause)] : [])
       if (cleanupFailures.length > 0) {
@@ -485,13 +501,11 @@ export class CodexProvider implements AgentProviderApi {
     effect: Effect.Effect<A, E, R>,
     operation: string,
   ): Effect.Effect<A, E | ProviderError, R> {
-    return effect.pipe(Effect.timeoutOrElse({
-      duration: this.metadataCleanupTimeoutMs,
-      orElse: () => Effect.fail(this.providerError(
+    return withOperationTimeout(Effect.interruptible(effect), this.metadataCleanupTimeoutMs,
+      () => Effect.fail(this.providerError(
         operation,
         `Codex ${operation} app-server cleanup exceeded ${this.metadataCleanupTimeoutMs}ms`,
-      )),
-    }))
+      )))
   }
 
   private listSessionsFrom(
@@ -1172,7 +1186,7 @@ export function makeObservedServices(
       )),
     )
     if (Exit.isFailure(readiness)) {
-      const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
+      const rollback = yield* Effect.exit(sidecar.close())
       if (Exit.isFailure(rollback)) {
         return yield* Effect.fail(new CodexSidecarError({
           operation: "acquire-rollback",
@@ -1193,7 +1207,7 @@ export function makeObservedServices(
       initialThreadIsTemporary,
     })))
     if (Exit.isFailure(proxyAcquisition)) {
-      const rollback = yield* Effect.exit(boundedObservedCleanup(sidecar.close()))
+      const rollback = yield* Effect.exit(sidecar.close())
       if (Exit.isFailure(rollback)) {
         return yield* Effect.fail(new CodexSidecarError({
           operation: "acquire-rollback",
@@ -1207,14 +1221,15 @@ export function makeObservedServices(
       return yield* Effect.failCause(proxyAcquisition.cause)
     }
     const proxy = proxyAcquisition.value
-    const close = () => Effect.gen(function*() {
+    const cleanup = makeCloseOperation(Effect.gen(function*() {
+      const budget = yield* makeCleanupBudget()
       const failures: unknown[] = []
-      yield* boundedObservedCleanup(proxy.close()).pipe(
-        Effect.catch((error) => Effect.sync(() => failures.push(error))),
-      )
-      yield* boundedObservedCleanup(sidecar.close()).pipe(
-        Effect.catch((error) => Effect.sync(() => failures.push(error))),
-      )
+      for (const resource of [proxy, sidecar]) {
+        const result = yield* Effect.exit(budget.observe(resource.close() as Effect.Effect<void, CodexObservedServicesError>, () => new CodexSidecarError({
+          operation: "cleanup", message: "Codex observed-services cleanup deadline expired",
+        })).pipe(Effect.provideService(CleanupDeadline, budget)))
+        if (Exit.isFailure(result)) failures.push(result.cause)
+      }
       if (failures.length > 0) {
         return yield* Effect.fail(new CodexSidecarError({
           operation: "cleanup",
@@ -1222,7 +1237,9 @@ export function makeObservedServices(
           cause: failures.length === 1 ? failures[0] : new AggregateError(failures),
         }))
       }
-    })
+    }), true)
+    const close = () => cleanup
+    yield* Effect.addFinalizer(() => close().pipe(Effect.orDie))
     return {
       remoteUrl: proxy.remoteUrl,
       bearerToken: sidecar.bearerToken,
@@ -1243,16 +1260,6 @@ export function makeObservedServices(
   }))
 }
 
-function boundedObservedCleanup<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E | CodexSidecarError> {
-  return effect.pipe(Effect.timeoutOrElse({
-    duration: OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS,
-    orElse: () => Effect.fail(new CodexSidecarError({
-      operation: "cleanup",
-      message: `Codex observed-services cleanup timed out after ${OBSERVED_SERVICES_CLEANUP_TIMEOUT_MS}ms`,
-    })),
-  }))
-}
-
 function waitForSidecar(
   sidecar: CodexSidecar,
   connectSidecar: typeof connectCodexAppServerSidecar = connectCodexAppServerSidecar,
@@ -1269,7 +1276,6 @@ function waitForSidecar(
       const result = yield* Effect.matchEffect(
         Effect.scoped(connectSidecar(sidecar.remoteUrl, {
           bearerToken: sidecar.bearerToken,
-          shutdownTimeoutMs: 100,
         })),
         {
           onFailure: (error) => Effect.succeed({ _tag: "Failure" as const, error }),

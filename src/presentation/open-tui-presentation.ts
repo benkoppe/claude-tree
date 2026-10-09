@@ -113,6 +113,7 @@ type FooterAction =
   | "roots"
   | "about"
   | "details"
+  | "verification"
 
 interface FooterControl {
   readonly key: string
@@ -713,13 +714,15 @@ class OpenTuiPresentationController {
     const quit = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape") || isExitKey(key)
     if (
       !quit && movement === undefined && !isEnterKey(key) &&
-      !["d", "x", "n", "r", "e"].some((name) => isUnmodifiedKey(key, name))
+      !["d", "x", "n", "r", "e", "v"].some((name) => isUnmodifiedKey(key, name))
     ) return
     key.stopPropagation()
     if (quit) {
       this.enqueue(this.stop, true, "background")
     } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
       this.refresh()
+    } else if (isUnmodifiedKey(key, "v") && !key.repeated) {
+      this.manageVerification()
     } else if (this.interactionBlocked()) {
       return
     } else if (movement !== undefined) {
@@ -743,13 +746,15 @@ class OpenTuiPresentationController {
     const jumpToLeaf = isShiftedKey(key, "g")
     const direction = graphDirection(key)
     const recognized = isExitKey(key) || back || jumpToTop || jumpToLeaf || direction !== undefined || isEnterKey(key) ||
-      ["f", "c", "d", "x", "n", "r", "e"].some((name) => isUnmodifiedKey(key, name))
+      ["f", "c", "d", "x", "n", "r", "e", "v"].some((name) => isUnmodifiedKey(key, name))
     if (!recognized) return
     key.stopPropagation()
     if (isExitKey(key)) {
       this.enqueue(this.stop, true, "background")
     } else if (isUnmodifiedKey(key, "r") && !key.repeated) {
       this.refresh()
+    } else if (isUnmodifiedKey(key, "v") && !key.repeated) {
+      this.manageVerification()
     } else if (this.interactionBlocked()) {
       return
     } else if (back) {
@@ -1300,8 +1305,27 @@ class OpenTuiPresentationController {
   }
 
   private controlsWithDetails(controls: readonly FooterControl[]): readonly FooterControl[] {
-    return this.issueDetails().length ? controls.flatMap((control) => control.action === "about"
-      ? [{ key: "e", description: "details", action: "details" as const }, control] : [control]) : controls
+    const verification = this.selectedVerification()
+    const withVerification: readonly FooterControl[] = verification ? [{
+      key: "v", description: verification[1].status === "verifying" ? "verifying fork · cancel" : "retry verification", action: "verification",
+    }, ...controls] : controls
+    return this.issueDetails().length ? withVerification.flatMap((control) => control.action === "about"
+      ? [{ key: "e", description: "details", action: "details" as const }, control] : [control]) : withVerification
+  }
+
+  private selectedVerification() {
+    const entries = [...(this.viewModel?.branchVerifications ?? [])].filter(([, value]) => value.retryable)
+    const surface = this.viewModel?.surface
+    const selected = surface?._tag === "Roots" ? surface.selectedSessionId : surface?._tag === "Graph" ? surface.familySessionId : undefined
+    return entries.find(([id]) => id === selected) ?? entries.find(([, value]) => value.status === "verifying") ?? entries[0]
+  }
+
+  private manageVerification(): void {
+    const selected = this.selectedVerification()
+    if (!selected) return
+    const [sessionId, verification] = selected
+    const action = verification.status === "verifying" ? "cancel" : "retry"
+    this.runAction(this.appRuntime.manageBranchVerification(sessionId, action), `verification:${action}:${sessionId}`)
   }
 
   private render(): void {
@@ -1797,6 +1821,7 @@ class OpenTuiPresentationController {
     else if (action === "new") this.runAction(this.appRuntime.newSession, "terminal:new")
     else if (action === "refresh") this.refresh()
     else if (action === "details") this.showIssueDetails()
+    else if (action === "verification") this.manageVerification()
     else if (action === "quit") this.enqueue(this.stop, true, "background")
     else if (action === "open") this.openSelected()
     else if (action === "fork") this.forkSelected()

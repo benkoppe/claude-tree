@@ -1,4 +1,27 @@
 import { Cause, Effect, Exit } from "effect"
+import { makeCleanupBudget } from "../services/cleanup-budget"
+
+export const PROCESS_GROUP_POLL_INTERVAL_MS = 10
+
+export function isProcessGroupAlive(processGroupId: number): boolean {
+  try { process.kill(-processGroupId, 0); return true }
+  catch (cause) {
+    if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ESRCH") return false
+    throw cause
+  }
+}
+
+export function waitForProcessGroupExit(inspect: () => boolean, timeoutMs: number): Effect.Effect<boolean> {
+  return Effect.gen(function*() {
+    const budget = yield* makeCleanupBudget(timeoutMs)
+    while (yield* Effect.sync(inspect)) {
+      const remaining = yield* budget.remaining
+      if (remaining <= 0) return false
+      yield* Effect.sleep(Math.min(PROCESS_GROUP_POLL_INTERVAL_MS, remaining))
+    }
+    return true
+  })
+}
 
 export type ProcessGroupCleanupStage = "term" | "wait" | "kill" | "verify"
 

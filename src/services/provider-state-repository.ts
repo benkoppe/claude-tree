@@ -1,4 +1,4 @@
-import { Context, Effect, Layer } from "effect"
+import { Context, Layer } from "effect"
 
 import { PersistencePlatformLive } from "../infrastructure/metadata/platform"
 import { makeSqliteRepository } from "../infrastructure/metadata/sqlite-repository"
@@ -12,6 +12,5 @@ export class ProviderStateRepository extends Context.Service<ProviderStateReposi
 export const makeProviderStateRepository = makeSqliteRepository
 
 export function ProviderStateRepositoryLive(options: ProviderStateRepositoryOptions) {
-  return Layer.effect(ProviderStateRepository, Effect.acquireRelease(makeProviderStateRepository(options),
-    (repository) => repository.close.pipe(Effect.orDie))).pipe(Layer.provide(PersistencePlatformLive))
+  return Layer.effect(ProviderStateRepository, makeProviderStateRepository(options)).pipe(Layer.provide(PersistencePlatformLive))
 }

@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test"
 
-import { Cause, Clock, Effect, Exit, Fiber, PubSub, Scope } from "effect"
+import { Deferred, Effect, Exit, Fiber, PubSub, Scope } from "effect"
 import { TestClock } from "effect/testing"
 
 import { makeClaudeLifecycleHooks, type ClaudeLifecycleHooks } from "../../src/infrastructure/providers/claude/lifecycle-hooks"
@@ -120,6 +120,31 @@ test("scope closure is a cleanup backstop", async () => {
   const hooks = (await Effect.runPromise(Effect.scoped(makeClaudeLifecycleHooks("session"))))!
   expect(await Effect.runPromise(PubSub.isShutdown(hooks.activityHints))).toBeTrue()
   await expect(fetch(connection(hooks).url)).rejects.toThrow()
+})
+
+test("hook cleanup awaits slow native listener closure without a default deadline", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const started = Deferred.makeUnsafe<void>()
+    let release!: () => void
+    const stopped = new Promise<void>((resolve) => { release = resolve })
+    let stops = 0
+    const hooks = (yield* makeClaudeLifecycleHooks("session", () => ({
+      port: 1234,
+      stop: () => {
+        stops += 1
+        Deferred.doneUnsafe(started, Effect.void)
+        return stopped
+      },
+    })))!
+    const close = yield* Effect.forkChild(hooks.close)
+    yield* Deferred.await(started)
+    yield* TestClock.adjust(120_000)
+    expect(close.pollUnsafe()).toBeUndefined()
+    release()
+    yield* Fiber.join(close)
+    yield* hooks.close
+    expect(stops).toBe(1)
+  }).pipe(Effect.provide(TestClock.layer()))))
 })
 
 test("bind failure falls back only after shutting down its hint resource", async () => {
@@ -252,7 +277,7 @@ test("request deadline cancels a stalled body without publishing a hint", async 
   })))
 })
 
-test("stalled explicit cleanup reports within the supervisor deadline and scope safely retries", async () => {
+test("explicit hook cleanup deadline preserves the native attempt and scope retries only after failure", async () => {
   await Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const scope = yield* Scope.make()
     let stops = 0
@@ -267,12 +292,15 @@ test("stalled explicit cleanup reports within the supervisor deadline and scope 
         orElse: () => Effect.fail(new Error("Supervisor cleanup deadline exceeded")),
       })),
     ))
-    yield* TestClock.adjust(200)
-    expect(yield* Fiber.join(fiber)).toMatchObject({ _tag: "Failure", failure: { _tag: "ProviderCleanupError" } })
-    expect(yield* Clock.currentTimeMillis).toBe(200)
+    yield* TestClock.adjust(500)
+    expect(yield* Fiber.join(fiber)).toMatchObject({ _tag: "Failure", failure: { message: "Supervisor cleanup deadline exceeded" } })
+    expect(stops).toBe(1)
     expect(yield* PubSub.isShutdown(hooks.activityHints)).toBeTrue()
     // A late rejection is still observed by tryPromise, not an unhandled rejection.
+    const retained = yield* Effect.forkChild(Effect.result(hooks.close))
+    yield* Effect.yieldNow
     rejectStop(new Error("Late stop failure"))
+    expect(yield* Fiber.join(retained)).toMatchObject({ _tag: "Failure", failure: { _tag: "ProviderCleanupError" } })
     yield* Effect.interruptible(Scope.close(scope, Exit.void)).pipe(Effect.timeoutOrElse({
       duration: 500,
       orElse: () => Effect.fail(new Error("Supervisor scope deadline exceeded")),
@@ -283,7 +311,7 @@ test("stalled explicit cleanup reports within the supervisor deadline and scope 
   }), TestClock.layer()))
 })
 
-test("stalled scope backstop is bounded and repeated explicit close remains safe", async () => {
+test("scope backstop waits for slow native closure and repeated explicit close shares completion", async () => {
   await Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const scope = yield* Scope.make()
     let stops = 0
@@ -292,22 +320,15 @@ test("stalled scope backstop is bounded and repeated explicit close remains safe
       port: 1234,
       stop: () => ++stops === 1 ? new Promise<void>((resolve) => { resolveStop = resolve }) : Promise.resolve(),
     })), Scope.Scope, scope))!
-    const fiber = yield* Effect.forkChild(Effect.exit(
-      Effect.interruptible(Scope.close(scope, Exit.void)).pipe(Effect.timeoutOrElse({
-        duration: 500,
-        orElse: () => Effect.fail(new Error("Supervisor scope deadline exceeded")),
-      })),
-    ))
-    yield* TestClock.adjust(200)
-    const exit = yield* Fiber.join(fiber)
-    expect(Exit.isFailure(exit)).toBeTrue()
-    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "ProviderCleanupError" })
-    expect(yield* Clock.currentTimeMillis).toBe(200)
+    const fiber = yield* Effect.forkChild(Scope.close(scope, Exit.void))
+    yield* TestClock.adjust(120_000)
+    expect(fiber.pollUnsafe()).toBeUndefined()
     expect(yield* PubSub.isShutdown(hooks.activityHints)).toBeTrue()
     resolveStop()
+    yield* Fiber.join(fiber)
     yield* Effect.all([hooks.close, hooks.close], { concurrency: "unbounded" })
     yield* Scope.close(scope, Exit.void)
     yield* hooks.close
-    expect(stops).toBe(2)
+    expect(stops).toBe(1)
   }), TestClock.layer()))
 })
