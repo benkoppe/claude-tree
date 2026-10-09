@@ -8,6 +8,8 @@ export const presentationTheme = {
   sessionElement: RGBA.fromHex("#12313a"),
   selected: primary,
   selectedText: RGBA.fromHex("#082f49"),
+  searchMatchBackground: RGBA.fromHex("#3a2d14"),
+  searchMatchMarker: RGBA.fromHex("#fbbf24"),
   selectedSuccess: RGBA.fromHex("#14532d"),
   selectedWarning: RGBA.fromHex("#713f12"),
   selectedDanger: RGBA.fromHex("#7f1d1d"),

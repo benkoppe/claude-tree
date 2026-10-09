@@ -3,7 +3,7 @@ import { parentPort, workerData } from "node:worker_threads"
 import { Cause, Deferred, Effect, Exit, Fiber, FiberSet } from "effect"
 
 import type { AgentMessage, AgentSessionSnapshot, TranscriptRead } from "../../domain/model"
-import { errorSummary } from "../../error-format"
+import { errorDetails } from "../../error-format"
 import type { AgentProviderApi } from "../../services/provider"
 import type { ProviderReadRequest, ProviderReadResponse, ProviderReadWorkerOptions } from "./read-worker-protocol"
 
@@ -133,7 +133,7 @@ const run = Effect.scoped(Effect.gen(function*() {
     const fiber = runJob(Effect.yieldNow.pipe(Effect.andThen(operation), Effect.onExit((exit) => Effect.sync(() => {
       jobs.delete(request.id)
       if (Exit.isSuccess(exit)) send({ _tag: "Completed", id: request.id })
-      else send({ _tag: "Failed", id: request.id, message: errorSummary(Cause.squash(exit.cause)) })
+      else send({ _tag: "Failed", id: request.id, message: errorDetails(Cause.squash(exit.cause)) })
       finishClose()
     })), Effect.exit, Effect.asVoid))
     jobs.set(request.id, fiber)
