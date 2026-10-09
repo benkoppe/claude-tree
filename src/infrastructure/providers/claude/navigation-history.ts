@@ -22,7 +22,14 @@ export function projectNavigationHistory(
   ancestors: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map(),
   trace?: HistoryTrace,
 ): NavigationHistoryProjection {
-  const evidence = new RecordEvidence(entries, ancestors, trace)
+  return projectNavigationHistoryFromEvidence(new RecordEvidence(entries, ancestors, trace), selectedRecordIds, trace)
+}
+
+export function projectNavigationHistoryFromEvidence(
+  evidence: RecordEvidence,
+  selectedRecordIds: readonly string[],
+  trace?: HistoryTrace,
+): NavigationHistoryProjection {
   const effective = evidence.current.effective
   const sourceRecords = evidence.current.ordered
   // Without logical compaction links there is no application-owned reconstruction:

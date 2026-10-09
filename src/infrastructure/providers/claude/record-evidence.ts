@@ -97,6 +97,19 @@ class RecordIndex {
   }
 }
 
+class RecordIndexes {
+  private readonly snapshots = new WeakMap<readonly SessionStoreEntry[], RecordIndex>()
+
+  get(entries: readonly SessionStoreEntry[]): RecordIndex {
+    let index = this.snapshots.get(entries)
+    if (!index) {
+      index = new RecordIndex(entries)
+      this.snapshots.set(entries, index)
+    }
+    return index
+  }
+}
+
 /** One immutable snapshot index for references, record versions, and parent
  * evidence. Unloaded lineage is requested explicitly, never treated as absent. */
 export class RecordEvidence {
@@ -107,13 +120,19 @@ export class RecordEvidence {
   private readonly parentCache = new Map<string, ReadonlySet<string | null>>()
   private readonly matches = new WeakMap<TranscriptRecord, Map<ScopeId, Map<string, readonly TranscriptRecord[]>>>()
 
-  constructor(entries: readonly SessionStoreEntry[], snapshots: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map(), private readonly trace?: HistoryTrace) {
-    this.current = new RecordIndex(entries)
+  constructor(private readonly entries: readonly SessionStoreEntry[], snapshots: ReadonlyMap<string, readonly SessionStoreEntry[]> = new Map(), private readonly trace?: HistoryTrace,
+    private readonly indexes = new RecordIndexes()) {
+    this.current = indexes.get(entries)
     this.currentSessionId = [...snapshots].find(([, records]) => records === entries)?.[0]
     this.scopes.set(null, this.current)
     for (const [id, records] of snapshots) {
-      if (id !== this.currentSessionId) this.scopes.set(id, new RecordIndex(records))
+      if (id !== this.currentSessionId) this.scopes.set(id, indexes.get(records))
     }
+  }
+
+  /** Reuse immutable indexes, but recompute derived evidence against the new snapshot set. */
+  withSnapshots(snapshots: ReadonlyMap<string, readonly SessionStoreEntry[]>): RecordEvidence {
+    return new RecordEvidence(this.entries, snapshots, this.trace, this.indexes)
   }
 
   private scope(id: string): ScopeId { return id === this.currentSessionId ? null : id }

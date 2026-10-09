@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 import { getSessionMessages, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk"
 import { Deferred, Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 
-import { NavigationHistoryError, projectNavigationHistory } from "../../src/infrastructure/providers/claude/navigation-history"
+import { NavigationHistoryError, projectNavigationHistory, projectNavigationHistoryFromEvidence } from "../../src/infrastructure/providers/claude/navigation-history"
 import { ClaudeProvider } from "../../src/infrastructure/providers/claude/provider"
 import { RecordEvidence } from "../../src/infrastructure/providers/claude/record-evidence"
 import { HistoryTrace } from "../../src/diagnostics/history-trace"
@@ -30,6 +30,53 @@ function copy(records: readonly SessionStoreEntry[], sourceSession: string, pref
     forkedFrom: { sessionId: sourceSession, messageUuid: record.uuid },
   }))
 }
+
+test("an operation indexes each immutable snapshot once across ancestor acquisition retries", () => {
+  const f = fixture()
+  const currentScans = spyOn(f.current, "forEach")
+  const parentScans = spyOn(f.parents, "forEach")
+  try {
+    const snapshots = new Map([["child", f.current]])
+    const evidence = new RecordEvidence(f.current, snapshots)
+    expect(() => projectNavigationHistoryFromEvidence(evidence.withSnapshots(snapshots), f.selected)).toThrow("requires copied-record evidence")
+    snapshots.set("parent", f.parents)
+    const complete = evidence.withSnapshots(snapshots)
+    const projection = projectNavigationHistoryFromEvidence(complete, f.selected)
+    expect(complete.current).toBe(evidence.current)
+    expect(projection.records.find((record) => record.uuid === "child:answer")?.parentUuid).toBe("child:question")
+    expect(projectNavigationHistoryFromEvidence(evidence.withSnapshots(snapshots), f.selected)).toEqual(projection)
+    expect(currentScans).toHaveBeenCalledTimes(1)
+    expect(parentScans).toHaveBeenCalledTimes(1)
+  } finally {
+    currentScans.mockRestore()
+    parentScans.mockRestore()
+  }
+})
+
+test("adding ancestor snapshots invalidates derived parent evidence without rebuilding the current index", () => {
+  const f = fixture()
+  const initial = new RecordEvidence(f.current, new Map([["child", f.current]]))
+  const answer = initial.current.effective.get("child:answer")!
+  expect(initial.availableParents(answer)).toEqual(new Set(["child:summary"]))
+  const complete = initial.withSnapshots(new Map([["child", f.current], ["parent", f.parents]]))
+  expect(complete.current).toBe(initial.current)
+  expect(complete.availableParents(answer)).toEqual(new Set(["child:summary", "child:question"]))
+  expect(initial.availableParents(answer)).toEqual(new Set(["child:summary"]))
+})
+
+test("a different ancestor snapshot never reuses the previous snapshot's payload evidence", () => {
+  const f = fixture()
+  const snapshots = new Map([["child", f.current], ["parent", f.parents]])
+  const evidence = new RecordEvidence(f.current, snapshots)
+  expect(projectNavigationHistoryFromEvidence(evidence, f.selected).changed).toBeTrue()
+  const changed = f.parents.map((record) => record.type === "attachment"
+    ? { ...record, attachment: { type: "fixture", value: "contradictory" } } : record)
+  snapshots.set("parent", changed)
+  const revised = evidence.withSnapshots(snapshots)
+  expect(revised.current).toBe(evidence.current)
+  expect(() => projectNavigationHistoryFromEvidence(revised, f.selected)).toThrow()
+  expect(() => projectNavigationHistory(f.current, f.selected, snapshots)).toThrow()
+})
 
 test("a single child version recovers its parent from the same evidence used to resolve foreign preservation UUIDs", () => {
   const f = fixture()
