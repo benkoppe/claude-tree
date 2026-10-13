@@ -8,7 +8,7 @@ The launcher is `@benkoppe/claude-tree`; platform packages are `@benkoppe/claude
 
 Use **Actions → Release → Run workflow**, select the validated source ref, and enter a version such as `0.1.0` or `0.1.0-beta.1` without a `v` prefix. Releases run only by workflow dispatch.
 
-The workflow runs the normal tests, builds five platform packages (musl in Alpine), and checks Git/npm version conflicts before publishing. Platform packages publish before the launcher, then `v<VERSION>` is tagged at the dispatched commit. Stable releases use `latest` and must be newer than its current version; prereleases use `next`. The version is embedded during packaging, without a source version-bump commit.
+The workflow runs the normal tests, builds five platform packages (musl in Alpine), and checks Git/npm version conflicts before publishing. Platform packages publish before the launcher, then `v<VERSION>` is tagged at the dispatched commit and a GitHub Release is created with generated notes. Prereleases are marked accordingly; no binary attachments are added. Stable releases use `latest` and must be newer than its current version; prereleases use `next`. The version is embedded during packaging, without a source version-bump commit.
 
 Before dispatching:
 

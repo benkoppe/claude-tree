@@ -302,7 +302,7 @@ Terminal mode keeps a persistent bottom bar with left-aligned `c/t · Ctrl+Space
 
 ## Releases Are Compiled npm Packages
 
-Binary releases use one build/package script and an explicitly dispatched workflow with a version input. Run the existing regression suite without release smoke tests, package all supported platforms, publish their npm tarballs before the exact-version launcher, then create the Git tag at the dispatched source commit. Retain basic version/tag conflict checks, not custom publication recovery, artifact manifests, GitHub Release staging, or standalone downloads. Never overwrite npm versions or move release tags; inspect partial publications before releasing a new version. Nix remains a separate optional source installation, not the release pipeline. Provider executables remain external dependencies.
+Binary releases use one build/package script and an explicitly dispatched workflow with a version input. Run the existing regression suite without release smoke tests, package all supported platforms, publish their npm tarballs before the exact-version launcher, then create the Git tag at the dispatched source commit and a GitHub Release with generated notes. GitHub Releases announce npm versions without binary attachments. Retain basic version/tag conflict checks, not custom publication recovery, artifact manifests, GitHub Release staging, or standalone downloads. Never overwrite npm versions or move release tags; inspect partial publications before releasing a new version. Nix remains a separate optional source installation, not the release pipeline. Provider executables remain external dependencies.
 
 ## Shared Working Tree Is Deliberate
 

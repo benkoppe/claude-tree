@@ -99,7 +99,9 @@ jobs:
           pattern: release-*
           path: dist/packages
           merge-multiple: true
-      - name: Publish platform packages, launcher, and tag
+      - name: Publish npm packages and create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           bun run build:release --validate
@@ -118,3 +120,10 @@ jobs:
           npm publish "dist/packages/benkoppe-claude-tree-$RELEASE_VERSION.tgz" --access public --tag "$channel" --ignore-scripts
           git tag "v$RELEASE_VERSION" "$BUILD_REVISION"
           git push origin "refs/tags/v$RELEASE_VERSION"
+          release_flags=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then release_flags+=(--prerelease); fi
+          gh release create "v$RELEASE_VERSION" \
+            --verify-tag \
+            --title "v$RELEASE_VERSION" \
+            --generate-notes \
+            "${release_flags[@]}"
