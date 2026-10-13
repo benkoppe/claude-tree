@@ -147,6 +147,8 @@ test("release workflow stays dispatch-only and publishes the launcher after plat
   expect(workflow).not.toMatch(/smoke|test:release|nix build|nix run|nix flake|staging|SHA256SUMS|gh release/)
   expect(workflow).toContain("needs: build")
   expect(workflow).toContain("cancel-in-progress: false")
+  expect(workflow).toContain("      id-token: write")
+  expect(workflow).not.toMatch(/NPM_TOKEN|NODE_AUTH_TOKEN/)
   const publishLauncher = 'npm publish "dist/packages/benkoppe-claude-tree-$RELEASE_VERSION.tgz"'
   expect(workflow).toContain(publishLauncher)
   expect(workflow).toContain('packages=(dist/packages/benkoppe-claude-tree-{darwin,linux}-*-"$RELEASE_VERSION".tgz)')

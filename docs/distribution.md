@@ -13,8 +13,10 @@ The workflow runs the normal tests, builds five platform packages (musl in Alpin
 Before dispatching:
 
 1. Confirm your npm account owns the `@benkoppe` scope and can publish all six packages publicly.
-2. Configure **NPM_TOKEN** in the GitHub **release** environment with unattended publishing permissions for all six packages.
+2. Create the GitHub **release** environment. In each npm package's settings, add a GitHub Actions trusted publisher with owner `benkoppe`, repository `claude-tree`, workflow `release.yml`, and environment `release`. Allow direct `npm publish`. The publish job uses OIDC with Node 24 and npm 11.5.1+; no npm token is needed.
 3. Require green CI and complete the [real-provider lifecycle gate](lifecycle-review.md#implementation-and-test-gates) and runtime licensing review below.
+
+Configure trusted publishers near the next release: new configurations must successfully publish within two days or be recreated. After a successful OIDC release, revoke the old npm token and delete the GitHub `NPM_TOKEN` secret. You can then enable **Require two-factor authentication and disallow tokens** in each npm package's settings; trusted publishing still works.
 
 Existing Git tags and npm versions cannot be overwritten. Publication is not atomic: after a partial publication, inspect what succeeded and use a new version for a fresh release rather than blindly rerunning. There is no custom retry or recovery system.
 

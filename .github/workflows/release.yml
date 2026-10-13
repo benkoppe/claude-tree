@@ -80,8 +80,7 @@ jobs:
     environment: release
     permissions:
       contents: write
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -104,7 +103,6 @@ jobs:
         shell: bash
         run: |
           bun run build:release --validate
-          test -n "$NODE_AUTH_TOKEN" || { echo "Configure NPM_TOKEN in the release environment" >&2; exit 1; }
           existing_tag="$(git ls-remote --tags origin "refs/tags/v$RELEASE_VERSION")"
           test -z "$existing_tag" || { echo "Release tag already exists" >&2; exit 1; }
           bun run build:release --preflight
