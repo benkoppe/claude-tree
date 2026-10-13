@@ -5,12 +5,12 @@
 `claude-tree` frees you from a linear history & turns a project's agent conversations into a navigable message tree. Every leaf corresponds to a distinct session:
 
 <p align="center">
-  <img src="docs/images/conversation-tree.png"
+  <img src="https://raw.githubusercontent.com/benkoppe/claude-tree/main/docs/images/conversation-tree.png"
        alt="claude-tree showing branching conversations with live sessions and new updates"
        width="600">
 </p>
 
-Claude Code is used by default. To use codex, pass `--codex`. Optionally, you can pass the project directory:
+Claude Code is used by default. To use Codex, pass `--codex`. Optionally, you can pass the project directory:
 
 ```sh
 claude-tree /path/to/project
@@ -44,7 +44,7 @@ On musl Linux, set `OPENTUI_LIBC=musl` when running `claude-tree`.
 nix run github:benkoppe/claude-tree
 ```
 
-If provider CLIs are already installed separately, use `#unwrapped` to keep the existing commands on `$PATH`:
+This command also installs separate Claude/Codex agents. To use your own system-installed agents, use `#unwrapped`:
 
 ```sh
 nix run github:benkoppe/claude-tree#unwrapped
