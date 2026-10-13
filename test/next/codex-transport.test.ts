@@ -6,6 +6,7 @@ import type { ProviderTerminalEvent } from "../../src/services/provider"
 
 import {
   CodexCleanupError,
+  CodexConnectionError,
   CodexMutationAmbiguousError,
   CodexProcessError,
   CodexProtocolError,
@@ -19,6 +20,28 @@ import {
   CodexTuiProxyError,
   makeCodexTuiProxy,
 } from "../../src/infrastructure/providers/codex/tui-proxy"
+
+class ConnectingSocket extends EventTarget {
+  readyState: number = WebSocket.CONNECTING
+  terminations = 0
+
+  constructor(private readonly closureEvidence: "event" | "state" | "none") { super() }
+
+  terminate() {
+    this.terminations++
+    if (this.closureEvidence === "event") this.confirmClose()
+    else if (this.closureEvidence === "state") this.readyState = WebSocket.CLOSED
+  }
+
+  confirmClose() {
+    if (this.readyState === WebSocket.CLOSED) return
+    this.readyState = WebSocket.CLOSED
+    this.dispatchEvent(Object.assign(new Event("close"), { code: 1000 }))
+  }
+
+  close() { this.terminate() }
+  send() { throw new Error("An unconnected socket must not dispatch") }
+}
 
 describe("Effect Codex app-server transport", () => {
   test("a response cannot bypass its caller's outstanding transport write", async () => {
@@ -941,32 +964,76 @@ describe("Effect Codex sidecar and TUI proxy", () => {
     }))
   })
 
-  test("bounds sidecar connection attempts and reports unconfirmed rollback", async () => {
-    const server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      async fetch(request, bunServer) {
-        await Bun.sleep(100)
-        return bunServer.upgrade(request)
-          ? undefined
-          : new Response("Upgrade required", { status: 426 })
-      },
-      websocket: { message() {} },
-    })
+  test.each(["event", "state"] as const)("connection timeout preserves its error after confirmed rollback (%s)", async (evidence) => {
+    const socket = new ConnectingSocket(evidence)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquisition = yield* Effect.forkChild(connectCodexAppServerSidecar("ws://127.0.0.1:12345", {
+        bearerToken: "sidecar-secret",
+        connectTimeoutMs: 10,
+        shutdownTimeoutMs: 10,
+        createWebSocket: () => socket as unknown as WebSocket,
+      }))
+      yield* TestClock.adjust(10)
+      const error = yield* Effect.flip(Fiber.join(acquisition))
+      expect(error).toBeInstanceOf(CodexConnectionError)
+      expect(error).toMatchObject({ message: "Timed out connecting to Codex sidecar", retryable: true })
+      expect(socket.terminations).toBeGreaterThan(0)
+      expect(socket.readyState).toBe(WebSocket.CLOSED)
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
 
+  test("connection timeout retains rollback until late socket closure is confirmed", async () => {
+    const socket = new ConnectingSocket("none")
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const acquisition = yield* Effect.forkChild(connectCodexAppServerSidecar("ws://127.0.0.1:12345", {
+        bearerToken: "sidecar-secret",
+        connectTimeoutMs: 10,
+        shutdownTimeoutMs: 10,
+        createWebSocket: () => socket as unknown as WebSocket,
+      }))
+      try {
+        yield* TestClock.adjust(10)
+        expect(socket.terminations).toBeGreaterThan(0)
+        expect(socket.readyState).toBe(WebSocket.CONNECTING)
+        expect(acquisition.pollUnsafe()).toBeUndefined()
+        socket.confirmClose()
+        const error = yield* Effect.flip(Fiber.join(acquisition))
+        expect(error).toBeInstanceOf(CodexConnectionError)
+        expect(error.message).toBe("Timed out connecting to Codex sidecar")
+      } finally { socket.confirmClose() }
+    })).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  test("connection timeout reports acquisition and rollback failures without socket closure evidence", async () => {
+    const socket = new ConnectingSocket("none")
     try {
-      const error = await Effect.runPromise(Effect.scoped(
-        connectCodexAppServerSidecar(`ws://127.0.0.1:${server.port}`, {
+      await Effect.runPromise(Effect.gen(function*() {
+        const acquisition = yield* Effect.forkChild(Effect.scoped(connectCodexAppServerSidecar("ws://127.0.0.1:12345", {
           bearerToken: "sidecar-secret",
           connectTimeoutMs: 10,
           shutdownTimeoutMs: 10,
-        }),
-      )).catch((cause: unknown) => cause)
-      expect(error).toBeInstanceOf(CodexCleanupError)
-      expect(error).toMatchObject({ message: "Codex app-server acquisition failed and rollback was incomplete" })
-    } finally {
-      await stopTestServer(server)
-    }
+          createWebSocket: () => socket as unknown as WebSocket,
+        })))
+        yield* TestClock.adjust(10)
+        expect(acquisition.pollUnsafe()).toBeUndefined()
+        expect(socket.readyState).toBe(WebSocket.CONNECTING)
+        yield* TestClock.adjust(100)
+        const exit = yield* Fiber.await(acquisition)
+        expect(Exit.isFailure(exit)).toBeTrue()
+        if (Exit.isSuccess(exit)) throw new Error("Expected unconfirmed rollback")
+        const failures = exit.cause.reasons.flatMap((reason) => reason._tag === "Fail" ? [reason.error] : [])
+        const error = failures.find((failure) => failure instanceof CodexCleanupError &&
+          failure.message === "Codex app-server acquisition failed and rollback was incomplete")
+        expect(error).toBeInstanceOf(CodexCleanupError)
+        expect(error?.cause).toBeInstanceOf(AggregateError)
+        const causes = (error?.cause as AggregateError).errors
+        expect(causes[0]).toBeInstanceOf(CodexConnectionError)
+        expect(causes[0].message).toBe("Timed out connecting to Codex sidecar")
+        expect(causes[1]).toBeInstanceOf(CodexCleanupError)
+        expect(socket.terminations).toBeGreaterThan(1)
+        expect(socket.readyState).toBe(WebSocket.CONNECTING)
+      }).pipe(Effect.provide(TestClock.layer())))
+    } finally { socket.readyState = WebSocket.CLOSED }
   })
 
   test("authenticates a loopback sidecar and rejects binary protocol messages", async () => {
