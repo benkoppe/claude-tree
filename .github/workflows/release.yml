@@ -31,8 +31,6 @@ jobs:
             platform: linux-x64-glibc
           - os: ubuntu-24.04-arm
             platform: linux-arm64-glibc
-          - os: macos-15-intel
-            platform: darwin-x64
           - os: macos-latest
             platform: darwin-arm64
           - os: ubuntu-latest
@@ -113,7 +111,7 @@ jobs:
           if [[ "$RELEASE_VERSION" == *-* ]]; then channel=next; fi
           shopt -s nullglob
           packages=(dist/packages/benkoppe-claude-tree-{darwin,linux}-*-"$RELEASE_VERSION".tgz)
-          test "${#packages[@]}" -eq 6
+          test "${#packages[@]}" -eq 5
           for package in "${packages[@]}"; do
             npm publish "$package" --access public --tag "$channel" --ignore-scripts
           done

@@ -3,7 +3,7 @@ import { join, resolve } from "node:path"
 
 import packageJson from "../package.json" with { type: "json" }
 
-export const releasePlatforms = ["linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl", "linux-arm64-musl", "darwin-x64", "darwin-arm64"] as const
+export const releasePlatforms = ["linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl", "linux-arm64-musl", "darwin-arm64"] as const
 
 export function platformPackageName(platform: string): string {
   return `${packageJson.name}-${platform}`

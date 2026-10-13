@@ -2,18 +2,18 @@
 
 Users install or update with `npm install -g @benkoppe/claude-tree@latest` (or `@benkoppe/claude-tree@next` for prereleases) and run `claude-tree`. A small Node 20+ launcher selects an exact-version platform package containing the compiled Bun executables, migrations, native/parser assets, and dependency notices. No separately installed Bun or install scripts are required. Provider CLIs remain external dependencies.
 
-The launcher is `@benkoppe/claude-tree`; platform packages are `@benkoppe/claude-tree-<os>-<arch>[-<libc>]`, covering Linux x64/arm64 with glibc/musl and macOS x64/arm64. The executable and application identity remain `claude-tree`.
+The launcher is `@benkoppe/claude-tree`; platform packages are `@benkoppe/claude-tree-<os>-<arch>[-<libc>]`, covering Linux x64/arm64 with glibc/musl and macOS arm64. The executable and application identity remain `claude-tree`.
 
 ## Release
 
 Use **Actions → Release → Run workflow**, select the validated source ref, and enter a version such as `0.1.0` or `0.1.0-beta.1` without a `v` prefix. Releases run only by workflow dispatch.
 
-The workflow runs the normal tests, builds six platform packages (musl in Alpine), and checks Git/npm version conflicts before publishing. Platform packages publish before the launcher, then `v<VERSION>` is tagged at the dispatched commit. Stable releases use `latest` and must be newer than its current version; prereleases use `next`. The version is embedded during packaging, without a source version-bump commit.
+The workflow runs the normal tests, builds five platform packages (musl in Alpine), and checks Git/npm version conflicts before publishing. Platform packages publish before the launcher, then `v<VERSION>` is tagged at the dispatched commit. Stable releases use `latest` and must be newer than its current version; prereleases use `next`. The version is embedded during packaging, without a source version-bump commit.
 
 Before dispatching:
 
-1. Confirm your npm account owns the `@benkoppe` scope and can publish all seven packages publicly.
-2. Configure **NPM_TOKEN** in the GitHub **release** environment with unattended publishing permissions for all seven packages.
+1. Confirm your npm account owns the `@benkoppe` scope and can publish all six packages publicly.
+2. Configure **NPM_TOKEN** in the GitHub **release** environment with unattended publishing permissions for all six packages.
 3. Require green CI and complete the [real-provider lifecycle gate](lifecycle-review.md#implementation-and-test-gates) and runtime licensing review below.
 
 Existing Git tags and npm versions cannot be overwritten. Publication is not atomic: after a partial publication, inspect what succeeded and use a new version for a fresh release rather than blindly rerunning. There is no custom retry or recovery system.
