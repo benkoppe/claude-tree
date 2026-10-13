@@ -28,7 +28,7 @@
             ''
           );
       claudeTreeUnwrapped = bun2nix.mkDerivation {
-        pname = package.name;
+        pname = "claude-tree";
         inherit (package) version;
 
         src = lib.fileset.toSource {
@@ -136,7 +136,7 @@
         package = claudeTree;
         package-unwrapped = claudeTreeUnwrapped;
         version = pkgs.runCommand "claude-tree-version-check" { } ''
-          test "$(${lib.getExe claudeTree} --version)" = "${package.name} ${package.version}"
+          test "$(${lib.getExe claudeTree} --version)" = "claude-tree ${package.version}"
           ${lib.getExe claudeTree} --help >/dev/null
           touch "$out"
         '';

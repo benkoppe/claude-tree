@@ -3,6 +3,7 @@
 
 const { spawn } = require("node:child_process");
 const { dirname, join } = require("node:path");
+const { name } = require("../package.json");
 
 const platform = process.platform;
 const arch = process.arch;
@@ -16,16 +17,18 @@ if (platform === "linux") {
   libc = report?.header?.glibcVersionRuntime ? "glibc" : "musl";
 }
 const suffix = `${platform}-${arch}${libc ? `-${libc}` : ""}`;
+const platformPackage = `${name}-${suffix}`;
 let executable;
 try {
-  executable = join(dirname(require.resolve(`@claude-tree/${suffix}/package.json`)), "claude-tree");
+  executable = join(dirname(require.resolve(`${platformPackage}/package.json`)), "claude-tree");
 } catch {
-  console.error(`claude-tree: missing platform package @claude-tree/${suffix}. Reinstall with optional dependencies enabled.`);
+  console.error(`claude-tree: missing platform package ${platformPackage}. Reinstall with optional dependencies enabled.`);
   process.exit(1);
 }
-const child = spawn(executable, process.argv.slice(2), { stdio: "inherit", env: { ...process.env, ...(libc ? { OPENTUI_LIBC: libc } : {}) } });
+// Only the launcher receives foreground process-group signals; forward each once.
+const child = spawn(executable, process.argv.slice(2), { detached: true, stdio: "inherit", env: { ...process.env, ...(libc ? { OPENTUI_LIBC: libc } : {}) } });
 const handlers = new Map();
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]) {
   const handler = () => { if (child.exitCode === null && child.signalCode === null) child.kill(signal); };
   handlers.set(signal, handler);
   process.on(signal, handler);

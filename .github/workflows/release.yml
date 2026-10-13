@@ -107,15 +107,16 @@ jobs:
           test -n "$NODE_AUTH_TOKEN" || { echo "Configure NPM_TOKEN in the release environment" >&2; exit 1; }
           existing_tag="$(git ls-remote --tags origin "refs/tags/v$RELEASE_VERSION")"
           test -z "$existing_tag" || { echo "Release tag already exists" >&2; exit 1; }
+          bun run build:release --preflight
           bun run build:release --launcher
           channel=latest
           if [[ "$RELEASE_VERSION" == *-* ]]; then channel=next; fi
           shopt -s nullglob
-          packages=(dist/packages/claude-tree-{darwin,linux}-*-"$RELEASE_VERSION".tgz)
+          packages=(dist/packages/benkoppe-claude-tree-{darwin,linux}-*-"$RELEASE_VERSION".tgz)
           test "${#packages[@]}" -eq 6
           for package in "${packages[@]}"; do
             npm publish "$package" --access public --tag "$channel" --ignore-scripts
           done
-          npm publish "dist/packages/claude-tree-$RELEASE_VERSION.tgz" --access public --tag "$channel" --ignore-scripts
+          npm publish "dist/packages/benkoppe-claude-tree-$RELEASE_VERSION.tgz" --access public --tag "$channel" --ignore-scripts
           git tag "v$RELEASE_VERSION" "$BUILD_REVISION"
           git push origin "refs/tags/v$RELEASE_VERSION"

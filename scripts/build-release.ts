@@ -5,6 +5,10 @@ import packageJson from "../package.json" with { type: "json" }
 
 export const releasePlatforms = ["linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl", "linux-arm64-musl", "darwin-x64", "darwin-arm64"] as const
 
+export function platformPackageName(platform: string): string {
+  return `${packageJson.name}-${platform}`
+}
+
 export function releaseVersion(input = process.env.RELEASE_VERSION ?? packageJson.version): string {
   if (input.trim() !== input || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/.test(input)) throw new Error("Expected SemVer without a v prefix or build metadata")
   if (input.split("-")[0]!.split(".").some((part) => BigInt(part) > BigInt(Number.MAX_SAFE_INTEGER))) throw new Error("Version numbers exceed SemVer's supported range")
@@ -22,7 +26,33 @@ export function launcherManifest(version: string) {
   return { name: packageJson.name, version: releaseVersion(version), description: packageJson.description,
     license: packageJson.license, repository: packageJson.repository, homepage: packageJson.homepage,
     bin: { "claude-tree": "bin/claude-tree.cjs" }, files: ["bin", "LICENSE", "README.md"], engines: { node: ">=20" },
-    optionalDependencies: Object.fromEntries(releasePlatforms.map((platform) => [`@claude-tree/${platform}`, version])),
+    optionalDependencies: Object.fromEntries(releasePlatforms.map((platform) => [platformPackageName(platform), version])),
+  }
+}
+
+interface NpmPackageMetadata {
+  readonly versions?: string | readonly string[]
+  readonly "dist-tags"?: Record<string, string>
+}
+
+export function checkNpmVersion(name: string, version: string, metadata: NpmPackageMetadata): void {
+  if ([metadata.versions].flat().includes(version)) throw new Error(`${name}@${version} is already published`)
+  const latest = metadata["dist-tags"]?.latest
+  if (name === packageJson.name && !version.includes("-") && latest && Bun.semver.order(version, latest) <= 0) {
+    throw new Error(`Refusing to move latest from ${latest} to ${version}`)
+  }
+}
+
+function preflight(version: string): void {
+  for (const name of [packageJson.name, ...releasePlatforms.map(platformPackageName)]) {
+    const result = Bun.spawnSync(["npm", "view", name, "versions", "dist-tags", "--json"], { stdout: "pipe", stderr: "pipe" })
+    const output = result.stdout.toString()
+    if (result.exitCode !== 0) {
+      const error = JSON.parse(output || "{}") as { error?: { code?: string } }
+      if (error.error?.code === "E404") continue
+      throw new Error(`Unable to check ${name}: ${result.stderr.toString().trim() || output}`)
+    }
+    checkNpmVersion(name, version, JSON.parse(output) as NpmPackageMetadata)
   }
 }
 
@@ -96,8 +126,8 @@ async function buildPlatform(version: string): Promise<void> {
     const notices = (await readdir(source)).filter((name) => /^(LICENSE|COPYING|NOTICE|AUTHORS|PATENTS)/i.test(name))
     if (notices.length) { await mkdir(destination, { recursive: true }); for (const notice of notices) await cp(join(source, notice), join(destination, notice), { recursive: true }) }
   }
-  run(["tar", "-czf", join(directory, "source.tar.gz"), "src", "scripts", "bin", "docs", "test", ".github", "package.json", "bun.lock", "tsconfig.json", "drizzle.config.ts", "LICENSE", "THIRD_PARTY_LICENSES"])
-  await Bun.write(join(directory, "package.json"), JSON.stringify({ name: `@claude-tree/${suffix}`, version,
+  run(["tar", "-czf", join(directory, "source.tar.gz"), "src", "scripts", "bin", "docs", "test", ".github", "package.json", "bun.lock", "tsconfig.json", "drizzle.config.ts", "LICENSE", "THIRD_PARTY_LICENSES", "README.md"])
+  await Bun.write(join(directory, "package.json"), JSON.stringify({ name: platformPackageName(suffix), version,
     description: packageJson.description, license: packageJson.license, repository: packageJson.repository,
     os: [platform], cpu: [arch], ...(libc ? { libc: [libc] } : {}),
     files: ["claude-tree", "claude-tree-history", "migrations", "licenses", "source.tar.gz", "BUILDING.md", "build-metadata.json", "LICENSE", "THIRD_PARTY_LICENSES"],
@@ -108,7 +138,8 @@ async function buildPlatform(version: string): Promise<void> {
 if (import.meta.main) {
   const version = releaseVersion()
   if (process.argv[2] === "--validate") console.log(version)
+  else if (process.argv[2] === "--preflight") preflight(version)
   else if (process.argv[2] === "--launcher") await buildLauncher(version)
-  else if (process.argv.length > 2) throw new Error("Expected --validate, --launcher, or no arguments")
+  else if (process.argv.length > 2) throw new Error("Expected --validate, --preflight, --launcher, or no arguments")
   else await buildPlatform(version)
 }

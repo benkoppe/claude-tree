@@ -21,22 +21,30 @@ claude-tree --codex /path/to/project
 
 `claude-tree` is project-scoped. Run it inside your project folder.
 
-### Bun
+### npm (recommended)
 
-Requires Linux or macOS, Bun, Claude Code or Codex on `$PATH`, and a truecolor terminal using a nerdfont.
+Requires Linux or macOS, Node.js 20+, Claude Code or Codex installed on `$PATH`, and a truecolor terminal using a Nerd Font.
 
 ```sh
-bun add --global github:benkoppe/claude-tree
+npm install -g @benkoppe/claude-tree
 
 cd /path/to/project
 claude-tree
 ```
 
-This installs the current `main` branch. Run the install command again to update it.
+Run the install command again to update.
 
-If the command is not found after installation, add `$BUN_INSTALL/bin` (normally `$HOME/.bun/bin`) to `$PATH`.
+### Bun (from source)
 
-On musl Linux, set `OPENTUI_LIBC=musl` when running `claude-tree`.
+With Bun 1.3.13+ installed, you can install the current `main` branch instead of a release:
+
+```sh
+bun add --global github:benkoppe/claude-tree
+```
+
+Run that command again to update. If the command is not found, add `$BUN_INSTALL/bin` (normally `$HOME/.bun/bin`) to `$PATH`.
+
+On musl Linux, please set `OPENTUI_LIBC=musl`.
 
 ### Nix
 

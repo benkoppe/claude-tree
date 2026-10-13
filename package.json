@@ -1,5 +1,5 @@
 {
-  "name": "claude-tree",
+  "name": "@benkoppe/claude-tree",
   "version": "0.1.0",
   "description": "Explore and run coding-agent conversations as a tree",
   "private": true,
