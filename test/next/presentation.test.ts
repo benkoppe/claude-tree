@@ -392,7 +392,7 @@ test("normal navigation hides another message's excerpt and repeat search uses t
   } finally { await running.stop() }
 })
 
-test.each(["accept", "cancel", "navigate", "disabled"] as const)("delayed inline results respect %s", async (mode) => {
+test.each(["accept", "cancel", "navigate", "action"] as const)("delayed inline results respect %s", async (mode) => {
   const setup = await createTestRenderer({ width: 100, height: 24 })
   const client = new DeferredSearchClient()
   const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Delayed search"), new Map(), undefined,
@@ -406,11 +406,11 @@ test.each(["accept", "cancel", "navigate", "disabled"] as const)("delayed inline
     else {
       setup.mockInput.pressEnter()
       if (mode === "navigate") setup.mockInput.pressKey("j")
-      if (mode === "disabled") setup.mockInput.pressKey("f")
+      if (mode === "action") setup.mockInput.pressKey("f")
     }
     client.reply("right", ["right-message"], "right branch")
     await frame(setup, (value) => mode === "cancel" ? !value.includes("Searching…") : value.includes("/right") && !value.includes("Searching…"))
-    if (mode === "accept" || mode === "disabled") await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:right-message"))
+    if (mode === "accept") await waitFor(() => running.harness.calls.includes("select-graph:message:root-1:right-message"))
     else expect(running.harness.calls).not.toContain("select-graph:message:root-1:right-message")
     expect(setup.captureCharFrame()).not.toContain("Search full messages")
   } finally { await running.stop() }
@@ -437,16 +437,24 @@ test("search owns its controls and keeps a muted query above a white count in th
     expect(accepted.split("\n")[queryRow + 1]!.trim()).toBe("1/3 hits")
     expect(accepted).toContain("/ edit")
     expect(accepted).toContain("Esc clear")
-    for (const hidden of ["f fork", "d delete", "x kill", "n new", "Enter open", "Selected user"]) expect(accepted).not.toContain(hidden)
+    expect(accepted).toContain("Enter open")
+    expect(accepted).not.toContain("n new")
+    expect(accepted).not.toContain("Selected user")
     setup.mockInput.pressKey("/")
     const editingAgain = await frame(setup, (value) => value.includes("Enter accept"))
     expect(editingAgain.split("\n").findIndex((line) => line.trim() === "/branch")).toBe(queryRow)
   } finally { await running.stop() }
 })
 
-test("unadvertised actions are disabled in accepted search and clicking nodes only selects", async () => {
+test("accepted search shares normal actions and survives refresh and cancelled dialogs", async () => {
   const setup = await createTestRenderer({ width: 120, height: 30 })
-  const running = await startPresentation(setup.renderer, branchingGraph("root-1", "Focused search"))
+  const graph = branchingGraph("root-1", "Focused search")
+  if (graph.surface._tag !== "Graph") throw new Error("Expected graph")
+  const running = await startPresentation(setup.renderer, { ...graph, surface: {
+    ...graph.surface, nodes: graph.surface.nodes.map((node) => node._tag === "Message" ? { ...node, text: node.preview } : node),
+  } })
+  const copied: string[] = []
+  setup.renderer.copyToClipboardOSC52 = (text) => { copied.push(text); return true }
   try {
     await frame(setup, (value) => value.includes("Focused search"))
     setup.mockInput.pressKey("/")
@@ -454,24 +462,26 @@ test("unadvertised actions are disabled in accepted search and clicking nodes on
     await frame(setup, (value) => value.includes("1/3 hits"))
     setup.mockInput.pressEnter()
     await frame(setup, (value) => value.includes("n next"))
-    const before = [...running.harness.calls]
-    for (const key of ["f", "d", "x", "c", "r", "v", "e", "g", "?"]) setup.mockInput.pressKey(key)
-    setup.mockInput.pressEnter()
-    await frame(setup, (value) => value.includes("Focused search") && value.includes("/branch"))
-    expect(running.harness.calls).toEqual(before)
-    const node = coordinateOf(setup.captureCharFrame(), "branch source")
-    await setup.mockMouse.click(node.x, node.y)
-    await setup.mockMouse.click(node.x, node.y)
-    await frame(setup, (value) => value.includes("/branch"))
-    expect(running.harness.calls.some((call) => /^(open:|resume:|branch:|remove:|stop:|enter-root:|new$|refresh$)/u.test(call))).toBeFalse()
-    setup.mockInput.pressEscape()
-    await frame(setup, (value) => value.includes("f fork") && !value.includes("/branch"))
+    setup.mockInput.pressKey("c")
+    await waitFor(() => copied.length > 0)
+    expect(copied).toEqual(["branch source"])
+    setup.mockInput.pressKey("r")
+    await waitFor(() => running.harness.calls.includes("refresh"))
+    for (const key of ["d", "?"]) {
+      setup.mockInput.pressKey(key)
+      await waitFor(() => running.harness.modalUpdates.length === (key === "d" ? 1 : 2))
+      const title = key === "d" ? "Delete conversation path" : "About"
+      await frame(setup, (value) => value.includes(title))
+      setup.mockInput.pressEscape()
+      await frame(setup, (value) => value.includes("/branch") && !value.includes(title))
+    }
+    expect(running.harness.calls.some((call) => call.startsWith("remove:"))).toBeFalse()
     setup.mockInput.pressKey("f")
-    await waitFor(() => running.harness.calls.some((call) => call.startsWith("branch:")))
+    await waitFor(() => running.harness.calls.includes("branch:root-1:source"))
   } finally { await running.stop() }
 })
 
-test("accepted root search ignores activation keys and repeated root clicks", async () => {
+test.each(["keyboard", "mouse", "footer"] as const)("accepted root search allows %s activation", async (input) => {
   const setup = await createTestRenderer({ width: 120, height: 30 })
   const running = await startPresentation(setup.renderer, rootsView())
   try {
@@ -481,17 +491,49 @@ test("accepted root search ignores activation keys and repeated root clicks", as
     await frame(setup, (value) => value.includes("1/1 hits"))
     setup.mockInput.pressEnter()
     await frame(setup, (value) => value.includes("n next"))
+    if (input === "keyboard") setup.mockInput.pressEnter()
+    else {
+      const root = coordinateOf(setup.captureCharFrame(), input === "footer" ? "Enter open" : "First conversation")
+      await setup.mockMouse.click(root.x, root.y)
+    }
+    await waitFor(() => running.harness.calls.includes("enter-root:root-1"))
+    expect(running.harness.calls).not.toContain("shutdown")
+  } finally { await running.stop() }
+})
+
+test.each(["keyboard", "footer"] as const)("accepted search opens a non-matching endpoint and permits stopping via %s", async (input) => {
+  const setup = await createTestRenderer({ width: 220, height: 30 })
+  const running = await startPresentation(setup.renderer, withLiveSessions(branchingGraph("root-1", "Search actions"), ["left"]))
+  try {
+    await frame(setup, (value) => value.includes("Search actions"))
+    setup.mockInput.pressKey("/")
+    setup.mockInput.typeText("left branch")
+    await frame(setup, (value) => value.includes("1/1 hits"))
     setup.mockInput.pressEnter()
-    const root = coordinateOf(setup.captureCharFrame(), "First conversation")
-    await setup.mockMouse.click(root.x, root.y)
-    await setup.mockMouse.click(root.x, root.y)
-    await frame(setup, (value) => value.includes("Conversation roots") && value.includes("/First"))
-    expect(running.harness.calls.some((call) => call.startsWith("enter-root:") || call === "shutdown")).toBeFalse()
+    await frame(setup, (value) => value.includes("n next"))
+    setup.mockInput.pressKey("g", { shift: true })
+    await frame(setup, (value) => value.includes("1 hits") && isSelected(setup, "Draft"))
+    if (input === "keyboard") setup.mockInput.pressKey("x")
+    else {
+      const kill = coordinateOf(setup.captureCharFrame(), "x kill")
+      await setup.mockMouse.click(kill.x, kill.y)
+    }
+    await frame(setup, (value) => value.includes("Stop live session"))
+    expect(running.harness.calls).not.toContain("stop:left")
+    setup.mockInput.pressEscape()
+    await frame(setup, (value) => !value.includes("Stop live session") && value.includes("/left branch"))
+    if (input === "keyboard") setup.mockInput.pressEnter()
+    else {
+      const open = coordinateOf(setup.captureCharFrame(), "Enter open")
+      await setup.mockMouse.click(open.x, open.y)
+    }
+    await waitFor(() => running.harness.calls.includes("open:left"))
+    await frame(setup, (value) => value.includes("Ctrl+Space back") && !value.includes("/left branch"))
   } finally { await running.stop() }
 })
 
 test.each(["graph", "roots"] as const)("q is query text while typing and goes back from accepted %s search", async (surface) => {
-  const setup = await createTestRenderer({ width: 120, height: 30 })
+  const setup = await createTestRenderer({ width: 220, height: 30 })
   const running = await startPresentation(setup.renderer, surface === "graph" ? branchingGraph("root-1", "Quit search") : rootsView())
   try {
     await frame(setup, (value) => value.includes(surface === "graph" ? "Quit search" : "Conversation roots"))
@@ -507,6 +549,9 @@ test.each(["graph", "roots"] as const)("q is query text while typing and goes ba
     setup.mockInput.pressEnter()
     const accepted = await frame(setup, (value) => value.includes("q close"))
     expect(accepted).not.toContain("Ctrl+c quit")
+    expect(accepted).not.toContain("g/G top/bottom")
+    expect(accepted).not.toContain("? about")
+    expect(accepted.split("\n").find((line) => line.includes("q close"))!.trimEnd()).toEndWith("q close")
     const selected = surface === "graph" ? "left branch" : "Second conversation"
     setup.mockInput.pressKey("q")
     await frame(setup, (value) => !value.includes("1/1 hits") && value.includes(surface === "graph" ? "Message tree" : "Conversation roots"))

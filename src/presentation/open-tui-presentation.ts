@@ -789,10 +789,7 @@ class OpenTuiPresentationController {
         this.handleModalKey(key)
         return
       }
-      if (this.searchState) {
-        this.handleAcceptedSearchKey(key)
-        return
-      }
+      if (this.searchState && this.handleAcceptedSearchKey(key)) return
       if (isQuestionMarkKey(key) && !key.repeated) {
         key.stopPropagation()
         this.enqueue(this.appRuntime.openModal({ _tag: "About" }))
@@ -910,7 +907,7 @@ class OpenTuiPresentationController {
   private reconcileSearch(): void {
     const state = this.searchState, surface = this.viewModel?.surface
     if (!state || !surface) return
-    if (state.scope !== searchScope(surface) || this.viewModel?.modal) {
+    if (state.scope !== searchScope(surface)) {
       this.closeSearch()
       this.searchState = undefined
       this.savedSearch = undefined
@@ -1031,21 +1028,16 @@ class OpenTuiPresentationController {
     else if (isUnmodifiedKey(key, "tab")) key.stopPropagation()
   }
 
-  private handleAcceptedSearchKey(key: KeyEvent): void {
-    key.stopPropagation()
-    const direction = this.graphSurface() ? graphDirection(key) : undefined
-    const movement = this.rootsSurface() && ["up", "down", "j", "k"].some((name) => isUnmodifiedKey(key, name)) ? listNavigationDelta(key) : undefined
+  private handleAcceptedSearchKey(key: KeyEvent): boolean {
     const step = isUnmodifiedKey(key, "n") || isUnmodifiedKey(key, "]") || isShiftedKey(key, "p") ? 1
       : isUnmodifiedKey(key, "p") || isUnmodifiedKey(key, "[") || isShiftedKey(key, "n") ? -1 : undefined
     const back = isUnmodifiedKey(key, "q") || isUnmodifiedKey(key, "escape")
-    if (!isExitKey(key) && !back && !isUnmodifiedKey(key, "/") && step === undefined && !direction && movement === undefined) return
     this.searchState!.acceptWhenReady = false
-    if (isExitKey(key)) this.enqueue(this.stop, true, "background")
-    else if (back) this.dismissSearch()
-    else if (isUnmodifiedKey(key, "/") && !key.repeated) this.openSearch()
-    else if (step !== undefined) this.stepSearch(step)
-    else if (direction) this.moveGraph(direction)
-    else if (movement !== undefined) this.moveRoot(movement)
+    if (!back && step === undefined) return false
+    key.stopPropagation()
+    if (back) this.dismissSearch()
+    else if (step !== undefined && !this.interactionBlocked()) this.stepSearch(step)
+    return true
   }
 
   private stepSearch(delta: -1 | 1): void {
@@ -1674,23 +1666,26 @@ class OpenTuiPresentationController {
   }
 
   private controlsWithDetails(controls: readonly FooterControl[]): readonly FooterControl[] {
-    if (this.searchState) return this.searchState.open ? [
+    if (this.searchState?.open) return [
       { key: "Ctrl+n/p", description: "hits", action: "search-next" },
       { key: "Enter", description: "accept", action: "search-accept" },
       { key: "Esc", description: "cancel", action: "search-close" },
-    ] : [
+    ]
+    if (this.searchState) controls = [
       { key: "n", description: "next", action: "search-next" },
       { key: "p", description: "previous", action: "search-previous" },
       { key: "/", description: "edit", action: "search" },
       { key: "Esc", description: "clear", action: "search-close" },
       { key: this.graphSurface() ? "↑↓←→/hjkl" : "↑↓/jk", description: "move" },
+      ...controls.filter((control) =>
+        control.action !== undefined && !["search", "new", "roots", "quit", "about"].includes(control.action)),
       { key: "q", description: "close", action: "search-close" },
     ]
     const selected = this.selectedGraphNode()
     if (selected?._tag === "Message" && selected.forkTarget === undefined) {
       controls = controls.filter((control) => control.action !== "fork")
     }
-    return this.issueDetails().length ? controls.flatMap((control) => control.action === "about"
+    return this.issueDetails().length ? controls.flatMap((control) => control.action === (this.searchState ? "search-close" : "about") && control.key !== "Esc"
       ? [{ key: "e", description: "details", action: "details" as const }, control] : [control]) : controls
   }
 
@@ -1871,12 +1866,15 @@ class OpenTuiPresentationController {
     const footer = renderControls(this.controlsWithDetails(controls), this.busyFooterActions(), this.operationFrame())
     const operation = this.operationStatusChunks()
     const state = this.searchState
-    const prefix = state && operation ? [...operation, chunk(" · ", theme.textMuted)] : []
     const status = state?.busy ? "Searching…" : state && !state.query.trim() ? "Type to search" : ""
     const notice = state ? [status, state.notice, this.graphSurface()?.warnings.length ? "Available history only" : ""].filter(Boolean).join(" · ") : ""
+    const prefix = state ? [
+      ...(operation ? [...operation, chunk(" · ", theme.textMuted)] : []),
+      ...(notice ? [chunk(`${notice} · `, theme.textMuted)] : []),
+    ] : []
     this.footer.content = styledText([
       ...prefix, ...footer.chunks,
-      ...(state ? notice ? [chunk(` · ${notice}`, theme.textMuted)] : [] : [chunk("\n", theme.text), ...(operation ?? normal)]),
+      ...(state ? [] : [chunk("\n", theme.text), ...(operation ?? normal)]),
     ])
     const offset = prefix.reduce((width, part) => width + displayWidth(part.text), 0)
     this.footerHitRegions = footer.hitRegions.map((region) => ({ ...region, startX: region.startX + offset, endX: region.endX + offset }))
@@ -2145,14 +2143,14 @@ class OpenTuiPresentationController {
     event.preventDefault()
     event.stopPropagation()
     if (action.kind === "root") {
-      if (action.sessionId === this.selectedRootSessionId && !this.searchState) this.enterSelectedRoot()
+      if (action.sessionId === this.selectedRootSessionId && !this.searchState?.open) this.enterSelectedRoot()
       else {
         this.queueRootSelection(action.sessionId)
         this.render()
       }
     } else {
       const selected = this.selectedGraphNode()
-      if (action.nodeId === selected?.id && !this.searchState) this.openSelected()
+      if (action.nodeId === selected?.id && !this.searchState?.open) this.openSelected()
       else {
         const graph = this.graphSurface()
         const node = graph?.nodes.find((candidate) => candidate.id === action.nodeId)
@@ -2257,7 +2255,7 @@ class OpenTuiPresentationController {
         else this.dismissSearch()
       } else if (action === "search") this.openSearch()
       else if (action === "quit") this.enqueue(this.stop, true, "background")
-      return
+      if (this.searchState?.open || ["search-next", "search-previous", "search-accept", "search-close", "search", "quit"].includes(action)) return
     }
     if (action !== "quit" && action !== "about" && this.interactionBlocked()) return
     this.finishSearchForNavigation()
